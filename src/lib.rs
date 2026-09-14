@@ -5,7 +5,6 @@ pub mod api;
 pub mod app;
 pub mod infra;
 
-pub use insight_control::*;
-pub use wist_reporting::*;
+pub use wist_control::*;
 
 pub type AppError = wist_error::AppError;

@@ -1,44 +1,38 @@
 use axum::{
-    extract::State,
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     Json,
+    extract::State,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 
 use crate::infra::{
-    new_secret_token, sha256_hex,
+    StoredAgentRegistration, StoredCredentialStatus, new_secret_token, sha256_hex,
     victoria_metrics::{import_lines, metric_line},
-    StoredAgentRegistration, StoredCredentialStatus,
-};
-use insight_control::types::DateTime;
-use insight_control::{
-    ActionResultAccepted, AgentControlCommandsReturned, AgentHello, AgentStatusAccepted,
-    PollControlCommands, ReportActionResult,
 };
 use wist_contracts::enrollment::{
-    CredentialBundle, CredentialRenewed, CredentialRenewal,
-    RENEW_AGENT_CREDENTIAL_KIND,
+    CredentialBundle, CredentialRenewal, CredentialRenewed, RENEW_AGENT_CREDENTIAL_KIND,
 };
-use wist_reporting::{
-    ActionResultReceipt, HealthState, MetricsHealthSnapshot, RuntimeHealthSnapshot,
+use wist_contracts::gateway::{
+    ActionResultAck, AgentStatusAck, AgentStatusReport, ReportActionResult,
 };
+use wist_control::types::DateTime;
+use wist_control::{AgentControlCommandsReturned, PollControlCommands};
 
 use super::ApiState;
 
 pub async fn submit_agent_status(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(input): Json<AgentHello>,
+    Json(input): Json<AgentStatusReport>,
 ) -> Response {
     match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id) {
         Ok(agent) => {
-            let now = DateTime::now();
             let now_utc = chrono::Utc::now();
             let last_seen_at = now_utc.to_rfc3339();
             let timestamp_ms = now_utc.timestamp_millis();
-            let memory_bytes = input.memory_bytes.map(|value| value as u64);
+            let memory_bytes = input.memory_bytes;
             let cpu_percent = input.cpu_percent;
-            let admin_latency_ms = input.admin_latency_ms.map(|value| value as u64);
+            let admin_latency_ms = input.admin_latency_ms;
             let update_result = state.store.update(|snapshot| {
                 if let Some(stored) = snapshot.agents.get_mut(&agent.agent_id) {
                     stored.version = input.version.clone();
@@ -99,21 +93,10 @@ pub async fn submit_agent_status(
             }
             (
                 StatusCode::ACCEPTED,
-                Json(AgentStatusAccepted {
-                    snapshot: RuntimeHealthSnapshot {
-                        running_count: 0,
-                        state: HealthState::Healthy,
-                        queue_depth: 0,
-                        metrics: MetricsHealthSnapshot {
-                            sample_count: 0,
-                            target_count: 0,
-                            failure_count: 0,
-                            active: true,
-                        },
-                        updated_at: now,
-                        reporting_count: 0,
-                        discovery: "accepted".to_string(),
-                    },
+                Json(AgentStatusAck {
+                    agent_id: input.agent_id,
+                    instance_id: input.instance_id,
+                    acknowledged_at: now_utc.to_rfc3339(),
                 }),
             )
                 .into_response()
@@ -241,12 +224,10 @@ pub async fn report_action_result(
     match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id) {
         Ok(_) => (
             StatusCode::ACCEPTED,
-            Json(ActionResultAccepted {
-                receipt: ActionResultReceipt {
-                    agent_id: input.agent_id,
-                    report_id: input.report_id,
-                    accepted_at: DateTime::now(),
-                },
+            Json(ActionResultAck {
+                agent_id: input.agent_id,
+                report_id: input.report_id,
+                acknowledged_at: chrono::Utc::now().to_rfc3339(),
             }),
         )
             .into_response(),

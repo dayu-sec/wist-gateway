@@ -565,20 +565,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "insight-control"
-version = "0.1.1"
-dependencies = [
- "chrono",
- "jumo-core",
- "jumo-derive 0.1.3",
- "serde",
- "wist-observed",
- "wist-reporting",
- "wist-security",
- "wist-shared",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -602,46 +588,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "jumo-core"
-version = "0.2.2"
-dependencies = [
- "jumo-derive 0.1.3 (git+https://github.com/jumo-design/jumo-derive.git?branch=main)",
- "orion-error",
- "winnow 1.0.4",
- "wp-primitives",
-]
-
-[[package]]
-name = "jumo-derive"
-version = "0.1.3"
-dependencies = [
- "jumo-derive-macros 0.1.0",
-]
-
-[[package]]
 name = "jumo-derive"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d13031db93a0130ba158ff7f58fce8e21e80f5e2f149546ac081efb8dd44354"
 dependencies = [
- "jumo-derive-macros 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
-name = "jumo-derive"
-version = "0.1.3"
-source = "git+https://github.com/jumo-design/jumo-derive.git?branch=main#09a7a178be817aa7e3b23ee23a23251332c9e834"
-dependencies = [
- "jumo-derive-macros 0.1.0 (git+https://github.com/jumo-design/jumo-derive.git?branch=main)",
-]
-
-[[package]]
-name = "jumo-derive-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "jumo-derive-macros",
 ]
 
 [[package]]
@@ -649,16 +601,6 @@ name = "jumo-derive-macros"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf1e38722eb62938f49051682ccce8d44fabfafe81ab329299eea936901e03e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "jumo-derive-macros"
-version = "0.1.0"
-source = "git+https://github.com/jumo-design/jumo-derive.git?branch=main#09a7a178be817aa7e3b23ee23a23251332c9e834"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1318,7 +1260,7 @@ dependencies = [
  "serde_spanned",
  "toml_datetime",
  "toml_write",
- "winnow 0.7.15",
+ "winnow",
 ]
 
 [[package]]
@@ -1679,20 +1621,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "winnow"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
-dependencies = [
- "memchr",
-]
-
-[[package]]
 name = "wist-contracts"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "wist-control"
+version = "0.1.2"
+dependencies = [
+ "chrono",
+ "jumo-derive",
+ "serde",
+ "wist-shared",
 ]
 
 [[package]]
@@ -1711,8 +1654,7 @@ dependencies = [
  "chrono",
  "hyper",
  "hyper-util",
- "insight-control",
- "jumo-derive 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "jumo-derive",
  "orion-error",
  "reqwest",
  "ring",
@@ -1726,60 +1668,20 @@ dependencies = [
  "toml",
  "tower",
  "wist-contracts",
+ "wist-control",
  "wist-error",
- "wist-reporting",
-]
-
-[[package]]
-name = "wist-observed"
-version = "0.1.1"
-dependencies = [
- "chrono",
- "jumo-core",
- "jumo-derive 0.1.3",
- "serde",
- "wist-shared",
-]
-
-[[package]]
-name = "wist-reporting"
-version = "0.1.1"
-dependencies = [
- "chrono",
- "jumo-core",
- "jumo-derive 0.1.3",
- "serde",
- "wist-shared",
-]
-
-[[package]]
-name = "wist-security"
-version = "0.1.1"
-dependencies = [
- "chrono",
- "jumo-core",
- "jumo-derive 0.1.3",
- "serde",
- "wist-shared",
 ]
 
 [[package]]
 name = "wist-shared"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb248ae9e6c57651296666df8bf3205384fe06f1aab7f6b5fd78f4598ed1e821"
 dependencies = [
  "chrono",
  "serde",
  "serde_json",
  "time",
-]
-
-[[package]]
-name = "wp-primitives"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a05a191757675e60b6e0256e299ca91d3d9ccd4d755d3b0b234859f81d7bec60"
-dependencies = [
- "winnow 1.0.4",
 ]
 
 [[package]]

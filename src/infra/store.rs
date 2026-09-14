@@ -11,7 +11,7 @@ use std::{
 use orion_error::{conversion::ToStructError, prelude::*};
 use serde::{Deserialize, Serialize};
 
-use insight_control::AgentWorkStateChange;
+use wist_contracts::gateway::AgentWorkStateChange;
 use wist_error::StoreReason;
 
 #[derive(Debug, Clone)]

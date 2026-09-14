@@ -8,8 +8,8 @@ use axum::{
 };
 use serde::Deserialize;
 
-use insight_control::types::{AgentRuntimeStatus, DateTime, DispatchReceipt};
-use insight_control::{
+use wist_control::types::{AgentRuntimeStatus, DateTime, DispatchReceipt};
+use wist_control::{
     AdminAgentRuntimeStatusReturned, AdminPauseAgentDispatchReturned,
     AdminUpgradeAgentDispatchReturned,
 };

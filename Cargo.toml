@@ -22,8 +22,7 @@ rustls-pki-types = "1"
 rustls-webpki = "0.103"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 wist-contracts = { version = "0.1.1", path = "../wist-contracts" }
-insight-control = { version = "0.1.1", path = "../insight-control" }
-wist-reporting = { version = "0.1.1", path = "../wist-reporting" }
+wist-control = { version = "0.1.1", path = "../wist-control" }
 wist-error = { version = "0.1.1", path = "../wist-error" }
 orion-error = { version = "0.8", features = ["derive", "serde_json"] }
 ring = "0.17"

@@ -1,7 +1,7 @@
 // @jumo generated
 // @jumo hash=5cd0b68d5b14ca27
 
-use insight_control::AdminShowAgentRuntimeStatus;
+use wist_control::AdminShowAgentRuntimeStatus;
 
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "interface", domain = "Control", module = "Control.GatewayApp.UserFacingInterface")]

@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    body::{to_bytes, Body},
-    extract::State,
-    http::{header, Request, StatusCode},
     Json,
+    body::{Body, to_bytes},
+    extract::State,
+    http::{Request, StatusCode, header},
 };
 use ring::{
     rand as ring_rand,
@@ -14,21 +14,23 @@ use ring::{
 };
 use tower::ServiceExt;
 use wist_contracts::enrollment::{
-    CredentialRenewed, EnrollmentEnvelope, EnrollmentStatus,
-    AgentIdentityStatus, CredentialRenewal, EnrollmentRequest,
+    AgentIdentityStatus, CredentialRenewal, CredentialRenewed, EnrollmentEnvelope,
+    EnrollmentRequest, EnrollmentStatus,
 };
 
 use crate::infra::{
-    load_install_script_public_key_pem, sha256_hex, AdminConfig, AdminStore,
-    StoredEnrollmentTokenStatus,
+    AdminConfig, AdminStore, StoredEnrollmentTokenStatus, load_install_script_public_key_pem,
+    sha256_hex,
 };
-use insight_control::types::DateTime;
-use insight_control::{
-    AgentHello, AgentWorkState, AgentWorkStateChange, PollControlCommands, ReportActionResult,
+use wist_contracts::action_result::{ActionResult, FinalStatus};
+use wist_contracts::gateway::{
+    AgentStatusReport, AgentWorkState, AgentWorkStateChange, ReportActionResult, ResultAttestation,
 };
-use wist_reporting::ResultAttestation;
+use wist_control::PollControlCommands;
+use wist_control::types::DateTime;
 
 use super::{
+    AdminRuntimeState, ApiState,
     enrollment::{
         agent_enrollment_result, agent_enrollment_result_with_token_issuer, enroll_agent,
     },
@@ -36,8 +38,8 @@ use super::{
         agent_initial_config_toml, agent_install_code, agent_package_sha256,
         issue_agent_install_code, token_hash, validate_bootstrap_token_for_config,
     },
-    overview::{agent_overview, RecentOnlineRegisteredAgentSource},
-    router, AdminRuntimeState, ApiState,
+    overview::{RecentOnlineRegisteredAgentSource, agent_overview},
+    router,
 };
 
 const TEST_ADMIN_API_TOKEN: &str = "test-admin-token";
@@ -59,26 +61,34 @@ fn install_code_uses_header_bootstrap_token_without_url_token_leak() {
         install_code.bootstrap_bundle.agent_package_url,
         "https://127.0.0.1:3000/api/v1/agent/packages/current"
     );
-    assert!(!install_code
-        .bootstrap_bundle
-        .agent_package_sha256
-        .is_empty());
+    assert!(
+        !install_code
+            .bootstrap_bundle
+            .agent_package_sha256
+            .is_empty()
+    );
     assert!(install_code.x86_linux_install_code.contains(
         "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/x86/install.sh\" -o \"$D/s\""
     ));
     assert!(install_code.arm_linux_install_code.contains(
         "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/arm/install.sh\" -o \"$D/s\""
     ));
-    assert!(install_code
-        .x86_linux_install_code
-        .contains("install.sh.sig"));
-    assert!(install_code
-        .x86_linux_install_code
-        .contains("openssl pkeyutl -verify -pubin"));
+    assert!(
+        install_code
+            .x86_linux_install_code
+            .contains("install.sh.sig")
+    );
+    assert!(
+        install_code
+            .x86_linux_install_code
+            .contains("openssl pkeyutl -verify -pubin")
+    );
     assert!(install_code.x86_linux_install_code.contains("sh \"$D/s\""));
-    assert!(install_code
-        .x86_linux_install_code
-        .contains("-----BEGIN PUBLIC KEY-----"));
+    assert!(
+        install_code
+            .x86_linux_install_code
+            .contains("-----BEGIN PUBLIC KEY-----")
+    );
     let macos = &install_code.macos_install_code;
     assert!(macos.contains("\"$(uname -s)\" != \"Darwin\""));
     assert!(macos.contains("arm64) ARCH=arm ;; *) ARCH=x86"));
@@ -93,22 +103,30 @@ fn install_code_uses_header_bootstrap_token_without_url_token_leak() {
     assert_eq!(install_code.bootstrap_enrollment_token, "token-a");
     assert!(!install_code.x86_linux_install_code.contains("token-a"));
     assert!(!install_code.arm_linux_install_code.contains("token-a"));
-    assert!(!install_code
-        .x86_linux_install_code
-        .contains("WARP_INSIGHT_ENROLLMENT_TOKEN="));
-    assert!(!install_code
-        .arm_linux_install_code
-        .contains("WARP_INSIGHT_ENROLLMENT_TOKEN="));
+    assert!(
+        !install_code
+            .x86_linux_install_code
+            .contains("WARP_INSIGHT_ENROLLMENT_TOKEN=")
+    );
+    assert!(
+        !install_code
+            .arm_linux_install_code
+            .contains("WARP_INSIGHT_ENROLLMENT_TOKEN=")
+    );
     assert!(!install_code.x86_linux_install_code.contains("?token="));
     assert!(!install_code.arm_linux_install_code.contains("?token="));
-    assert!(!install_code
-        .bootstrap_bundle
-        .install_script_url
-        .contains("?token="));
-    assert!(!install_code
-        .bootstrap_bundle
-        .agent_package_url
-        .contains("?token="));
+    assert!(
+        !install_code
+            .bootstrap_bundle
+            .install_script_url
+            .contains("?token=")
+    );
+    assert!(
+        !install_code
+            .bootstrap_bundle
+            .agent_package_url
+            .contains("?token=")
+    );
 }
 
 #[test]
@@ -302,10 +320,12 @@ fn enrollment_accepts_valid_token_and_issues_identity() {
     assert_eq!(identity.status, AgentIdentityStatus::Active);
     let credential = result.credential_bundle.expect("credential bundle");
     assert_eq!(credential.auth_scheme.as_deref(), Some("bearer"));
-    assert!(credential
-        .bearer_token
-        .as_deref()
-        .is_some_and(|token| token.starts_with("wic_")));
+    assert!(
+        credential
+            .bearer_token
+            .as_deref()
+            .is_some_and(|token| token.starts_with("wic_"))
+    );
     assert!(credential.not_after.is_some());
 }
 
@@ -498,10 +518,7 @@ async fn enrollment_handler_returns_created_contract_response() {
     let returned = decode_enrollment_response(response).await;
 
     assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(
-        returned.result.status,
-        EnrollmentStatus::Accepted
-    );
+    assert_eq!(returned.result.status, EnrollmentStatus::Accepted);
     assert_eq!(returned.result.agent_id.as_deref(), Some("agent-node-a"));
 }
 
@@ -513,19 +530,18 @@ async fn enrollment_route_accepts_valid_contract_request() {
 
     assert_eq!(response.status(), StatusCode::CREATED);
     let returned = decode_enrollment_response(response).await;
-    assert_eq!(
-        returned.result.status,
-        EnrollmentStatus::Accepted
-    );
+    assert_eq!(returned.result.status, EnrollmentStatus::Accepted);
     assert_eq!(returned.result.agent_id.as_deref(), Some("agent-node-a"));
     assert_eq!(returned.result.instance_id.as_deref(), Some("node-a"));
     assert!(returned.result.issued_identity.is_some());
-    assert!(returned
-        .result
-        .credential_bundle
-        .as_ref()
-        .and_then(|credential| credential.bearer_token.as_deref())
-        .is_some_and(|token| token.starts_with("wic_")));
+    assert!(
+        returned
+            .result
+            .credential_bundle
+            .as_ref()
+            .and_then(|credential| credential.bearer_token.as_deref())
+            .is_some_and(|token| token.starts_with("wic_"))
+    );
 }
 
 #[tokio::test]
@@ -545,7 +561,7 @@ async fn agent_status_route_requires_bearer_credential() {
         &env.config,
         "/api/v1/agent/status",
         Some(&credential),
-        &AgentHello {
+        &AgentStatusReport {
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -562,7 +578,7 @@ async fn agent_status_route_requires_bearer_credential() {
         &env.config,
         "/api/v1/agent/status",
         None,
-        &AgentHello {
+        &AgentStatusReport {
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -593,7 +609,7 @@ async fn agent_status_route_persists_reported_metrics() {
         &env.config,
         "/api/v1/agent/status",
         Some(&credential),
-        &AgentHello {
+        &AgentStatusReport {
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -630,7 +646,7 @@ async fn agent_status_route_persists_work_state_changes() {
         &env.config,
         "/api/v1/agent/status",
         Some(&credential),
-        &AgentHello {
+        &AgentStatusReport {
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -686,7 +702,7 @@ async fn agent_status_route_rejects_expired_bearer_credential() {
         &env.config,
         "/api/v1/agent/status",
         Some(&credential),
-        &AgentHello {
+        &AgentStatusReport {
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -740,7 +756,7 @@ async fn agent_credential_renewal_rotates_bearer_and_rejects_old_token() {
         &env.config,
         "/api/v1/agent/status",
         Some(&old_bearer),
-        &AgentHello {
+        &AgentStatusReport {
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -757,7 +773,7 @@ async fn agent_credential_renewal_rotates_bearer_and_rejects_old_token() {
         &env.config,
         "/api/v1/agent/status",
         Some(new_bearer),
-        &AgentHello {
+        &AgentStatusReport {
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -826,27 +842,28 @@ async fn agent_control_and_action_result_routes_accept_bearer_credential() {
         &env.config,
         "/api/v1/agent/action-results",
         Some(&credential),
-        &ReportActionResult {
-            execution_id: "exec-1".to_string(),
-            kind: "command".to_string(),
-            agent_id: "agent-node-a".to_string(),
-            result_attestation: ResultAttestation {
-                issued_by: "agent-node-a".to_string(),
-                attested_at: DateTime::now(),
+        &ReportActionResult::new(
+            "report-1".to_string(),
+            "action-1".to_string(),
+            1,
+            FinalStatus::Succeeded,
+            "exec-1".to_string(),
+            "sha256:plan".to_string(),
+            "agent-node-a".to_string(),
+            "node-a".to_string(),
+            ResultAttestation {
                 result_digest: "sha256:test".to_string(),
                 signature: "test-signature".to_string(),
+                issued_by: "agent-node-a".to_string(),
+                attested_at: DateTime::now().to_chrono().to_rfc3339(),
             },
-            action_id: "action-1".to_string(),
-            reported_at: DateTime::now(),
-            final_status: "succeeded".to_string(),
-            result: "{}".to_string(),
-            dispatch_id: "dispatch-1".to_string(),
-            plan_digest: "sha256:plan".to_string(),
-            report_attempt: 1,
-            report_id: "report-1".to_string(),
-            api_version: "v1".to_string(),
-            instance_id: "node-a".to_string(),
-        },
+            DateTime::now().to_chrono().to_rfc3339(),
+            ActionResult::new(
+                "action-1".to_string(),
+                "exec-1".to_string(),
+                FinalStatus::Succeeded,
+            ),
+        ),
     )
     .await;
     assert_eq!(report.status(), StatusCode::ACCEPTED);
@@ -860,10 +877,7 @@ async fn enrollment_route_rejects_invalid_token_as_contract_result() {
 
     assert_eq!(response.status(), StatusCode::CREATED);
     let returned = decode_enrollment_response(response).await;
-    assert_eq!(
-        returned.result.status,
-        EnrollmentStatus::Rejected
-    );
+    assert_eq!(returned.result.status, EnrollmentStatus::Rejected);
     assert_eq!(
         returned.result.reason_code.as_deref(),
         Some("invalid_enrollment_token")
@@ -1500,9 +1514,7 @@ async fn post_json_to_router<T: serde::Serialize>(
         .expect("route response")
 }
 
-async fn decode_enrollment_response(
-    response: axum::response::Response,
-) -> EnrollmentEnvelope {
+async fn decode_enrollment_response(response: axum::response::Response) -> EnrollmentEnvelope {
     decode_json_response(response).await
 }
 

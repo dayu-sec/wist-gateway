@@ -64,7 +64,7 @@ src/
 - [`wist-shared`](../wist-shared) — shared helpers (fs, ids, paths, time).
 - [`wist-error`](../wist-error) — shared error type.
 - [`wist-reporting`](../wist-reporting) — reporting domain model.
-- [`insight-control`](../insight-control) — control domain model.
+- [`wist-control`](../wist-control) — control domain model.
 
 ## License
 

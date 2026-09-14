@@ -14,8 +14,8 @@ use crate::infra::{
     StoredEnrollmentToken, StoredEnrollmentTokenStatus,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use insight_control::types::{AgentBootstrapBundle, AgentInstallCode, DateTime};
-use insight_control::AdminAgentInstallCodeReturned;
+use wist_control::types::{AgentBootstrapBundle, AgentInstallCode, DateTime};
+use wist_control::AdminAgentInstallCodeReturned;
 use ring::digest::{digest, SHA256};
 use rustls_pki_types::{pem::PemObject, CertificateDer};
 use webpki::EndEntityCert;

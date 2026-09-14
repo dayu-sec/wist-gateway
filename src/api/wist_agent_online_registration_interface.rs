@@ -1,7 +1,7 @@
 // @jumo generated
 // @jumo hash=91638372490551d3
 
-use insight_control::SubmitEnrollmentRequest;
+use wist_control::SubmitEnrollmentRequest;
 
 #[derive(::jumo_derive::Jumo)]
 #[jumo(kind = "interface", domain = "Control", module = "Control.AgentApp.FacingInterface")]

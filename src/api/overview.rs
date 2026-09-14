@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::infra::victoria_metrics::query_json;
 use crate::infra::{AgentMetricSample, StoredAgentRegistration};
-use insight_control::types::{AgentRuntimeStatus, DateTime};
+use wist_control::types::{AgentRuntimeStatus, DateTime};
 
 use super::admin_auth::require_admin_bearer;
 use super::{rate_limit, AdminRuntimeState, ApiState};
