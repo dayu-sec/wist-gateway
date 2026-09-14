@@ -8,12 +8,12 @@ license = "Apache-2.0"
 
 [dependencies]
 jumo-derive = "0.1"
-axum = "0.7"
+axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
-toml = "0.8"
-base64 = "0.22"
+toml = "1.1"
+base64 = "0.23"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "http1", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }

@@ -1,10 +1,9 @@
-use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
 use axum::{
     Json,
-    extract::{Path, State, connect_info::ConnectInfo},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -41,7 +40,7 @@ static PACKAGE_HASH_CACHE: Mutex<Option<PackageHashCacheEntry>> = Mutex::new(Non
 pub async fn get_agent_install_code(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -137,7 +136,7 @@ fn unknown_arch_response() -> Response {
 pub async fn get_agent_initial_config_with_token(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Some(response) = rate_limit::check_rate_limit(&state, &client_key, BOOTSTRAP_AUTH_SCOPE)
@@ -171,7 +170,7 @@ pub async fn get_agent_initial_config_with_token(
 pub async fn download_agent_package(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Some(response) = rate_limit::check_rate_limit(&state, &client_key, BOOTSTRAP_AUTH_SCOPE)

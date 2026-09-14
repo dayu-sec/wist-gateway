@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use axum::{
+    extract::FromRequestParts,
     extract::connect_info::ConnectInfo,
     http::{StatusCode, header},
+    http::request::Parts,
     response::{IntoResponse, Response},
 };
 
@@ -29,13 +32,36 @@ struct RateLimitBucket {
     blocked_until: Option<Instant>,
 }
 
+/// Peer socket address if one was injected (via the `ConnectInfo` middleware
+/// in production or `MockConnectInfo` in tests), otherwise `None`.
+///
+/// axum 0.8 removed the `Option<ConnectInfo<T>>` extractor (`ConnectInfo` no
+/// longer implements `OptionalFromRequestParts`), so this restores the
+/// optional-address behavior the rate-limit code depends on.
+pub struct OptionalConnectInfo(pub Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for OptionalConnectInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Infallible> {
+        let addr = match ConnectInfo::<SocketAddr>::from_request_parts(parts, state).await {
+            Ok(ConnectInfo(addr)) => Some(addr),
+            Err(_) => None,
+        };
+        Ok(OptionalConnectInfo(addr))
+    }
+}
+
 /// Derive a stable per-client bucket key from the peer socket address injected by
 /// [`axum::extract::connect_info::ConnectInfo`]. Client-supplied headers such as
 /// `x-real-ip` / `x-forwarded-for` are intentionally ignored (they are spoofable).
 /// Falls back to a single shared bucket when no connection info is available (e.g. tests).
-pub fn client_key(client: Option<ConnectInfo<SocketAddr>>) -> String {
+pub fn client_key(client: Option<SocketAddr>) -> String {
     client
-        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
 

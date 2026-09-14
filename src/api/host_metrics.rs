@@ -1,8 +1,6 @@
-use std::net::SocketAddr;
-
 use axum::{
     Json,
-    extract::{Path, State, connect_info::ConnectInfo},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -80,7 +78,7 @@ pub async fn get_agent_host_metrics(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(agent_id): Path<String>,
-    client: Option<ConnectInfo<SocketAddr>>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -113,7 +111,7 @@ pub async fn get_agent_host_metrics(
 pub async fn get_all_agents_host_metrics(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {

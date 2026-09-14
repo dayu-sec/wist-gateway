@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::SocketAddr;
 
 use axum::{
     Json,
-    extract::{State, connect_info::ConnectInfo},
+    extract::State,
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
@@ -62,7 +61,7 @@ pub struct AgentOverview {
 pub async fn get_agent_overview(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {

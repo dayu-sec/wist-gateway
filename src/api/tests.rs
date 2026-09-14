@@ -512,7 +512,12 @@ fn enrollment_response_uses_contract_wire_status() {
 async fn enrollment_handler_returns_created_contract_response() {
     let state = test_state();
     let token = issue_token_for_state(&state);
-    let response = enroll_agent(State(state), None, Json(enrollment_request(&token))).await;
+    let response = enroll_agent(
+        State(state),
+        super::rate_limit::OptionalConnectInfo(None),
+        Json(enrollment_request(&token)),
+    )
+    .await;
     let status = response.status();
     assert_no_store(&response);
     let returned = decode_enrollment_response(response).await;
@@ -1341,7 +1346,12 @@ async fn agent_overview_reflects_successful_enrollment() {
     let mut request = enrollment_request(&token);
     request.capability_summary = "wist-agentd:test,version=v0.9.1".to_string();
 
-    let _ = enroll_agent(State(state.clone()), None, Json(request)).await;
+    let _ = enroll_agent(
+        State(state.clone()),
+        super::rate_limit::OptionalConnectInfo(None),
+        Json(request),
+    )
+    .await;
     let overview = agent_overview(&state).await;
 
     assert_eq!(overview.metrics.total_agents, 1);

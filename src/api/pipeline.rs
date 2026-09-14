@@ -18,11 +18,10 @@
 //!   因此「落存储速率」不恒等于入流速率，分组数 > 1 时天然偏高。
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
 
 use axum::{
     Json,
-    extract::{Query, State, connect_info::ConnectInfo},
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -139,7 +138,7 @@ pub async fn get_pipeline_topology(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<PipelineQuery>,
-    client: Option<ConnectInfo<SocketAddr>>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {

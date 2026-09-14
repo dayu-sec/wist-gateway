@@ -59,11 +59,11 @@ pub fn router(config: AdminConfig) -> Router {
     Router::new()
         .route("/api/v1/agent/install-code", get(get_agent_install_code))
         .route(
-            "/api/v1/agent/install/:arch/install.sh",
+            "/api/v1/agent/install/{arch}/install.sh",
             get(get_agent_install_script),
         )
         .route(
-            "/api/v1/agent/install/:arch/install.sh.sig",
+            "/api/v1/agent/install/{arch}/install.sh.sig",
             get(get_agent_install_script_signature),
         )
         .route(
@@ -91,11 +91,11 @@ pub fn router(config: AdminConfig) -> Router {
             get(get_all_agents_host_metrics),
         )
         .route(
-            "/api/v1/admin/agents/:agent_id/runtime-status",
+            "/api/v1/admin/agents/{agent_id}/runtime-status",
             get(get_agent_runtime_status),
         )
         .route(
-            "/api/v1/admin/agents/:agent_id/host-metrics",
+            "/api/v1/admin/agents/{agent_id}/host-metrics",
             get(get_agent_host_metrics),
         )
         // NOTE(hand-added): 数据采集吞吐视图（见 api/pipeline.rs 顶部说明）
@@ -103,9 +103,9 @@ pub fn router(config: AdminConfig) -> Router {
             "/api/v1/admin/pipeline/topology",
             get(get_pipeline_topology),
         )
-        .route("/api/v1/admin/agents/:agent_id/pause", post(pause_agent))
+        .route("/api/v1/admin/agents/{agent_id}/pause", post(pause_agent))
         .route(
-            "/api/v1/admin/agents/:agent_id/upgrade",
+            "/api/v1/admin/agents/{agent_id}/upgrade",
             post(upgrade_agent),
         )
         .with_state(ApiState {

@@ -1,8 +1,6 @@
-use std::net::SocketAddr;
-
 use axum::{
     Json,
-    extract::{Path, State, connect_info::ConnectInfo},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -31,7 +29,7 @@ pub async fn get_agent_runtime_status(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(agent_id): Path<String>,
-    client: Option<ConnectInfo<SocketAddr>>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -70,7 +68,7 @@ pub async fn pause_agent(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(agent_id): Path<String>,
-    client: Option<ConnectInfo<SocketAddr>>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
     Json(input): Json<PauseAgentRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -96,7 +94,7 @@ pub async fn upgrade_agent(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(agent_id): Path<String>,
-    client: Option<ConnectInfo<SocketAddr>>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
     Json(input): Json<UpgradeAgentRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);

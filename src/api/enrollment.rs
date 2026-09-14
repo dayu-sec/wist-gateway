@@ -1,8 +1,6 @@
-use std::net::SocketAddr;
-
 use axum::{
     Json,
-    extract::{State, connect_info::ConnectInfo},
+    extract::State,
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -28,7 +26,7 @@ const NO_STORE: &str = "no-store";
 
 pub async fn enroll_agent(
     State(state): State<ApiState>,
-    client: Option<ConnectInfo<SocketAddr>>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
     Json(input): Json<EnrollmentRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
