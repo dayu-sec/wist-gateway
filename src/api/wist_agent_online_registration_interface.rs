@@ -4,7 +4,11 @@
 use wist_control::SubmitEnrollmentRequest;
 
 #[derive(::jumo_derive::Jumo)]
-#[jumo(kind = "interface", domain = "Control", module = "Control.AgentApp.FacingInterface")]
+#[jumo(
+    kind = "interface",
+    domain = "Control",
+    module = "Control.AgentApp.FacingInterface"
+)]
 pub struct WpAgentOnlineRegistrationInterface;
 
 impl WpAgentOnlineRegistrationInterface {

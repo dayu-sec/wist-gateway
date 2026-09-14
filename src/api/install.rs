@@ -3,22 +3,22 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use axum::{
-    extract::{connect_info::ConnectInfo, Path, State},
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     Json,
+    extract::{Path, State, connect_info::ConnectInfo},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 
 use crate::infra::{
-    bytes_sha256_hex, new_secret_token, sha256_hex, sign_install_script, AdminConfig, AdminStore,
-    StoredEnrollmentToken, StoredEnrollmentTokenStatus,
+    AdminConfig, AdminStore, StoredEnrollmentToken, StoredEnrollmentTokenStatus, bytes_sha256_hex,
+    new_secret_token, sha256_hex, sign_install_script,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use wist_control::types::{AgentBootstrapBundle, AgentInstallCode, DateTime};
-use wist_control::AdminAgentInstallCodeReturned;
-use ring::digest::{digest, SHA256};
-use rustls_pki_types::{pem::PemObject, CertificateDer};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use ring::digest::{SHA256, digest};
+use rustls_pki_types::{CertificateDer, pem::PemObject};
 use webpki::EndEntityCert;
+use wist_control::AdminAgentInstallCodeReturned;
+use wist_control::types::{AgentBootstrapBundle, AgentInstallCode, DateTime};
 
 use super::ApiState;
 use super::{admin_auth::require_admin_bearer, rate_limit};
@@ -100,7 +100,7 @@ pub async fn get_agent_install_script_signature(
     let Ok(arch) = supported_agent_arch(&arch) else {
         return unknown_arch_response();
     };
-    match install_script_signature(&state.config, &arch) {
+    match install_script_signature(&state.config, arch) {
         Ok(signature) => (
             [
                 (header::CONTENT_TYPE, "application/octet-stream"),
@@ -241,7 +241,7 @@ pub fn issue_agent_install_code(
             snapshot.enrollment_tokens.insert(token_hash, stored);
         })
         .map_err(|err| err.to_string())?;
-    Ok(agent_install_code(config, &token, expires_at)?)
+    agent_install_code(config, &token, expires_at)
 }
 
 pub fn agent_install_code(
@@ -420,7 +420,7 @@ pub fn validate_bootstrap_token_for_config(
     // Use `update` (always persists) rather than `update_result` (rolls back on
     // Err) so status transitions — marking an expired token, recovering an
     // expired reservation — are actually written to the store.
-    let validation = store
+    store
         .update(|snapshot| -> Result<(), String> {
             let Some(stored) = snapshot.enrollment_tokens.get_mut(&token_hash) else {
                 return Err("unknown enrollment token".to_string());
@@ -450,8 +450,7 @@ pub fn validate_bootstrap_token_for_config(
             }
             Ok(())
         })
-        .map_err(|err| err.to_string())?;
-    validation
+        .map_err(|err| err.to_string())?
 }
 
 pub fn agent_package_sha256(config: &AdminConfig) -> Result<String, String> {

@@ -1,14 +1,14 @@
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{connect_info::ConnectInfo, Path, State},
+    Json,
+    extract::{Path, State, connect_info::ConnectInfo},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Serialize;
 
-use super::{admin_auth::require_admin_bearer, rate_limit, ApiState};
+use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 use crate::infra::victoria_metrics::query_json;
 
 /// 趋势图时间窗口（秒）与采样步长（秒）。

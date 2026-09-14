@@ -1,0 +1,74 @@
+name: Build & Test
+
+on:
+  push:
+    branches:
+      - "*"
+  pull_request:
+    types: [opened, reopened]
+    branches:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cargo fmt
+        run: cargo fmt --check
+
+      - name: Cargo build (release)
+        run: cargo build --release --all
+
+      - name: Cargo test (release)
+        run: cargo test --release --all
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage report
+        run: |
+          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info -- --test-threads=1
+          echo "Coverage file generated:"
+          ls -la lcov.info
+          echo "File size: $(wc -c < lcov.info) bytes"
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: ./lcov.info
+          flags: unittests
+          name: coverage-${{ github.ref_name }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: ${{ github.event_name == 'push' }}
+          verbose: true

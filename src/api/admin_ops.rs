@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{connect_info::ConnectInfo, Path, State},
+    Json,
+    extract::{Path, State, connect_info::ConnectInfo},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Deserialize;
 
@@ -14,7 +14,7 @@ use wist_control::{
     AdminUpgradeAgentDispatchReturned,
 };
 
-use super::{admin_auth::require_admin_bearer, rate_limit, ApiState};
+use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PauseAgentRequest {
@@ -137,6 +137,7 @@ fn agent_not_found_response(state: &ApiState, agent_id: &str) -> Option<Response
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn runtime_status(
     agent_id: &str,
     instance_id: &str,

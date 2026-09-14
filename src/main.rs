@@ -9,10 +9,10 @@ use std::{
 };
 
 use axum::{
-    extract::{connect_info::ConnectInfo, Request, State},
-    middleware::{from_fn_with_state, Next},
-    response::Response,
     Router,
+    extract::{Request, State, connect_info::ConnectInfo},
+    middleware::{Next, from_fn_with_state},
+    response::Response,
 };
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},

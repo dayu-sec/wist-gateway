@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 const PEM_BEGIN_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----";
@@ -14,6 +14,7 @@ const ED25519_PUBLIC_KEY_SPKI_PREFIX: [u8; 12] = [
 
 /// Cache the decoded signing key pair keyed by the key file's mtime/size, so the
 /// public install endpoints do not re-read and re-parse the PEM on every request.
+#[allow(clippy::type_complexity)]
 static SIGNING_KEY_CACHE: Mutex<Option<(PathBuf, SystemTime, u64, Arc<Ed25519KeyPair>)>> =
     Mutex::new(None);
 

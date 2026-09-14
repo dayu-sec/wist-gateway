@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     extract::connect_info::ConnectInfo,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 

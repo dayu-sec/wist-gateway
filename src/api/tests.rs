@@ -1526,10 +1526,9 @@ async fn decode_json_response<T: serde::de::DeserializeOwned>(
 }
 
 async fn body_bytes(response: axum::response::Response) -> axum::body::Bytes {
-    let bytes = to_bytes(response.into_body(), usize::MAX)
+    to_bytes(response.into_body(), usize::MAX)
         .await
-        .expect("body bytes");
-    bytes
+        .expect("body bytes")
 }
 
 fn write_install_signing_key(root: &std::path::Path) -> (std::path::PathBuf, Vec<u8>) {

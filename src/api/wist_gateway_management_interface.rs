@@ -4,7 +4,11 @@
 use wist_control::AdminShowAgentRuntimeStatus;
 
 #[derive(::jumo_derive::Jumo)]
-#[jumo(kind = "interface", domain = "Control", module = "Control.GatewayApp.UserFacingInterface")]
+#[jumo(
+    kind = "interface",
+    domain = "Control",
+    module = "Control.GatewayApp.UserFacingInterface"
+)]
 pub struct WarpGateWayManagementInterface;
 
 impl WarpGateWayManagementInterface {

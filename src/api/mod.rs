@@ -4,8 +4,8 @@
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 
 use crate::infra::{AdminConfig, AdminStore};
@@ -24,9 +24,9 @@ mod rate_limit;
 
 pub mod wist_gateway_management_interface;
 pub mod wist_gateway_public_install_interface;
-pub use wist_gateway_management_interface::*;
+pub use wist_gateway_management_interface::WarpGateWayManagementInterface;
 pub mod wist_agent_online_registration_interface;
-pub use wist_agent_online_registration_interface::*;
+pub use wist_agent_online_registration_interface::WpAgentOnlineRegistrationInterface;
 
 use admin_ops::{get_agent_runtime_status, pause_agent, upgrade_agent};
 use agent_ops::{
@@ -38,7 +38,7 @@ use install::{
     download_agent_package, get_agent_initial_config_with_token, get_agent_install_code,
     get_agent_install_script, get_agent_install_script_signature,
 };
-use overview::{get_agent_overview, RecentOnlineRegisteredAgent};
+use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
 use pipeline::get_pipeline_topology;
 
 #[derive(Debug, Clone)]

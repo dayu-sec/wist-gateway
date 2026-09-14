@@ -1623,6 +1623,8 @@ dependencies = [
 [[package]]
 name = "wist-contracts"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c4a409c90b530d597946df3b3cc01633d1dca9ca89c167db8656bdbe1662bce"
 dependencies = [
  "serde",
  "serde_json",
@@ -1631,6 +1633,8 @@ dependencies = [
 [[package]]
 name = "wist-control"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdc2d8e17b080878e3e0aa736607dfe6eb91f1aca98646a141a04a83cd8c003a"
 dependencies = [
  "chrono",
  "jumo-derive",
@@ -1640,7 +1644,9 @@ dependencies = [
 
 [[package]]
 name = "wist-error"
-version = "0.1.1"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21ef56ce2924470f14b826458dce32f706c68f2123ad23b311cd9184b9dd5351"
 dependencies = [
  "orion-error",
 ]

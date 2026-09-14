@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{connect_info::ConnectInfo, State},
+    Json,
+    extract::{State, connect_info::ConnectInfo},
     http::HeaderMap,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Serialize;
 
@@ -14,7 +14,7 @@ use crate::infra::{AgentMetricSample, StoredAgentRegistration};
 use wist_control::types::{AgentRuntimeStatus, DateTime};
 
 use super::admin_auth::require_admin_bearer;
-use super::{rate_limit, AdminRuntimeState, ApiState};
+use super::{AdminRuntimeState, ApiState, rate_limit};
 
 #[derive(Debug, Clone, Serialize, ::jumo_derive::Jumo)]
 #[serde(rename_all = "camelCase")]
@@ -194,6 +194,7 @@ pub fn record_recent_online_agent(
     state.recent_online_agents.truncate(6);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recent_online_registered_agent_at(
     agent_id: &str,
     instance_id: &str,

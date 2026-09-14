@@ -10,8 +10,7 @@ pub fn new_secret_token(prefix: &str) -> Result<String, String> {
 
 /// 短 admin token（10 位随机字母数字）——demo/开发便捷用，非生产安全强度（可被暴力枚举）。
 pub fn new_admin_token() -> Result<String, String> {
-    const CHARS: &[u8] =
-        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let mut bytes = [0_u8; 10];
     let rng = ring_rand::SystemRandom::new();
     ring_rand::SecureRandom::fill(&rng, &mut bytes)

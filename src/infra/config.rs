@@ -351,7 +351,7 @@ fn require_seconds_at_most(field: &str, value: i64, max: i64) -> Result<(), Conf
 }
 
 fn require_min_secret_length(field: &str, value: &str, min: usize) -> Result<(), ConfigError> {
-    if value.as_bytes().len() >= min {
+    if value.len() >= min {
         return Ok(());
     }
     Err(config_validation(format!(
@@ -851,11 +851,10 @@ environment_id = "env-default"
     }
 
     fn unique_suffix() -> u128 {
-        let suffix = SystemTime::now()
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
-            .as_nanos();
-        suffix
+            .as_nanos()
     }
 
     fn write_install_signing_key(path: &Path) {

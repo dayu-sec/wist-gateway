@@ -21,14 +21,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{connect_info::ConnectInfo, Query, State},
+    Json,
+    extract::{Query, State, connect_info::ConnectInfo},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 
-use super::{admin_auth::require_admin_bearer, rate_limit, ApiState};
+use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 use crate::infra::victoria_metrics::query_json;
 
 /// 默认统计窗口 30 分钟；步长固定 60s（= VM 导出粒度）。
@@ -166,11 +166,7 @@ pub async fn get_pipeline_topology(
     }
 }
 
-async fn build_topology(
-    vm_url: &str,
-    window: i64,
-    step: i64,
-) -> Result<PipelineTopology, String> {
+async fn build_topology(vm_url: &str, window: i64, step: i64) -> Result<PipelineTopology, String> {
     // 来源层：每个 `source_type:source_name` 一行
     let source_level = query_level(vm_url, SOURCE_METRIC, &SOURCE_LABELS, window, step).await?;
     let mut sources: Vec<PipelineNode> = source_level
@@ -266,7 +262,9 @@ async fn build_groups(
     // 未落存储的分组排最前 —— 它们是唯一需要立刻处理的。
     groups.sort_by(|left, right| {
         let rank = |group: &PipelineGroup| i32::from(group.kind.as_deref() != Some("loss"));
-        rank(left).cmp(&rank(right)).then(right.rate.total_cmp(&left.rate))
+        rank(left)
+            .cmp(&rank(right))
+            .then(right.rate.total_cmp(&left.rate))
     });
     Ok(groups)
 }
@@ -365,6 +363,7 @@ async fn instant_by_labels(
     Ok(map)
 }
 
+#[allow(clippy::type_complexity)]
 fn collect_labeled(
     payload: &serde_json::Value,
     labels: &[&str],

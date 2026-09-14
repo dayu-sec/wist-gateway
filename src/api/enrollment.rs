@@ -1,25 +1,26 @@
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{connect_info::ConnectInfo, State},
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
     Json,
+    extract::{State, connect_info::ConnectInfo},
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use wist_contracts::enrollment::{
-    CredentialBundle, EnrollmentOutcome, EnrollmentEnvelope,
-    EnrollmentStatus, AgentIdentity, AgentIdentityStatus, EnrollmentRequest,
+    AgentIdentity, AgentIdentityStatus, CredentialBundle, EnrollmentEnvelope, EnrollmentOutcome,
+    EnrollmentRequest, EnrollmentStatus,
 };
 
 use crate::infra::{
-    new_secret_token, sha256_hex, AdminConfig, AdminStore, StoredAgentRegistration,
-    StoredCredentialStatus, StoredEnrollmentTokenStatus,
+    AdminConfig, AdminStore, StoredAgentRegistration, StoredCredentialStatus,
+    StoredEnrollmentTokenStatus, new_secret_token, sha256_hex,
 };
 
 use super::{
+    ApiState,
     install::{recover_expired_reservation, token_hash},
     overview::record_recent_online_agent,
-    rate_limit, ApiState,
+    rate_limit,
 };
 
 const ENROLLMENT_AUTH_SCOPE: &str = "enrollment";
@@ -187,7 +188,7 @@ fn reserve_enrollment_token(
     agent_id: &str,
 ) -> Result<EnrollmentTokenReservation, String> {
     let token_hash = token_hash(&input.token);
-    let reserve_result = store
+    store
         .update_result(|snapshot| {
             let now = chrono::Utc::now();
             let Some(token) = snapshot.enrollment_tokens.get_mut(&token_hash) else {
@@ -222,8 +223,7 @@ fn reserve_enrollment_token(
                 token_hash: token_hash.clone(),
             })
         })
-        .map_err(|err| err.to_string())?;
-    reserve_result
+        .map_err(|err| err.to_string())?
 }
 
 fn commit_reserved_registration(
@@ -252,7 +252,7 @@ fn commit_reserved_registration(
         .map(|value| value.with_timezone(&chrono::Utc).to_rfc3339())
         .unwrap_or_else(|_| now.clone());
 
-    let commit_result = store
+    store
         .update_result(|snapshot| {
             let Some(token) = snapshot.enrollment_tokens.get_mut(&token_hash) else {
                 return Err("invalid_enrollment_token".to_string());
@@ -298,8 +298,7 @@ fn commit_reserved_registration(
             );
             Ok(())
         })
-        .map_err(|err| err.to_string())?;
-    commit_result
+        .map_err(|err| err.to_string())?
 }
 
 fn rollback_enrollment_token_reservation(

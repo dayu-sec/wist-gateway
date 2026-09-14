@@ -1,14 +1,15 @@
 use axum::{
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 
 use crate::infra::sha256_hex;
 
-use super::{rate_limit, ApiState};
+use super::{ApiState, rate_limit};
 
 const ADMIN_AUTH_SCOPE: &str = "admin";
 
+#[allow(clippy::result_large_err)]
 pub(super) fn require_admin_bearer(
     state: &ApiState,
     headers: &HeaderMap,

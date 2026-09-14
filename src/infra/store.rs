@@ -92,18 +92,13 @@ pub struct StoredAgentRegistration {
     pub work_state_changes: Option<Vec<AgentWorkStateChange>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StoredCredentialStatus {
+    #[default]
     Active,
     Expired,
     Revoked,
-}
-
-impl Default for StoredCredentialStatus {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 impl AdminStore {
@@ -174,7 +169,7 @@ impl AdminStore {
         if content.trim().is_empty() {
             return Ok(AdminStoreSnapshot::default());
         }
-        Ok(serde_json::from_str(&content).source_err(StoreReason::Json, "parse store")?)
+        serde_json::from_str(&content).source_err(StoreReason::Json, "parse store")
     }
 
     fn save_snapshot(&self, snapshot: &AdminStoreSnapshot) -> Result<(), StoreError> {
@@ -282,6 +277,7 @@ impl FileLockGuard {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .source_err(StoreReason::Io, "open lock file")?;
         lock_file_exclusive(&file).source_err(StoreReason::Io, "lock store file")?;

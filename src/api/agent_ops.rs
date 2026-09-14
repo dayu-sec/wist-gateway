@@ -235,6 +235,7 @@ pub async fn report_action_result(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn authenticate_agent(
     state: &ApiState,
     headers: &HeaderMap,
