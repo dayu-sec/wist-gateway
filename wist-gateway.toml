@@ -1,0 +1,17 @@
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+tls_cert_file = "state/admin-tls.crt.pem"
+tls_key_file = "state/admin-tls.key.pem"
+admin_api_token = "${WARP_INSIGHT_ADMIN_TOKEN}"
+victoria_metrics_url = "http://127.0.0.1:18429"
+
+[agent]
+package_file = "../../../wist-agentd/target/debug/wist-agentd"
+bootstrap_token_ttl_seconds = 900
+credential_ttl_seconds = 2592000
+store_file = "state/wist-gateway-store.json"
+trust_bundle = "internal-ca-stub"
+install_script_signing_private_key_file = "state/install-script-signing-ed25519.pkcs8.pem"
+tenant_id = "tenant-default"
+environment_id = "env-default"
