@@ -2,8 +2,10 @@
 
 Control-plane gateway for the **wist** agent fleet.
 
+[![Build & Test](https://github.com/dayu-sec/wist-gateway/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/dayu-sec/wist-gateway/actions/workflows/build-and-test.yml)
+[![codecov](https://codecov.io/gh/dayu-sec/wist-gateway/branch/main/graph/badge.svg)](https://codecov.io/gh/dayu-sec/wist-gateway)
+[![dependency status](https://deps.rs/repo/github/dayu-sec/wist-gateway/status.svg)](https://deps.rs/repo/github/dayu-sec/wist-gateway)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/rustc-1.85+-orange.svg)](#)
 
 `wist-gateway` is the center-side HTTPS service that [`wist-agentd`](../wist-agentd) agents
 enroll with and report to. It exposes an admin/agent API over TLS and is the single choke point
@@ -57,14 +59,6 @@ src/
   app/      # global runtime state and services
   infra/    # config, TLS, secrets, store, install signing, VictoriaMetrics
 ```
-
-## Related crates
-
-- [`wist-contracts`](../wist-contracts) — shared contract and schema types.
-- [`wist-shared`](../wist-shared) — shared helpers (fs, ids, paths, time).
-- [`wist-error`](../wist-error) — shared error type.
-- [`wist-reporting`](../wist-reporting) — reporting domain model.
-- [`wist-control`](../wist-control) — control domain model.
 
 ## License
 
