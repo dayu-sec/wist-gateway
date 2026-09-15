@@ -1,0 +1,31 @@
+# ===========================================================================
+# wist-gateway — Bootstrap Image（首次启动自动初始化，零配置体验）
+#
+# 基于运行时镜像，额外加入 openssl + 初始化脚本 + entrypoint。
+# 首次启动若缺 config，自动生成 config + 自签 TLS 证书 + 签名密钥，再拉起服务；
+# 生成的密钥持久化到挂载卷，之后复用。
+#
+# 构建（需先构建运行时镜像）：
+#   docker build -t wist-gateway:latest -f Dockerfile .
+#   docker build -t wist-gateway:bootstrap -f Dockerfile.bootstrap .
+# ===========================================================================
+
+ARG BASE_IMAGE=wist-gateway:latest
+FROM ${BASE_IMAGE}
+
+USER root
+
+# 首次启动自签 TLS 证书需要 openssl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY init-gateway.sh /usr/local/bin/init-gateway.sh
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/init-gateway.sh /usr/local/bin/entrypoint.sh
+
+USER wist
+WORKDIR /wist-gateway
+
+ENTRYPOINT ["entrypoint.sh"]
+CMD []
