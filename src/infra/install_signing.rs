@@ -66,10 +66,12 @@ fn load_install_script_signing_key_pair(path: &Path) -> Result<Arc<Ed25519KeyPai
         let cache = SIGNING_KEY_CACHE
             .lock()
             .map_err(|_| "install script signing key cache poisoned".to_string())?;
-        if let Some((cached_path, cached_modified, cached_len, key)) = cache.as_ref() {
-            if cached_path == path && *cached_modified == modified && *cached_len == len {
-                return Ok(Arc::clone(key));
-            }
+        if let Some((cached_path, cached_modified, cached_len, key)) = cache.as_ref()
+            && cached_path == path
+            && *cached_modified == modified
+            && *cached_len == len
+        {
+            return Ok(Arc::clone(key));
         }
     }
 

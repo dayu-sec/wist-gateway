@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use axum::{
     extract::FromRequestParts,
     extract::connect_info::ConnectInfo,
-    http::{StatusCode, header},
     http::request::Parts,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 
