@@ -106,12 +106,12 @@ fn install_code_uses_header_bootstrap_token_without_url_token_leak() {
     assert!(
         !install_code
             .x86_linux_install_code
-            .contains("WARP_INSIGHT_ENROLLMENT_TOKEN=")
+            .contains("WIST_ENROLLMENT_TOKEN=")
     );
     assert!(
         !install_code
             .arm_linux_install_code
-            .contains("WARP_INSIGHT_ENROLLMENT_TOKEN=")
+            .contains("WIST_ENROLLMENT_TOKEN=")
     );
     assert!(!install_code.x86_linux_install_code.contains("?token="));
     assert!(!install_code.arm_linux_install_code.contains("?token="));
@@ -154,7 +154,7 @@ fn install_script_downloads_package_verifies_sha256_and_fetches_scoped_initial_c
 
     assert!(script.contains("ARCH=\"x86\""));
     assert!(script.contains("AGENT_PACKAGE_SHA256=\""));
-    assert!(script.contains("WARP_INSIGHT_ENROLLMENT_TOKEN"));
+    assert!(script.contains("WIST_ENROLLMENT_TOKEN"));
     assert!(script.contains("Enrollment token:"));
     assert!(script.contains("</dev/tty"));
     assert!(script.contains("umask 077"));
@@ -163,11 +163,13 @@ fn install_script_downloads_package_verifies_sha256_and_fetches_scoped_initial_c
     assert!(script.contains(&sha256));
     assert!(script.contains("sha256sum"));
     assert!(script.contains("shasum -a 256"));
-    assert!(script.contains("WARP_INSIGHT_HOME=\"/opt/warp-insight\""));
-    assert!(script.contains("WARP_INSIGHT_HOME=\"/usr/local/warp-insight\""));
-    assert!(script.contains("WARP_INSIGHT_HOME=\"$HOME/.warp-insight\""));
-    assert!(script.contains("CONFIG_DIR=\"$WARP_INSIGHT_HOME/.wist-agentd\""));
-    assert!(script.contains("-H \"authorization: Bearer $WARP_INSIGHT_ENROLLMENT_TOKEN\""));
+    assert!(script.contains("WIST_AGENTD_HOME=\"/opt/wist-agentd\""));
+    assert!(script.contains("WIST_AGENTD_HOME=\"/usr/local/wist-agentd\""));
+    assert!(script.contains("WIST_AGENTD_HOME=\"$HOME/.wist-agentd\""));
+    assert!(script.contains("BIN_DIR=\"/usr/local/bin\""));
+    assert!(script.contains("BIN_DIR=\"$HOME/bin\""));
+    assert!(script.contains("CONFIG_DIR=\"$WIST_AGENTD_HOME\""));
+    assert!(script.contains("-H \"authorization: Bearer $WIST_ENROLLMENT_TOKEN\""));
     assert!(script.contains("\"https://127.0.0.1:3000/api/v1/agent/packages/current\""));
     assert!(script.contains("\"https://127.0.0.1:3000/api/v1/agent/initial-config\""));
     assert!(!script.contains("?token="));
@@ -258,7 +260,7 @@ fn initial_config_is_valid_agent_config_contract_with_scoped_token() {
         parsed.control_plane.trust_bundle.as_deref(),
         Some("internal-ca-stub")
     );
-    assert_eq!(parsed.paths.root_dir, "..");
+    assert_eq!(parsed.paths.root_dir, ".");
 }
 
 #[test]

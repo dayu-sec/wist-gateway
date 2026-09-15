@@ -379,7 +379,7 @@ trust_bundle = "{trust_bundle}"
 auth_mode = "enrollment_token"
 
 [paths]
-root_dir = ".."
+root_dir = "."
 run_dir = "run"
 state_dir = "state"
 log_dir = "log"

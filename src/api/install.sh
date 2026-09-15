@@ -3,32 +3,41 @@ set -eu
 
 ARCH="{{ARCH}}"
 AGENT_PACKAGE_SHA256="{{AGENT_PACKAGE_SHA256}}"
-if [ -z "${WARP_INSIGHT_ENROLLMENT_TOKEN:-}" ]; then
+if [ -z "${WIST_ENROLLMENT_TOKEN:-}" ]; then
   if [ -r /dev/tty ]; then
     printf "Enrollment token: " >/dev/tty
     stty -echo </dev/tty 2>/dev/null || true
-    IFS= read -r WARP_INSIGHT_ENROLLMENT_TOKEN </dev/tty
+    IFS= read -r WIST_ENROLLMENT_TOKEN </dev/tty
     stty echo </dev/tty 2>/dev/null || true
     printf "\n" >/dev/tty
   fi
 fi
-if [ -z "${WARP_INSIGHT_ENROLLMENT_TOKEN:-}" ]; then
-  echo "missing WARP_INSIGHT_ENROLLMENT_TOKEN" >&2
+if [ -z "${WIST_ENROLLMENT_TOKEN:-}" ]; then
+  echo "missing WIST_ENROLLMENT_TOKEN" >&2
   exit 1
 fi
-if [ -z "${WARP_INSIGHT_HOME:-}" ]; then
+if [ -z "${WIST_AGENTD_HOME:-}" ]; then
   OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
   if [ "$(id -u)" = "0" ]; then
     case "$OS_NAME" in
-      Darwin) WARP_INSIGHT_HOME="/usr/local/warp-insight" ;;
-      *) WARP_INSIGHT_HOME="/opt/warp-insight" ;;
+      Darwin) WIST_AGENTD_HOME="/usr/local/wist-agentd" ;;
+      *) WIST_AGENTD_HOME="/opt/wist-agentd" ;;
     esac
   else
-    WARP_INSIGHT_HOME="$HOME/.warp-insight"
+    WIST_AGENTD_HOME="$HOME/.wist-agentd"
   fi
 fi
-BIN_DIR="$WARP_INSIGHT_HOME/bin"
-CONFIG_DIR="$WARP_INSIGHT_HOME/.wist-agentd"
+# 二进制放标准 bin 目录，与数据 home 解耦；数据 home 只放 config + state/run/log。
+if [ -z "${WIST_AGENTD_BIN_DIR:-}" ]; then
+  if [ "$(id -u)" = "0" ]; then
+    BIN_DIR="/usr/local/bin"
+  else
+    BIN_DIR="$HOME/bin"
+  fi
+else
+  BIN_DIR="$WIST_AGENTD_BIN_DIR"
+fi
+CONFIG_DIR="$WIST_AGENTD_HOME"
 
 umask 077
 mkdir -p "$BIN_DIR" "$CONFIG_DIR"
@@ -45,7 +54,7 @@ EOF
 chmod 0600 "$CA_CERT"
 trap 'rm -f "$CA_CERT"' EXIT INT TERM
 
-curl -fsSL --cacert "$CA_CERT" -H "authorization: Bearer $WARP_INSIGHT_ENROLLMENT_TOKEN" "{{AGENT_PACKAGE_URL}}" -o "$BIN_DIR/wist-agentd"
+curl -fsSL --cacert "$CA_CERT" -H "authorization: Bearer $WIST_ENROLLMENT_TOKEN" "{{AGENT_PACKAGE_URL}}" -o "$BIN_DIR/wist-agentd"
 if [ -n "$AGENT_PACKAGE_SHA256" ]; then
   if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL_SHA256="$(sha256sum "$BIN_DIR/wist-agentd" | awk '{print $1}')"
@@ -62,7 +71,7 @@ if [ -n "$AGENT_PACKAGE_SHA256" ]; then
 fi
 chmod 0755 "$BIN_DIR/wist-agentd"
 
-curl -fsSL --cacert "$CA_CERT" -H "authorization: Bearer $WARP_INSIGHT_ENROLLMENT_TOKEN" "{{AGENT_INITIAL_CONFIG_URL}}" -o "$CONFIG_DIR/agentd.toml"
+curl -fsSL --cacert "$CA_CERT" -H "authorization: Bearer $WIST_ENROLLMENT_TOKEN" "{{AGENT_INITIAL_CONFIG_URL}}" -o "$CONFIG_DIR/agentd.toml"
 chmod 0600 "$CONFIG_DIR/agentd.toml"
 
 echo "wist-agentd installed for $ARCH"
@@ -70,6 +79,6 @@ echo "binary: $BIN_DIR/wist-agentd"
 echo "config: $CONFIG_DIR/agentd.toml"
 echo "start:  $BIN_DIR/wist-agentd --config-dir $CONFIG_DIR"
 
-if [ "${WARP_INSIGHT_START:-0}" = "1" ]; then
+if [ "${WIST_AGENTD_START:-0}" = "1" ]; then
   exec "$BIN_DIR/wist-agentd" --config-dir "$CONFIG_DIR"
 fi
