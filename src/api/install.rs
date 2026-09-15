@@ -460,10 +460,11 @@ pub fn agent_package_sha256(config: &AdminConfig) -> Result<String, String> {
     let mut cache = PACKAGE_HASH_CACHE
         .lock()
         .map_err(|_| "package hash cache poisoned".to_string())?;
-    if let Some(entry) = cache.as_ref() {
-        if entry.modified == modified && entry.len == len {
-            return Ok(entry.hash.clone());
-        }
+    if let Some(entry) = cache.as_ref()
+        && entry.modified == modified
+        && entry.len == len
+    {
+        return Ok(entry.hash.clone());
     }
     let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
     let hash = bytes_sha256_hex(&bytes);

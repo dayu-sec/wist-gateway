@@ -83,13 +83,13 @@ pub async fn submit_agent_status(
             .into_iter()
             .flatten()
             .collect();
-            if !lines.is_empty() {
-                if let Err(err) = import_lines(&state.config.victoria_metrics_url, &lines).await {
-                    eprintln!(
-                        "warn agent metrics import failed agent_id={} instance_id={}: {err}",
-                        agent.agent_id, agent.instance_id
-                    );
-                }
+            if !lines.is_empty()
+                && let Err(err) = import_lines(&state.config.victoria_metrics_url, &lines).await
+            {
+                eprintln!(
+                    "warn agent metrics import failed agent_id={} instance_id={}: {err}",
+                    agent.agent_id, agent.instance_id
+                );
             }
             (
                 StatusCode::ACCEPTED,
