@@ -79,14 +79,41 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 国内镜像源（腾讯云 TCR）：国内服务器拉 ghcr.io 很慢，客户端改用 TCR 地址。
+      # 凭据在 TCR 控制台生成（访问凭证），存 GitHub Secrets：TCR_USERNAME / TCR_PASSWORD。
+      - name: Login to TCR
+        uses: docker/login-action@v3
+        with:
+          registry: dy-sec.tencentcloudcr.com
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          # 预发布 tag（v0.1.3-alpha / -beta / -rc …）只推该 tag，**不覆盖 :latest**：
+          # 否则 :latest 会指向预发布产物，而 wist-gateway-stack 是按 :latest 拉镜像的。
+          # 注意 on.push.tags 的 `v*.*.*` 也会匹配 `v0.1.3-alpha`，不能指望触发条件区分。
+          # 两个源（ghcr / TCR）同进退。
+          ghcr="ghcr.io/${{ github.repository }}"
+          tcr="dy-sec.tencentcloudcr.com/cloud/wist-gateway"
+          tags="$(printf '%s\n%s' "$ghcr:${{ github.ref_name }}" "$tcr:${{ github.ref_name }}")"
+          case "${{ github.ref_name }}" in
+            *-*)
+              ;;
+            *)
+              tags="$(printf '%s\n%s' "$tags" "$ghcr:latest")"
+              tags="$(printf '%s\n%s' "$tags" "$tcr:latest")"
+              ;;
+          esac
+          printf 'tags<<__EOF__\n%s\n__EOF__\n' "$tags" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: docker
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:latest
+          tags: ${{ steps.meta.outputs.tags }}
           platforms: linux/amd64,linux/arm64
 
   # 3. 发布 tarball 到 GitHub Release
