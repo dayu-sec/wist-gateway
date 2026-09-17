@@ -16,7 +16,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use ring::digest::{SHA256, digest};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use webpki::EndEntityCert;
-use wist_control::AdminAgentInstallCodeReturned;
 use wist_control::types::{AgentBootstrapBundle, AgentInstallCode, DateTime};
 
 use super::ApiState;
@@ -54,11 +53,7 @@ pub async fn get_agent_install_code(
                 state.config.environment_id,
                 install_code.bootstrap_bundle.bundle_id,
             );
-            (
-                [(header::CACHE_CONTROL, NO_STORE)],
-                Json(AdminAgentInstallCodeReturned { install_code }),
-            )
-                .into_response()
+            ([(header::CACHE_CONTROL, NO_STORE)], Json(install_code)).into_response()
         }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,

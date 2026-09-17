@@ -7,10 +7,6 @@ use axum::{
 use serde::Deserialize;
 
 use wist_control::types::{AgentRuntimeStatus, DateTime, DispatchReceipt};
-use wist_control::{
-    AdminAgentRuntimeStatusReturned, AdminPauseAgentDispatchReturned,
-    AdminUpgradeAgentDispatchReturned,
-};
 
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 
@@ -48,19 +44,17 @@ pub async fn get_agent_runtime_status(
     let Some(agent) = snapshot.agents.get(&agent_id).cloned() else {
         return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
     };
-    Json(AdminAgentRuntimeStatusReturned {
-        status: runtime_status(
-            &agent.agent_id,
-            &agent.instance_id,
-            &agent.version,
-            "online",
-            "healthy",
-            &agent.last_seen_at,
-            agent.last_memory_bytes,
-            agent.last_cpu_percent,
-            agent.last_admin_latency_ms,
-        ),
-    })
+    Json(runtime_status(
+        &agent.agent_id,
+        &agent.instance_id,
+        &agent.version,
+        "online",
+        "healthy",
+        &agent.last_seen_at,
+        agent.last_memory_bytes,
+        agent.last_cpu_percent,
+        agent.last_admin_latency_ms,
+    ))
     .into_response()
 }
 
@@ -83,9 +77,7 @@ pub async fn pause_agent(
         .unwrap_or_else(|| "admin-operator".to_string());
     (
         StatusCode::ACCEPTED,
-        Json(AdminPauseAgentDispatchReturned {
-            result: dispatch_receipt(&agent_id, "pause", &requested_by),
-        }),
+        Json(dispatch_receipt(&agent_id, "pause", &requested_by)),
     )
         .into_response()
 }
@@ -110,13 +102,11 @@ pub async fn upgrade_agent(
     let target_version = input.target_version.unwrap_or_else(|| "v0.3.2".to_string());
     (
         StatusCode::ACCEPTED,
-        Json(AdminUpgradeAgentDispatchReturned {
-            result: dispatch_receipt(
-                &agent_id,
-                &format!("upgrade-{target_version}"),
-                &requested_by,
-            ),
-        }),
+        Json(dispatch_receipt(
+            &agent_id,
+            &format!("upgrade-{target_version}"),
+            &requested_by,
+        )),
     )
         .into_response()
 }
