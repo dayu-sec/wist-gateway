@@ -9,9 +9,9 @@ use wist_control::AdminShowAgentRuntimeStatus;
     domain = "Control",
     module = "Control.GatewayApp.UserFacingInterface"
 )]
-pub struct WarpGateWayManagementInterface;
+pub struct WarpGatewayManagementInterface;
 
-impl WarpGateWayManagementInterface {
+impl WarpGatewayManagementInterface {
     pub fn route() -> (&'static str, &'static str) {
         ("GET", "/api/v1/admin/agents/{agent_id}/runtime-status")
     }

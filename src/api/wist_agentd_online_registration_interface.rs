@@ -9,9 +9,9 @@ use wist_control::SubmitEnrollmentRequest;
     domain = "Control",
     module = "Control.AgentApp.FacingInterface"
 )]
-pub struct WpAgentOnlineRegistrationInterface;
+pub struct WistAgentdOnlineRegistrationInterface;
 
-impl WpAgentOnlineRegistrationInterface {
+impl WistAgentdOnlineRegistrationInterface {
     pub fn route() -> (&'static str, &'static str) {
         ("POST", "/api/v1/agent/enroll")
     }

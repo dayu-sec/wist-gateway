@@ -24,9 +24,9 @@ mod rate_limit;
 
 pub mod wist_gateway_management_interface;
 pub mod wist_gateway_public_install_interface;
-pub use wist_gateway_management_interface::WarpGateWayManagementInterface;
-pub mod wist_agent_online_registration_interface;
-pub use wist_agent_online_registration_interface::WpAgentOnlineRegistrationInterface;
+pub use wist_gateway_management_interface::WarpGatewayManagementInterface;
+pub mod wist_agentd_online_registration_interface;
+pub use wist_agentd_online_registration_interface::WistAgentdOnlineRegistrationInterface;
 
 use admin_ops::{get_agent_runtime_status, pause_agent, upgrade_agent};
 use agent_ops::{

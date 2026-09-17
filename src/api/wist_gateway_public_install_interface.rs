@@ -9,9 +9,9 @@ use wist_control::AdminGetAgentInstallCode;
     domain = "Control",
     module = "Control.GatewayApp.UserFacingInterface"
 )]
-pub struct WarpGateWayPublicInstallInterface;
+pub struct WarpGatewayPublicInstallInterface;
 
-impl WarpGateWayPublicInstallInterface {
+impl WarpGatewayPublicInstallInterface {
     pub fn route() -> (&'static str, &'static str) {
         ("GET", "/api/v1/agent/install-code")
     }
