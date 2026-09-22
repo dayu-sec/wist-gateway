@@ -1,7 +1,8 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use base64::Engine;
 use rustls::ServerConfig;
+use rustls::client::danger::ServerCertVerifier;
 use rustls_pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
 };
@@ -43,6 +44,46 @@ fn install_crypto_provider() {
         return;
     }
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// 用 rustls 的**客户端**校验器验证一张证书链。
+///
+/// 这等价于 Rust 客户端（包括 wist-agentd 经 `reqwest` + `add_root_certificate`）拿这张证书当
+/// 信任锚去连本网关时的判定，**不等于 OpenSSL 的判定**：自签名证书「既当信任锚又当服务端叶证书」
+/// 这类情形，二者结论可能不同。排查「客户端拒绝网关证书」时必须跑这条路径。
+///
+/// `cert_pem` 的第一张证书同时被当作信任锚与叶证书（这是网关 dev 自签证书的实际形态）。
+pub fn verify_certificate_as_rustls_client(
+    cert_pem: &str,
+    server_name: &str,
+) -> Result<(), String> {
+    install_crypto_provider();
+    let chain = certificate_chain_from_pem(cert_pem)?;
+    let Some((leaf, intermediates)) = chain.split_first() else {
+        return Err("certificate chain is empty".to_string());
+    };
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(leaf.clone())
+        .map_err(|err| format!("failed to add trust anchor: {err}"))?;
+    let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|err| format!("failed to build verifier: {err}"))?;
+
+    let name = rustls_pki_types::ServerName::try_from(server_name.to_string())
+        .map_err(|err| format!("invalid server name {server_name}: {err}"))?;
+
+    verifier
+        .verify_server_cert(
+            leaf,
+            intermediates,
+            &name,
+            &[],
+            rustls_pki_types::UnixTime::now(),
+        )
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 fn certificate_chain_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -142,5 +183,26 @@ AQID
         let err = certificate_chain_from_pem("not a certificate").expect_err("missing cert");
 
         assert!(err.contains("CERTIFICATE PEM block"));
+    }
+
+    /// 诊断用：验证**正在使用的**网关证书能否被 rustls 客户端接受（agentd 走的就是这条路径）。
+    ///
+    /// 需要本机已生成的 dev 证书，不是 hermetic 测试，因此默认忽略。手工跑：
+    ///   cargo test --offline --lib -- --ignored rustls_accepts_gateway_certificate --nocapture
+    /// 可用 `WIST_GATEWAY_TLS_CERT` / `WIST_GATEWAY_TLS_SERVER_NAME` 覆盖。
+    #[test]
+    #[ignore = "depends on a locally generated dev certificate"]
+    fn rustls_accepts_gateway_certificate() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = std::env::var("WIST_GATEWAY_TLS_CERT")
+            .unwrap_or_else(|_| format!("{home}/.wist-gateway/state/admin-tls.crt.pem"));
+        let server_name = std::env::var("WIST_GATEWAY_TLS_SERVER_NAME")
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
+        let pem = fs::read_to_string(&path).expect("read gateway certificate");
+
+        match verify_certificate_as_rustls_client(&pem, &server_name) {
+            Ok(()) => println!("rustls ACCEPTS {path} for {server_name}"),
+            Err(err) => panic!("rustls REJECTS {path} for {server_name}: {err}"),
+        }
     }
 }

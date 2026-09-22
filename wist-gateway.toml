@@ -15,3 +15,20 @@ trust_bundle = "internal-ca-stub"
 install_script_signing_private_key_file = "state/install-script-signing-ed25519.pkcs8.pem"
 tenant_id = "tenant-default"
 environment_id = "env-default"
+
+[store]
+# 持久化 DSN。留空 → 使用上面 agent.store_file 同目录下的 wist-gateway.db（SQLite）。
+# 可用环境变量 WIST_GATEWAY_DATABASE_URL 覆盖（显式置空 = 回到默认 SQLite 文件）。
+# 本版本只实现了 SQLite：其它 scheme 会在启动时被拒。
+database_url = ""
+
+[purpose]
+# 用途推断规则表（策展数据）。源头是 jumo 模型仓的
+#   jumo/model/content/purpose-rules.toml
+# 部署时拷过来并把路径写在这里（相对本配置文件）。留空 = 不推断：
+# Agent 报上来的事实摘要照常入库，但页面不会有建议。
+#
+# 为什么不做内嵌默认副本：那会有两份真相，改规则时必然漂移；
+# 为什么不做热加载：规则表改动要走审定，"这个建议是哪版规则算的" 必须说得清 ——
+# 所以启动时装载一次，改规则通过重启生效。
+rules_file = ""

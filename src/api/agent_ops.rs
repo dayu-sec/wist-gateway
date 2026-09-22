@@ -6,14 +6,17 @@ use axum::{
 };
 
 use crate::infra::{
-    StoredAgentRegistration, StoredCredentialStatus, new_secret_token, sha256_hex,
+    AgentStatusUpdate, RenewCredential, StoredAgentFactSummary, StoredAgentRegistration,
+    StoredCredentialStatus, new_secret_token, sha256_hex,
     victoria_metrics::{import_lines, metric_line},
 };
+use wist_contracts::API_VERSION_V1;
 use wist_contracts::enrollment::{
     CredentialBundle, CredentialRenewal, CredentialRenewed, RENEW_AGENT_CREDENTIAL_KIND,
 };
 use wist_contracts::gateway::{
-    ActionResultAck, AgentStatusAck, AgentStatusReport, ReportActionResult,
+    ActionResultAck, AgentStatusAck, AgentStatusReport, FactSummaryAccepted, FactSummaryAckStatus,
+    REPORT_AGENT_FACT_SUMMARY_KIND, ReportActionResult, ReportAgentFactSummary,
 };
 use wist_control::types::DateTime;
 use wist_control::{AgentControlCommandsReturned, PollControlCommands};
@@ -25,7 +28,7 @@ pub async fn submit_agent_status(
     headers: HeaderMap,
     Json(input): Json<AgentStatusReport>,
 ) -> Response {
-    match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id) {
+    match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await {
         Ok(agent) => {
             let now_utc = chrono::Utc::now();
             let last_seen_at = now_utc.to_rfc3339();
@@ -33,22 +36,38 @@ pub async fn submit_agent_status(
             let memory_bytes = input.memory_bytes;
             let cpu_percent = input.cpu_percent;
             let admin_latency_ms = input.admin_latency_ms;
-            let update_result = state.store.update(|snapshot| {
-                if let Some(stored) = snapshot.agents.get_mut(&agent.agent_id) {
-                    stored.version = input.version.clone();
-                    stored.last_seen_at = last_seen_at;
-                    stored.last_memory_bytes = memory_bytes;
-                    stored.last_cpu_percent = cpu_percent;
-                    stored.last_admin_latency_ms = admin_latency_ms;
-                    stored.work_state_changes = input.work_state_changes.clone();
+            let status_result = state
+                .store
+                .record_agent_status(&AgentStatusUpdate {
+                    agent_id: &agent.agent_id,
+                    instance_id: &input.instance_id,
+                    boot_id: "",
+                    version: &input.version,
+                    last_seen_at: &last_seen_at,
+                    memory_bytes,
+                    cpu_percent,
+                    admin_latency_ms,
+                    work_state_changes: input.work_state_changes.clone(),
+                })
+                .await;
+            match status_result {
+                Ok(true) => {}
+                Ok(false) => {
+                    // 未知 agent 的状态上报不再静默成功：旧实现会丢弃该次上报，
+                    // 这里显式返回 404，让上报方感知身份/凭据不一致。
+                    return (
+                        StatusCode::NOT_FOUND,
+                        format!("unknown agent {}", input.agent_id),
+                    )
+                        .into_response();
                 }
-            });
-            if let Err(err) = update_result {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to update agent status: {err}"),
-                )
-                    .into_response();
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to update agent status: {err}"),
+                    )
+                        .into_response();
+                }
             }
             // 统一进 VM：agent 自身运行指标以时间序列写入，文件只保留最新值缓存。
             let lines: Vec<serde_json::Value> = [
@@ -110,7 +129,7 @@ pub async fn poll_control_commands(
     headers: HeaderMap,
     Json(input): Json<PollControlCommands>,
 ) -> Response {
-    match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id) {
+    match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await {
         Ok(_) => (
             StatusCode::OK,
             Json(AgentControlCommandsReturned {
@@ -146,10 +165,11 @@ pub async fn renew_agent_credential(
     };
     let current_token_hash = sha256_hex(current_token);
 
-    let agent = match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id) {
-        Ok(agent) => agent,
-        Err(response) => return response,
-    };
+    let agent =
+        match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await {
+            Ok(agent) => agent,
+            Err(response) => return response,
+        };
     let bearer_token = match new_secret_token("wic") {
         Ok(token) => token,
         Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
@@ -177,22 +197,19 @@ pub async fn renew_agent_credential(
         not_after: Some(not_after.clone()),
     };
 
-    let update_result = state.store.update(|snapshot| {
-        let Some(stored) = snapshot.agents.get_mut(&agent.agent_id) else {
-            return false;
-        };
-        if stored.instance_id != agent.instance_id
-            || stored.credential_token_hash != current_token_hash
-            || stored.credential_status != StoredCredentialStatus::Active
-        {
-            return false;
-        }
-        stored.credential_id = credential_id;
-        stored.credential_token_hash = sha256_hex(&bearer_token);
-        stored.credential_issued_at = issued_at;
-        stored.credential_expires_at = not_after;
-        true
-    });
+    let new_token_hash = sha256_hex(&bearer_token);
+    let update_result = state
+        .store
+        .renew_agent_credential(&RenewCredential {
+            agent_id: &agent.agent_id,
+            instance_id: &agent.instance_id,
+            current_token_hash: &current_token_hash,
+            new_credential_id: &credential_id,
+            new_token_hash: &new_token_hash,
+            issued_at: &issued_at,
+            expires_at: &not_after,
+        })
+        .await;
     match update_result {
         Ok(true) => {
             eprintln!(
@@ -221,7 +238,7 @@ pub async fn report_action_result(
     headers: HeaderMap,
     Json(input): Json<ReportActionResult>,
 ) -> Response {
-    match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id) {
+    match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await {
         Ok(_) => (
             StatusCode::ACCEPTED,
             Json(ActionResultAck {
@@ -235,8 +252,146 @@ pub async fn report_action_result(
     }
 }
 
+/// 接收 agentd 上报的事实**摘要**（对应模型 `ReportAgentFactSummary` / `IngestAgentFactSummary`）。
+///
+/// 幂等键是 `content_digest`：内容没变就什么都**不动**（不重写、不重算、不重复计分），
+/// 回 `duplicate` 并带上已存建议。这一点很关键 —— agentd 会因重启等原因重发同一份摘要。
+pub async fn submit_agent_facts(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<ReportAgentFactSummary>,
+) -> Response {
+    if input.api_version != API_VERSION_V1 || input.kind != REPORT_AGENT_FACT_SUMMARY_KIND {
+        return (StatusCode::BAD_REQUEST, "invalid agent fact summary report").into_response();
+    }
+    let agent =
+        match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await {
+            Ok(agent) => agent,
+            Err(response) => return response,
+        };
+    let received_at = chrono::Utc::now().to_rfc3339();
+
+    match state.store.get_agent_fact_summary(&agent.agent_id).await {
+        Ok(Some(existing)) if existing.content_digest == input.content_digest => {
+            let suggestion_id = match state.store.get_purpose_suggestion(&agent.agent_id).await {
+                Ok(suggestion) => suggestion.map(|suggestion| suggestion.suggestion_id),
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to load purpose suggestion: {err}"),
+                    )
+                        .into_response();
+                }
+            };
+            return (
+                StatusCode::ACCEPTED,
+                Json(FactSummaryAccepted {
+                    report_id: input.report_id,
+                    agent_id: agent.agent_id,
+                    content_digest: input.content_digest,
+                    ack_status: FactSummaryAckStatus::Duplicate,
+                    suggestion_id,
+                    received_at,
+                }),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load agent fact summary: {err}"),
+            )
+                .into_response();
+        }
+    }
+
+    let summary = StoredAgentFactSummary {
+        agent_id: agent.agent_id.clone(),
+        content_digest: input.content_digest.clone(),
+        revision: input.revision,
+        observed_at: input.observed_at.clone(),
+        os: input.os.clone(),
+        arch: input.arch.clone(),
+        process_count: input.process_count,
+        process_executables: input.process_executables.clone(),
+        packages: input.packages.clone(),
+        listen_ports: input.listen_ports.clone(),
+        received_at: received_at.clone(),
+    };
+    // 先落事实再算建议：规则表坏了不该连带把 Agent 报上来的事实丢掉。
+    if let Err(err) = state.store.upsert_agent_fact_summary(&summary).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store agent fact summary: {err}"),
+        )
+            .into_response();
+    }
+
+    let suggestion_id = match infer_and_store(&state, &summary, &received_at).await {
+        Ok(suggestion_id) => suggestion_id,
+        Err(detail) => {
+            eprintln!(
+                "warn purpose inference failed agent_id={}: {detail}",
+                summary.agent_id
+            );
+            None
+        }
+    };
+
+    (
+        StatusCode::ACCEPTED,
+        Json(FactSummaryAccepted {
+            report_id: input.report_id,
+            agent_id: summary.agent_id,
+            content_digest: summary.content_digest,
+            ack_status: FactSummaryAckStatus::Accepted,
+            suggestion_id,
+            received_at,
+        }),
+    )
+        .into_response()
+}
+
+/// 按规则表算建议并落库，返回生效的 `suggestion_id`。
+///
+/// 三种情况要分清：
+///   - 没配规则表：不推断，也**不动**已有建议 —— 页面能看到它的 `computed_at`，人自己判；
+///   - 算出建议：覆盖写入（建议可变可过期）；
+///   - 确实不该有建议（平台无规则册，或既无命中又无基线）：**清掉旧建议** ——
+///     旧结论是照着旧事实算的，留着比没有更误导。
+async fn infer_and_store(
+    state: &ApiState,
+    summary: &StoredAgentFactSummary,
+    computed_at: &str,
+) -> Result<Option<String>, String> {
+    let Some(table) = state.purpose_rules.as_deref() else {
+        return Ok(None);
+    };
+    let suggestion_id = new_secret_token("sug")?;
+    let suggestion = crate::app::purpose::infer(summary, table, &suggestion_id, computed_at);
+    match suggestion {
+        Some(suggestion) => {
+            state
+                .store
+                .upsert_purpose_suggestion(&suggestion)
+                .await
+                .map_err(|err| format!("store purpose suggestion: {err}"))?;
+            Ok(Some(suggestion.suggestion_id))
+        }
+        None => {
+            state
+                .store
+                .clear_purpose_suggestion(&summary.agent_id)
+                .await
+                .map_err(|err| format!("clear purpose suggestion: {err}"))?;
+            Ok(None)
+        }
+    }
+}
+
 #[allow(clippy::result_large_err)]
-fn authenticate_agent(
+async fn authenticate_agent(
     state: &ApiState,
     headers: &HeaderMap,
     agent_id: &str,
@@ -246,14 +401,14 @@ fn authenticate_agent(
         return Err((StatusCode::UNAUTHORIZED, "missing bearer credential").into_response());
     };
     let token_hash = sha256_hex(token);
-    let snapshot = state.store.load().map_err(|err| {
+    let agent = state.store.get_agent(agent_id).await.map_err(|err| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to load agent credential store: {err}"),
         )
             .into_response()
     })?;
-    let Some(agent) = snapshot.agents.get(agent_id) else {
+    let Some(agent) = agent else {
         return Err((StatusCode::UNAUTHORIZED, "unknown agent credential").into_response());
     };
     if agent.instance_id != instance_id
@@ -270,7 +425,7 @@ fn authenticate_agent(
     if credential_is_expired(&agent.credential_expires_at) {
         return Err((StatusCode::UNAUTHORIZED, "agent credential is expired").into_response());
     }
-    Ok(agent.clone())
+    Ok(agent)
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {

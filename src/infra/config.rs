@@ -11,6 +11,8 @@ use wist_error::ConfigReason;
 
 const DEFAULT_CONFIG_PATH: &str = "wist-gateway.toml";
 const CONFIG_ENV: &str = "WIST_GATEWAY_CONFIG";
+/// 显式设置即覆盖文件值；显式置空 = 回到默认 SQLite 文件存储。
+const ENV_DATABASE_URL: &str = "WIST_GATEWAY_DATABASE_URL";
 // Lower bound on the admin token length; the actual strength gate is the
 // entropy check in require_non_weak_admin_token (>= 8 alphanumeric chars).
 const MIN_ADMIN_API_TOKEN_BYTES: usize = 8;
@@ -36,13 +38,20 @@ pub struct AdminConfig {
     pub agent_package_file: PathBuf,
     pub bootstrap_token_ttl_seconds: i64,
     pub credential_ttl_seconds: i64,
+    /// 旧版单文件 JSON 存储路径：现在只作为「首次启动一次性导入」的来源。
     pub store_file: PathBuf,
+    /// SQLite DSN（显式配置时），留空则由 [`AdminConfig::sqlite_path`] 决定。
+    pub database_url: Option<String>,
+    /// 默认 SQLite 数据库文件（DSN 未配置时使用）。
+    pub sqlite_path: PathBuf,
     pub trust_bundle: String,
     pub install_script_signing_private_key_file: PathBuf,
     pub install_script_signing_public_key_pem: String,
     pub tenant_id: String,
     pub environment_id: String,
     pub victoria_metrics_url: String,
+    /// 用途推断规则表（策展数据）。未配置时：事实照常入库，但不产出建议。
+    pub purpose_rules_file: Option<PathBuf>,
 }
 
 pub use wist_error::ConfigError;
@@ -63,6 +72,28 @@ fn config_parse(message: impl Into<String>) -> ConfigError {
 struct RawAdminConfig {
     server: RawServerConfig,
     agent: RawAgentConfig,
+    #[serde(default)]
+    store: RawStoreConfig,
+    #[serde(default)]
+    purpose: RawPurposeConfig,
+}
+
+/// `[purpose]` 段。缺省时不装载规则表：摘要照常入库，但不产出建议。
+#[derive(Debug, Default, Deserialize)]
+struct RawPurposeConfig {
+    /// 源头是 jumo 模型仓的 `jumo/model/content/purpose-rules.toml`，由部署侧提供给网关。
+    /// 为什么不做内嵌默认副本：那会有两份真相，改规则时必然漂移。
+    #[serde(default)]
+    rules_file: Option<String>,
+}
+
+/// `[store]` 段。缺省（旧配置无此段）时回退到本地 SQLite 文件。
+#[derive(Debug, Default, Deserialize)]
+struct RawStoreConfig {
+    /// 持久化 DSN，目前支持 `sqlite:` 前缀（如 `sqlite:state/wist-gateway.db`）。
+    /// 留空 → 使用 `agent.store_file` 同目录下的 `wist-gateway.db`。
+    #[serde(default)]
+    database_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +194,8 @@ impl AdminConfig {
             bootstrap_token_ttl_seconds: raw.agent.bootstrap_token_ttl_seconds,
             credential_ttl_seconds: raw.agent.credential_ttl_seconds,
             store_file: absolutize_path(config_dir, Path::new(&expand_env(&raw.agent.store_file)?)),
+            database_url: resolved_database_url(&raw.store)?,
+            sqlite_path: default_sqlite_path(config_dir, &raw.agent.store_file)?,
             trust_bundle: expand_env(&raw.agent.trust_bundle)?,
             install_script_signing_private_key_file: install_script_signing_private_key_file
                 .clone(),
@@ -175,6 +208,14 @@ impl AdminConfig {
             victoria_metrics_url: trim_trailing_slash(expand_env(
                 &raw.server.victoria_metrics_url,
             )?),
+            purpose_rules_file: normalize_optional(
+                raw.purpose
+                    .rules_file
+                    .as_deref()
+                    .map(expand_env)
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
         })
     }
 
@@ -206,6 +247,27 @@ impl AdminConfig {
         require_non_empty("agent.tenant_id", &self.tenant_id)?;
         require_non_empty("agent.environment_id", &self.environment_id)?;
         require_non_empty("server.victoria_metrics_url", &self.victoria_metrics_url)?;
+        if let Some(rules_file) = self.purpose_rules_file.as_deref() {
+            // 配了就必须能读、能解析：规则表拼错不该拖到「收到第一份事实才报错」。
+            // 这里只做语法级校验（不引 app 层类型，避免 infra → app 反向依赖）；
+            // "能解析但语义不对"（如缺 platform）由启动时的装载告警呈报。
+            require_existing_file("purpose.rules_file", rules_file)?;
+            let text = std::fs::read_to_string(rules_file)
+                .map_err(|err| config_io(format!("read purpose.rules_file: {err}")))?;
+            toml::from_str::<toml::Value>(&text).map_err(|err| {
+                config_parse(format!(
+                    "parse purpose.rules_file {}: {err}",
+                    rules_file.display()
+                ))
+            })?;
+        }
+        if let Some(database_url) = self.database_url.as_deref()
+            && !database_url.starts_with("sqlite:")
+        {
+            return Err(config_validation(format!(
+                "unsupported store.database_url scheme (this build implements SQLite only): {database_url}"
+            )));
+        }
         Ok(())
     }
 
@@ -223,6 +285,15 @@ impl AdminConfig {
     pub fn agent_initial_config_url(&self) -> String {
         format!("{}/api/v1/agent/initial-config", self.public_base_url)
     }
+
+    /// 管理面设置的安装包**本地缓存**路径（单例）。
+    ///
+    /// 设置来源地址时网关会把制品拉到这里，之后所有安装都从这份缓存分发；
+    /// 放在 SQLite 库同目录（`state/`）下，便于随 `state/` 一起备份或清理。
+    pub fn install_package_cache_path(&self) -> PathBuf {
+        let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
+        state_dir.join("install-package").join("agent-package")
+    }
 }
 
 fn default_bootstrap_token_ttl_seconds() -> i64 {
@@ -239,6 +310,36 @@ fn default_victoria_metrics_url() -> String {
 
 fn default_store_file() -> String {
     "state/wist-gateway-store.json".to_string()
+}
+
+/// 未配置 `database_url` 时的默认 SQLite 库：与旧存储文件同目录。
+fn default_sqlite_path(config_dir: &Path, store_file: &str) -> Result<PathBuf, ConfigError> {
+    let store_file = absolutize_path(config_dir, Path::new(&expand_env(store_file)?));
+    let file_name = store_file
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("wist-gateway-store.json")
+        .replace(".json", ".db");
+    Ok(store_file.with_file_name(file_name))
+}
+
+/// `database_url` 的解析：文件值 → 环境变量覆盖（显式置空等于「回到默认 SQLite 文件」）。
+fn resolved_database_url(raw: &RawStoreConfig) -> Result<Option<String>, ConfigError> {
+    let file_value = match raw.database_url.as_deref() {
+        Some(value) => Some(expand_env(value)?),
+        None => None,
+    };
+    let value = match env::var(ENV_DATABASE_URL) {
+        Ok(value) => Some(value),
+        Err(_) => file_value,
+    };
+    Ok(normalize_optional(value))
+}
+
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn absolutize_config_path(path: &Path) -> Result<PathBuf, ConfigError> {
@@ -558,6 +659,68 @@ environment_id = "env-default"
             dir.join("install-signing-ed25519.pkcs8.pem")
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    const RULES_TOML: &str = r#"
+[[rule_set]]
+rule_set_id = "macos-v1"
+platform = "macos"
+baseline_class = "MacDaily"
+weak_score = 20
+"#;
+
+    /// 生成一份最小可用配置，其中 `[purpose]` 表体由调用方给出（可为空）。
+    /// `[purpose]` 放在最前面：`write_temp_config` 会在文末补签名私钥行，
+    /// 那行应落在 `[agent]` 里而不是 `[purpose]` 里。
+    fn config_with_purpose(purpose_body: &str) -> String {
+        let package_file = write_temp_file("wist-agentd");
+        format!(
+            "[purpose]\n{purpose_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+            package_file.display()
+        )
+    }
+
+    #[test]
+    fn purpose_rules_file_is_none_when_unset_or_blank() {
+        let unset = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&unset).expect("config loads");
+        assert_eq!(config.purpose_rules_file, None);
+
+        // 空串必须归成 None；否则会变成 config 目录本身，校验时报“不是文件”。
+        let blank = write_temp_config(&config_with_purpose("rules_file = \"\""));
+        let config = AdminConfig::load_from_path(&blank).expect("config loads");
+        assert_eq!(config.purpose_rules_file, None);
+    }
+
+    #[test]
+    fn purpose_rules_file_is_absolutized_and_must_load() {
+        // 规则表写进 temp_dir（与 write_temp_config 同目录），所以相对路径可解析。
+        let rules = write_temp_file(RULES_TOML);
+        let name = rules
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        let path = write_temp_config(&config_with_purpose(&format!("rules_file = \"{name}\"")));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(config.purpose_rules_file.as_deref(), Some(rules.as_path()));
+
+        // 配了就必须能读到：不存在的文件在启动时就被拒。
+        let missing =
+            write_temp_config(&config_with_purpose("rules_file = \"no-such-rules.toml\""));
+        assert!(AdminConfig::load_from_path(&missing).is_err());
+
+        // 语法坏掉同样在启动时被拒，不拖到“收到第一份事实才报错”。
+        let broken = write_temp_file("[[rule_set]\nbroken");
+        let broken_name = broken
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        let path = write_temp_config(&config_with_purpose(&format!(
+            "rules_file = \"{broken_name}\""
+        )));
+        assert!(AdminConfig::load_from_path(&path).is_err());
     }
 
     #[test]

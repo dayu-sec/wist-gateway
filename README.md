@@ -19,7 +19,7 @@ collects status and host metrics, issues control commands, and aggregates execut
 - **Status & metrics** — accepts agent status reports and host/process metrics, with
   per-client rate limiting.
 - **Control commands** — queues `ActionPlan`s for agents to poll and receives `ActionResult`s back.
-- **Admin API** — fleet overview, per-agent runtime status, pipeline topology, pause / upgrade.
+- **Admin API** — fleet overview, per-agent runtime status, pipeline topology.
 - **TLS-first** — serves HTTPS with rustls and injects the real peer address for rate limiting.
 
 ## Building
@@ -50,6 +50,49 @@ sections:
 
 - `[server]` — listen address, public base URL, TLS cert/key, admin token, VictoriaMetrics URL.
 - `[agent]` — package file, bootstrap/credential TTLs, store file, trust bundle, signing key.
+- `[store]` — persistence DSN (`database_url`).
+
+## Storage
+
+Agent registry and enrollment tokens are persisted in **SQLite** (embedded, no extra service):
+
+- Default database file: `state/wist-gateway.db`, next to the configured `agent.store_file`.
+  Set `[store] database_url = "sqlite:/var/lib/wist-gateway/gateway.db"` to place it elsewhere,
+  or override with the `WIST_GATEWAY_DATABASE_URL` environment variable (an explicitly empty
+  value falls back to the default file). This build implements SQLite only; other schemes are
+  rejected at startup.
+- Schema lives in `migrations/sqlite/` and is applied on startup via `sqlx::migrate!`, so new
+  tables/columns are created on an existing database too.
+- The file is the whole durable state: back it up and it can be restored. Deleting it forces all
+  agents to enroll again.
+- Upgrading from the older single-file JSON store (`state/wist-gateway-store.json`): it is
+  imported automatically on first start when the database is still empty, then renamed to
+  `*.imported`. The import is skipped if the database already has data.
+
+Agents, their instances and their credentials are separate tables: a restarted agentd adds an
+instance row instead of overwriting the previous one, and credential rotation/revocation keeps
+history rather than replacing the row in place.
+
+### Install package address
+
+The address the gateway hands out for the wist-agentd package is a managed setting rather than a
+build-time constant:
+
+- `GET /api/v1/admin/agent/install-package` — current effective address (falls back to the
+gateway's own `/api/v1/agent/packages/current` route when never set; `updated_by` is empty and
+`updated_at` is null in that case).
+- `POST /api/v1/admin/agent/install-package` — set it. Body: `package_url` plus optional
+`package_sha256` and `requested_by`. The URL must be `https://…` or an absolute path (plain `http`
+is rejected — the package is what an agent boots from); the digest, when given, is normalized to
+`sha256:<64 hex>`.
+
+New install codes and freshly rendered `install.sh` use the setting; already-issued install codes
+keep the address they were generated with. Both are admin-bearer authenticated and stored in the
+`agent_install_package` table.
+
+> WAL mode allows concurrent readers but only a single writer, and the database is not shared
+> across hosts. Run a single `wist-gateway` replica; a shared database (Postgres) would be needed
+> to scale out behind a load balancer.
 
 ## Repository layout
 
@@ -57,7 +100,9 @@ sections:
 src/
   api/      # HTTP handlers and the admin/agent router
   app/      # global runtime state and services
-  infra/    # config, TLS, secrets, store, install signing, VictoriaMetrics
+  infra/    # config, TLS, secrets, store trait + SQLite backend, install signing, VictoriaMetrics
+migrations/
+  sqlite/   # embedded schema migrations (sqlx)
 ```
 
 ## License

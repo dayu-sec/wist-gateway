@@ -31,11 +31,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config =
         wist_gateway::infra::AdminConfig::load_from_env().map_err(|err| err.into_boxed_std())?;
     let addr = config.listen_addr.clone();
+    let store = build_store(&config).await?;
     let tls_config = wist_gateway::infra::load_admin_tls_config(&config)?;
     let listener = TcpListener::bind(&addr).await?;
     println!("wist-gateway listening on https://{addr}");
-    serve_tls(listener, wist_gateway::api::router(config), tls_config).await?;
+    serve_tls(
+        listener,
+        wist_gateway::api::router(config, store),
+        tls_config,
+    )
+    .await?;
     Ok(())
+}
+
+/// 打开持久化后端（当前实现：SQLite），并在库为空时一次性导入旧版 JSON 存储。
+async fn build_store(
+    config: &wist_gateway::infra::AdminConfig,
+) -> Result<Arc<dyn wist_gateway::infra::Store>, Box<dyn std::error::Error + Send + Sync>> {
+    let store = match config.database_url.as_deref() {
+        Some(database_url) => wist_gateway::infra::SqliteStore::connect(database_url)
+            .await
+            .map_err(|err| err.into_boxed_std())?,
+        None => wist_gateway::infra::SqliteStore::connect_path(&config.sqlite_path)
+            .await
+            .map_err(|err| err.into_boxed_std())?,
+    };
+    match store.import_legacy_json(&config.store_file).await {
+        Ok(true) => println!(
+            "imported legacy store {} into the database",
+            config.store_file.display()
+        ),
+        Ok(false) => {}
+        // 导入失败不阻断启动：库本身可用，旧注册表可由 Agent 重新注册恢复。
+        Err(err) => eprintln!(
+            "warning: failed to import legacy store {}: {err}",
+            config.store_file.display()
+        ),
+    }
+    Ok(Arc::new(store))
 }
 
 /// Generate a wist-gateway.toml with a freshly random admin API token

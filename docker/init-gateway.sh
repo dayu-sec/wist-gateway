@@ -43,7 +43,15 @@ fi
 mkdir -p "${STATE_DIR}"
 
 # 2. TLS 自签证书/私钥（幂等）
-if [[ ! -f "${STATE_DIR}/admin-tls.crt.pem" || ! -f "${STATE_DIR}/admin-tls.key.pem" ]]; then
+#
+# 这张证书既是网关的服务端证书、又被下发给 Agent 当信任锚。两个角色的要求不同：
+#   - 服务端：必须是**合法叶证书**（`basicConstraints: critical,CA:FALSE` + `keyUsage` 含
+#     digitalSignature/keyEncipherment + `extendedKeyUsage: serverAuth`）。
+#     `openssl req -x509` 的旧默认会给自签证书打上 `CA:TRUE`，而 rustls/webpki 会以
+#     `CaUsedAsEndEntity` 拒收它作服务端证书 —— Agent 一侧表现为 TLS 握手失败
+#     （日志里是 `error sending request for url (...)`）。
+#   - 信任锚：不要求是 CA，webpki 接受非 CA 的自签证书作锚，所以一张证书两用可行。
+ensure_admin_tls_cert() {
   if ! command -v openssl >/dev/null 2>&1; then
     echo "缺少 openssl，无法生成 TLS 证书" >&2
     exit 1
@@ -52,8 +60,25 @@ if [[ ! -f "${STATE_DIR}/admin-tls.crt.pem" || ! -f "${STATE_DIR}/admin-tls.key.
     -keyout "${STATE_DIR}/admin-tls.key.pem" \
     -out "${STATE_DIR}/admin-tls.crt.pem" \
     -days "${CERT_DAYS}" -subj "/CN=${CERT_CN}" \
+    -addext "basicConstraints=critical,CA:FALSE" \
+    -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+    -addext "extendedKeyUsage=serverAuth" \
     -addext "subjectAltName=DNS:${CERT_CN},IP:127.0.0.1" >/dev/null 2>&1
   echo "已生成 TLS 证书/私钥: ${STATE_DIR}/admin-tls.{crt,key}.pem"
+}
+
+# 旧版脚本生成的证书是 `CA:TRUE` 形态，会被 rustls 客户端（含 wist-agentd）拒收，需要重生成。
+cert_is_end_entity() {
+  openssl x509 -in "$1" -noout -text 2>/dev/null \
+    | grep -A1 "Basic Constraints" | grep -q "CA:FALSE"
+}
+
+if [[ ! -f "${STATE_DIR}/admin-tls.crt.pem" || ! -f "${STATE_DIR}/admin-tls.key.pem" ]]; then
+  ensure_admin_tls_cert
+elif command -v openssl >/dev/null 2>&1 && ! cert_is_end_entity "${STATE_DIR}/admin-tls.crt.pem"; then
+  echo "已有 TLS 证书不是合法叶证书（basicConstraints 非 CA:FALSE），重新生成。"
+  echo "  注意：证书已更换，Agent 侧内嵌的 trust_bundle 随之失效，必须重跑安装才能拿到新信任锚。"
+  ensure_admin_tls_cert
 else
   echo "TLS 证书已存在，跳过生成: ${STATE_DIR}"
 fi

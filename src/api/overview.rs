@@ -9,7 +9,7 @@ use axum::{
 use serde::Serialize;
 
 use crate::infra::victoria_metrics::query_json;
-use crate::infra::{AgentMetricSample, StoredAgentRegistration};
+use crate::infra::{AgentMetricSample, AgentQuery, StoredAgentRegistration};
 use wist_control::types::{AgentRuntimeStatus, DateTime};
 
 use super::admin_auth::require_admin_bearer;
@@ -75,25 +75,28 @@ const HISTORY_WINDOW_SECONDS: i64 = 3600;
 const HISTORY_STEP_SECONDS: i64 = 30;
 
 pub async fn agent_overview(state: &ApiState) -> AgentOverview {
-    let snapshot = state.store.load().unwrap_or_default();
+    // 有意吞掉存储错误：总览页在存储不可用时降级为空列表，而不是整页 500。
+    let agents = state
+        .store
+        .list_agents(&AgentQuery::default())
+        .await
+        .unwrap_or_default();
     let now = DateTime::now();
 
     // 总览指标对「全部 agent」计算，而不是只对最近 6 张卡片（卡片列表单独 truncate）。
-    let total_agents = snapshot.agents.len() as i64;
-    let online_agents = snapshot
-        .agents
-        .values()
+    let total_agents = agents.len() as i64;
+    let online_agents = agents
+        .iter()
         .filter(|agent| agent_is_online(&agent.last_seen_at, &now))
         .count() as i64;
-    let last_seen_lag_seconds = snapshot
-        .agents
-        .values()
+    let last_seen_lag_seconds = agents
+        .iter()
         .filter_map(|agent| DateTime::from_rfc3339(&agent.last_seen_at))
         .map(|last_seen| last_seen.seconds_until(&now))
         .max()
         .unwrap_or(0);
 
-    let stored_agents = snapshot.agents.into_values().collect::<Vec<_>>();
+    let stored_agents = agents;
     let memory_agents = state
         .runtime
         .lock()

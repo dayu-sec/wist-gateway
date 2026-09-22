@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     Json,
     extract::State,
@@ -10,13 +12,12 @@ use wist_contracts::enrollment::{
 };
 
 use crate::infra::{
-    AdminConfig, AdminStore, StoredAgentRegistration, StoredCredentialStatus,
-    StoredEnrollmentTokenStatus, new_secret_token, sha256_hex,
+    AdminConfig, CommitRegistration, ReserveEnrollmentToken, Store, new_secret_token, sha256_hex,
 };
 
 use super::{
     ApiState,
-    install::{recover_expired_reservation, token_hash},
+    install::{ENROLLMENT_TOKEN_RESERVATION_TTL_SECONDS, token_hash},
     overview::record_recent_online_agent,
     rate_limit,
 };
@@ -36,7 +37,7 @@ pub async fn enroll_agent(
     }
     let requested_at = input.requested_at.clone();
     let version = agent_version_from_capability_summary(&input.capability_summary);
-    let result = agent_enrollment_result(&state.config, &state.store, input, &version);
+    let result = agent_enrollment_result(&state.config, &state.store, input, &version).await;
     if result.status == EnrollmentStatus::Accepted {
         rate_limit::clear_auth_failures(&state, &client_key, ENROLLMENT_AUTH_SCOPE);
         if let (Some(agent_id), Some(instance_id)) =
@@ -78,18 +79,18 @@ pub async fn enroll_agent(
         .into_response()
 }
 
-pub fn agent_enrollment_result(
+pub async fn agent_enrollment_result(
     config: &AdminConfig,
-    store: &AdminStore,
+    store: &Arc<dyn Store>,
     input: EnrollmentRequest,
     version: &str,
 ) -> EnrollmentOutcome {
-    agent_enrollment_result_with_token_issuer(config, store, input, version, new_secret_token)
+    agent_enrollment_result_with_token_issuer(config, store, input, version, new_secret_token).await
 }
 
-pub(super) fn agent_enrollment_result_with_token_issuer(
+pub(super) async fn agent_enrollment_result_with_token_issuer(
     config: &AdminConfig,
-    store: &AdminStore,
+    store: &Arc<dyn Store>,
     input: EnrollmentRequest,
     version: &str,
     issue_secret_token: impl FnOnce(&str) -> Result<String, String>,
@@ -106,14 +107,14 @@ pub(super) fn agent_enrollment_result_with_token_issuer(
     .unwrap_or("agent-instance")
     .to_string();
     let agent_id = format!("agent-{}", stable_identifier(&instance_id));
-    let reservation = match reserve_enrollment_token(config, store, &input, &agent_id) {
+    let reservation = match reserve_enrollment_token(config, store, &input, &agent_id).await {
         Ok(reservation) => reservation,
         Err(reason) => return rejected_result(reason),
     };
     let bearer_token = match issue_secret_token("wic") {
         Ok(token) => token,
         Err(reason) => {
-            let _ = rollback_enrollment_token_reservation(store, &reservation);
+            let _ = rollback_enrollment_token_reservation(store, &reservation).await;
             return rejected_result(reason);
         }
     };
@@ -157,9 +158,9 @@ pub(super) fn agent_enrollment_result_with_token_issuer(
         policy_binding: None,
     };
     if let Err(reason) =
-        commit_reserved_registration(config, store, &input, &result, version, &bearer_token)
+        commit_reserved_registration(config, store, &input, &result, version, &bearer_token).await
     {
-        let _ = rollback_enrollment_token_reservation(store, &reservation);
+        let _ = rollback_enrollment_token_reservation(store, &reservation).await;
         return rejected_result(reason);
     }
     result
@@ -179,54 +180,33 @@ struct EnrollmentTokenReservation {
     token_hash: String,
 }
 
-fn reserve_enrollment_token(
+async fn reserve_enrollment_token(
     config: &AdminConfig,
-    store: &AdminStore,
+    store: &Arc<dyn Store>,
     input: &EnrollmentRequest,
     agent_id: &str,
 ) -> Result<EnrollmentTokenReservation, String> {
     let token_hash = token_hash(&input.token);
-    store
-        .update_result(|snapshot| {
-            let now = chrono::Utc::now();
-            let Some(token) = snapshot.enrollment_tokens.get_mut(&token_hash) else {
-                return Err("invalid_enrollment_token".to_string());
-            };
-            if token.tenant_id != config.tenant_id || token.environment_id != config.environment_id
-            {
-                return Err("invalid_enrollment_token".to_string());
-            }
-            recover_expired_reservation(token, &now);
-            if token.status != StoredEnrollmentTokenStatus::Active
-                || token.used_count >= token.max_uses
-                || token.token_hash != token_hash
-            {
-                return Err("invalid_enrollment_token".to_string());
-            }
-            let expires_at = match chrono::DateTime::parse_from_rfc3339(&token.expires_at) {
-                Ok(value) => value.with_timezone(&chrono::Utc),
-                Err(_) => return Err("invalid_enrollment_token".to_string()),
-            };
-            if chrono::Utc::now() >= expires_at {
-                return Err("invalid_enrollment_token".to_string());
-            }
-            if snapshot.agents.contains_key(agent_id) {
-                return Err("duplicate_agent_registration".to_string());
-            }
-
-            token.used_count = token.used_count.saturating_add(1);
-            token.reserved_at = Some(now.to_rfc3339());
-            token.status = StoredEnrollmentTokenStatus::Reserved;
-            Ok(EnrollmentTokenReservation {
-                token_hash: token_hash.clone(),
-            })
+    let rejection = store
+        .reserve_enrollment_token(&ReserveEnrollmentToken {
+            token_hash: &token_hash,
+            tenant_id: &config.tenant_id,
+            environment_id: &config.environment_id,
+            agent_id,
+            reservation_ttl_seconds: ENROLLMENT_TOKEN_RESERVATION_TTL_SECONDS,
         })
+        .await
         .map_err(|err| err.to_string())?
+        .err();
+    match rejection {
+        Some(rejection) => Err(rejection.rejection_code().to_string()),
+        None => Ok(EnrollmentTokenReservation { token_hash }),
+    }
 }
 
-fn commit_reserved_registration(
+async fn commit_reserved_registration(
     config: &AdminConfig,
-    store: &AdminStore,
+    store: &Arc<dyn Store>,
     input: &EnrollmentRequest,
     result: &EnrollmentOutcome,
     version: &str,
@@ -249,71 +229,45 @@ fn commit_reserved_registration(
     let registered_at = chrono::DateTime::parse_from_rfc3339(&input.requested_at)
         .map(|value| value.with_timezone(&chrono::Utc).to_rfc3339())
         .unwrap_or_else(|_| now.clone());
+    let credential_token_hash = sha256_hex(bearer_token);
+    let credential_expires_at = credential.not_after.clone().unwrap_or_default();
 
-    store
-        .update_result(|snapshot| {
-            let Some(token) = snapshot.enrollment_tokens.get_mut(&token_hash) else {
-                return Err("invalid_enrollment_token".to_string());
-            };
-            if token.status != StoredEnrollmentTokenStatus::Reserved
-                || token.token_hash != token_hash
-            {
-                return Err("invalid_enrollment_token".to_string());
-            }
-            if snapshot.agents.contains_key(agent_id) {
-                return Err("duplicate_agent_registration".to_string());
-            }
-            token.status = if token.used_count >= token.max_uses {
-                StoredEnrollmentTokenStatus::Used
-            } else {
-                StoredEnrollmentTokenStatus::Active
-            };
-            token.reserved_at = None;
-
-            snapshot.agents.insert(
-                agent_id.to_string(),
-                StoredAgentRegistration {
-                    agent_id: agent_id.to_string(),
-                    instance_id: instance_id.to_string(),
-                    tenant_id: config.tenant_id.clone(),
-                    environment_id: config.environment_id.clone(),
-                    node_id: input.host_profile.node_id.clone(),
-                    hostname: input.host_profile.hostname.clone(),
-                    machine_id: input.host_profile.machine_id.clone(),
-                    version: version.to_string(),
-                    credential_id: credential.credential_id.clone(),
-                    credential_token_hash: sha256_hex(bearer_token),
-                    credential_issued_at: credential.issued_at.clone(),
-                    credential_expires_at: credential.not_after.clone().unwrap_or_default(),
-                    credential_status: StoredCredentialStatus::Active,
-                    registered_at,
-                    last_seen_at: now,
-                    last_memory_bytes: None,
-                    last_cpu_percent: None,
-                    last_admin_latency_ms: None,
-                    work_state_changes: None,
-                },
-            );
-            Ok(())
+    // token 状态收尾（used/reserved_at）与 agents 落库现在都在 store 单事务内完成。
+    let rejection = store
+        .commit_reserved_registration(&CommitRegistration {
+            token_hash: &token_hash,
+            agent_id,
+            instance_id,
+            boot_id: "",
+            tenant_id: &config.tenant_id,
+            environment_id: &config.environment_id,
+            node_id: &input.host_profile.node_id,
+            hostname: &input.host_profile.hostname,
+            machine_id: &input.host_profile.machine_id,
+            version,
+            credential_id: &credential.credential_id,
+            credential_token_hash: &credential_token_hash,
+            credential_issued_at: &credential.issued_at,
+            credential_expires_at: &credential_expires_at,
+            registered_at: &registered_at,
+            now: &now,
         })
+        .await
         .map_err(|err| err.to_string())?
+        .err();
+    match rejection {
+        Some(rejection) => Err(rejection.rejection_code().to_string()),
+        None => Ok(()),
+    }
 }
 
-fn rollback_enrollment_token_reservation(
-    store: &AdminStore,
+async fn rollback_enrollment_token_reservation(
+    store: &Arc<dyn Store>,
     reservation: &EnrollmentTokenReservation,
 ) -> Result<(), String> {
     store
-        .update(|snapshot| {
-            let Some(token) = snapshot.enrollment_tokens.get_mut(&reservation.token_hash) else {
-                return;
-            };
-            if token.status == StoredEnrollmentTokenStatus::Reserved {
-                token.used_count = token.used_count.saturating_sub(1);
-                token.reserved_at = None;
-                token.status = StoredEnrollmentTokenStatus::Active;
-            }
-        })
+        .rollback_enrollment_token_reservation(&reservation.token_hash)
+        .await
         .map_err(|err| err.to_string())
 }
 

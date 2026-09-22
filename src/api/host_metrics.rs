@@ -84,8 +84,11 @@ pub async fn get_agent_host_metrics(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    let snapshot = match state.store.load() {
-        Ok(snapshot) => snapshot,
+    match state.store.agent_exists(&agent_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
+        }
         Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -93,9 +96,6 @@ pub async fn get_agent_host_metrics(
             )
                 .into_response();
         }
-    };
-    if !snapshot.agents.contains_key(&agent_id) {
-        return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
     }
 
     match query_host_metrics(&state.config.victoria_metrics_url, &agent_id).await {
@@ -117,8 +117,8 @@ pub async fn get_all_agents_host_metrics(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    let agent_ids = match state.store.load() {
-        Ok(snapshot) => snapshot.agents.keys().cloned().collect::<Vec<_>>(),
+    let agent_ids = match state.store.list_agent_ids().await {
+        Ok(agent_ids) => agent_ids,
         Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
