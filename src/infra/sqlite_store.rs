@@ -39,7 +39,9 @@ const AGENT_PROJECTION: &str = "SELECT a.agent_id, a.tenant_id, a.environment_id
      COALESCE(a.current_instance_id, '') AS instance_id, \
      COALESCE(i.version, '') AS version, \
      COALESCE(i.last_seen_at, '') AS last_seen_at, \
+     COALESCE(i.started_at, '') AS started_at, \
      i.memory_bytes, i.cpu_percent, i.admin_latency_ms, i.work_state_changes, \
+     i.discovery_policy_version, \
      COALESCE(a.current_credential_id, '') AS credential_id, \
      COALESCE(c.token_hash, '') AS credential_token_hash, \
      COALESCE(c.issued_at, '') AS credential_issued_at, \
@@ -389,9 +391,11 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
         credential_status: StoredCredentialStatus::parse(&credential_status),
         registered_at: column!(row, "registered_at"),
         last_seen_at: column!(row, "last_seen_at"),
+        started_at: column!(row, "started_at"),
         last_memory_bytes: column!(row, "memory_bytes"),
         last_cpu_percent: column!(row, "cpu_percent"),
         last_admin_latency_ms: column!(row, "admin_latency_ms"),
+        last_discovery_policy_version: column!(row, "discovery_policy_version"),
         work_state_changes: deserialize_work_state_changes(work_state_changes),
     })
 }
@@ -913,14 +917,16 @@ impl Store for SqliteStore {
             sqlx::query(
                 "INSERT INTO agent_instances (instance_id, agent_id, boot_id, version, \
                  started_at, last_seen_at, memory_bytes, cpu_percent, admin_latency_ms, \
-                 work_state_changes) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9) \
+                 work_state_changes, discovery_policy_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10) \
                  ON CONFLICT (instance_id) DO UPDATE SET version = excluded.version, \
                  boot_id = CASE WHEN excluded.boot_id = '' THEN agent_instances.boot_id \
                  ELSE excluded.boot_id END, \
                  last_seen_at = excluded.last_seen_at, \
                  memory_bytes = excluded.memory_bytes, cpu_percent = excluded.cpu_percent, \
                  admin_latency_ms = excluded.admin_latency_ms, \
-                 work_state_changes = excluded.work_state_changes",
+                 work_state_changes = excluded.work_state_changes, \
+                 discovery_policy_version = excluded.discovery_policy_version",
             )
             .bind(&instance_id)
             .bind(update.agent_id)
@@ -931,6 +937,7 @@ impl Store for SqliteStore {
             .bind(update.cpu_percent)
             .bind(to_sql_int(update.admin_latency_ms))
             .bind(work_state_changes)
+            .bind(update.discovery_policy_version)
             .execute(&mut *tx)
             .await
             .map_err(|err| sql_error(err, "upsert agent instance"))?;
@@ -1475,6 +1482,7 @@ mod tests {
                 memory_bytes: None,
                 cpu_percent: None,
                 admin_latency_ms: None,
+                discovery_policy_version: None,
                 work_state_changes: None,
             })
             .await
@@ -1496,6 +1504,7 @@ mod tests {
                     memory_bytes: memory,
                     cpu_percent: Some(1.5),
                     admin_latency_ms: Some(7),
+                    discovery_policy_version: None,
                     work_state_changes: None,
                 })
                 .await
@@ -1511,6 +1520,89 @@ mod tests {
         let instances = store.list_agent_instances("agent-1").await.unwrap();
         assert_eq!(instances.len(), 2);
         assert_eq!(instances[0].instance_id, "inst-2");
+    }
+
+    #[tokio::test]
+    async fn migration_adds_agent_discovery_policy_version_column() {
+        // 迁移 0005 是 ALTER TABLE ADD COLUMN（SQLite 不支持 ADD COLUMN IF NOT EXISTS），
+        // 直接查 pragma 确认列真存在，而不是只靠“插得进去”。
+        let store = store().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('agent_instances')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            columns
+                .iter()
+                .any(|name| name == "discovery_policy_version"),
+            "{columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stores_agent_discovery_policy_version_and_distinguishes_none_from_zero() {
+        let store = store().await;
+        register(&store, "hash-l", "agent-1", "inst-1").await;
+
+        // 旧 agent（没带新字段）：写入必须不失败，且留 NULL。
+        let legacy = store
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-1",
+                instance_id: "inst-1",
+                boot_id: "boot-1",
+                version: "0.1.0",
+                last_seen_at: "2026-01-02T00:00:00+00:00",
+                memory_bytes: None,
+                cpu_percent: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+            })
+            .await
+            .unwrap();
+        assert!(legacy);
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.last_discovery_policy_version, None);
+
+        // 上报实际生效的版本：读写一致。
+        let recorded = store
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-1",
+                instance_id: "inst-1",
+                boot_id: "boot-1",
+                version: "0.2.0",
+                last_seen_at: "2026-01-03T00:00:00+00:00",
+                memory_bytes: Some(4096),
+                cpu_percent: Some(1.5),
+                admin_latency_ms: Some(7),
+                discovery_policy_version: Some(2),
+                work_state_changes: None,
+            })
+            .await
+            .unwrap();
+        assert!(recorded);
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.last_discovery_policy_version, Some(2));
+
+        // 版本 0 是一个真实版本，必须与 None（还没拉到）区分开。
+        store
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-1",
+                instance_id: "inst-1",
+                boot_id: "boot-1",
+                version: "0.2.0",
+                last_seen_at: "2026-01-04T00:00:00+00:00",
+                memory_bytes: None,
+                cpu_percent: None,
+                admin_latency_ms: None,
+                discovery_policy_version: Some(0),
+                work_state_changes: None,
+            })
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.last_discovery_policy_version, Some(0));
     }
 
     #[tokio::test]

@@ -140,9 +140,17 @@ pub struct StoredAgentRegistration {
     pub credential_status: StoredCredentialStatus,
     pub registered_at: String,
     pub last_seen_at: String,
+    /// 当前实例的开始时刻（历史起点）。
+    ///
+    /// 注册时 `agent_instances` 行就把 `last_seen_at` 初始化成 `started_at`，只有真正的心跳
+    /// （状态上报）才会推进 `last_seen_at`。因此 `last_seen_at == started_at` 是“注册过但
+    /// 一次状态都没报过”的判据 —— 管理面用它把 `last_seen_at` 显示成空串。
+    pub started_at: String,
     pub last_memory_bytes: Option<u64>,
     pub last_cpu_percent: Option<f64>,
     pub last_admin_latency_ms: Option<u64>,
+    /// 本机**实际生效**的发现方向策略版本；`None` = 还没拿到策略表（在用内建默认周期）。
+    pub last_discovery_policy_version: Option<i64>,
     /// 最近一次状态上报携带的工作状态变化（paused/resumed），非告警/失败。
     pub work_state_changes: Option<Vec<AgentWorkStateChange>>,
 }
@@ -413,6 +421,8 @@ pub struct AgentStatusUpdate<'a> {
     pub memory_bytes: Option<u64>,
     pub cpu_percent: Option<f64>,
     pub admin_latency_ms: Option<u64>,
+    /// 本机**实际生效**的发现方向策略版本；`None` = 还没拿到策略表（区别于「生效了第 0 版」）。
+    pub discovery_policy_version: Option<i64>,
     pub work_state_changes: Option<Vec<AgentWorkStateChange>>,
 }
 

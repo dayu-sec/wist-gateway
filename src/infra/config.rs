@@ -570,6 +570,7 @@ mod tests {
         rand as ring_rand,
         signature::{Ed25519KeyPair, KeyPair},
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1136,10 +1137,16 @@ environment_id = "env-default"
     }
 
     fn unique_suffix() -> u128 {
+        // 加一个自增序号：只用纳秒时，并行跑的测试有几率拿到同一个后缀从而互相覆写
+        // 临时配置文件（曾表现为「不存在的策略表竟然装载成功」这种偶发失败）。
+        // `src/api/tests.rs` 的同名函数早就踩过并这么修了，这里补上。
+        static NEXT_SUFFIX: AtomicU64 = AtomicU64::new(1);
+        let seq = NEXT_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos()
+            + seq
     }
 
     fn write_install_signing_key(path: &Path) {

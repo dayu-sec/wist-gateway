@@ -39,6 +39,7 @@ pub async fn submit_agent_status(
             let memory_bytes = input.memory_bytes;
             let cpu_percent = input.cpu_percent;
             let admin_latency_ms = input.admin_latency_ms;
+            let discovery_policy_version = input.discovery_policy_version;
             let status_result = state
                 .store
                 .record_agent_status(&AgentStatusUpdate {
@@ -50,6 +51,7 @@ pub async fn submit_agent_status(
                     memory_bytes,
                     cpu_percent,
                     admin_latency_ms,
+                    discovery_policy_version,
                     work_state_changes: input.work_state_changes.clone(),
                 })
                 .await;
@@ -73,38 +75,14 @@ pub async fn submit_agent_status(
                 }
             }
             // 统一进 VM：agent 自身运行指标以时间序列写入，文件只保留最新值缓存。
-            let lines: Vec<serde_json::Value> = [
-                memory_bytes.map(|value| {
-                    metric_line(
-                        "agent.memory.bytes",
-                        &agent.agent_id,
-                        "agent_metrics",
-                        value as f64,
-                        timestamp_ms,
-                    )
-                }),
-                cpu_percent.map(|value| {
-                    metric_line(
-                        "agent.cpu.percent",
-                        &agent.agent_id,
-                        "agent_metrics",
-                        value,
-                        timestamp_ms,
-                    )
-                }),
-                admin_latency_ms.map(|value| {
-                    metric_line(
-                        "agent.admin_latency.ms",
-                        &agent.agent_id,
-                        "agent_metrics",
-                        value as f64,
-                        timestamp_ms,
-                    )
-                }),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
+            let lines = agent_status_metric_lines(
+                &agent.agent_id,
+                memory_bytes,
+                cpu_percent,
+                admin_latency_ms,
+                discovery_policy_version,
+                timestamp_ms,
+            );
             if !lines.is_empty()
                 && let Err(err) = import_lines(&state.config.victoria_metrics_url, &lines).await
             {
@@ -125,6 +103,62 @@ pub async fn submit_agent_status(
         }
         Err(response) => response,
     }
+}
+
+/// agent 状态上报对应的 VM 指标行（只含有值的项）。
+///
+/// 缺值（`None`）**不产生行、更不补 0**：把「没上报」写成 0 会在图上伪造出一段真实读数。
+/// 对 `discovery_policy_version` 尤其致命 —— 0 代表确实生效了第 0 版，与「还没拉到策略表」
+/// 是两回事，混为一谈正好毁掉运维要回答的那句「哪些机器还没生效」。
+pub(super) fn agent_status_metric_lines(
+    agent_id: &str,
+    memory_bytes: Option<u64>,
+    cpu_percent: Option<f64>,
+    admin_latency_ms: Option<u64>,
+    discovery_policy_version: Option<i64>,
+    timestamp_ms: i64,
+) -> Vec<serde_json::Value> {
+    [
+        memory_bytes.map(|value| {
+            metric_line(
+                "agent.memory.bytes",
+                agent_id,
+                "agent_metrics",
+                value as f64,
+                timestamp_ms,
+            )
+        }),
+        cpu_percent.map(|value| {
+            metric_line(
+                "agent.cpu.percent",
+                agent_id,
+                "agent_metrics",
+                value,
+                timestamp_ms,
+            )
+        }),
+        admin_latency_ms.map(|value| {
+            metric_line(
+                "agent.admin_latency.ms",
+                agent_id,
+                "agent_metrics",
+                value as f64,
+                timestamp_ms,
+            )
+        }),
+        discovery_policy_version.map(|value| {
+            metric_line(
+                "agent.discovery_policy_version",
+                agent_id,
+                "agent_metrics",
+                value as f64,
+                timestamp_ms,
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 pub async fn poll_control_commands(

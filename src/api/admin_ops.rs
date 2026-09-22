@@ -129,8 +129,28 @@ pub struct DiscoveryPoliciesView {
     pub configured: bool,
     /// 未配置时为 null（不编一份空表来冒充“已配置”）。
     pub policy: Option<DiscoveryAspectPolicySet>,
+    /// 每台已注册 Agent 实际生效的策略版本。
+    ///
+    /// 为什么**包含从未上报过的 Agent**：运维的问题是「谁还没生效」，那些从没打过状态
+    /// 上报的机器必须**看得见**（`applied_policy_version=null`），而不是从列表里静默消失 ——
+    /// 看不见的机器正是最可能漏掉的那一批。
+    pub agents: Vec<AgentAppliedDiscoveryPolicy>,
     /// 与其它管理面视图一致：带上“这份视图是什么时候生成的”。
     pub generated_at: DateTime,
+}
+
+/// 单台 Agent 实际生效的发现方向策略版本（对应模型侧的并行类型）。
+#[derive(Debug, Serialize)]
+pub struct AgentAppliedDiscoveryPolicy {
+    pub agent_id: String,
+    /// null = 这台机器还没拉到策略表（在用内建默认周期）；0 是一个真实版本，不可混同。
+    pub applied_policy_version: Option<i64>,
+    pub instance_id: String,
+    /// null = 从未上报过状态（只有注册记录）。
+    ///
+    /// 为什么不用空串：这套 API 里「没有」一律用 null（同 `applied_policy_version`、
+    /// 同相邻视图的 `updated_at`），空串是另一种需要调用方另记的约定。
+    pub last_seen_at: Option<String>,
 }
 
 /// Agent 用途视图（对应模型 `AgentPurposeView`）。
@@ -518,16 +538,47 @@ pub async fn view_discovery_policies(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
+    // 一次拉全表（不分页）：运维要看的是「谁还没生效」，漏掉一页就是漏掉一批机器。
+    // `list_agents` 在 SQL 里已按 agent_id 排序，这里再显式排一次，不把契约挂在存储层实现细节上。
+    let agents = match state.store.list_agents(&AgentQuery::default()).await {
+        Ok(agents) => agents,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load agent store: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let mut agents: Vec<AgentAppliedDiscoveryPolicy> = agents
+        .into_iter()
+        .map(|agent| AgentAppliedDiscoveryPolicy {
+            agent_id: agent.agent_id,
+            applied_policy_version: agent.last_discovery_policy_version,
+            instance_id: agent.instance_id,
+            // 注册时会先建一行实例记录（`last_seen_at` 初值等于 `started_at`），但那不是一次
+            // 状态上报。两者相等 = 注册过但一次状态都没报过，此时回 null，而不是把注册时刻
+            // 冒充成“最后一次上报”。
+            last_seen_at: if agent.last_seen_at == agent.started_at {
+                None
+            } else {
+                Some(agent.last_seen_at)
+            },
+        })
+        .collect();
+    agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
     match state.discovery_policies.as_deref() {
         Some(set) => Json(DiscoveryPoliciesView {
             configured: true,
             policy: Some(set.clone()),
+            agents,
             generated_at: DateTime::now(),
         })
         .into_response(),
         None => Json(DiscoveryPoliciesView {
             configured: false,
             policy: None,
+            agents,
             generated_at: DateTime::now(),
         })
         .into_response(),

@@ -836,6 +836,7 @@ async fn agent_status_route_requires_bearer_credential() {
             memory_bytes: None,
             cpu_percent: None,
             admin_latency_ms: None,
+            discovery_policy_version: None,
             work_state_changes: None,
         },
     )
@@ -854,6 +855,7 @@ async fn agent_status_route_requires_bearer_credential() {
             memory_bytes: None,
             cpu_percent: None,
             admin_latency_ms: None,
+            discovery_policy_version: None,
             work_state_changes: None,
         },
     )
@@ -891,6 +893,7 @@ async fn agent_status_route_persists_reported_metrics() {
             memory_bytes: Some(12_345_678),
             cpu_percent: Some(7.5),
             admin_latency_ms: Some(42),
+            discovery_policy_version: None,
             work_state_changes: None,
         },
     )
@@ -1445,6 +1448,68 @@ async fn get_discovery_view(env: &TestEnv, admin_token: Option<&str>) -> Respons
     .await
 }
 
+/// 注册一台指定 `node_id` 的 Agent 并拿回 bearer 凭据。
+///
+/// `agent_id` 由网关按 `node_id` 派生（`agent-<node_id>`），所以换个 node 就是一台不同的机器。
+async fn enroll_agent_at_node(env: &TestEnv, node_id: &str) -> String {
+    let token = env.issue_token().await;
+    let mut request = enrollment_request(&token);
+    request.host_profile.node_id = node_id.to_string();
+    let response = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        serde_json::to_string(&request).expect("serialize enrollment"),
+    )
+    .await;
+    decode_enrollment_response(response)
+        .await
+        .result
+        .credential_bundle
+        .expect("credential bundle")
+        .bearer_token
+        .expect("bearer token")
+}
+
+/// 发一次状态上报。
+///
+/// `policy_version=None` 造一份**不带**该字段的报文（旧 agentd 不知道它），
+/// 而不是显式建 `"discovery_policy_version": null` —— 后者是「知道字段但没值」，
+/// 前者才是要验的向后兼容场景。
+async fn post_agent_status(
+    env: &TestEnv,
+    credential: &str,
+    instance_id: &str,
+    policy_version: Option<i64>,
+) -> Response {
+    let agent_id = format!("agent-{instance_id}");
+    let body = match policy_version {
+        Some(version) => serde_json::to_value(AgentStatusReport {
+            agent_id,
+            instance_id: instance_id.to_string(),
+            version: "v0.2.0".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            admin_latency_ms: None,
+            discovery_policy_version: Some(version),
+            work_state_changes: None,
+        })
+        .expect("serialize status"),
+        None => serde_json::json!({
+            "agent_id": agent_id,
+            "instance_id": instance_id,
+            "version": "v0.1.0",
+        }),
+    };
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(credential),
+        &body,
+    )
+    .await
+}
+
 #[tokio::test]
 async fn discovery_policies_poll_requires_bearer_credential() {
     let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
@@ -1554,6 +1619,123 @@ async fn admin_discovery_view_requires_admin_bearer() {
 
     let response = get_discovery_view(&env, None).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn agent_status_persists_the_applied_discovery_policy_version() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_agent_status(&env, &credential, "node-a", Some(2)).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("agent");
+    assert_eq!(stored.last_discovery_policy_version, Some(2));
+}
+
+#[tokio::test]
+async fn agent_status_without_the_policy_version_keeps_it_null() {
+    // 旧 agentd 的报文里没有这个 key：既不能因此回 400，也不能把它当成 0。
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_agent_status(&env, &credential, "node-a", None).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("agent");
+    assert_eq!(stored.last_discovery_policy_version, None);
+}
+
+#[tokio::test]
+async fn admin_discovery_view_lists_per_agent_applied_versions() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+    // a 报上生效版本 2；b 报了状态但不带版本；c 注册后从没报过 —— 三台都必须出现。
+    let credential_a = enroll_agent_at_node(&env, "node-a").await;
+    let credential_b = enroll_agent_at_node(&env, "node-b").await;
+    let _credential_c = enroll_agent_at_node(&env, "node-c").await;
+    assert_eq!(
+        post_agent_status(&env, &credential_a, "node-a", Some(2))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        post_agent_status(&env, &credential_b, "node-b", None)
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+
+    let view: serde_json::Value =
+        decode_json_response(get_discovery_view(&env, Some(TEST_ADMIN_API_TOKEN)).await).await;
+    // 未配置/已配置两路都带上 agents；这里策略表是配了的，顺带确认旧字段语义没变。
+    assert_eq!(view["configured"], serde_json::Value::Bool(true));
+
+    let agents = view["agents"].as_array().expect("agents array");
+    let ids: Vec<&str> = agents
+        .iter()
+        .map(|agent| agent["agent_id"].as_str().expect("agent_id"))
+        .collect();
+    assert_eq!(ids, vec!["agent-node-a", "agent-node-b", "agent-node-c"]);
+
+    assert_eq!(agents[0]["applied_policy_version"], 2);
+    assert_eq!(agents[0]["instance_id"], "node-a");
+    assert!(
+        agents[0]["last_seen_at"]
+            .as_str()
+            .expect("last_seen_at")
+            .starts_with("20"),
+        "{agents:?}"
+    );
+
+    // b 上报过但没带版本：null，不是 0，也不是缺行。
+    assert!(agents[1]["applied_policy_version"].is_null());
+    assert_eq!(agents[1]["instance_id"], "node-b");
+    assert!(!agents[1]["last_seen_at"].as_str().unwrap().is_empty());
+
+    // c 从没上报：仍在列表里（运维要看的正是「谁还没生效」），last_seen_at 为 null。
+    assert!(agents[2]["applied_policy_version"].is_null());
+    assert!(agents[2]["last_seen_at"].is_null(), "{agents:?}");
+}
+
+#[tokio::test]
+async fn agent_status_metric_reports_policy_version_only_when_present() {
+    // 缺值不能补 0：0 是「确实生效了第 0 版」，与「还没拉到策略表」在图上必须分开。
+    let with = super::agent_ops::agent_status_metric_lines(
+        "agent-node-a",
+        None,
+        None,
+        None,
+        Some(2),
+        1_700_000_000_000,
+    );
+    let version_line = with
+        .iter()
+        .find(|line| line["metric"]["__name__"] == "agent.discovery_policy_version")
+        .expect("discovery policy version metric line");
+    assert_eq!(version_line["values"][0], 2.0);
+    assert_eq!(version_line["metric"]["agent"], "agent-node-a");
+    assert_eq!(with.len(), 1);
+
+    let without = super::agent_ops::agent_status_metric_lines(
+        "agent-node-a",
+        None,
+        None,
+        None,
+        None,
+        1_700_000_000_000,
+    );
+    assert!(without.is_empty(), "{without:?}");
 }
 
 /// 用**真实策展策略表**跑通下发：装载校验通过，且下发的是七个方向那一版。
@@ -1756,6 +1938,7 @@ async fn agent_status_route_persists_work_state_changes() {
             memory_bytes: None,
             cpu_percent: None,
             admin_latency_ms: None,
+            discovery_policy_version: None,
             work_state_changes: Some(vec![AgentWorkStateChange {
                 input_id: "app".to_string(),
                 state: AgentWorkState::Paused,
@@ -1827,6 +2010,7 @@ async fn agent_status_route_rejects_expired_bearer_credential() {
             memory_bytes: None,
             cpu_percent: None,
             admin_latency_ms: None,
+            discovery_policy_version: None,
             work_state_changes: None,
         },
     )
@@ -1888,6 +2072,7 @@ async fn credential_renewal_replaces_previous_credential() {
             memory_bytes: None,
             cpu_percent: None,
             admin_latency_ms: None,
+            discovery_policy_version: None,
             work_state_changes: None,
         },
     )
@@ -1906,6 +2091,7 @@ async fn credential_renewal_replaces_previous_credential() {
             memory_bytes: None,
             cpu_percent: None,
             admin_latency_ms: None,
+            discovery_policy_version: None,
             work_state_changes: None,
         },
     )
