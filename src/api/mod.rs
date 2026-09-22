@@ -11,6 +11,7 @@ use axum::{
 
 use crate::app::purpose::PurposeRuleTable;
 use crate::infra::{AdminConfig, Store};
+use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 
 mod admin_auth;
 mod admin_ops;
@@ -38,10 +39,11 @@ pub use wist_agentd_online_registration_interface::WistAgentdOnlineRegistrationI
 use admin_ops::{
     get_agent_runtime_status, list_agents, revoke_agent_credential, set_agent_install_package,
     set_agent_uplink, view_agent_install_package, view_agent_purpose, view_agent_uplink,
+    view_discovery_policies,
 };
 use agent_ops::{
-    poll_control_commands, renew_agent_credential, report_action_result, submit_agent_facts,
-    submit_agent_status,
+    poll_control_commands, poll_discovery_policies, renew_agent_credential, report_action_result,
+    submit_agent_facts, submit_agent_status,
 };
 use enrollment::enroll_agent;
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
@@ -63,6 +65,11 @@ pub struct ApiState {
     /// 启动时装载一次并缓存（改规则通过重启生效）：规则表是策展数据，改它要走审定，
     /// 不做热加载 —— 热加载会让"哪一版规则算出的这个建议"变得说不清。
     pub purpose_rules: Option<Arc<PurposeRuleTable>>,
+    /// 已装载的发现方向策略表；未配置 `[discovery] policies_file` 时为 `None`。
+    ///
+    /// 与规则表同理：启动时装载一次并缓存（改策略通过重启生效）。`None` 时下发端点
+    /// 回 503，而不是发一份空表 —— 空表会让「平台没发布策略」与「从未配置」无法区分。
+    pub discovery_policies: Option<Arc<DiscoveryAspectPolicySet>>,
 }
 
 /// 启动时装载规则表。
@@ -83,6 +90,24 @@ fn load_purpose_rules(config: &AdminConfig) -> Option<Arc<PurposeRuleTable>> {
     }
 }
 
+/// 启动时装载发现方向策略表。
+///
+/// 与规则表同样的退化策略：`AdminConfig::validate` 已经校验过一次（配置错就起不来），
+/// 走到这里还失败，说明文件在启动后被改动过 —— 记一条警告并当作"未配置"（端点回 503）。
+fn load_discovery_policies(config: &AdminConfig) -> Option<Arc<DiscoveryAspectPolicySet>> {
+    let path = config.discovery_policies_file.as_deref()?;
+    match crate::app::discovery_policy::load_policy_table(path) {
+        Ok(set) => Some(Arc::new(set)),
+        Err(err) => {
+            eprintln!(
+                "warning: failed to load discovery aspect policy table {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AdminRuntimeState {
     pub recent_online_agents: Vec<RecentOnlineRegisteredAgent>,
@@ -90,6 +115,7 @@ pub struct AdminRuntimeState {
 
 pub fn router(config: AdminConfig, store: Arc<dyn Store>) -> Router {
     let purpose_rules = load_purpose_rules(&config);
+    let discovery_policies = load_discovery_policies(&config);
     Router::new()
         .route("/api/v1/agent/install-code", get(get_agent_install_code))
         .route(
@@ -128,6 +154,13 @@ pub fn router(config: AdminConfig, store: Arc<dyn Store>) -> Router {
             post(poll_control_commands),
         )
         .route("/api/v1/agent/action-results", post(report_action_result))
+        // NOTE(hand-added): agentd 拉取发现方向策略表。带 `:poll` 后缀以标明它是幂等的
+        // “拉当前版本”，而不是一次汇报。已在 jumo 模型 WistAgentdOnlineRegistrationInterface
+        // 声明；重新生成控制面代码时需回补本路由。
+        .route(
+            "/api/v1/agent/discovery-policies:poll",
+            post(poll_discovery_policies),
+        )
         .route("/api/v1/admin/agents/overview", get(get_agent_overview))
         .route(
             "/api/v1/admin/agents/host-metrics",
@@ -168,6 +201,11 @@ pub fn router(config: AdminConfig, store: Arc<dyn Store>) -> Router {
         // NOTE(hand-added): Agent 管理面列表与凭据吊销。已在 jumo 模型
         // WistGatewayManagementInterface（AdminListAgents / AdminRevokeAgentCredential）中声明，
         // 重新生成控制面代码时需保证这两条路由不丢失。
+        // NOTE(hand-added): 发现方向策略表视图（管理面）。
+        .route(
+            "/api/v1/admin/discovery-policies",
+            get(view_discovery_policies),
+        )
         .route("/api/v1/admin/agents", get(list_agents))
         .route(
             "/api/v1/admin/agents/{agent_id}/credentials:revoke",
@@ -179,6 +217,7 @@ pub fn router(config: AdminConfig, store: Arc<dyn Store>) -> Router {
             runtime: Arc::new(Mutex::new(AdminRuntimeState::default())),
             rate_limits: Arc::new(Mutex::new(rate_limit::RateLimitState::default())),
             purpose_rules,
+            discovery_policies,
         })
 }
 

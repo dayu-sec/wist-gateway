@@ -8,3 +8,7 @@ pub use global_service::*;
 // Control.Agent.Purpose 的 IngestAgentFactSummaryFlow 里那一步 InferPurpose；
 // 规则表是策展数据，只读不内嵌。重新生成控制面代码时需回补本模块。
 pub mod purpose;
+
+// NOTE(hand-added): 发现方向策略表（策展数据）。网关装载并校验后通过控制面下发给
+// agentd；与 purpose 同类 —— 模型留结构、值留 content/。重新生成控制面代码时需回补本模块。
+pub mod discovery_policy;

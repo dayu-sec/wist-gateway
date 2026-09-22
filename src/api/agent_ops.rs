@@ -17,7 +17,8 @@ use wist_contracts::enrollment::{
 };
 use wist_contracts::fact_summary::FactContent;
 use wist_contracts::gateway::{
-    ActionResultAck, AgentStatusAck, AgentStatusReport, FactSummaryAccepted, FactSummaryAckStatus,
+    ActionResultAck, AgentStatusAck, AgentStatusReport, DiscoveryPoliciesReturned,
+    FactSummaryAccepted, FactSummaryAckStatus, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
     REPORT_AGENT_FACT_SUMMARY_KIND, ReportActionResult, ReportAgentFactSummary,
 };
 use wist_control::types::DateTime;
@@ -144,6 +145,43 @@ pub async fn poll_control_commands(
         )
             .into_response(),
         Err(response) => response,
+    }
+}
+
+/// agentd 拉取发现方向策略表（控制面，复用 agent 凭据）。
+///
+/// 未配置策略表时回 **503**，而不是一份空表：空表会让「平台没发布策略」与
+/// 「这台网关从未配置」变得无法区分，而 agentd 必须能分辨才能决定是应用空策略
+/// 还是继续用自己的内建默认值 —— 静默发空表等于把平台的配置缺失伪装成一次成功下发。
+///
+/// 策略表是幂等内容：拉到的`policy_version` 未变时由 agentd 自行跳过重算。
+pub async fn poll_discovery_policies(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<PollDiscoveryPolicies>,
+) -> Response {
+    if input.api_version != API_VERSION_V1 || input.kind != POLL_DISCOVERY_POLICIES_KIND {
+        return (StatusCode::BAD_REQUEST, "invalid discovery policies poll").into_response();
+    }
+    if let Err(response) =
+        authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await
+    {
+        return response;
+    }
+    match state.discovery_policies.as_deref() {
+        Some(set) => (
+            StatusCode::OK,
+            Json(DiscoveryPoliciesReturned::from_set(
+                set,
+                chrono::Utc::now().to_rfc3339(),
+            )),
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "discovery policy table is not configured",
+        )
+            .into_response(),
     }
 }
 

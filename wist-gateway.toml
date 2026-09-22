@@ -32,3 +32,14 @@ database_url = ""
 # 注意：**改了规则内容必须同时 bump rule_set_id**。网关靠 rule_set_id 判断建议是否
 # 过期并在读取时重算；只改内容不改版本号，旧建议会被当成仍然有效。
 rules_file = ""
+
+[discovery]
+# 发现方向策略表（策展数据）。源头是 jumo 模型仓的
+#   jumo/model/content/aspect-policies.toml
+# 部署时拷过来并把路径写在这里（相对本配置文件）。
+# 留空 = 不下发（`POST /api/v1/agent/discovery-policies:poll` 回 503）：Agent 继续用
+# 自己的内建默认值（与内容仓同值），行为与从前一致，不会因为「拿不到策略」而不采集。
+#
+# 注意：**改了策略内容必须同时 bump policy_version**。Agent 靠版本号判断手上那份
+# 是不是同一版；只改值不改版本号，已经拉过表的 Agent 不会重读。
+policies_file = ""

@@ -27,8 +27,9 @@ use crate::infra::{
 use wist_contracts::action_result::{ActionResult, FinalStatus};
 use wist_contracts::fact_summary::FactContent;
 use wist_contracts::gateway::{
-    AgentStatusReport, AgentWorkState, AgentWorkStateChange, FactSummaryAccepted,
-    FactSummaryAckStatus, ReportActionResult, ReportAgentFactSummary, ResultAttestation,
+    AgentStatusReport, AgentWorkState, AgentWorkStateChange, DiscoveryPoliciesReturned,
+    FactSummaryAccepted, FactSummaryAckStatus, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
+    ReportActionResult, ReportAgentFactSummary, ResultAttestation,
 };
 use wist_control::PollControlCommands;
 use wist_control::types::DateTime;
@@ -1379,6 +1380,209 @@ fn config_with_purpose_rules(env: &TestEnv, rules: &str) -> AdminConfig {
     let mut config = env.config.clone();
     config.purpose_rules_file = Some(path);
     config
+}
+
+// ── 发现方向策略表（装载校验 + 下发 + 管理视图）──────────────────────
+
+/// 精简策略表：七个方向各一条（校验要求不许缺/重）。版本号特意取 7，便于断言下发的是这一版。
+const TEST_DISCOVERY_POLICIES: &str = r#"
+policy_version = 7
+published_at = "2026-09-22T00:00:00Z"
+policies = [
+  { aspect = "host", default_interval_seconds = 900, min_interval_seconds = 300, max_interval_seconds = 3600, baseline = true, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "network", default_interval_seconds = 900, min_interval_seconds = 300, max_interval_seconds = 3600, baseline = false, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "process", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "endpoint", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = true, platforms = ["linux"] },
+  { aspect = "container", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = false, platforms = ["macos", "linux"] },
+  { aspect = "k8s", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = false, platforms = ["macos", "linux"] },
+  { aspect = "package", default_interval_seconds = 1800, min_interval_seconds = 900, max_interval_seconds = 21600, baseline = false, enabled_by_default = true, platforms = ["linux"] },
+]
+"#;
+
+/// 建一份带策略表的配置副本（同一个库），用来模拟“策略表后来才配上”。
+fn config_with_discovery_policies(env: &TestEnv, policies: &str) -> AdminConfig {
+    let path =
+        std::env::temp_dir().join(format!("wist-gateway-discovery-{}.toml", unique_suffix()));
+    std::fs::write(&path, policies).expect("write discovery policies");
+    let mut config = env.config.clone();
+    config.discovery_policies_file = Some(path);
+    config
+}
+
+fn discovery_poll_request() -> PollDiscoveryPolicies {
+    PollDiscoveryPolicies {
+        api_version: "v1".to_string(),
+        kind: POLL_DISCOVERY_POLICIES_KIND.to_string(),
+        agent_id: "agent-node-a".to_string(),
+        instance_id: "node-a".to_string(),
+        requested_at: "2026-09-22T00:00:00Z".to_string(),
+    }
+}
+
+async fn post_discovery_poll(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    credential: Option<&str>,
+    request: &PollDiscoveryPolicies,
+) -> Response {
+    post_json_to_router(
+        config,
+        store,
+        "/api/v1/agent/discovery-policies:poll",
+        credential,
+        request,
+    )
+    .await
+}
+
+async fn get_discovery_view(env: &TestEnv, admin_token: Option<&str>) -> Response {
+    get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/discovery-policies",
+        admin_token,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn discovery_policies_poll_requires_bearer_credential() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+
+    let response = post_discovery_poll(
+        &env.config,
+        &env.store_handle,
+        None,
+        &discovery_poll_request(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn discovery_policies_poll_refuses_an_unknown_envelope() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+    let credential = enroll_agent_credential(&env).await;
+    let mut request = discovery_poll_request();
+    request.kind = "something_else".to_string();
+
+    let response =
+        post_discovery_poll(&env.config, &env.store_handle, Some(&credential), &request).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn discovery_policies_poll_serves_the_configured_table() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_discovery_poll(
+        &env.config,
+        &env.store_handle,
+        Some(&credential),
+        &discovery_poll_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned: DiscoveryPoliciesReturned = decode_json_response(response).await;
+
+    assert_eq!(returned.policy_version, 7);
+    assert_eq!(returned.published_at, "2026-09-22T00:00:00Z");
+    assert_eq!(returned.policies.len(), 7);
+    let host = returned
+        .policies
+        .iter()
+        .find(|policy| policy.aspect == "host")
+        .expect("host policy");
+    assert!(host.baseline);
+    assert!(host.supports("macos"));
+}
+
+#[tokio::test]
+async fn discovery_policies_poll_is_unavailable_when_unconfigured() {
+    // 未配置时回 503 而不是空表：空表会让「平台没发布策略」与「从未配置」无法区分。
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_discovery_poll(
+        &env.config,
+        &env.store_handle,
+        Some(&credential),
+        &discovery_poll_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8 body");
+    assert!(body.contains("not configured"), "{body}");
+}
+
+#[tokio::test]
+async fn admin_discovery_view_reports_configured() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+
+    let response = get_discovery_view(&env, Some(TEST_ADMIN_API_TOKEN)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+
+    assert_eq!(view["configured"], serde_json::Value::Bool(true));
+    assert_eq!(view["policy"]["policy_version"], 7);
+    assert_eq!(
+        view["policy"]["policies"]
+            .as_array()
+            .expect("policies")
+            .len(),
+        7
+    );
+}
+
+#[tokio::test]
+async fn admin_discovery_view_reports_unconfigured() {
+    let env = TestEnv::new().await;
+
+    let response = get_discovery_view(&env, Some(TEST_ADMIN_API_TOKEN)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+
+    assert_eq!(view["configured"], serde_json::Value::Bool(false));
+    assert!(view["policy"].is_null());
+}
+
+#[tokio::test]
+async fn admin_discovery_view_requires_admin_bearer() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+
+    let response = get_discovery_view(&env, None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 用**真实策展策略表**跑通下发：装载校验通过，且下发的是七个方向那一版。
+///
+/// 这是“用夹具数据验证契约”的那份证据；策略表文件缺失（如单独拷本仓）时跳过。
+#[tokio::test]
+async fn discovery_policies_poll_serves_the_checked_in_table() {
+    // 相对本 crate 根：../../wist-design/jumo/model/content/aspect-policies.toml
+    let path = std::path::Path::new("../../wist-design/jumo/model/content/aspect-policies.toml");
+    let Ok(policies) = std::fs::read_to_string(path) else {
+        return;
+    };
+    // 换个实现就能在这里早失败：装载校验不过不会走到端点。
+    let env = TestEnv::new().await;
+    let config = config_with_discovery_policies(&env, &policies);
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_discovery_poll(
+        &config,
+        &env.store_handle,
+        Some(&credential),
+        &discovery_poll_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned: DiscoveryPoliciesReturned = decode_json_response(response).await;
+
+    assert!(returned.policy_version >= 1);
+    assert_eq!(returned.policies.len(), 7);
 }
 
 #[tokio::test]
@@ -2844,6 +3048,19 @@ impl TestEnv {
     /// 需要用途推断的用例用这个：把规则表写进 temp 目录并挂到配置上。
     /// `None` = 模拟「尚未配置规则表」 （事实照常入库，但不产出建议）。
     async fn new_with_purpose_rules(purpose_rules_toml: Option<&str>) -> Self {
+        Self::new_with_policy_files(purpose_rules_toml, None).await
+    }
+
+    /// 需要发现方向策略表的用例用这个：把策略表写进 temp 目录并挂到配置上。
+    /// `None` = 模拟「尚未配置策略表」（poll 回 503，agentd 回落内建默认值）。
+    async fn new_with_discovery_policies(discovery_policies_toml: Option<&str>) -> Self {
+        Self::new_with_policy_files(None, discovery_policies_toml).await
+    }
+
+    async fn new_with_policy_files(
+        purpose_rules_toml: Option<&str>,
+        discovery_policies_toml: Option<&str>,
+    ) -> Self {
         let root = std::env::temp_dir().join(format!("wist-gateway-test-{}", unique_suffix()));
         std::fs::create_dir_all(&root).expect("create root");
         let package_file = root.join("wist-agentd");
@@ -2880,6 +3097,11 @@ impl TestEnv {
                 std::fs::write(&path, text).expect("write purpose rules");
                 path
             }),
+            discovery_policies_file: discovery_policies_toml.map(|text| {
+                let path = root.join("aspect-policies.toml");
+                std::fs::write(&path, text).expect("write discovery policies");
+                path
+            }),
         };
         // A temp-file DB (not `:memory:`) because the router may use several
         // pooled connections; `SqliteStore` is `Clone` and shares the same pool.
@@ -2908,6 +3130,7 @@ async fn test_state() -> ApiState {
     let env = TestEnv::new().await;
     ApiState {
         purpose_rules: super::load_purpose_rules(&env.config),
+        discovery_policies: super::load_discovery_policies(&env.config),
         config: env.config.clone(),
         store: Arc::clone(&env.store_handle),
         runtime: Arc::new(Mutex::new(AdminRuntimeState::default())),

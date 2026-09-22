@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 use wist_control::types::{AgentRuntimeStatus, DateTime};
 
 use crate::infra::{
@@ -117,6 +118,19 @@ pub struct AgentUplinkResponse {
     pub updated_by: String,
     /// 未设置过时为 null。
     pub updated_at: Option<DateTime>,
+}
+
+/// 当前生效的发现方向策略表视图（管理面）。
+///
+/// `configured=false` 表示这台网关没配策略表（agent 回落内建默认值），与「配了一张空表」
+/// 区分开：后者在装载期就被拒了，不可能出现在这里。
+#[derive(Debug, Serialize)]
+pub struct DiscoveryPoliciesView {
+    pub configured: bool,
+    /// 未配置时为 null（不编一份空表来冒充“已配置”）。
+    pub policy: Option<DiscoveryAspectPolicySet>,
+    /// 与其它管理面视图一致：带上“这份视图是什么时候生成的”。
+    pub generated_at: DateTime,
 }
 
 /// Agent 用途视图（对应模型 `AgentPurposeView`）。
@@ -488,6 +502,35 @@ fn install_package_response(
         package_sha256: setting.package_sha256.clone(),
         updated_by: setting.updated_by.clone(),
         updated_at: DateTime::from_rfc3339(&setting.updated_at),
+    }
+}
+
+/// 查看当前生效的发现方向策略表（管理面）。
+///
+/// 未配置时回 `configured: false` 而不是 404：
+/// “未配置”是一种合法状态（agent 回落内建默认值），管理页要能区分它和“网关挂了”。
+pub async fn view_discovery_policies(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    match state.discovery_policies.as_deref() {
+        Some(set) => Json(DiscoveryPoliciesView {
+            configured: true,
+            policy: Some(set.clone()),
+            generated_at: DateTime::now(),
+        })
+        .into_response(),
+        None => Json(DiscoveryPoliciesView {
+            configured: false,
+            policy: None,
+            generated_at: DateTime::now(),
+        })
+        .into_response(),
     }
 }
 

@@ -52,6 +52,8 @@ pub struct AdminConfig {
     pub victoria_metrics_url: String,
     /// 用途推断规则表（策展数据）。未配置时：事实照常入库，但不产出建议。
     pub purpose_rules_file: Option<PathBuf>,
+    /// 发现方向策略表（策展数据）。未配置时：不下发该端点，Agent 回落到自己的内建默认值。
+    pub discovery_policies_file: Option<PathBuf>,
 }
 
 pub use wist_error::ConfigError;
@@ -76,6 +78,8 @@ struct RawAdminConfig {
     store: RawStoreConfig,
     #[serde(default)]
     purpose: RawPurposeConfig,
+    #[serde(default)]
+    discovery: RawDiscoveryConfig,
 }
 
 /// `[purpose]` 段。缺省时不装载规则表：摘要照常入库，但不产出建议。
@@ -85,6 +89,15 @@ struct RawPurposeConfig {
     /// 为什么不做内嵌默认副本：那会有两份真相，改规则时必然漂移。
     #[serde(default)]
     rules_file: Option<String>,
+}
+
+/// `[discovery]` 段。缺省时不装载策略表：不提供下发端点，Agent 用自己的内建默认值。
+#[derive(Debug, Default, Deserialize)]
+struct RawDiscoveryConfig {
+    /// 源头是 jumo 模型仓的 `jumo/model/content/aspect-policies.toml`，由部署侧提供给网关。
+    /// 为什么不做内嵌默认副本：那会有两份真相，改策略时必然漂移。
+    #[serde(default)]
+    policies_file: Option<String>,
 }
 
 /// `[store]` 段。缺省（旧配置无此段）时回退到本地 SQLite 文件。
@@ -216,6 +229,14 @@ impl AdminConfig {
                     .transpose()?,
             )
             .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            discovery_policies_file: normalize_optional(
+                raw.discovery
+                    .policies_file
+                    .as_deref()
+                    .map(expand_env)
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
         })
     }
 
@@ -259,6 +280,17 @@ impl AdminConfig {
                 config_validation(format!(
                     "purpose.rules_file {}: {err}",
                     rules_file.display()
+                ))
+            })?;
+        }
+        if let Some(policies_file) = self.discovery_policies_file.as_deref() {
+            require_existing_file("discovery.policies_file", policies_file)?;
+            // 同 purpose：用**真实的装载器**做结构化校验，策略表写错必须在启动时被拒，
+            // 而不是静默降级成「不下发」（那会让 agentd 悄悄回落内建默认值）。
+            crate::app::discovery_policy::load_policy_table(policies_file).map_err(|err| {
+                config_validation(format!(
+                    "discovery.policies_file {}: {err}",
+                    policies_file.display()
                 ))
             })?;
         }
@@ -670,6 +702,21 @@ baseline_class = "MacDaily"
 weak_score = 20
 "#;
 
+    /// 一份合法的发现策略表：七个方向各一条（校验要求不许缺/重）。
+    const DISCOVERY_POLICIES: &str = r#"
+policy_version = 1
+published_at = "2026-09-22T00:00:00Z"
+policies = [
+  { aspect = "host", default_interval_seconds = 900, min_interval_seconds = 300, max_interval_seconds = 3600, baseline = true, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "network", default_interval_seconds = 900, min_interval_seconds = 300, max_interval_seconds = 3600, baseline = false, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "process", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "endpoint", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = true, platforms = ["linux"] },
+  { aspect = "container", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = false, platforms = ["macos", "linux"] },
+  { aspect = "k8s", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = false, platforms = ["macos", "linux"] },
+  { aspect = "package", default_interval_seconds = 1800, min_interval_seconds = 900, max_interval_seconds = 21600, baseline = false, enabled_by_default = true, platforms = ["linux"] },
+]
+"#;
+
     /// 生成一份最小可用配置，其中 `[purpose]` 表体由调用方给出（可为空）。
     /// `[purpose]` 放在最前面：`write_temp_config` 会在文末补签名私钥行，
     /// 那行应落在 `[agent]` 里而不是 `[purpose]` 里。
@@ -677,6 +724,15 @@ weak_score = 20
         let package_file = write_temp_file("wist-agentd");
         format!(
             "[purpose]\n{purpose_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+            package_file.display()
+        )
+    }
+
+    /// 同 `config_with_purpose`，但给出的是 `[discovery]` 表体。
+    fn config_with_discovery(discovery_body: &str) -> String {
+        let package_file = write_temp_file("wist-agentd");
+        format!(
+            "[discovery]\n{discovery_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
             package_file.display()
         )
     }
@@ -722,6 +778,71 @@ weak_score = 20
             "rules_file = \"{broken_name}\""
         )));
         assert!(AdminConfig::load_from_path(&path).is_err());
+    }
+
+    #[test]
+    fn discovery_policies_file_is_none_when_unset_or_blank() {
+        let unset = write_temp_config(&config_with_discovery(""));
+        let config = AdminConfig::load_from_path(&unset).expect("config loads");
+        assert_eq!(config.discovery_policies_file, None);
+
+        // 空串必须归成 None；否则会变成 config 目录本身，校验时报“不是文件”。
+        let blank = write_temp_config(&config_with_discovery("policies_file = \"\""));
+        let config = AdminConfig::load_from_path(&blank).expect("config loads");
+        assert_eq!(config.discovery_policies_file, None);
+    }
+
+    #[test]
+    fn discovery_policies_file_is_absolutized_and_must_load() {
+        // 策略表写进 temp_dir（与 write_temp_config 同目录），所以相对路径可解析。
+        let policies = write_temp_file(DISCOVERY_POLICIES);
+        let name = policies
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        let path = write_temp_config(&config_with_discovery(&format!(
+            "policies_file = \"{name}\""
+        )));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(
+            config.discovery_policies_file.as_deref(),
+            Some(policies.as_path())
+        );
+
+        // 配了就必须能读到：不存在的文件在启动时就被拒。
+        let missing = write_temp_config(&config_with_discovery(
+            "policies_file = \"no-such-policies.toml\"",
+        ));
+        assert!(AdminConfig::load_from_path(&missing).is_err());
+
+        // 语法坏掉同样在启动时被拒，不拖到“Agent 来拉表才发现”。
+        let broken = write_temp_file("policy_version = 1\n[[policies]\nbroken");
+        let broken_name = broken
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        let path = write_temp_config(&config_with_discovery(&format!(
+            "policies_file = \"{broken_name}\""
+        )));
+        assert!(AdminConfig::load_from_path(&path).is_err());
+
+        // 语法合法但**内容非法**（缺方向）也要在启动时被拒 —— 这正是把真实装载器
+        // 接进 validate 的意义：否则一份半截表会被当成配好了而下发。
+        let incomplete = write_temp_file(
+            "policy_version = 1\npublished_at = \"x\"\n[[policies]]\naspect = \"host\"\ndefault_interval_seconds = 900\nmin_interval_seconds = 300\nmax_interval_seconds = 3600\nbaseline = true\nenabled_by_default = true\nplatforms = [\"linux\"]\n",
+        );
+        let incomplete_name = incomplete
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        let path = write_temp_config(&config_with_discovery(&format!(
+            "policies_file = \"{incomplete_name}\""
+        )));
+        let err = AdminConfig::load_from_path(&path).expect_err("incomplete table rejected");
+        assert!(err.to_string().contains("discovery.policies_file"), "{err}");
     }
 
     #[test]
