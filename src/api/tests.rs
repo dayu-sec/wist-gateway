@@ -25,6 +25,7 @@ use crate::infra::{
     load_install_script_public_key_pem, sha256_hex,
 };
 use wist_contracts::action_result::{ActionResult, FinalStatus};
+use wist_contracts::fact_summary::FactContent;
 use wist_contracts::gateway::{
     AgentStatusReport, AgentWorkState, AgentWorkStateChange, FactSummaryAccepted,
     FactSummaryAckStatus, ReportActionResult, ReportAgentFactSummary, ResultAttestation,
@@ -931,12 +932,16 @@ machine_class = "MacDev"
 weight = 30
 "#;
 
-fn fact_report(digest: &str, processes: &[&str]) -> ReportAgentFactSummary {
+/// 报文骨架（`content_digest` 先空着，由调用方填）。
+///
+/// 注意它造的是**声明**：网关会用 `wist_contracts::fact_summary` 自己重算一份，
+/// 声明不一致只记告警，不影响判重。
+fn raw_fact_report(processes: &[&str]) -> ReportAgentFactSummary {
     ReportAgentFactSummary::new_agent_facts(
-        format!("report-{digest}"),
+        "report-1".to_string(),
         "agent-node-a".to_string(),
         "node-a".to_string(),
-        digest.to_string(),
+        String::new(),
         7,
         "2026-09-22T00:00:00Z".to_string(),
         "macos".to_string(),
@@ -947,6 +952,32 @@ fn fact_report(digest: &str, processes: &[&str]) -> ReportAgentFactSummary {
         Vec::new(),
         "2026-09-22T00:00:01Z".to_string(),
     )
+}
+
+/// 网关会算出的内容摘要（与生产代码同一实现）。
+fn digest_of(report: &ReportAgentFactSummary) -> String {
+    FactContent::new(
+        report.os.clone(),
+        report.arch.clone(),
+        report.process_executables.clone(),
+        report.packages.clone(),
+        report.listen_ports.clone(),
+    )
+    .content_digest()
+}
+
+/// 一份「声明正确」的报文：`content_digest` 与网关自算一致。
+fn fact_report(processes: &[&str]) -> ReportAgentFactSummary {
+    let mut report = raw_fact_report(processes);
+    report.content_digest = digest_of(&report);
+    report
+}
+
+/// 一份「声明被写错」的报文：用来验证判重不看声明。
+fn fact_report_declaring(processes: &[&str], declared: &str) -> ReportAgentFactSummary {
+    let mut report = raw_fact_report(processes);
+    report.content_digest = declared.to_string();
+    report
 }
 
 /// 注册一个 Agent 并拿回 bearer 凭据（事实上报路径要它）。
@@ -999,7 +1030,7 @@ async fn agent_facts_route_requires_bearer_credential() {
         &env.store_handle,
         "/api/v1/agent/facts",
         None,
-        &fact_report("sha256:digest-a", &["xcodebuild"]),
+        &fact_report(&["xcodebuild"]),
     )
     .await;
     assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
@@ -1009,17 +1040,15 @@ async fn agent_facts_route_requires_bearer_credential() {
 async fn agent_facts_route_stores_summary_and_answers_with_a_suggestion() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
     let credential = enroll_agent_credential(&env).await;
+    let report = fact_report(&["/usr/bin/xcodebuild", "launchd"]);
 
-    let accepted = post_facts(
-        &env,
-        &credential,
-        &fact_report("sha256:digest-a", &["/usr/bin/xcodebuild", "launchd"]),
-    )
-    .await;
+    let accepted = post_facts(&env, &credential, &report).await;
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
     let ack: FactSummaryAccepted = decode_json_response(accepted).await;
     assert_eq!(ack.ack_status, FactSummaryAckStatus::Accepted);
     assert!(ack.suggestion_id.is_some());
+    // ack 回的是**网关自算**的摘要，不是照抄声明。
+    assert_eq!(ack.content_digest, digest_of(&report));
 
     let stored = env
         .store
@@ -1027,7 +1056,7 @@ async fn agent_facts_route_stores_summary_and_answers_with_a_suggestion() {
         .await
         .expect("store read")
         .expect("fact summary");
-    assert_eq!(stored.content_digest, "sha256:digest-a");
+    assert_eq!(stored.content_digest, digest_of(&report));
     assert_eq!(stored.process_count, 2);
     assert_eq!(
         stored.process_executables,
@@ -1036,7 +1065,7 @@ async fn agent_facts_route_stores_summary_and_answers_with_a_suggestion() {
 
     let view = get_purpose_view(&env, "agent-node-a").await;
     assert_eq!(view["agent_id"], "agent-node-a");
-    assert_eq!(view["fact_summary"]["content_digest"], "sha256:digest-a");
+    assert_eq!(view["fact_summary"]["content_digest"], digest_of(&report));
     assert_eq!(view["suggestion"]["suggested_class"], "MacDev");
     // 单类命中（无次高分）→ 100；40 >= weak_score(20) 不打折。
     assert_eq!(view["suggestion"]["confidence"], 100);
@@ -1055,10 +1084,10 @@ async fn agent_facts_route_stores_summary_and_answers_with_a_suggestion() {
 }
 
 #[tokio::test]
-async fn agent_facts_route_is_idempotent_on_content_digest() {
+async fn agent_facts_route_is_idempotent_on_the_content_digest() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
     let credential = enroll_agent_credential(&env).await;
-    let report = fact_report("sha256:digest-a", &["/usr/bin/xcodebuild"]);
+    let report = fact_report(&["/usr/bin/xcodebuild"]);
 
     let first: FactSummaryAccepted =
         decode_json_response(post_facts(&env, &credential, &report).await).await;
@@ -1076,7 +1105,9 @@ async fn agent_facts_route_is_idempotent_on_content_digest() {
 }
 
 #[tokio::test]
-async fn agent_facts_route_recomputes_when_the_digest_changes() {
+async fn agent_facts_route_dedupes_on_its_own_digest_not_the_declaration() {
+    // 恶意/退化的 agent 声明一个**常量**摘要：若判重用声明，第二份不同内容就会被当重复，
+    // 视图静默停在旧内容上。网关自算，所以必须识别出内容变了。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
     let credential = enroll_agent_credential(&env).await;
 
@@ -1084,9 +1115,80 @@ async fn agent_facts_route_recomputes_when_the_digest_changes() {
         post_facts(
             &env,
             &credential,
-            &fact_report("sha256:digest-a", &["launchd"]),
+            &fact_report_declaring(&["launchd"], "sha256:constant"),
         )
         .await,
+    )
+    .await;
+    assert_eq!(first.ack_status, FactSummaryAckStatus::Accepted);
+
+    let second = decode_json_response::<FactSummaryAccepted>(
+        post_facts(
+            &env,
+            &credential,
+            &fact_report_declaring(&["xcodebuild"], "sha256:constant"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(second.ack_status, FactSummaryAckStatus::Accepted);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    // 存的是网关自算的摘要，不是被声明的常量。
+    assert_ne!(stored.content_digest, "sha256:constant");
+    assert_eq!(stored.process_executables, vec!["xcodebuild"]);
+}
+
+#[tokio::test]
+async fn agent_facts_route_refreshes_only_marks_on_duplicate() {
+    // 内容没变、只是又采了一轮：只刷留痕（revision/observed_at/process_count/received_at），
+    // 内容列与幂等键不动，也不重算建议。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    let credential = enroll_agent_credential(&env).await;
+    let report = fact_report(&["/usr/bin/xcodebuild"]);
+
+    let first: FactSummaryAccepted =
+        decode_json_response(post_facts(&env, &credential, &report).await).await;
+    let first_suggestion = first.suggestion_id.clone();
+    let digest = digest_of(&report);
+
+    let mut rerun = report.clone();
+    rerun.revision = 999;
+    rerun.observed_at = "2026-09-22T01:00:00Z".to_string();
+    rerun.process_count = 42;
+    rerun.reported_at = "2026-09-22T01:00:01Z".to_string();
+    let second: FactSummaryAccepted =
+        decode_json_response(post_facts(&env, &credential, &rerun).await).await;
+    assert_eq!(second.ack_status, FactSummaryAckStatus::Duplicate);
+    assert_eq!(second.suggestion_id, first_suggestion);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    // 留痕被刷新。
+    assert_eq!(stored.revision, 999);
+    assert_eq!(stored.observed_at, "2026-09-22T01:00:00Z");
+    assert_eq!(stored.process_count, 42);
+    // 内容与幂等键不变。
+    assert_eq!(stored.content_digest, digest);
+    assert_eq!(stored.process_executables, vec!["/usr/bin/xcodebuild"]);
+}
+
+#[tokio::test]
+async fn agent_facts_route_recomputes_when_the_content_changes() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let first = decode_json_response::<FactSummaryAccepted>(
+        post_facts(&env, &credential, &fact_report(&["launchd"])).await,
     )
     .await;
     // 只有 launchd：没命中规则 → 回落到基线 MacDaily。
@@ -1096,28 +1198,34 @@ async fn agent_facts_route_recomputes_when_the_digest_changes() {
     assert!(first.suggestion_id.is_some());
 
     // 内容变了：覆盖式入库并重算，建议 id 也应是新的。
-    let second = decode_json_response::<FactSummaryAccepted>(
-        post_facts(
-            &env,
-            &credential,
-            &fact_report("sha256:digest-b", &["xcodebuild"]),
-        )
-        .await,
-    )
-    .await;
+    let changed = fact_report(&["xcodebuild"]);
+    let second =
+        decode_json_response::<FactSummaryAccepted>(post_facts(&env, &credential, &changed).await)
+            .await;
     assert_eq!(second.ack_status, FactSummaryAckStatus::Accepted);
     assert_ne!(second.suggestion_id, first.suggestion_id);
 
     let view = get_purpose_view(&env, "agent-node-a").await;
-    assert_eq!(view["fact_summary"]["content_digest"], "sha256:digest-b");
+    assert_eq!(view["fact_summary"]["content_digest"], digest_of(&changed));
     assert_eq!(view["suggestion"]["suggested_class"], "MacDev");
+}
+
+#[tokio::test]
+async fn agent_facts_route_rejects_an_overlong_content_digest() {
+    // 声明会进告警日志：不限长就能让一条上报写出几 MB 的单行日志。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    let credential = enroll_agent_credential(&env).await;
+    let report = fact_report_declaring(&["xcodebuild"], &"d".repeat(1024));
+
+    let response = post_facts(&env, &credential, &report).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn agent_facts_route_refuses_an_unknown_envelope() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
     let credential = enroll_agent_credential(&env).await;
-    let mut report = fact_report("sha256:digest-a", &["xcodebuild"]);
+    let mut report = fact_report(&["xcodebuild"]);
     report.kind = "something_else".to_string();
 
     let response = post_facts(&env, &credential, &report).await;
@@ -1137,15 +1245,9 @@ async fn agent_facts_route_stores_facts_even_without_a_rule_table() {
     let env = TestEnv::new().await;
     let credential = enroll_agent_credential(&env).await;
 
-    let ack: FactSummaryAccepted = decode_json_response(
-        post_facts(
-            &env,
-            &credential,
-            &fact_report("sha256:digest-a", &["xcodebuild"]),
-        )
-        .await,
-    )
-    .await;
+    let ack: FactSummaryAccepted =
+        decode_json_response(post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await)
+            .await;
     assert_eq!(ack.ack_status, FactSummaryAckStatus::Accepted);
     assert!(ack.suggestion_id.is_none());
     assert!(
@@ -1166,22 +1268,20 @@ async fn agent_purpose_route_clears_a_stale_suggestion_when_nothing_should_be_su
     // 平台没有规则册 → 这次确实不该有建议；旧建议是照着旧事实算的，必须清掉。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
     let credential = enroll_agent_credential(&env).await;
-    post_facts(
-        &env,
-        &credential,
-        &fact_report("sha256:digest-a", &["xcodebuild"]),
-    )
-    .await;
+    post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await;
     assert!(get_purpose_view(&env, "agent-node-a").await["suggestion"].is_object());
 
-    let mut linux_report = fact_report("sha256:digest-b", &["postgres"]);
+    let mut linux_report = fact_report(&["postgres"]);
     linux_report.os = "linux".to_string();
     let ack: FactSummaryAccepted =
         decode_json_response(post_facts(&env, &credential, &linux_report).await).await;
     assert!(ack.suggestion_id.is_none());
 
     let view = get_purpose_view(&env, "agent-node-a").await;
-    assert_eq!(view["fact_summary"]["content_digest"], "sha256:digest-b");
+    assert_eq!(
+        view["fact_summary"]["content_digest"],
+        digest_of(&linux_report)
+    );
     assert!(view["suggestion"].is_null());
 }
 
@@ -1246,15 +1346,8 @@ async fn agent_facts_route_infers_with_the_checked_in_rule_table() {
         "/Applications/OrbStack.app/Contents/MacOS/OrbStack",
         "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/node_modules/x",
     ];
-    let ack: FactSummaryAccepted = decode_json_response(
-        post_facts(
-            &env,
-            &credential,
-            &fact_report("sha256:digest-real", &processes),
-        )
-        .await,
-    )
-    .await;
+    let ack: FactSummaryAccepted =
+        decode_json_response(post_facts(&env, &credential, &fact_report(&processes)).await).await;
     assert_eq!(ack.ack_status, FactSummaryAckStatus::Accepted);
 
     let view = get_purpose_view(&env, "agent-node-a").await;
@@ -1294,15 +1387,9 @@ async fn agent_facts_route_survives_a_corrupt_json_column() {
     // （upsert 根本走不到），坏行无法被覆盖自愈。这里把列真的写坏来验。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
     let credential = enroll_agent_credential(&env).await;
-    let first: FactSummaryAccepted = decode_json_response(
-        post_facts(
-            &env,
-            &credential,
-            &fact_report("sha256:digest-a", &["xcodebuild"]),
-        )
-        .await,
-    )
-    .await;
+    let first: FactSummaryAccepted =
+        decode_json_response(post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await)
+            .await;
     assert_eq!(first.ack_status, FactSummaryAckStatus::Accepted);
 
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", env.config.sqlite_path.display()))
@@ -1317,25 +1404,14 @@ async fn agent_facts_route_survives_a_corrupt_json_column() {
     pool.close().await;
 
     // 1）同一份内容再报：判重只读 digest，不该 500。
-    let duplicate: FactSummaryAccepted = decode_json_response(
-        post_facts(
-            &env,
-            &credential,
-            &fact_report("sha256:digest-a", &["xcodebuild"]),
-        )
-        .await,
-    )
-    .await;
+    let duplicate: FactSummaryAccepted =
+        decode_json_response(post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await)
+            .await;
     assert_eq!(duplicate.ack_status, FactSummaryAckStatus::Duplicate);
 
     // 2）换一份内容：必须能覆盖写入，坏列随之自愈。
     let second: FactSummaryAccepted = decode_json_response(
-        post_facts(
-            &env,
-            &credential,
-            &fact_report("sha256:digest-b", &["/opt/homebrew/bin/mise"]),
-        )
-        .await,
+        post_facts(&env, &credential, &fact_report(&["/opt/homebrew/bin/mise"])).await,
     )
     .await;
     assert_eq!(second.ack_status, FactSummaryAckStatus::Accepted);
@@ -1358,7 +1434,7 @@ async fn agent_facts_route_rejects_oversized_and_invalid_input() {
     let credential = enroll_agent_credential(&env).await;
 
     // 条数超限（被管机器可以自己控制数组长度，网关必须自己封顶）。
-    let mut too_many = fact_report("sha256:digest-a", &["xcodebuild"]);
+    let mut too_many = fact_report(&["xcodebuild"]);
     too_many.process_executables = vec!["x".to_string(); 10_001];
     assert_eq!(
         post_facts(&env, &credential, &too_many).await.status(),
@@ -1366,7 +1442,7 @@ async fn agent_facts_route_rejects_oversized_and_invalid_input() {
     );
 
     // 单元素超长。
-    let mut too_long = fact_report("sha256:digest-a", &["xcodebuild"]);
+    let mut too_long = fact_report(&["xcodebuild"]);
     too_long.process_executables = vec!["x".repeat(4097)];
     assert_eq!(
         post_facts(&env, &credential, &too_long).await.status(),
@@ -1374,7 +1450,7 @@ async fn agent_facts_route_rejects_oversized_and_invalid_input() {
     );
 
     // 负数留痕字段。
-    let mut negative = fact_report("sha256:digest-a", &["xcodebuild"]);
+    let mut negative = fact_report(&["xcodebuild"]);
     negative.process_count = -1;
     assert_eq!(
         post_facts(&env, &credential, &negative).await.status(),
@@ -1396,15 +1472,9 @@ async fn agent_purpose_route_recomputes_a_missing_suggestion() {
     // 首次上报时还没配规则表：只入库、无建议。
     let env = TestEnv::new().await;
     let credential = enroll_agent_credential(&env).await;
-    let ack: FactSummaryAccepted = decode_json_response(
-        post_facts(
-            &env,
-            &credential,
-            &fact_report("sha256:digest-a", &["xcodebuild"]),
-        )
-        .await,
-    )
-    .await;
+    let ack: FactSummaryAccepted =
+        decode_json_response(post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await)
+            .await;
     assert!(ack.suggestion_id.is_none());
 
     // 之后配上规则表（重启生效）。事实没变、agentd 不会再报 ——
@@ -1432,12 +1502,7 @@ async fn agent_purpose_route_recomputes_a_missing_suggestion() {
 async fn agent_purpose_route_recomputes_when_the_rule_set_version_changes() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
     let credential = enroll_agent_credential(&env).await;
-    post_facts(
-        &env,
-        &credential,
-        &fact_report("sha256:digest-a", &["xcodebuild"]),
-    )
-    .await;
+    post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await;
     assert_eq!(
         get_purpose_view(&env, "agent-node-a").await["suggestion"]["rule_set_id"],
         "macos-v1"

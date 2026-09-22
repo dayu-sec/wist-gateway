@@ -6,14 +6,16 @@ use axum::{
 };
 
 use crate::infra::{
-    AgentStatusUpdate, RenewCredential, StoredAgentFactSummary, StoredAgentRegistration,
-    StoredCredentialStatus, StoredPurposeSuggestion, new_secret_token, sha256_hex,
+    AgentFactSummaryMarks, AgentStatusUpdate, RenewCredential, StoredAgentFactSummary,
+    StoredAgentRegistration, StoredCredentialStatus, StoredPurposeSuggestion, new_secret_token,
+    sha256_hex,
     victoria_metrics::{import_lines, metric_line},
 };
 use wist_contracts::API_VERSION_V1;
 use wist_contracts::enrollment::{
     CredentialBundle, CredentialRenewal, CredentialRenewed, RENEW_AGENT_CREDENTIAL_KIND,
 };
+use wist_contracts::fact_summary::FactContent;
 use wist_contracts::gateway::{
     ActionResultAck, AgentStatusAck, AgentStatusReport, FactSummaryAccepted, FactSummaryAckStatus,
     REPORT_AGENT_FACT_SUMMARY_KIND, ReportActionResult, ReportAgentFactSummary,
@@ -254,8 +256,13 @@ pub async fn report_action_result(
 
 /// 接收 agentd 上报的事实**摘要**（对应模型 `ReportAgentFactSummary` / `IngestAgentFactSummary`）。
 ///
-/// 幂等键是 `content_digest`：内容没变就什么都**不动**（不重写、不重算、不重复计分），
-/// 回 `duplicate` 并带上已存建议。这一点很关键 —— agentd 会因重启等原因重发同一份摘要。
+/// 幂等键是**网关自算**的内容摘要，不是 `input.content_digest`：
+/// 用 agent 的声明判重的话，agent 侧算法一退化（比如退化成常量）就会让所有上报都命中重复，
+/// 视图静默停在旧内容上，而且没有任何一层能发现。声明与自算不一致时记
+/// `FactDigestMismatch` 告警（可能只是版本偏差，**不拒收**）。
+///
+/// 判重命中时**只刷留痕**（`revision` / `observed_at` / `process_count` / `received_at`）：
+/// 内容没变就不重写、不重算、不重复计分，只记录「何时又见到同一份内容」。
 pub async fn submit_agent_facts(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -275,16 +282,50 @@ pub async fn submit_agent_facts(
     }
     let received_at = chrono::Utc::now().to_rfc3339();
 
+    let digest = gateway_digest(&input);
+    if digest != input.content_digest {
+        // 只作告警：不一致更可能是版本偏差（比如两侧实现不同源），不是非法输入。
+        // 自己的这份才是判重依据，所以不一致时仍用 `digest` 走下去。
+        eprintln!(
+            "event=FactDigestMismatch agent_id={} agent={} gateway={}",
+            agent.agent_id, input.content_digest, digest
+        );
+    }
+
     // 判重只读 `content_digest`：三个 JSON 列一旦损坏就不该把写路径也堵死。
     match state
         .store
         .get_agent_fact_summary_digest(&agent.agent_id)
         .await
     {
-        Ok(Some(existing_digest)) if existing_digest == input.content_digest => {
-            // 幂等命中：不改数据、不重算，只回带已存建议。
+        Ok(Some(existing_digest)) if existing_digest == digest => {
+            // 幂等命中：不改内容、不重算，只刷留痕 + 回带已存建议。
             // 注意「不过期自愈」是有意的：这条路径只读一个 id，不做重算；规则册换版本留下的
             // 过期建议由读取路径（`ensure_fresh_suggestion`）负责。
+            let marks = AgentFactSummaryMarks {
+                revision: input.revision,
+                observed_at: input.observed_at.clone(),
+                process_count: input.process_count,
+                received_at: received_at.clone(),
+            };
+            match state
+                .store
+                .touch_agent_fact_summary_marks(&agent.agent_id, &marks)
+                .await
+            {
+                Ok(true) => {}
+                // 行在判重与刷新之间消失了（并发删除）：下次上报会走覆盖写补回来，
+                // 不值得为这个竞争把 agent 卡在 500 上。
+                Ok(false) => eprintln!(
+                    "warn agent fact summary vanished during dedupe agent_id={}",
+                    agent.agent_id
+                ),
+                // 留痕刷不动不该让 agent 收到 500（它会一直重试）：内容确实没变，照回 duplicate。
+                Err(err) => eprintln!(
+                    "warn failed to refresh agent fact marks agent_id={}: {err}",
+                    agent.agent_id
+                ),
+            }
             let suggestion_id = match state.store.get_purpose_suggestion(&agent.agent_id).await {
                 Ok(suggestion) => suggestion.map(|suggestion| suggestion.suggestion_id),
                 Err(err) => {
@@ -301,7 +342,7 @@ pub async fn submit_agent_facts(
                 Json(FactSummaryAccepted {
                     report_id: input.report_id,
                     agent_id: agent.agent_id,
-                    content_digest: input.content_digest,
+                    content_digest: digest,
                     ack_status: FactSummaryAckStatus::Duplicate,
                     suggestion_id,
                     received_at,
@@ -321,7 +362,7 @@ pub async fn submit_agent_facts(
 
     let summary = StoredAgentFactSummary {
         agent_id: agent.agent_id.clone(),
-        content_digest: input.content_digest.clone(),
+        content_digest: digest.clone(),
         revision: input.revision,
         observed_at: input.observed_at.clone(),
         os: input.os.clone(),
@@ -357,13 +398,28 @@ pub async fn submit_agent_facts(
         Json(FactSummaryAccepted {
             report_id: input.report_id,
             agent_id: summary.agent_id,
-            content_digest: summary.content_digest,
+            content_digest: digest,
             ack_status: FactSummaryAckStatus::Accepted,
             suggestion_id,
             received_at,
         }),
     )
         .into_response()
+}
+
+/// 网关从收到的**内容字段**自算的内容摘要（判重键）。
+///
+/// 与 agentd 共用 `wist_contracts::fact_summary` —— 两侧只有一份规范化实现，
+/// 否则「一边认为没变、另一边认为变了」无法被发现。
+fn gateway_digest(input: &ReportAgentFactSummary) -> String {
+    FactContent::new(
+        input.os.clone(),
+        input.arch.clone(),
+        input.process_executables.clone(),
+        input.packages.clone(),
+        input.listen_ports.clone(),
+    )
+    .content_digest()
 }
 
 /// 上报体上限：摘要是**被管机器上报的内容**，网关必须自己封顶，不能指望 agent 守规矩。
@@ -373,8 +429,17 @@ const MAX_PROCESS_EXECUTABLES: usize = 10_000;
 const MAX_PACKAGES: usize = 5_000;
 const MAX_LISTEN_PORTS: usize = 1_000;
 const MAX_ELEMENT_BYTES: usize = 4096;
+/// `content_digest` 是固定格式的标识符（`fact-v1:sha256:<64 hex>`）。
+/// 封顶是必要的：它会进告警日志，不限长就能让一条上报写出几 MB 的单行日志。
+const MAX_CONTENT_DIGEST_BYTES: usize = 128;
 
 fn validate_fact_summary(input: &ReportAgentFactSummary) -> Result<(), String> {
+    if input.content_digest.len() > MAX_CONTENT_DIGEST_BYTES {
+        return Err(format!(
+            "content_digest is {} bytes (limit {MAX_CONTENT_DIGEST_BYTES})",
+            input.content_digest.len()
+        ));
+    }
     if input.revision < 0 {
         return Err("revision must not be negative".to_string());
     }

@@ -1115,6 +1115,26 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn touch_agent_fact_summary_marks(
+        &self,
+        agent_id: &str,
+        marks: &AgentFactSummaryMarks,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE agent_fact_summary SET revision = ?2, observed_at = ?3, \
+             process_count = ?4, received_at = ?5 WHERE agent_id = ?1",
+        )
+        .bind(agent_id)
+        .bind(marks.revision)
+        .bind(&marks.observed_at)
+        .bind(marks.process_count)
+        .bind(&marks.received_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "touch agent fact summary marks"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn get_purpose_suggestion(
         &self,
         agent_id: &str,

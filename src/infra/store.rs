@@ -211,7 +211,9 @@ pub struct AgentMetricSample {
 
 /// Agent 事实摘要（对应模型 `AgentFactSummary`）：覆盖式，一台一条。
 ///
-/// 幂等键是 `content_digest`（不是 `revision`）：事实上报按内容变化触发。
+/// 幂等键是 `content_digest`（不是 `revision`：后者每轮无条件 +1）。
+/// **它是网关自己算的**（`wist_contracts::fact_summary`），不是照抄 agent 的声明 ——
+/// 用 agent 声明判重的话，agent 侧算法一退化就会把所有上报当重复、静默停在旧内容上。
 /// 去重前的进程条数单独留一个 `process_count`，因为去重会毁掉基数。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -257,6 +259,21 @@ pub struct StoredPurposeSuggestion {
     /// 依据哪一版事实算的，与 `computed_at` 区分开。
     pub observed_at: String,
     pub computed_at: String,
+}
+
+/// 事实上报的**留痕**：内容没变时只刷这几项，用来回答「什么时候又见到同一份内容」。
+///
+/// 故意不含三个内容列（`process_executables` / `packages` / `listen_ports`）与
+/// `content_digest`：`duplicate` 的前提就是内容没变，重写它们既浪费，
+/// 又会把「损坏列自愈」混进判重路径。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentFactSummaryMarks {
+    /// 快照 revision（每轮 refresh 无条件 +1）。
+    pub revision: i64,
+    pub observed_at: String,
+    /// 去重前的进程条数。
+    pub process_count: i64,
+    pub received_at: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -503,8 +520,22 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 写入/覆盖事实摘要（一台一条）。
     ///
-    /// 是否重复上报（`content_digest` 命中）由调用方先查再决，本方法本身是**无条件覆盖**。
+    /// 是否重复上报由调用方先查再决，本方法本身是**无条件覆盖**。
     async fn upsert_agent_fact_summary(&self, summary: &StoredAgentFactSummary) -> StoreResult<()>;
+
+    /// 只刷留痕字段（`revision` / `observed_at` / `process_count` / `received_at`），
+    /// **不动**内容列与 `content_digest`。返回是否真的命中了行。
+    ///
+    /// 为什么单独开一个：`duplicate` 路径已经判定内容没变，此时重写整行（含三个 JSON 列）
+    /// 纯属浪费；更重要的是，那会把「读坏列 → 拒绝写入」的自愈路径混进判重路径 ——
+    /// 判重只该看一个 id，坏列不该把刷留痕也堵死。
+    ///
+    /// 返回 `false`（行不存在）说明行在判重与刷新之间被删了，调用方需要知晓。
+    async fn touch_agent_fact_summary_marks(
+        &self,
+        agent_id: &str,
+        marks: &AgentFactSummaryMarks,
+    ) -> StoreResult<bool>;
 
     /// 读取用途建议；未算过返回 `None`。
     async fn get_purpose_suggestion(
