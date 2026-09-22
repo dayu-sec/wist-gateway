@@ -303,6 +303,53 @@ pub struct AgentFactSummaryMarks {
     pub received_at: String,
 }
 
+/// 清单里的一行：`(agent_id, path)` 唯一。
+///
+/// 它是事实摘要里 `process_executables` 的**机械投影**（见 `app::inventory`），
+/// 不是独立事实源：摘要内容一变就整台重建，因此它随时可由摘要重算。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSoftwareEntry {
+    pub agent_id: String,
+    /// 机械聚类键（`.app` 包路径，或路径本身）。
+    pub software_key: String,
+    /// 展示名（`.app` 名去后缀，否则 basename）。
+    pub name: String,
+    /// `app` | `binary`。
+    pub kind: String,
+    /// 命中的归并规则（回答「这个名字是怎么来的」）。
+    pub matched_rule: String,
+    pub path: String,
+    pub received_at: String,
+}
+
+/// 一台机器在清单里的汇总（「按机器看软件」头部计数用，不必把整张表读出来数）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SoftwareInventorySummary {
+    /// 总行数（= 去重后的可执行路径条数）。
+    pub paths: i64,
+    /// 其中 `kind = app` 的行数。
+    pub apps: i64,
+}
+
+/// 「按软件看机器」的一行：一个聚类键 + 持有它的机器（按 `agent_id` 升序）。
+///
+/// 只带 `agent_id` 与 `path`，不带主机名/状态：那属于机器台账，而调用方（管理面/页面）
+/// 手上就有台账 —— 库里再存一份会过期的副本没意义。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSoftwareHolding {
+    pub software_key: String,
+    pub name: String,
+    pub kind: String,
+    pub holders: Vec<SoftwareHolder>,
+}
+
+/// 某台机器上的某条路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftwareHolder {
+    pub agent_id: String,
+    pub path: String,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 操作入参 / 拒绝原因
 // ─────────────────────────────────────────────────────────────────────────────
@@ -565,6 +612,44 @@ pub trait Store: Send + Sync + fmt::Debug {
         agent_id: &str,
         marks: &AgentFactSummaryMarks,
     ) -> StoreResult<bool>;
+
+    /// 用这台机器的清单**替换**它此前全部行（覆盖式重建），返回写入的行数。
+    ///
+    /// 为什么是「替换」而不是 upsert：清单是摘要的投影，而摘要每次都是**全量**上报 ——
+    /// 上次有、这次没有的路径就是「不再观测到」，必须删掉。留着会让「哪些机器装了 X」
+    /// 永久多出幽灵条目，而这类错误在页面上看不出来（只是多一行）。
+    ///
+    /// 传空切片是合法输入（摘要里没有可执行标识）：那会清空该 agent 的行，也是正确结果。
+    async fn replace_agent_software_inventory(
+        &self,
+        agent_id: &str,
+        entries: &[StoredSoftwareEntry],
+    ) -> StoreResult<usize>;
+
+    /// 这台机器有没有清单行。
+    ///
+    /// `duplicate` 路径用它决定要不要补建一次：内容没变时投影也不必重算，
+    /// 但「上次投影没写成」（进程被杀、库锁）需要一次自愈机会。
+    async fn agent_has_software_inventory(&self, agent_id: &str) -> StoreResult<bool>;
+
+    /// 某台机器的清单（按 `kind`、`software_key`、`path` 排序）。
+    async fn list_agent_software(&self, agent_id: &str) -> StoreResult<Vec<StoredSoftwareEntry>>;
+
+    /// 某台机器的清单汇总（总行数 / 其中 app 行数）。
+    async fn summarize_agent_software(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<SoftwareInventorySummary>;
+
+    /// 「按软件看机器」：取**持有机器数最多**的前 `limit` 个聚类键及其持有者。
+    ///
+    /// 为什么要 limit：`software_key` 是机械聚类键，元素数随「机器数 × 路径数」增长；
+    /// 一次把所有键都读出来会在几百台机器时就把响应撞大（而页面一次也看不完）。
+    async fn list_software_holdings(&self, limit: usize)
+    -> StoreResult<Vec<StoredSoftwareHolding>>;
+
+    /// 聚类键总数（用来告诉调用方 `list_software_holdings` 是不是截断了）。
+    async fn count_software_keys(&self) -> StoreResult<i64>;
 
     /// 读取用途建议；未算过返回 `None`。
     async fn get_purpose_suggestion(

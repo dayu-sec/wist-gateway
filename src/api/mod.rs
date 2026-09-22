@@ -30,6 +30,9 @@ mod overview;
 // 同一模式（模型里也没有 host-metrics 路由）。重新生成控制面代码时需回补本模块与下方路由。
 mod pipeline;
 mod rate_limit;
+// NOTE(hand-added): L1a 机械资产清单（从事实摘要派生）。不在 jumo 静态模型 binding.mju
+// 的声明里，与 host_metrics / pipeline 同一模式。重新生成控制面代码时需回补本模块与下方路由。
+mod software_ops;
 
 pub mod wist_gateway_management_interface;
 pub mod wist_gateway_public_install_interface;
@@ -55,6 +58,7 @@ use install::{
 };
 use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
 use pipeline::get_pipeline_topology;
+use software_ops::{view_agent_software, view_software_holdings};
 
 #[derive(Debug, Clone)]
 pub struct ApiState {
@@ -216,6 +220,14 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/pipeline/topology",
             get(get_pipeline_topology),
+        )
+        // NOTE(hand-added): L1a 机械资产清单（见 api/software_ops.rs 顶部说明）。
+        // 「按软件看机器」在前，「按机器看软件」在后 —— 后者要 `{agent_id}` 路径参数，
+        // 两条路由不冲突，但把静态段放前面更不容易让人误以为是同一个前缀。
+        .route("/api/v1/admin/software", get(view_software_holdings))
+        .route(
+            "/api/v1/admin/agents/{agent_id}/software",
+            get(view_agent_software),
         )
         // NOTE(hand-added): wist-agentd 安装包地址的读取/设置。已在 jumo 模型
         // WistGatewayManagementInterface（AdminViewAgentInstallPackageAddress /

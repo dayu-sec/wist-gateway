@@ -372,6 +372,18 @@ fn push_agent_filters(builder: &mut QueryBuilder<Sqlite>, query: &AgentQuery) {
     }
 }
 
+fn software_entry_from_row(row: &SqliteRow) -> StoreResult<StoredSoftwareEntry> {
+    Ok(StoredSoftwareEntry {
+        agent_id: column!(row, "agent_id"),
+        software_key: column!(row, "software_key"),
+        name: column!(row, "name"),
+        kind: column!(row, "kind"),
+        matched_rule: column!(row, "matched_rule"),
+        path: column!(row, "path"),
+        received_at: column!(row, "received_at"),
+    })
+}
+
 fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
     let credential_status: String = column!(row, "credential_status");
     let work_state_changes: Option<String> = column!(row, "work_state_changes");
@@ -1157,6 +1169,139 @@ impl Store for SqliteStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn replace_agent_software_inventory(
+        &self,
+        agent_id: &str,
+        entries: &[StoredSoftwareEntry],
+    ) -> StoreResult<usize> {
+        // 一个事务里「先删后插」：中间态不能让读者看见（管理面可能正好在这时查）。
+        // 也正因为在一个事务里，插到一半撞主键会整体回滚 —— 宁可这台机器的清单保持旧值，
+        // 也不要留下一半新一半旧的半成品。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin software inventory replace"))?;
+        sqlx::query("DELETE FROM agent_software_inventory WHERE agent_id = ?1")
+            .bind(agent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| sql_error(err, "clear software inventory"))?;
+        for entry in entries {
+            sqlx::query(
+                "INSERT INTO agent_software_inventory (agent_id, software_key, name, kind, \
+                 matched_rule, path, received_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .bind(&entry.agent_id)
+            .bind(&entry.software_key)
+            .bind(&entry.name)
+            .bind(&entry.kind)
+            .bind(&entry.matched_rule)
+            .bind(&entry.path)
+            .bind(&entry.received_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| sql_error(err, "insert software inventory entry"))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit software inventory replace"))?;
+        Ok(entries.len())
+    }
+
+    async fn agent_has_software_inventory(&self, agent_id: &str) -> StoreResult<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_software_inventory WHERE agent_id = ?1 LIMIT 1",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "count software inventory"))?;
+        Ok(count > 0)
+    }
+
+    async fn list_agent_software(&self, agent_id: &str) -> StoreResult<Vec<StoredSoftwareEntry>> {
+        let rows = sqlx::query(
+            "SELECT agent_id, software_key, name, kind, matched_rule, path, received_at \
+             FROM agent_software_inventory WHERE agent_id = ?1 \
+             ORDER BY kind, software_key, path",
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list agent software inventory"))?;
+        rows.iter().map(software_entry_from_row).collect()
+    }
+
+    async fn summarize_agent_software(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<SoftwareInventorySummary> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS paths, \
+             COALESCE(SUM(CASE WHEN kind = 'app' THEN 1 ELSE 0 END), 0) AS apps \
+             FROM agent_software_inventory WHERE agent_id = ?1",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "summarize software inventory"))?;
+        Ok(SoftwareInventorySummary {
+            paths: column!(row, "paths"),
+            apps: column!(row, "apps"),
+        })
+    }
+
+    async fn list_software_holdings(
+        &self,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredSoftwareHolding>> {
+        // 一条查询拿完：子查询先定「持有机器数最多的前 limit 个键」，外层再把它们的行取回。
+        // 这样不必在 Rust 里拼 IN (?, ?, ...)，也不必让调用方逐个键回库（N+1）。
+        // 返回行数上界是 `limit × 机器数`，由调用方把 limit 控在合理范围。
+        let rows = sqlx::query(
+            "SELECT software_key, name, kind, agent_id, path FROM agent_software_inventory \
+             WHERE software_key IN (\
+               SELECT software_key FROM agent_software_inventory \
+               GROUP BY software_key \
+               ORDER BY COUNT(DISTINCT agent_id) DESC, software_key \
+               LIMIT ?1\
+             ) \
+             ORDER BY software_key, agent_id, path",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list software holdings"))?;
+        // 行已按 software_key 排序，所以同键的行必然相邻 —— 一次顺序折叠即可分组，
+        // 不必用 HashMap 再排一遍（排序键还得跟 SQL 保持一致，那是两处真相）。
+        let mut holdings: Vec<StoredSoftwareHolding> = Vec::new();
+        for row in rows.iter() {
+            let key: String = column!(row, "software_key");
+            let holder = SoftwareHolder {
+                agent_id: column!(row, "agent_id"),
+                path: column!(row, "path"),
+            };
+            match holdings.last_mut() {
+                Some(current) if current.software_key == key => current.holders.push(holder),
+                _ => holdings.push(StoredSoftwareHolding {
+                    software_key: key,
+                    name: column!(row, "name"),
+                    kind: column!(row, "kind"),
+                    holders: vec![holder],
+                }),
+            }
+        }
+        Ok(holdings)
+    }
+
+    async fn count_software_keys(&self) -> StoreResult<i64> {
+        sqlx::query_scalar("SELECT COUNT(DISTINCT software_key) FROM agent_software_inventory")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "count software keys"))
+    }
+
     async fn get_purpose_suggestion(
         &self,
         agent_id: &str,
@@ -1905,5 +2050,137 @@ mod tests {
             .expect("token");
         assert_eq!(untouched.status, StoredEnrollmentTokenStatus::Active);
         assert_eq!(untouched.used_count, 0);
+    }
+
+    // ── L1a 机械资产清单 ───────────────────────────────────────────────
+
+    fn entry(agent_id: &str, key: &str, kind: &str, path: &str) -> StoredSoftwareEntry {
+        StoredSoftwareEntry {
+            agent_id: agent_id.to_string(),
+            software_key: key.to_string(),
+            name: "demo".to_string(),
+            kind: kind.to_string(),
+            matched_rule: "test".to_string(),
+            path: path.to_string(),
+            received_at: "2026-09-22T00:00:00Z".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn replaces_software_inventory_instead_of_appending() {
+        // 清单是摘要的**投影**：上次有、这次没有的路径必须消失，否则「哪些机器装了 X」
+        // 会永久多出幽灵条目，而页面上看不出来（只是多一行）。
+        let store = store().await;
+        store
+            .replace_agent_software_inventory(
+                "agent-a",
+                &[
+                    entry(
+                        "agent-a",
+                        "/Applications/Firefox.app",
+                        "app",
+                        "/Applications/Firefox.app/Contents/MacOS/firefox",
+                    ),
+                    entry("agent-a", "/usr/bin/true", "binary", "/usr/bin/true"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(store.agent_has_software_inventory("agent-a").await.unwrap());
+
+        let written = store
+            .replace_agent_software_inventory(
+                "agent-a",
+                &[entry("agent-a", "/usr/bin/true", "binary", "/usr/bin/true")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, 1);
+
+        let entries = store.list_agent_software("agent-a").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].software_key, "/usr/bin/true");
+
+        // 不同 agent 互不干扰：一个 agent 的重建不得清掉另一个的。
+        store
+            .replace_agent_software_inventory(
+                "agent-b",
+                &[entry(
+                    "agent-b",
+                    "/usr/bin/false",
+                    "binary",
+                    "/usr/bin/false",
+                )],
+            )
+            .await
+            .unwrap();
+        store
+            .replace_agent_software_inventory("agent-a", &[])
+            .await
+            .unwrap();
+        assert_eq!(store.list_agent_software("agent-a").await.unwrap().len(), 0);
+        assert_eq!(store.list_agent_software("agent-b").await.unwrap().len(), 1);
+        assert!(!store.agent_has_software_inventory("agent-a").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn summarizes_and_groups_software_inventory() {
+        let store = store().await;
+        // 同一 `.app` 两个可执行文件 → 一个键（`software_key`），两条路径（`path`）。
+        store
+            .replace_agent_software_inventory(
+                "agent-a",
+                &[
+                    entry("agent-a", "/Applications/Firefox.app", "app", "firefox"),
+                    entry(
+                        "agent-a",
+                        "/Applications/Firefox.app",
+                        "app",
+                        "plugin-container",
+                    ),
+                    entry("agent-a", "/usr/bin/true", "binary", "/usr/bin/true"),
+                ],
+            )
+            .await
+            .unwrap();
+        // agent-b 持有同一 `.app`（另一条路径）→ 该键应算 2 台机器。
+        store
+            .replace_agent_software_inventory(
+                "agent-b",
+                &[entry(
+                    "agent-b",
+                    "/Applications/Firefox.app",
+                    "app",
+                    "firefox",
+                )],
+            )
+            .await
+            .unwrap();
+
+        let summary = store.summarize_agent_software("agent-a").await.unwrap();
+        assert_eq!(summary.paths, 3);
+        assert_eq!(summary.apps, 2);
+        assert!(store.agent_has_software_inventory("agent-a").await.unwrap());
+
+        // 键总数 2（Firefox.app / /usr/bin/true），但 holder 行数是 4。
+        assert_eq!(store.count_software_keys().await.unwrap(), 2);
+        let holdings = store.list_software_holdings(10).await.unwrap();
+        assert_eq!(holdings.len(), 2);
+        // 排序按「持有机器数降序」：Firefox.app 有 2 台，必须排第一。
+        assert_eq!(holdings[0].software_key, "/Applications/Firefox.app");
+        assert_eq!(holdings[0].holders.len(), 3);
+        let mut agents: Vec<&str> = holdings[0]
+            .holders
+            .iter()
+            .map(|holder| holder.agent_id.as_str())
+            .collect();
+        agents.sort_unstable();
+        agents.dedup();
+        assert_eq!(agents, vec!["agent-a", "agent-b"]);
+
+        // limit 生效，并且调用方据此能知道截断了。
+        let one = store.list_software_holdings(1).await.unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].software_key, "/Applications/Firefox.app");
     }
 }

@@ -12,3 +12,8 @@ pub mod purpose;
 // NOTE(hand-added): 发现方向策略表（策展数据）。网关装载并校验后通过控制面下发给
 // agentd；与 purpose 同类 —— 模型留结构、值留 content/。重新生成控制面代码时需回补本模块。
 pub mod discovery_policy;
+
+// NOTE(hand-added): L1a 机械资产清单（从事实摘要派生，见 doc/design/center/
+// agent-work-delivery-plan.md §8.2）。只做机械归并，不做识别（识别在采集侧）。
+// 重新生成控制面代码时需回补本模块。
+pub mod inventory;

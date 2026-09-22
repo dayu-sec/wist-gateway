@@ -420,6 +420,29 @@ pub(super) async fn ingest_fact_summary(
                     agent.agent_id
                 ),
             }
+            // L1a 清单是摘要的**投影**：内容没变就不必重建。只有「上次投影没写成」
+            // （进程被杀 / 库锁）才补一次 —— 否则清单会一直空着而没人知道。
+            // 常见路径只多付一次 COUNT；自愈路径才重读摘要（那时本也不在乎这点开销）。
+            match state
+                .store
+                .agent_has_software_inventory(&agent.agent_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => match state.store.get_agent_fact_summary(&agent.agent_id).await {
+                    Ok(Some(current)) => refresh_software_inventory(state, &current).await,
+                    // 摘要行在判重与自愈之间消失了：下次上报会走覆盖写补回，不值得卡住 agent。
+                    Ok(None) => {}
+                    Err(err) => eprintln!(
+                        "warn failed to reload fact summary for inventory repair agent_id={}: {err}",
+                        agent.agent_id
+                    ),
+                },
+                Err(err) => eprintln!(
+                    "warn failed to check software inventory agent_id={}: {err}",
+                    agent.agent_id
+                ),
+            }
             let suggestion_id = match state.store.get_purpose_suggestion(&agent.agent_id).await {
                 Ok(suggestion) => suggestion.map(|suggestion| suggestion.suggestion_id),
                 Err(err) => {
@@ -479,6 +502,9 @@ pub(super) async fn ingest_fact_summary(
             .into_response();
     }
 
+    // 事实变了 → 重建 L1a 清单（内容变才重建，与判重同一道门）。
+    refresh_software_inventory(state, &summary).await;
+
     let suggestion_id = match ensure_fresh_suggestion(state, &summary, None, &received_at).await {
         Ok(suggestion) => suggestion.map(|suggestion| suggestion.suggestion_id),
         Err(detail) => {
@@ -502,6 +528,40 @@ pub(super) async fn ingest_fact_summary(
         }),
     )
         .into_response()
+}
+
+/// 重建这台机器的 L1a 机械资产清单（事实摘要的**投影**）。
+///
+/// 为什么失败不影响上报结果：清单是派生视图，摘要才是事实源。重建失败只是页面上少了清单，
+/// 不是「事实没收到」—— 下次内容变化会重建，重复上报路径还有一次自愈机会
+/// （见 `ingest_fact_summary` 的 duplicate 分支）。所以这里只记日志。
+///
+/// 但它**必须留日志**：清单一直空着是一个看不出来的故障（页面会显示「没有数据」，
+/// 而那与「这台机器真的什么都没有」长得一样）。
+async fn refresh_software_inventory(state: &ApiState, summary: &StoredAgentFactSummary) {
+    let entries = crate::app::inventory::derive_inventory(
+        &summary.agent_id,
+        &summary.process_executables,
+        &summary.received_at,
+    );
+    let expected = entries.len();
+    match state
+        .store
+        .replace_agent_software_inventory(&summary.agent_id, &entries)
+        .await
+    {
+        Ok(written) if written == expected => {}
+        // 行数不符理论上不会发生（同一事务内 delete+insert）。真发生了要看得见，
+        // 因为它是「清单与摘要不一致」的唯一信号。
+        Ok(written) => eprintln!(
+            "warn software inventory row count mismatch agent_id={}: wrote {written}, expected {expected}",
+            summary.agent_id
+        ),
+        Err(err) => eprintln!(
+            "warn failed to rebuild software inventory agent_id={}: {err}",
+            summary.agent_id
+        ),
+    }
 }
 
 /// 网关从收到的**内容字段**自算的内容摘要（判重键）。

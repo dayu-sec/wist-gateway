@@ -1469,6 +1469,143 @@ async fn ingest_endpoint_rejects_a_body_that_is_not_a_fact_summary() {
     );
 }
 
+// ── L1a 机械资产清单（从事实摘要派生）────────────────────────────
+
+#[tokio::test]
+async fn software_routes_require_admin_bearer() {
+    let env = TestEnv::new().await;
+    for uri in [
+        "/api/v1/admin/software",
+        "/api/v1/admin/agents/agent-node-a/software",
+    ] {
+        let response = get_to_router(&env.config, &env.store_handle, uri, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "uri {uri}");
+    }
+}
+
+#[tokio::test]
+async fn agent_software_route_differentiates_unknown_agent_from_empty_inventory() {
+    // 「agent 不存在」与「存在但没上报过清单」必须能区分，否则运维分不清打错 id 与没采到。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+
+    let unknown = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-nobody/software",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    let empty = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/software",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(empty).await;
+    assert_eq!(body["paths"], 0);
+    assert_eq!(body["apps"], 0);
+    assert_eq!(body["entries"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn software_inventory_is_derived_from_the_fact_summary() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    let report = fact_report(&[
+        "/Applications/Firefox.app/Contents/MacOS/firefox",
+        "/Applications/Firefox.app/Contents/MacOS/plugin-container",
+        "/usr/bin/true",
+    ]);
+    let accepted = post_facts(&env, &credential, &report).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/software",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    // 三条路径，其中两条归到同一个 `.app` 键。
+    assert_eq!(body["paths"], 3);
+    assert_eq!(body["apps"], 2);
+    let entries = body["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 3);
+    // 排序：`kind` 在前，所以 app 条目先出。
+    assert_eq!(entries[0]["software_key"], "/Applications/Firefox.app");
+    assert_eq!(entries[0]["name"], "Firefox");
+    assert_eq!(entries[0]["kind"], "app");
+    assert_eq!(entries[0]["matched_rule"], "macos-app-bundle");
+    assert_eq!(entries[2]["kind"], "binary");
+    assert_eq!(entries[2]["matched_rule"], "unix-path");
+
+    // 「按软件看机器」：`.app` 键持有 2 条路径，但只有 1 台机器。
+    let holdings = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/software",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(holdings.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(holdings).await;
+    assert_eq!(body["truncated"], false);
+    let software = body["software"].as_array().expect("software");
+    assert_eq!(software.len(), 2);
+    let firefox = software
+        .iter()
+        .find(|view| view["software_key"] == "/Applications/Firefox.app")
+        .expect("firefox holding");
+    assert_eq!(firefox["agent_count"], 1);
+    assert_eq!(firefox["holders"].as_array().expect("holders").len(), 2);
+    assert_eq!(firefox["holders"][0]["agent_id"], "agent-node-a");
+}
+
+#[tokio::test]
+async fn software_inventory_self_heals_on_a_duplicate_report() {
+    // 内容没变时清单不重算（投影相同），但若上次重建没写成（进程被杀 / 库锁），
+    // 重复上报要能补上 —— 否则清单会一直空着而没人知道。
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    let report = fact_report(&["/usr/bin/true"]);
+    assert_eq!(
+        post_facts(&env, &credential, &report).await.status(),
+        StatusCode::ACCEPTED
+    );
+
+    // 模拟「上次重建没写成」：把已建好的清单删掉，内容与 digest 都不动。
+    env.store
+        .replace_agent_software_inventory("agent-node-a", &[])
+        .await
+        .expect("clear inventory");
+    assert!(
+        !env.store
+            .agent_has_software_inventory("agent-node-a")
+            .await
+            .expect("has inventory")
+    );
+
+    // 同一份内容再报一次：走 duplicate 分支（不重算 digest），但清单必须回来。
+    assert_eq!(
+        post_facts(&env, &credential, &report).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let entries = env
+        .store
+        .list_agent_software("agent-node-a")
+        .await
+        .expect("list inventory");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "/usr/bin/true");
+}
+
 #[tokio::test]
 async fn agent_facts_route_refreshes_display_fields_on_duplicate() {
     // 内容（可执行标识集合）没变，机器却换了网、改了名：这是 **duplicate**。
