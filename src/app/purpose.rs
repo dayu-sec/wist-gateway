@@ -45,10 +45,24 @@ pub struct PurposeRuleSet {
     /// 低于此总分视为「信号太弱」，置信度打折。
     #[serde(default)]
     pub weak_score: i64,
+    /// 某类别至少命中几条规则才算「有把握」（`1` = 不启用）。
+    ///
+    /// 为什么需要它：进程集合里会混进**偶发进程**。一台 `MacDaily` 机器上碰巧跑一次
+    /// `xcodebuild` 就能命中高权重规则、而次高分为 0 → 置信度 100，而 `weak_score` 拦不住
+    /// （40 ≥ 20）。阈值按类别判据丰度定（`MacDev` 有 14 条、`MacDaily` 只有 4 条），
+    /// 所以放在规则册上由策展侧调。
+    ///
+    /// 不足时的处置是**打折**（不回落基线）：保留「有倾向但不确信」给人看。
+    #[serde(default = "default_min_support")]
+    pub min_support: i64,
     #[serde(default)]
     pub published_at: Option<String>,
     #[serde(default)]
     pub rules: Vec<PurposeRule>,
+}
+
+fn default_min_support() -> i64 {
+    1
 }
 
 /// 一条规则（对应模型 `PurposeRule`）。
@@ -121,6 +135,12 @@ fn validate_rule_table(table: &mut PurposeRuleTable) -> ConfigResult<()> {
             return Err(invalid(format!(
                 "rule_set {rule_set_id}: unknown platform {:?} (expected one of {RULE_PLATFORMS:?})",
                 rule_set.platform
+            )));
+        }
+        if rule_set.min_support < 1 {
+            return Err(invalid(format!(
+                "rule_set {rule_set_id}: min_support {} must be >= 1 (1 = disabled)",
+                rule_set.min_support
             )));
         }
         let baseline = rule_set.baseline_class.take();
@@ -242,6 +262,8 @@ pub fn infer(
     let rule_set = table.for_platform(&summary.os)?;
 
     let mut scores: BTreeMap<String, i64> = BTreeMap::new();
+    // 每个类别命中的规则**条数**（给 `min_support` 用）：量与质是两件事。
+    let mut support: BTreeMap<String, i64> = BTreeMap::new();
     let mut signals: Vec<StoredPurposeSignal> = Vec::new();
     for rule in &rule_set.rules {
         let Some(values) = signals_for(rule, summary) else {
@@ -256,6 +278,7 @@ pub fn infer(
         // 只留依据不加分的规则（machine_class 为空）也要进依据列表。
         if let Some(class) = rule.machine_class.as_deref() {
             *scores.entry(class.to_string()).or_insert(0) += rule.weight;
+            *support.entry(class.to_string()).or_insert(0) += 1;
         }
         signals.push(StoredPurposeSignal {
             rule_id: rule.rule_id.clone(),
@@ -272,6 +295,12 @@ pub fn infer(
             // 整数除法向下取整（40 对 10 → 75，30 对 20 → 33）。
             let mut confidence = (100 * (highest - second) / highest).clamp(0, 100);
             if highest < rule_set.weak_score {
+                confidence /= 2;
+            }
+            // 单条判据不足以成案：偶发进程只命中一条高权重规则也能拿满分，这里把它压回去。
+            // （阈值按类别的判据丰度定，所以是策展数据 —— 见 PurposeRuleSet.min_support。）
+            let support_count = support.get(&class).copied().unwrap_or(0);
+            if support_count < rule_set.min_support {
                 confidence /= 2;
             }
             (class, confidence)
@@ -673,6 +702,60 @@ weight = -40
         .expect("suggestion");
         assert_eq!(suggestion.suggested_class, "MacDev");
         assert_eq!(suggestion.confidence, 50);
+    }
+
+    #[test]
+    fn min_support_discounts_a_lone_high_weight_hit() {
+        // 偶发进程场景：一台 MacDaily 机器上碰巧跑一次 xcodebuild，只命中一条高权重规则、
+        // 而次高分为 0 → 公式给 100，`weak_score` 也拦不住（40 ≥ 20）。
+        // `min_support = 2` 要求至少两条判据才算成案，所以这里打折成 50。
+        let table = parse_rule_table(
+            r#"
+[[rule_set]]
+rule_set_id = "macos-v1"
+platform = "macos"
+baseline_class = "MacDaily"
+weak_score = 20
+min_support = 2
+
+[[rule_set.rules]]
+rule_id = "mac-dev-xcodebuild"
+kind = "process"
+pattern = "xcodebuild"
+machine_class = "MacDev"
+weight = 40
+
+[[rule_set.rules]]
+rule_id = "mac-dev-homebrew-arm"
+kind = "process_path"
+pattern = "/opt/homebrew"
+machine_class = "MacDev"
+weight = 30
+"#,
+        )
+        .expect("rule table");
+
+        let lone = infer(&summary("macos", &["xcodebuild"]), &table, "s", "t").expect("suggestion");
+        assert_eq!(lone.suggested_class, "MacDev");
+        assert_eq!(lone.confidence, 50);
+
+        // 两条判据同向 → 达到 min_support，不打折。
+        let supported = infer(
+            &summary("macos", &["xcodebuild", "/opt/homebrew/bin/mise"]),
+            &table,
+            "s",
+            "t",
+        )
+        .expect("suggestion");
+        assert_eq!(supported.suggested_class, "MacDev");
+        assert_eq!(supported.confidence, 100);
+    }
+
+    #[test]
+    fn rejects_a_min_support_below_one() {
+        let text = "[[rule_set]]\nrule_set_id = \"x\"\nplatform = \"macos\"\nmin_support = 0\n";
+        let err = parse_rule_table(text).expect_err("min_support = 0 must be rejected");
+        assert!(err.to_string().contains("min_support"), "{err}");
     }
 
     #[test]
