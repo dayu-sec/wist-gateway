@@ -218,6 +218,7 @@ pub async fn view_agent_purpose(
                 .into_response();
         }
     };
+    let suggestion = refresh_suggestion_for_read(&state, fact_summary.as_ref(), suggestion).await;
     Json(AgentPurposeResponse {
         agent_id,
         fact_summary,
@@ -226,6 +227,44 @@ pub async fn view_agent_purpose(
         generated_at: DateTime::now(),
     })
     .into_response()
+}
+
+/// 读取路径上的建议自愈：过期就重算。
+///
+/// 什么时候算过期：还没有建议（上次推断失败、或当时没配规则表），或建议的 `rule_set_id`
+/// 与当前装载的规则册不一致（规则表改过并重启）。
+///
+/// 为什么放在读取路径：规则表只在启动时装载（不热加载），而 agentd 在事实内容没变时
+/// 不会重发 —— 只靠「等下次上报」会让旧建议无限期留在库里。读取是天然的重算触发点，
+/// 重算幂等且代价有界（一台机器一次）。
+///
+/// 自愈失败不该让整个页面挂掉：保留原值、问题进日志。
+async fn refresh_suggestion_for_read(
+    state: &ApiState,
+    fact_summary: Option<&StoredAgentFactSummary>,
+    suggestion: Option<StoredPurposeSuggestion>,
+) -> Option<StoredPurposeSuggestion> {
+    let Some(summary) = fact_summary else {
+        return suggestion;
+    };
+    let fallback = suggestion.clone();
+    match super::agent_ops::ensure_fresh_suggestion(
+        state,
+        summary,
+        suggestion,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .await
+    {
+        Ok(suggestion) => suggestion,
+        Err(detail) => {
+            eprintln!(
+                "warn purpose suggestion refresh failed agent_id={}: {detail}",
+                summary.agent_id
+            );
+            fallback
+        }
+    }
 }
 
 /// 分页列出已注册 Agent（管理面）。

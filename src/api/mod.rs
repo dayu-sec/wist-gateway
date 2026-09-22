@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 
@@ -111,7 +112,13 @@ pub fn router(config: AdminConfig, store: Arc<dyn Store>) -> Router {
         .route("/api/v1/agent/status", post(submit_agent_status))
         // NOTE(hand-added): agentd 上报事实**摘要**（不是原文快照，原文走数据面）。
         // 已在 jumo 模型 WistAgentdOnlineRegistrationInterface.ReportAgentFactSummary 声明。
-        .route("/api/v1/agent/facts", post(submit_agent_facts))
+        // 显式给这条路由设 body 上限：摘要是被管机器上报的内容，不能依赖框架默认值。
+        .route(
+            "/api/v1/agent/facts",
+            post(submit_agent_facts).layer(DefaultBodyLimit::max(
+                agent_ops::MAX_FACT_SUMMARY_BODY_BYTES,
+            )),
+        )
         .route(
             "/api/v1/agent/credentials:renew",
             post(renew_agent_credential),

@@ -1274,7 +1274,187 @@ async fn agent_facts_route_infers_with_the_checked_in_rule_table() {
     assert!(rule_ids.contains(&"mac-dev-homebrew-arm"));
     assert!(rule_ids.contains(&"mac-dev-orbstack"));
     // 排除规则在真实数据上生效：App bundle 里的 node_modules 不算开发特征。
-    assert!(!rule_ids.contains(&"mac-dev-node-modules"));
+    assert!(!rule_ids.contains(&"mac-dev-node_modules"));
+}
+
+// ── 审查发现的缺陷对应的回归测试 ──────────────────────────────────────
+
+/// 建一份带规则表的配置副本（同一个库），用来模拟“规则表后来才配上 / 换了版本”。
+fn config_with_purpose_rules(env: &TestEnv, rules: &str) -> AdminConfig {
+    let path = std::env::temp_dir().join(format!("wist-gateway-purpose-{}.toml", unique_suffix()));
+    std::fs::write(&path, rules).expect("write purpose rules");
+    let mut config = env.config.clone();
+    config.purpose_rules_file = Some(path);
+    config
+}
+
+#[tokio::test]
+async fn agent_facts_route_survives_a_corrupt_json_column() {
+    // 判重路径若顺带反序列化三个 JSON 列，一旦某列仕掉就会把**新摘要永远挡在门外**
+    // （upsert 根本走不到），坏行无法被覆盖自愈。这里把列真的写坏来验。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    let credential = enroll_agent_credential(&env).await;
+    let first: FactSummaryAccepted = decode_json_response(
+        post_facts(
+            &env,
+            &credential,
+            &fact_report("sha256:digest-a", &["xcodebuild"]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(first.ack_status, FactSummaryAckStatus::Accepted);
+
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", env.config.sqlite_path.display()))
+        .await
+        .expect("open raw pool");
+    sqlx::query("UPDATE agent_fact_summary SET process_executables = ?1 WHERE agent_id = ?2")
+        .bind("not json")
+        .bind("agent-node-a")
+        .execute(&pool)
+        .await
+        .expect("corrupt the column");
+    pool.close().await;
+
+    // 1）同一份内容再报：判重只读 digest，不该 500。
+    let duplicate: FactSummaryAccepted = decode_json_response(
+        post_facts(
+            &env,
+            &credential,
+            &fact_report("sha256:digest-a", &["xcodebuild"]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(duplicate.ack_status, FactSummaryAckStatus::Duplicate);
+
+    // 2）换一份内容：必须能覆盖写入，坏列随之自愈。
+    let second: FactSummaryAccepted = decode_json_response(
+        post_facts(
+            &env,
+            &credential,
+            &fact_report("sha256:digest-b", &["/opt/homebrew/bin/mise"]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(second.ack_status, FactSummaryAckStatus::Accepted);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("read summary")
+        .expect("summary");
+    assert_eq!(
+        stored.process_executables,
+        vec!["/opt/homebrew/bin/mise".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn agent_facts_route_rejects_oversized_and_invalid_input() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    let credential = enroll_agent_credential(&env).await;
+
+    // 条数超限（被管机器可以自己控制数组长度，网关必须自己封顶）。
+    let mut too_many = fact_report("sha256:digest-a", &["xcodebuild"]);
+    too_many.process_executables = vec!["x".to_string(); 10_001];
+    assert_eq!(
+        post_facts(&env, &credential, &too_many).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // 单元素超长。
+    let mut too_long = fact_report("sha256:digest-a", &["xcodebuild"]);
+    too_long.process_executables = vec!["x".repeat(4097)];
+    assert_eq!(
+        post_facts(&env, &credential, &too_long).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // 负数留痕字段。
+    let mut negative = fact_report("sha256:digest-a", &["xcodebuild"]);
+    negative.process_count = -1;
+    assert_eq!(
+        post_facts(&env, &credential, &negative).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // 被拒的上报不该落库。
+    assert!(
+        env.store
+            .get_agent_fact_summary("agent-node-a")
+            .await
+            .expect("read")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn agent_purpose_route_recomputes_a_missing_suggestion() {
+    // 首次上报时还没配规则表：只入库、无建议。
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    let ack: FactSummaryAccepted = decode_json_response(
+        post_facts(
+            &env,
+            &credential,
+            &fact_report("sha256:digest-a", &["xcodebuild"]),
+        )
+        .await,
+    )
+    .await;
+    assert!(ack.suggestion_id.is_none());
+
+    // 之后配上规则表（重启生效）。事实没变、agentd 不会再报 ——
+    // 读取路径必须自愈，否则「有事实、无建议」会无限期留着。
+    let with_rules = config_with_purpose_rules(&env, TEST_PURPOSE_RULES);
+    let response = get_to_router(
+        &with_rules,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/purpose",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["suggestion"]["suggested_class"], "MacDev");
+    assert_eq!(view["suggestion"]["rule_set_id"], "macos-v1");
+
+    // 自愈是**落库**的，不只影响这一响；而且未配规则表的那份配置读它时
+    // 不该把它清掉（不推断 ≠ 清空）。
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["suggestion"]["rule_set_id"], "macos-v1");
+}
+
+#[tokio::test]
+async fn agent_purpose_route_recomputes_when_the_rule_set_version_changes() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    let credential = enroll_agent_credential(&env).await;
+    post_facts(
+        &env,
+        &credential,
+        &fact_report("sha256:digest-a", &["xcodebuild"]),
+    )
+    .await;
+    assert_eq!(
+        get_purpose_view(&env, "agent-node-a").await["suggestion"]["rule_set_id"],
+        "macos-v1"
+    );
+
+    // 规则册换版本：同一份事实、agentd 不会再报，只能靠读取路径看出来并重算。
+    let v2 = TEST_PURPOSE_RULES.replace("macos-v1", "macos-v2");
+    let with_v2 = config_with_purpose_rules(&env, &v2);
+    let response = get_to_router(
+        &with_v2,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/purpose",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["suggestion"]["rule_set_id"], "macos-v2");
 }
 
 #[tokio::test]

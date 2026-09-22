@@ -7,7 +7,7 @@ use axum::{
 
 use crate::infra::{
     AgentStatusUpdate, RenewCredential, StoredAgentFactSummary, StoredAgentRegistration,
-    StoredCredentialStatus, new_secret_token, sha256_hex,
+    StoredCredentialStatus, StoredPurposeSuggestion, new_secret_token, sha256_hex,
     victoria_metrics::{import_lines, metric_line},
 };
 use wist_contracts::API_VERSION_V1;
@@ -269,18 +269,31 @@ pub async fn submit_agent_facts(
             Ok(agent) => agent,
             Err(response) => return response,
         };
+    // 先认证再验内容：不对未认证的请求做多余工。上限由网关自己封顶，不能指望 agent 守规矩。
+    if let Err(detail) = validate_fact_summary(&input) {
+        return (StatusCode::BAD_REQUEST, detail).into_response();
+    }
     let received_at = chrono::Utc::now().to_rfc3339();
 
-    match state.store.get_agent_fact_summary(&agent.agent_id).await {
-        Ok(Some(existing)) if existing.content_digest == input.content_digest => {
+    // 判重只读 `content_digest`：三个 JSON 列一旦损坏就不该把写路径也堵死。
+    match state
+        .store
+        .get_agent_fact_summary_digest(&agent.agent_id)
+        .await
+    {
+        Ok(Some(existing_digest)) if existing_digest == input.content_digest => {
+            // 幂等命中：不改数据、不重算，只回带已存建议。
+            // 注意「不过期自愈」是有意的：这条路径只读一个 id，不做重算；规则册换版本留下的
+            // 过期建议由读取路径（`ensure_fresh_suggestion`）负责。
             let suggestion_id = match state.store.get_purpose_suggestion(&agent.agent_id).await {
                 Ok(suggestion) => suggestion.map(|suggestion| suggestion.suggestion_id),
                 Err(err) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to load purpose suggestion: {err}"),
-                    )
-                        .into_response();
+                    // 建议读不出来不该让 agent 收到 500（它会一直重试）：当作“这次没建议”。
+                    eprintln!(
+                        "warn failed to load purpose suggestion agent_id={}: {err}",
+                        agent.agent_id
+                    );
+                    None
                 }
             };
             return (
@@ -328,8 +341,8 @@ pub async fn submit_agent_facts(
             .into_response();
     }
 
-    let suggestion_id = match infer_and_store(&state, &summary, &received_at).await {
-        Ok(suggestion_id) => suggestion_id,
+    let suggestion_id = match ensure_fresh_suggestion(&state, &summary, None, &received_at).await {
+        Ok(suggestion) => suggestion.map(|suggestion| suggestion.suggestion_id),
         Err(detail) => {
             eprintln!(
                 "warn purpose inference failed agent_id={}: {detail}",
@@ -353,31 +366,84 @@ pub async fn submit_agent_facts(
         .into_response()
 }
 
-/// 按规则表算建议并落库，返回生效的 `suggestion_id`。
+/// 上报体上限：摘要是**被管机器上报的内容**，网关必须自己封顶，不能指望 agent 守规矩。
+/// 没有上限时，一台机器就能让网关写进超长单行、让管理页渲染数十万 DOM 节点。
+pub(super) const MAX_FACT_SUMMARY_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROCESS_EXECUTABLES: usize = 10_000;
+const MAX_PACKAGES: usize = 5_000;
+const MAX_LISTEN_PORTS: usize = 1_000;
+const MAX_ELEMENT_BYTES: usize = 4096;
+
+fn validate_fact_summary(input: &ReportAgentFactSummary) -> Result<(), String> {
+    if input.revision < 0 {
+        return Err("revision must not be negative".to_string());
+    }
+    if input.process_count < 0 {
+        return Err("process_count must not be negative".to_string());
+    }
+    check_list(
+        "process_executables",
+        &input.process_executables,
+        MAX_PROCESS_EXECUTABLES,
+    )?;
+    check_list("packages", &input.packages, MAX_PACKAGES)?;
+    check_list("listen_ports", &input.listen_ports, MAX_LISTEN_PORTS)?;
+    Ok(())
+}
+
+fn check_list(field: &str, values: &[String], max_len: usize) -> Result<(), String> {
+    if values.len() > max_len {
+        return Err(format!(
+            "{field} has {} entries (limit {max_len})",
+            values.len()
+        ));
+    }
+    if values.iter().any(|value| value.len() > MAX_ELEMENT_BYTES) {
+        return Err(format!(
+            "{field} contains an entry longer than {MAX_ELEMENT_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+/// 按规则表算建议并落库，返回生效的建议。
+///
+/// `current` 传 `None` = 「新内容一律重算」（收到新事实）；传已存建议 = 「仅当过期才重算」
+/// （读取路径）。两种调用共用同一份判据，避免两处逻辑漂移。
 ///
 /// 三种情况要分清：
 ///   - 没配规则表：不推断，也**不动**已有建议 —— 页面能看到它的 `computed_at`，人自己判；
 ///   - 算出建议：覆盖写入（建议可变可过期）；
 ///   - 确实不该有建议（平台无规则册，或既无命中又无基线）：**清掉旧建议** ——
 ///     旧结论是照着旧事实算的，留着比没有更误导。
-async fn infer_and_store(
+pub(super) async fn ensure_fresh_suggestion(
     state: &ApiState,
     summary: &StoredAgentFactSummary,
+    current: Option<StoredPurposeSuggestion>,
     computed_at: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<StoredPurposeSuggestion>, String> {
     let Some(table) = state.purpose_rules.as_deref() else {
-        return Ok(None);
+        return Ok(current);
     };
+    // 过期判据：规则册换了版本（`rule_set_id` 变了）。所以**改规则必须 bump rule_set_id**，
+    // 否则内容变了而版本没变，这里看不出来。
+    let expected = table
+        .for_platform(&summary.os)
+        .map(|set| set.rule_set_id.clone());
+    if let Some(suggestion) = current.as_ref()
+        && suggestion.rule_set_id.as_deref() == expected.as_deref()
+    {
+        return Ok(current);
+    }
     let suggestion_id = new_secret_token("sug")?;
-    let suggestion = crate::app::purpose::infer(summary, table, &suggestion_id, computed_at);
-    match suggestion {
+    match crate::app::purpose::infer(summary, table, &suggestion_id, computed_at) {
         Some(suggestion) => {
             state
                 .store
                 .upsert_purpose_suggestion(&suggestion)
                 .await
                 .map_err(|err| format!("store purpose suggestion: {err}"))?;
-            Ok(Some(suggestion.suggestion_id))
+            Ok(Some(suggestion))
         }
         None => {
             state

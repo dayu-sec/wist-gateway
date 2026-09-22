@@ -1069,6 +1069,18 @@ impl Store for SqliteStore {
         row.as_ref().map(fact_summary_from_row).transpose()
     }
 
+    async fn get_agent_fact_summary_digest(&self, agent_id: &str) -> StoreResult<Option<String>> {
+        let row = sqlx::query("SELECT content_digest FROM agent_fact_summary WHERE agent_id = ?1")
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "select agent fact summary digest"))?;
+        match row {
+            Some(row) => Ok(Some(column!(row, "content_digest"))),
+            None => Ok(None),
+        }
+    }
+
     async fn upsert_agent_fact_summary(&self, summary: &StoredAgentFactSummary) -> StoreResult<()> {
         let process_executables = serialize_json_array(
             &summary.process_executables,

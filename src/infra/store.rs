@@ -494,6 +494,13 @@ pub trait Store: Send + Sync + fmt::Debug {
         agent_id: &str,
     ) -> StoreResult<Option<StoredAgentFactSummary>>;
 
+    /// 只读事实摘要的幂等键（`content_digest`）；未上报过返回 `None`。
+    ///
+    /// 为什么单独开一个：`get_agent_fact_summary` 会反序列化三个 JSON 列，而这些列
+    /// 一旦损坏就返回 Err。判重路径只要摘要，不该被它卡死 —— 否则新摘要永远写不进去，
+    /// 坏行也就无法被覆盖自愈。
+    async fn get_agent_fact_summary_digest(&self, agent_id: &str) -> StoreResult<Option<String>>;
+
     /// 写入/覆盖事实摘要（一台一条）。
     ///
     /// 是否重复上报（`content_digest` 命中）由调用方先查再决，本方法本身是**无条件覆盖**。

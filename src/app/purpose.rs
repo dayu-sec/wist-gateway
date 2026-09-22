@@ -10,11 +10,19 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use orion_error::conversion::ToStructError;
 use orion_error::prelude::*;
 use serde::Deserialize;
-use wist_error::{ConfigReason, ConfigResult};
+use wist_error::{ConfigError, ConfigReason, ConfigResult};
 
 use crate::infra::{StoredAgentFactSummary, StoredPurposeSignal, StoredPurposeSuggestion};
+
+/// 规则表里 `kind` 的闭合取值（与模型 `PurposeRule.kind` 一致）。
+const RULE_KINDS: &[&str] = &["process", "process_path", "listen_port", "package", "unit"];
+/// 规则册的平台取值（与 agentd 上报的 `os` 同源）。
+const RULE_PLATFORMS: &[&str] = &["macos", "linux"];
+/// `MachineClass` 的闭合取值（与模型 `variant MachineClass` 一致）。
+const MACHINE_CLASSES: &[&str] = &["MacDaily", "MacDev", "LinuxCompute", "LinuxData"];
 
 /// 规则表：按平台分册的集合。
 ///
@@ -82,7 +90,99 @@ pub fn load_rule_table(path: &Path) -> ConfigResult<PurposeRuleTable> {
 /// 解析规则表文本（测试与热加载都用它，避免只能通过文件系统验证）。
 pub fn parse_rule_table(text: &str) -> ConfigResult<PurposeRuleTable> {
     // 与 config.rs 一致：toml 的 error 走 `source_raw_err`，`source_err` 的 trait bound 不满足。
-    toml::from_str(text).source_raw_err(ConfigReason::Parse, "parse purpose rule table")
+    let mut table: PurposeRuleTable =
+        toml::from_str(text).source_raw_err(ConfigReason::Parse, "parse purpose rule table")?;
+    validate_rule_table(&mut table)?;
+    Ok(table)
+}
+
+fn invalid(detail: impl Into<String>) -> ConfigError {
+    ConfigReason::Validation.to_err().with_detail(detail)
+}
+
+/// 装载期校教 + 归一化。
+///
+/// 为什么必须在装载期拦：这些都是**策展数据里手写的**东西，写错一个字母的后果是静默的 ——
+///   - `pattern = ""` 会让 `contains("")` 恒真，那条规则对**每个值**都命中，
+///     一条笔误就能给所有机器加满权重；
+///   - `kind` 写错会被 [`signals_for`] 静默跳过，等于一条死规则；
+///   - `machine_class` / `baseline_class` 写错会把不在 `MachineClass` 里的裸名存进库，
+///     再让页面因闭合枚举校验而整页失败；
+///   - `platform` 写错（如 `macOS`）会让整册规则永不匹配，也不报错。
+///
+/// 宁可在启动时失败并指出是哪一册/哪条规则，也不要静默地不推断。
+fn validate_rule_table(table: &mut PurposeRuleTable) -> ConfigResult<()> {
+    for rule_set in &mut table.rule_set {
+        let rule_set_id = rule_set.rule_set_id.clone();
+        if rule_set_id.trim().is_empty() {
+            return Err(invalid("rule_set with empty rule_set_id"));
+        }
+        if !RULE_PLATFORMS.contains(&rule_set.platform.as_str()) {
+            return Err(invalid(format!(
+                "rule_set {rule_set_id}: unknown platform {:?} (expected one of {RULE_PLATFORMS:?})",
+                rule_set.platform
+            )));
+        }
+        let baseline = rule_set.baseline_class.take();
+        rule_set.baseline_class =
+            normalize_machine_class(baseline, &rule_set_id, "baseline_class")?;
+        for rule in &mut rule_set.rules {
+            validate_rule(&rule_set_id, rule)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_rule(rule_set_id: &str, rule: &mut PurposeRule) -> ConfigResult<()> {
+    if rule.rule_id.trim().is_empty() {
+        return Err(invalid(format!(
+            "rule_set {rule_set_id}: rule with empty rule_id"
+        )));
+    }
+    if !RULE_KINDS.contains(&rule.kind.as_str()) {
+        return Err(invalid(format!(
+            "rule {}: unknown kind {:?} (expected one of {RULE_KINDS:?})",
+            rule.rule_id, rule.kind
+        )));
+    }
+    if rule.pattern.is_empty() {
+        return Err(invalid(format!(
+            "rule {}: empty pattern (an empty pattern matches every value)",
+            rule.rule_id
+        )));
+    }
+    let class = rule.machine_class.take();
+    rule.machine_class = normalize_machine_class(
+        class,
+        rule_set_id,
+        &format!("rule {} machine_class", rule.rule_id),
+    )?;
+    // 空串的 exclude 等于没写（`Some("")` 会让下面的 contains 把一切都排除掉）。
+    if rule
+        .exclude_pattern
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        rule.exclude_pattern = None;
+    }
+    Ok(())
+}
+
+/// 空串按「没写」归一化为 `None`（模型里「留空 = 只留依据不加分 / 不产出建议」）；
+/// 非空必须是 `MachineClass` 的闭合取值。
+fn normalize_machine_class(
+    value: Option<String>,
+    rule_set_id: &str,
+    field: &str,
+) -> ConfigResult<Option<String>> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(class) if MACHINE_CLASSES.contains(&class) => Ok(Some(class.to_string())),
+        Some(class) => Err(invalid(format!(
+            "rule_set {rule_set_id}: {field} {class:?} is not a MachineClass \
+             (expected one of {MACHINE_CLASSES:?})"
+        ))),
+    }
 }
 
 /// 命中判定：大小写不敏感子串。
@@ -167,12 +267,14 @@ pub fn infer(
 
     let (suggested_class, confidence) = match top_two(&scores) {
         Some((class, highest, second)) if highest > 0 => {
-            let mut confidence = 100 * (highest - second) / highest;
+            // 先夹取再打折，顺序不能反：负权重会把 `second` 拉成负数，公式可能算出 >100，
+            // 若先打折再夹取，「弱信号不冒充有把握」会被夹取抹掉 —— 弱点信号反而拿到 100。
+            // 整数除法向下取整（40 对 10 → 75，30 对 20 → 33）。
+            let mut confidence = (100 * (highest - second) / highest).clamp(0, 100);
             if highest < rule_set.weak_score {
                 confidence /= 2;
             }
-            // 反向证据（负权重）会把 s2 拉到负数，公式可能算出 >100，夹回来。
-            (class, confidence.clamp(0, 100))
+            (class, confidence)
         }
         // 无规则命中、总分不为正：有基线就用基线（置信度 0），没有就不给建议。
         _ => (rule_set.baseline_class.clone()?, 0),
@@ -450,5 +552,165 @@ weight = 40
         // 两个平台判据完全不同，所以必须各有一册。
         assert!(!macos.rules.is_empty());
         assert!(!linux.rules.is_empty());
+    }
+
+    // ── 装载期校验（手写策展数据的笔误必须在这里被拦住）────────────────
+
+    /// 生成一份带单条规则的最小规则表。
+    fn table_with_rule(rule_body: &str) -> String {
+        format!(
+            r#"
+[[rule_set]]
+rule_set_id = "macos-v1"
+platform = "macos"
+baseline_class = "MacDaily"
+weak_score = 20
+
+[[rule_set.rules]]
+{rule_body}
+"#
+        )
+    }
+
+    #[test]
+    fn rejects_an_empty_pattern() {
+        // 空 pattern 的 contains("") 恒真：一条笔误就能让规则对每个值命中。
+        let err = parse_rule_table(&table_with_rule(
+            "rule_id = \"r1\"\nkind = \"process\"\npattern = \"\"\nmachine_class = \"MacDev\"\nweight = 40",
+        ))
+        .expect_err("empty pattern must be rejected");
+        assert!(err.to_string().contains("empty pattern"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_unknown_kind() {
+        // kind 写错会被 signals_for 静默跳过，等于一条死规则。
+        let err = parse_rule_table(&table_with_rule(
+            "rule_id = \"r1\"\nkind = \"proces\"\npattern = \"x\"\nweight = 40",
+        ))
+        .expect_err("unknown kind must be rejected");
+        assert!(err.to_string().contains("unknown kind"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_unknown_machine_class() {
+        // 写错会把不在 MachineClass 里的裸名存进库，再让页面整页报错。
+        let err = parse_rule_table(&table_with_rule(
+            "rule_id = \"r1\"\nkind = \"process\"\npattern = \"x\"\nmachine_class = \"MacDevv\"\nweight = 40",
+        ))
+        .expect_err("unknown machine class must be rejected");
+        assert!(err.to_string().contains("not a MachineClass"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_unknown_platform() {
+        // platform 大小写写错会让整册规则永不匹配，而且不报错。
+        let text = "[[rule_set]]\nrule_set_id = \"x\"\nplatform = \"macOS\"\n";
+        let err = parse_rule_table(text).expect_err("unknown platform must be rejected");
+        assert!(err.to_string().contains("unknown platform"), "{err}");
+    }
+
+    #[test]
+    fn treats_a_blank_machine_class_as_evidence_only() {
+        // 空串按「留空」处理：只留依据不加分，而不是把空串当类别名去计分。
+        let table = parse_rule_table(&table_with_rule(
+            "rule_id = \"r1\"\nkind = \"process\"\npattern = \"xcodebuild\"\nmachine_class = \"\"\nweight = 40",
+        ))
+        .expect("blank class loads");
+        assert!(
+            table
+                .for_platform("macos")
+                .and_then(|set| set.rules.first())
+                .expect("rule")
+                .machine_class
+                .is_none()
+        );
+
+        let suggestion = infer(&summary("macos", &["xcodebuild"]), &table, "s", "t")
+            .expect("baseline suggestion");
+        // 不加分 → 落到基线；但那一条命中仍然出现在依据里。
+        assert_eq!(suggestion.suggested_class, "MacDaily");
+        assert_eq!(suggestion.confidence, 0);
+        assert_eq!(suggestion.signals.len(), 1);
+        assert_eq!(suggestion.signals[0].rule_id, "r1");
+    }
+
+    #[test]
+    fn clamps_before_halving_so_a_weak_signal_cannot_reach_full_confidence() {
+        // s1=25（弱）对 s2=-40（反向证据）→ 公式得 260；先夹取到 100，再因 s1 < weak_score
+        // 打对折 → 50。若先打折再夹取，会得 130 → 100，把「弱信号不冒充有把握」抹掉。
+        let table = parse_rule_table(
+            r#"
+[[rule_set]]
+rule_set_id = "macos-v1"
+platform = "macos"
+baseline_class = "MacDaily"
+weak_score = 30
+
+[[rule_set.rules]]
+rule_id = "weak-dev"
+kind = "process"
+pattern = "dev"
+machine_class = "MacDev"
+weight = 25
+
+[[rule_set.rules]]
+rule_id = "anti-daily"
+kind = "process"
+pattern = "daily-marker"
+machine_class = "MacDaily"
+weight = -40
+"#,
+        )
+        .expect("rule table");
+
+        let suggestion = infer(
+            &summary("macos", &["dev", "daily-marker"]),
+            &table,
+            "s",
+            "t",
+        )
+        .expect("suggestion");
+        assert_eq!(suggestion.suggested_class, "MacDev");
+        assert_eq!(suggestion.confidence, 50);
+    }
+
+    #[test]
+    fn a_tie_between_classes_yields_zero_confidence_with_evidence() {
+        // 并列是真实的可能：置信度 0 但依据非空 —— 页面必须能把它与「基线兜底」区分开。
+        let table = parse_rule_table(
+            r#"
+[[rule_set]]
+rule_set_id = "macos-v1"
+platform = "macos"
+baseline_class = "MacDaily"
+weak_score = 20
+
+[[rule_set.rules]]
+rule_id = "dev"
+kind = "process"
+pattern = "node_modules"
+machine_class = "MacDev"
+weight = 20
+
+[[rule_set.rules]]
+rule_id = "daily"
+kind = "process"
+pattern = "/Safari.app"
+machine_class = "MacDaily"
+weight = 20
+"#,
+        )
+        .expect("rule table");
+
+        let suggestion = infer(
+            &summary("macos", &["node_modules", "/Safari.app/x"]),
+            &table,
+            "s",
+            "t",
+        )
+        .expect("suggestion");
+        assert_eq!(suggestion.confidence, 0);
+        assert_eq!(suggestion.signals.len(), 2);
     }
 }

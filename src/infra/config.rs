@@ -248,15 +248,16 @@ impl AdminConfig {
         require_non_empty("agent.environment_id", &self.environment_id)?;
         require_non_empty("server.victoria_metrics_url", &self.victoria_metrics_url)?;
         if let Some(rules_file) = self.purpose_rules_file.as_deref() {
-            // 配了就必须能读、能解析：规则表拼错不该拖到「收到第一份事实才报错」。
-            // 这里只做语法级校验（不引 app 层类型，避免 infra → app 反向依赖）；
-            // "能解析但语义不对"（如缺 platform）由启动时的装载告警呈报。
             require_existing_file("purpose.rules_file", rules_file)?;
-            let text = std::fs::read_to_string(rules_file)
-                .map_err(|err| config_io(format!("read purpose.rules_file: {err}")))?;
-            toml::from_str::<toml::Value>(&text).map_err(|err| {
-                config_parse(format!(
-                    "parse purpose.rules_file {}: {err}",
+            // 用**真实的装载器**做结构化校验（不只是 TOML 语法）：规则表写错必须在启动时
+            // 就被拒，而不是静默降级成「不推断」。
+            //
+            // 取舍：这是 infra 调 app（同 crate 内允许，非硬循环）。要彻底消掉这层反向引用，
+            // 得把 PurposeRule* 的类型与装载器从 `app/purpose.rs` 挪到 `infra/`，
+            // 只把 `infer` 留在 app —— 当下换来的是 fail-fast，值得。
+            crate::app::purpose::load_rule_table(rules_file).map_err(|err| {
+                config_validation(format!(
+                    "purpose.rules_file {}: {err}",
                     rules_file.display()
                 ))
             })?;
