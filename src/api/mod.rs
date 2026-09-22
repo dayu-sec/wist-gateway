@@ -47,7 +47,7 @@ use admin_ops::{
 };
 use agent_ops::{
     poll_control_commands, poll_discovery_policies, renew_agent_credential, report_action_result,
-    submit_agent_facts, submit_agent_status,
+    submit_agent_status,
 };
 use enrollment::enroll_agent;
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
@@ -172,15 +172,10 @@ pub fn router_with_state(state: ApiState) -> Router {
         )
         .route("/api/v1/agent/enroll", post(enroll_agent))
         .route("/api/v1/agent/status", post(submit_agent_status))
-        // NOTE(hand-added): agentd 上报事实**摘要**（不是原文快照，原文走数据面）。
-        // 已在 jumo 模型 WistAgentdOnlineRegistrationInterface.ReportAgentFactSummary 声明。
-        // 显式给这条路由设 body 上限：摘要是被管机器上报的内容，不能依赖框架默认值。
-        .route(
-            "/api/v1/agent/facts",
-            post(submit_agent_facts).layer(DefaultBodyLimit::max(
-                agent_ops::MAX_FACT_SUMMARY_BODY_BYTES,
-            )),
-        )
+        // （agentd 上报事实**摘要**的原控制面路由 `POST /api/v1/agent/facts` 已删。）
+        // 事实统一走数据面：agentd 发 `OBSFACT:` 帧 → warp-parse → 网关的**内部**端点
+        // `/api/v1/ingest/agent-facts`（见 `ingest_router` 与 api/ingest.rs）。
+        // 见 doc/design/center/agent-work-delivery-plan.md §4.1。
         .route(
             "/api/v1/agent/credentials:renew",
             post(renew_agent_credential),

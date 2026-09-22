@@ -28,8 +28,8 @@ use wist_contracts::action_result::{ActionResult, FinalStatus};
 use wist_contracts::fact_summary::FactContent;
 use wist_contracts::gateway::{
     AgentStatusReport, AgentWorkState, AgentWorkStateChange, DiscoveryPoliciesReturned,
-    FactSummaryAccepted, FactSummaryAckStatus, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
-    ReportActionResult, ReportAgentFactSummary, ResultAttestation,
+    POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies, ReportActionResult,
+    ReportAgentFactSummary, ResultAttestation,
 };
 use wist_control::PollControlCommands;
 use wist_control::types::DateTime;
@@ -1021,15 +1021,14 @@ async fn enroll_agent_credential(env: &TestEnv) -> String {
         .expect("bearer token")
 }
 
-async fn post_facts(env: &TestEnv, credential: &str, report: &ReportAgentFactSummary) -> Response {
-    post_json_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/facts",
-        Some(credential),
-        report,
-    )
-    .await
+/// 把一份摘要当作**数据面转发来的记录**投给网关（这是事实唯一的入口）。
+///
+/// 控制面那条直报路由已删（`POST /api/v1/agent/facts`，见 doc/design/center/
+/// agent-work-delivery-plan.md §4.1）。
+/// 注意：本函数**不消费凭据** —— 数据面这条路没有身份校验（挂起中，见 §8 #17）。
+/// 测试里仍需要先把 agent 注册进登记表（`enroll_agent_credential`），否则会被拒。
+async fn post_facts(env: &TestEnv, report: &ReportAgentFactSummary) -> Response {
+    post_to_ingest_router(env, &data_plane_record(&report.agent_id, report)).await
 }
 
 async fn get_purpose_view(env: &TestEnv, agent_id: &str) -> serde_json::Value {
@@ -1045,33 +1044,27 @@ async fn get_purpose_view(env: &TestEnv, agent_id: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn agent_facts_route_requires_bearer_credential() {
+async fn fact_summary_ingest_rejects_an_unparseable_body() {
+    // 控制面那条路由删了，但「不可解析的上报必须显形」这条不能丢：数据面这条路同样要有。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
 
-    let rejected = post_json_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/facts",
-        None,
-        &fact_report(&["xcodebuild"]),
+    let rejected = post_to_ingest_router(
+        &env,
+        &serde_json::json!({ "agent_id": "agent-node-a", "body": "{ not json" }),
     )
     .await;
-    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
-async fn agent_facts_route_stores_summary_and_answers_with_a_suggestion() {
+async fn fact_summary_ingest_stores_the_summary_and_produces_a_suggestion() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let report = fact_report(&["/usr/bin/xcodebuild", "launchd"]);
 
-    let accepted = post_facts(&env, &credential, &report).await;
+    let accepted = post_facts(&env, &report).await;
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
-    let ack: FactSummaryAccepted = decode_json_response(accepted).await;
-    assert_eq!(ack.ack_status, FactSummaryAckStatus::Accepted);
-    assert!(ack.suggestion_id.is_some());
-    // ack 回的是**网关自算**的摘要，不是照抄声明。
-    assert_eq!(ack.content_digest, digest_of(&report));
 
     let stored = env
         .store
@@ -1079,6 +1072,7 @@ async fn agent_facts_route_stores_summary_and_answers_with_a_suggestion() {
         .await
         .expect("store read")
         .expect("fact summary");
+    // 存的是**网关自算**的摘要，不是照抄声明（数据面那条回执不回转发的载荷）。
     assert_eq!(stored.content_digest, digest_of(&report));
     assert_eq!(stored.process_count, 2);
     assert_eq!(
@@ -1088,6 +1082,15 @@ async fn agent_facts_route_stores_summary_and_answers_with_a_suggestion() {
 
     let view = get_purpose_view(&env, "agent-node-a").await;
     assert_eq!(view["agent_id"], "agent-node-a");
+    // 建议确实**落库**了（不再看回执里带不带 suggestion_id：
+    // 数据面的回执只报“这批记录处理结果”，不带业务字段）。
+    assert!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .is_some()
+    );
     assert_eq!(view["fact_summary"]["content_digest"], digest_of(&report));
     assert_eq!(view["suggestion"]["suggested_class"], "MacDev");
     // 单类命中（无次高分）→ 100；40 >= weak_score(20) 不打折。
@@ -1107,54 +1110,61 @@ async fn agent_facts_route_stores_summary_and_answers_with_a_suggestion() {
 }
 
 #[tokio::test]
-async fn agent_facts_route_is_idempotent_on_the_content_digest() {
+async fn fact_summary_ingest_is_idempotent_on_the_content_digest() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let report = fact_report(&["/usr/bin/xcodebuild"]);
 
-    let first: FactSummaryAccepted =
-        decode_json_response(post_facts(&env, &credential, &report).await).await;
-    assert_eq!(first.ack_status, FactSummaryAckStatus::Accepted);
-    let first_suggestion = first.suggestion_id.expect("suggestion id");
+    assert_eq!(
+        post_facts(&env, &report).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let first = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
 
     // 重发同一份内容：不重写、不重算，建议 id 不变（而不是被重新算成新 id）。
-    let second: FactSummaryAccepted =
-        decode_json_response(post_facts(&env, &credential, &report).await).await;
-    assert_eq!(second.ack_status, FactSummaryAckStatus::Duplicate);
     assert_eq!(
-        second.suggestion_id.as_deref(),
-        Some(first_suggestion.as_str())
+        post_facts(&env, &report).await.status(),
+        StatusCode::ACCEPTED
     );
+    let second = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
+    assert_eq!(second.suggestion_id, first.suggestion_id);
 }
 
 #[tokio::test]
-async fn agent_facts_route_dedupes_on_its_own_digest_not_the_declaration() {
+async fn fact_summary_ingest_dedupes_on_its_own_digest_not_the_declaration() {
     // 恶意/退化的 agent 声明一个**常量**摘要：若判重用声明，第二份不同内容就会被当重复，
     // 视图静默停在旧内容上。网关自算，所以必须识别出内容变了。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
 
-    let first = decode_json_response::<FactSummaryAccepted>(
+    assert_eq!(
         post_facts(
             &env,
-            &credential,
-            &fact_report_declaring(&["launchd"], "sha256:constant"),
+            &fact_report_declaring(&["launchd"], "sha256:constant")
         )
-        .await,
-    )
-    .await;
-    assert_eq!(first.ack_status, FactSummaryAckStatus::Accepted);
-
-    let second = decode_json_response::<FactSummaryAccepted>(
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
         post_facts(
             &env,
-            &credential,
-            &fact_report_declaring(&["xcodebuild"], "sha256:constant"),
+            &fact_report_declaring(&["xcodebuild"], "sha256:constant")
         )
-        .await,
-    )
-    .await;
-    assert_eq!(second.ack_status, FactSummaryAckStatus::Accepted);
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
 
     let stored = env
         .store
@@ -1162,22 +1172,29 @@ async fn agent_facts_route_dedupes_on_its_own_digest_not_the_declaration() {
         .await
         .expect("store read")
         .expect("fact summary");
-    // 存的是网关自算的摘要，不是被声明的常量。
+    // 存的是网关自算的摘要，不是被声明的常量；且第二份内容真的覆盖进去了。
     assert_ne!(stored.content_digest, "sha256:constant");
     assert_eq!(stored.process_executables, vec!["xcodebuild"]);
 }
 
 #[tokio::test]
-async fn agent_facts_route_refreshes_only_marks_on_duplicate() {
+async fn fact_summary_ingest_refreshes_only_marks_on_duplicate() {
     // 内容没变、只是又采了一轮：只刷留痕（revision/observed_at/process_count/received_at），
     // 内容列与幂等键不动，也不重算建议。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let report = fact_report(&["/usr/bin/xcodebuild"]);
 
-    let first: FactSummaryAccepted =
-        decode_json_response(post_facts(&env, &credential, &report).await).await;
-    let first_suggestion = first.suggestion_id.clone();
+    assert_eq!(
+        post_facts(&env, &report).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let first_suggestion = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
     let digest = digest_of(&report);
 
     let mut rerun = report.clone();
@@ -1185,10 +1202,20 @@ async fn agent_facts_route_refreshes_only_marks_on_duplicate() {
     rerun.observed_at = "2026-09-22T01:00:00Z".to_string();
     rerun.process_count = 42;
     rerun.reported_at = "2026-09-22T01:00:01Z".to_string();
-    let second: FactSummaryAccepted =
-        decode_json_response(post_facts(&env, &credential, &rerun).await).await;
-    assert_eq!(second.ack_status, FactSummaryAckStatus::Duplicate);
-    assert_eq!(second.suggestion_id, first_suggestion);
+    assert_eq!(
+        post_facts(&env, &rerun).await.status(),
+        StatusCode::ACCEPTED
+    );
+    // 建议不重算（id 不变）。
+    assert_eq!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .expect("suggestion")
+            .suggestion_id,
+        first_suggestion.suggestion_id
+    );
 
     let stored = env
         .store
@@ -1210,7 +1237,7 @@ async fn agent_facts_route_stores_host_and_network_discovery_fields() {
     // agentd 一直在采集发现方向的 host.id / host.name 与网卡地址，以前不上传：
     // 这三个字段是**展示用留痕**，运维要在用途页上看得见「这台到底是谁」。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let report = fact_report_with_display(
         &["/usr/bin/xcodebuild"],
         "machine-id-abc123",
@@ -1218,7 +1245,7 @@ async fn agent_facts_route_stores_host_and_network_discovery_fields() {
         &["en0 192.168.1.5/24", "utun3 10.8.0.2/32"],
     );
 
-    let accepted = post_facts(&env, &credential, &report).await;
+    let accepted = post_facts(&env, &report).await;
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
 
     let stored = env
@@ -1250,20 +1277,21 @@ async fn agent_facts_route_stores_host_and_network_discovery_fields() {
 async fn agent_facts_route_stores_empty_display_fields_for_legacy_agents() {
     // 旧 agentd 的报文里**根本没有**这三个键：`serde(default)` 必须让上报照常成功，
     // 库里留空值（页面显示「—」并注明旧版 agentd 不带这些字段）。
+    // 这里走数据面记录的 body（契约对象原样透传），所以直接把 legacy 对象序列化进 body。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let mut legacy = serde_json::to_value(fact_report(&["/usr/bin/xcodebuild"])).expect("json");
     let object = legacy.as_object_mut().expect("report object");
     object.remove("host_id");
     object.remove("host_name");
     object.remove("network_addresses");
 
-    let accepted = post_json_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/facts",
-        Some(credential.as_str()),
-        &legacy,
+    let accepted = post_to_ingest_router(
+        &env,
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "body": serde_json::to_string(&legacy).expect("legacy body"),
+        }),
     )
     .await;
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
@@ -1515,13 +1543,13 @@ async fn agent_software_route_differentiates_unknown_agent_from_empty_inventory(
 #[tokio::test]
 async fn software_inventory_is_derived_from_the_fact_summary() {
     let env = TestEnv::new().await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let report = fact_report(&[
         "/Applications/Firefox.app/Contents/MacOS/firefox",
         "/Applications/Firefox.app/Contents/MacOS/plugin-container",
         "/usr/bin/true",
     ]);
-    let accepted = post_facts(&env, &credential, &report).await;
+    let accepted = post_facts(&env, &report).await;
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
 
     let response = get_to_router(
@@ -1573,10 +1601,10 @@ async fn software_inventory_self_heals_on_a_duplicate_report() {
     // 内容没变时清单不重算（投影相同），但若上次重建没写成（进程被杀 / 库锁），
     // 重复上报要能补上 —— 否则清单会一直空着而没人知道。
     let env = TestEnv::new().await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let report = fact_report(&["/usr/bin/true"]);
     assert_eq!(
-        post_facts(&env, &credential, &report).await.status(),
+        post_facts(&env, &report).await.status(),
         StatusCode::ACCEPTED
     );
 
@@ -1594,7 +1622,7 @@ async fn software_inventory_self_heals_on_a_duplicate_report() {
 
     // 同一份内容再报一次：走 duplicate 分支（不重算 digest），但清单必须回来。
     assert_eq!(
-        post_facts(&env, &credential, &report).await.status(),
+        post_facts(&env, &report).await.status(),
         StatusCode::ACCEPTED
     );
     let entries = env
@@ -1607,12 +1635,12 @@ async fn software_inventory_self_heals_on_a_duplicate_report() {
 }
 
 #[tokio::test]
-async fn agent_facts_route_refreshes_display_fields_on_duplicate() {
+async fn fact_summary_ingest_refreshes_display_fields_on_duplicate() {
     // 内容（可执行标识集合）没变，机器却换了网、改了名：这是 **duplicate**。
     // 展示字段必须跟着刷 —— 否则页面上的 IP 会停在几天前那一轮，而旁边「入库时间」
     // 写着刚刚，运维会以为采集坏了。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let first = fact_report_with_display(
         &["/usr/bin/xcodebuild"],
         "machine-id-abc123",
@@ -1620,23 +1648,36 @@ async fn agent_facts_route_refreshes_display_fields_on_duplicate() {
         &["en0 192.168.1.5/24"],
     );
     let digest = digest_of(&first);
-    let accepted =
-        decode_json_response::<FactSummaryAccepted>(post_facts(&env, &credential, &first).await)
-            .await;
-    assert_eq!(accepted.ack_status, FactSummaryAckStatus::Accepted);
-    let first_suggestion = accepted.suggestion_id.clone();
+    assert_eq!(
+        post_facts(&env, &first).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let first_suggestion = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
 
     let renamed = first.with_display(
         "machine-id-abc123".to_string(),
         "macbook-pro-renamed".to_string(),
         vec!["en0 10.0.0.9/24".to_string()],
     );
-    let duplicate =
-        decode_json_response::<FactSummaryAccepted>(post_facts(&env, &credential, &renamed).await)
-            .await;
-    assert_eq!(duplicate.ack_status, FactSummaryAckStatus::Duplicate);
+    assert_eq!(
+        post_facts(&env, &renamed).await.status(),
+        StatusCode::ACCEPTED
+    );
     // 只有留痕刷新：建议不重算。
-    assert_eq!(duplicate.suggestion_id, first_suggestion);
+    assert_eq!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .expect("suggestion")
+            .suggestion_id,
+        first_suggestion.suggestion_id
+    );
 
     let stored = env
         .store
@@ -1652,27 +1693,41 @@ async fn agent_facts_route_refreshes_display_fields_on_duplicate() {
 }
 
 #[tokio::test]
-async fn agent_facts_route_recomputes_when_the_content_changes() {
+async fn fact_summary_ingest_recomputes_when_the_content_changes() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
 
-    let first = decode_json_response::<FactSummaryAccepted>(
-        post_facts(&env, &credential, &fact_report(&["launchd"])).await,
-    )
-    .await;
+    assert_eq!(
+        post_facts(&env, &fact_report(&["launchd"])).await.status(),
+        StatusCode::ACCEPTED
+    );
     // 只有 launchd：没命中规则 → 回落到基线 MacDaily。
     let view = get_purpose_view(&env, "agent-node-a").await;
     assert_eq!(view["suggestion"]["suggested_class"], "MacDaily");
     assert_eq!(view["suggestion"]["confidence"], 0);
-    assert!(first.suggestion_id.is_some());
+    let first_suggestion = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
 
     // 内容变了：覆盖式入库并重算，建议 id 也应是新的。
     let changed = fact_report(&["xcodebuild"]);
-    let second =
-        decode_json_response::<FactSummaryAccepted>(post_facts(&env, &credential, &changed).await)
-            .await;
-    assert_eq!(second.ack_status, FactSummaryAckStatus::Accepted);
-    assert_ne!(second.suggestion_id, first.suggestion_id);
+    assert_eq!(
+        post_facts(&env, &changed).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let second_suggestion = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
+    assert_ne!(
+        second_suggestion.suggestion_id,
+        first_suggestion.suggestion_id
+    );
 
     let view = get_purpose_view(&env, "agent-node-a").await;
     assert_eq!(view["fact_summary"]["content_digest"], digest_of(&changed));
@@ -1683,10 +1738,10 @@ async fn agent_facts_route_recomputes_when_the_content_changes() {
 async fn agent_facts_route_rejects_an_overlong_content_digest() {
     // 声明会进告警日志：不限长就能让一条上报写出几 MB 的单行日志。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let report = fact_report_declaring(&["xcodebuild"], &"d".repeat(1024));
 
-    let response = post_facts(&env, &credential, &report).await;
+    let response = post_facts(&env, &report).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -1694,17 +1749,17 @@ async fn agent_facts_route_rejects_an_overlong_content_digest() {
 async fn agent_facts_route_rejects_an_overlong_host_id() {
     // 上报体是**被管机器**给的内容，网关必须自己封顶，不能指望 agent 守规矩。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let report = fact_report_with_display(&["xcodebuild"], &"h".repeat(1024), "macbook-pro", &[]);
 
-    let response = post_facts(&env, &credential, &report).await;
+    let response = post_facts(&env, &report).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn agent_facts_route_rejects_too_many_network_addresses() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let addresses: Vec<String> = (0..300)
         .map(|index| format!("en{index} 10.0.0.1/24"))
         .collect();
@@ -1714,18 +1769,18 @@ async fn agent_facts_route_rejects_too_many_network_addresses() {
         addresses,
     );
 
-    let response = post_facts(&env, &credential, &report).await;
+    let response = post_facts(&env, &report).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn agent_facts_route_refuses_an_unknown_envelope() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     let mut report = fact_report(&["xcodebuild"]);
     report.kind = "something_else".to_string();
 
-    let response = post_facts(&env, &credential, &report).await;
+    let response = post_facts(&env, &report).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(
         env.store
@@ -1737,22 +1792,31 @@ async fn agent_facts_route_refuses_an_unknown_envelope() {
 }
 
 #[tokio::test]
-async fn agent_facts_route_stores_facts_even_without_a_rule_table() {
+async fn fact_summary_ingest_stores_facts_even_without_a_rule_table() {
     // 未配置规则表：事实是 Agent 的数据，必须落库；只是不产出建议。
     let env = TestEnv::new().await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
 
-    let ack: FactSummaryAccepted =
-        decode_json_response(post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await)
-            .await;
-    assert_eq!(ack.ack_status, FactSummaryAckStatus::Accepted);
-    assert!(ack.suggestion_id.is_none());
+    assert_eq!(
+        post_facts(&env, &fact_report(&["xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
     assert!(
         env.store
             .get_agent_fact_summary("agent-node-a")
             .await
             .expect("store read")
             .is_some()
+    );
+    // 没有规则表 → 确实没有建议。
+    assert!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .is_none()
     );
 
     let view = get_purpose_view(&env, "agent-node-a").await;
@@ -1764,15 +1828,24 @@ async fn agent_facts_route_stores_facts_even_without_a_rule_table() {
 async fn agent_purpose_route_clears_a_stale_suggestion_when_nothing_should_be_suggested() {
     // 平台没有规则册 → 这次确实不该有建议；旧建议是照着旧事实算的，必须清掉。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
-    post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await;
+    enroll_agent_credential(&env).await;
+    post_facts(&env, &fact_report(&["xcodebuild"])).await;
     assert!(get_purpose_view(&env, "agent-node-a").await["suggestion"].is_object());
 
     let mut linux_report = fact_report(&["postgres"]);
     linux_report.os = "linux".to_string();
-    let ack: FactSummaryAccepted =
-        decode_json_response(post_facts(&env, &credential, &linux_report).await).await;
-    assert!(ack.suggestion_id.is_none());
+    assert_eq!(
+        post_facts(&env, &linux_report).await.status(),
+        StatusCode::ACCEPTED
+    );
+    // 平台无规则册 → 确实不该有建议，库里必须是空的（旧建议不清掉才是错的）。
+    assert!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .is_none()
+    );
 
     let view = get_purpose_view(&env, "agent-node-a").await;
     assert_eq!(
@@ -1799,8 +1872,7 @@ async fn agent_purpose_route_requires_admin_bearer() {
 #[tokio::test]
 async fn agent_purpose_view_is_empty_before_any_facts() {
     let env = TestEnv::new().await;
-    let credential = enroll_agent_credential(&env).await;
-    let _ = credential;
+    enroll_agent_credential(&env).await;
 
     let view = get_purpose_view(&env, "agent-node-a").await;
     // 「还没报过事实」与「这台机器不存在」是两回事：这里 200 + 空视图，不是 404。
@@ -1827,7 +1899,7 @@ async fn agent_purpose_route_returns_404_for_an_unknown_agent() {
 ///
 /// 这是“用夹具数据验证计算”的那份证据；规则表文件缺失（如单独拷本仓）时跳过。
 #[tokio::test]
-async fn agent_facts_route_infers_with_the_checked_in_rule_table() {
+async fn fact_summary_ingest_infers_with_the_checked_in_rule_table() {
     // 相对本 crate 根：../../wist-design/jumo/model/content/purpose-rules.toml
     let path = std::path::Path::new("../../wist-design/jumo/model/content/purpose-rules.toml");
     let Ok(rules) = std::fs::read_to_string(path) else {
@@ -1835,7 +1907,7 @@ async fn agent_facts_route_infers_with_the_checked_in_rule_table() {
     };
 
     let env = TestEnv::new_with_purpose_rules(Some(&rules)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
     // 一台真开发机上的典型进程（含一条 Electron 应用自带的 node_modules，应当被排除）。
     let processes = [
         "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild",
@@ -1843,9 +1915,10 @@ async fn agent_facts_route_infers_with_the_checked_in_rule_table() {
         "/Applications/OrbStack.app/Contents/MacOS/OrbStack",
         "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/node_modules/x",
     ];
-    let ack: FactSummaryAccepted =
-        decode_json_response(post_facts(&env, &credential, &fact_report(&processes)).await).await;
-    assert_eq!(ack.ack_status, FactSummaryAckStatus::Accepted);
+    assert_eq!(
+        post_facts(&env, &fact_report(&processes)).await.status(),
+        StatusCode::ACCEPTED
+    );
 
     let view = get_purpose_view(&env, "agent-node-a").await;
     assert_eq!(view["suggestion"]["suggested_class"], "MacDev");
@@ -2261,15 +2334,17 @@ async fn discovery_policies_poll_serves_the_checked_in_table() {
 }
 
 #[tokio::test]
-async fn agent_facts_route_survives_a_corrupt_json_column() {
+async fn fact_summary_ingest_survives_a_corrupt_json_column() {
     // 判重路径若顺带反序列化三个 JSON 列，一旦某列仕掉就会把**新摘要永远挡在门外**
     // （upsert 根本走不到），坏行无法被覆盖自愈。这里把列真的写坏来验。
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
-    let first: FactSummaryAccepted =
-        decode_json_response(post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await)
-            .await;
-    assert_eq!(first.ack_status, FactSummaryAckStatus::Accepted);
+    enroll_agent_credential(&env).await;
+    assert_eq!(
+        post_facts(&env, &fact_report(&["xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
 
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", env.config.sqlite_path.display()))
         .await
@@ -2283,17 +2358,20 @@ async fn agent_facts_route_survives_a_corrupt_json_column() {
     pool.close().await;
 
     // 1）同一份内容再报：判重只读 digest，不该 500。
-    let duplicate: FactSummaryAccepted =
-        decode_json_response(post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await)
-            .await;
-    assert_eq!(duplicate.ack_status, FactSummaryAckStatus::Duplicate);
+    assert_eq!(
+        post_facts(&env, &fact_report(&["xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
 
     // 2）换一份内容：必须能覆盖写入，坏列随之自愈。
-    let second: FactSummaryAccepted = decode_json_response(
-        post_facts(&env, &credential, &fact_report(&["/opt/homebrew/bin/mise"])).await,
-    )
-    .await;
-    assert_eq!(second.ack_status, FactSummaryAckStatus::Accepted);
+    assert_eq!(
+        post_facts(&env, &fact_report(&["/opt/homebrew/bin/mise"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
 
     let stored = env
         .store
@@ -2310,13 +2388,13 @@ async fn agent_facts_route_survives_a_corrupt_json_column() {
 #[tokio::test]
 async fn agent_facts_route_rejects_oversized_and_invalid_input() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
+    enroll_agent_credential(&env).await;
 
     // 条数超限（被管机器可以自己控制数组长度，网关必须自己封顶）。
     let mut too_many = fact_report(&["xcodebuild"]);
     too_many.process_executables = vec!["x".to_string(); 10_001];
     assert_eq!(
-        post_facts(&env, &credential, &too_many).await.status(),
+        post_facts(&env, &too_many).await.status(),
         StatusCode::BAD_REQUEST
     );
 
@@ -2324,7 +2402,7 @@ async fn agent_facts_route_rejects_oversized_and_invalid_input() {
     let mut too_long = fact_report(&["xcodebuild"]);
     too_long.process_executables = vec!["x".repeat(4097)];
     assert_eq!(
-        post_facts(&env, &credential, &too_long).await.status(),
+        post_facts(&env, &too_long).await.status(),
         StatusCode::BAD_REQUEST
     );
 
@@ -2332,7 +2410,7 @@ async fn agent_facts_route_rejects_oversized_and_invalid_input() {
     let mut negative = fact_report(&["xcodebuild"]);
     negative.process_count = -1;
     assert_eq!(
-        post_facts(&env, &credential, &negative).await.status(),
+        post_facts(&env, &negative).await.status(),
         StatusCode::BAD_REQUEST
     );
 
@@ -2350,11 +2428,21 @@ async fn agent_facts_route_rejects_oversized_and_invalid_input() {
 async fn agent_purpose_route_recomputes_a_missing_suggestion() {
     // 首次上报时还没配规则表：只入库、无建议。
     let env = TestEnv::new().await;
-    let credential = enroll_agent_credential(&env).await;
-    let ack: FactSummaryAccepted =
-        decode_json_response(post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await)
-            .await;
-    assert!(ack.suggestion_id.is_none());
+    enroll_agent_credential(&env).await;
+    assert_eq!(
+        post_facts(&env, &fact_report(&["xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    // 首次上报时还没配规则表：只入库、无建议。
+    assert!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .is_none()
+    );
 
     // 之后配上规则表（重启生效）。事实没变、agentd 不会再报 ——
     // 读取路径必须自愈，否则「有事实、无建议」会无限期留着。
@@ -2380,8 +2468,8 @@ async fn agent_purpose_route_recomputes_a_missing_suggestion() {
 #[tokio::test]
 async fn agent_purpose_route_recomputes_when_the_rule_set_version_changes() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
-    let credential = enroll_agent_credential(&env).await;
-    post_facts(&env, &credential, &fact_report(&["xcodebuild"])).await;
+    enroll_agent_credential(&env).await;
+    post_facts(&env, &fact_report(&["xcodebuild"])).await;
     assert_eq!(
         get_purpose_view(&env, "agent-node-a").await["suggestion"]["rule_set_id"],
         "macos-v1"

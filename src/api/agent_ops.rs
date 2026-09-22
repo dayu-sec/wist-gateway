@@ -335,28 +335,16 @@ pub async fn report_action_result(
 ///
 /// 判重命中时**只刷留痕**（`revision` / `observed_at` / `process_count` / `received_at`）：
 /// 内容没变就不重写、不重算、不重复计分，只记录「何时又见到同一份内容」。
-pub async fn submit_agent_facts(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(input): Json<ReportAgentFactSummary>,
-) -> Response {
-    // 身份先定：控制面这条路凭**凭据**锚定身份（声明的 agent_id/instance_id 必须与凭据一致）。
-    let agent =
-        match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await {
-            Ok(agent) => agent,
-            Err(response) => return response,
-        };
-    ingest_fact_summary(&state, &agent, input).await
-}
-
-/// 事实摘要「校验 → 判重 → 入库 → 推断」的**共享核心**。
 ///
-/// 两条上报路径都收敛到这里，口径只有一份：
-///   - 控制面直报：`POST /api/v1/agent/facts`（凭据认证）；
-///   - 数据面订阅：`POST /api/v1/ingest/agent-facts`（warp-parse 转发，见 [`super::ingest`]）。
+/// 事实摘要「校验 → 判重 → 入库 → 推断」的唯一实现。
 ///
-/// **校验放在这里而不是各调用方**：body 上限、条数上限、判重键必须一致，
-/// 否则同一份摘要在两条路径上会得出不同结果。
+/// **入口只有数据面订阅一条**：`POST /api/v1/ingest/agent-facts`
+/// （warp-parse 转发，见 [`super::ingest`]）。原来还有一条控制面直报
+/// （`POST /api/v1/agent/facts`，agent 凭据认证），已随「统一走数据面」废弃 ——
+/// 见 `doc/design/center/agent-work-delivery-plan.md` §4.1。
+///
+/// **校验放在这里而不是调用方**：body 上限、条数上限、判重键只有一份，
+/// 否则同一份摘要在不同入口会得出不同结果。
 ///
 /// 调用方负责的只有一件事：**先把 `agent` 钉死**（身份从哪来由路径决定）。
 pub(super) async fn ingest_fact_summary(
