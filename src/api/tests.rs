@@ -1287,6 +1287,188 @@ async fn agent_facts_route_stores_empty_display_fields_for_legacy_agents() {
     );
 }
 
+// ── 数据面订阅端点（warp-parse → 网关内部接入）────────────────────────────
+//
+// 与上面「控制面直报」共用同一个核心（`agent_ops::ingest_fact_summary`），所以这里
+// **不**重复测入库/判重/推断语义，只测这一层独有的东西：记录形状、身份对不上、批次。
+
+/// 把一份摘要包装成 warp-parse 记录（`agent-facts/json` sink 的落盘形状）。
+/// 形状取自真实输出：`{"schema","agent_id","observed_at","seq","category","log_desc","body",…}`，
+/// 其中 `body` 是契约对象的 **JSON 文本**（WPL/OML 不做字段建模）。
+fn data_plane_record(envelope_agent: &str, report: &ReportAgentFactSummary) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "v1",
+        "agent_id": envelope_agent,
+        "observed_at": "2026-09-22T00:00:00Z",
+        "seq": 4242,
+        "category": "agent.fact",
+        "log_desc": "Agent 事实",
+        "body": serde_json::to_string(report).expect("serialize report"),
+    })
+}
+
+async fn post_to_ingest_router(env: &TestEnv, payload: &serde_json::Value) -> Response {
+    super::ingest_router(super::build_state(
+        env.config.clone(),
+        Arc::clone(&env.store_handle),
+    ))
+    .oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/ingest/agent-facts")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(payload).expect("body")))
+            .expect("request"),
+    )
+    .await
+    .expect("route response")
+}
+
+#[tokio::test]
+async fn ingest_endpoint_stores_fact_summary_forwarded_by_the_data_plane() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    // 这条路径**不带 agent 凭据**：只要 agent 在登记表里、instance 对得上就收。
+    enroll_agent_credential(&env).await;
+    let report = fact_report(&["/usr/bin/xcodebuild", "launchd"]);
+    let record = data_plane_record("agent-node-a", &report);
+
+    let response = post_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    // 判重键仍是**网关自算**的那一份，不是转发链路上那一份。
+    assert_eq!(stored.content_digest, digest_of(&report));
+    assert_eq!(stored.process_count, 2);
+
+    // 入库后用途推断照常跑（与直报路径同一个核心）——这才算链路通了。
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["suggestion"]["suggested_class"], "MacDev");
+}
+
+#[tokio::test]
+async fn ingest_endpoint_accepts_a_batch_of_records() {
+    // sink 的 `batch_size` 将来调大就会出现数组，这里先钉住形状。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = data_plane_record("agent-node-a", &fact_report(&["/usr/bin/xcodebuild"]));
+
+    let response = post_to_ingest_router(&env, &serde_json::json!([record])).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["ingested"], 1);
+    assert_eq!(body["rejected"], 0);
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_an_unregistered_agent() {
+    // 「不存在的机器」不得被写进库：登记表是这条路径唯一的身份锚。
+    let env = TestEnv::new().await;
+    // 信封与正文都自称同一台**未注册**的 agent：先排除「自称不一致」那条分支。
+    let mut report = fact_report(&["/usr/bin/xcodebuild"]);
+    report.agent_id = "agent-ghost".to_string();
+    let record = data_plane_record("agent-ghost", &report);
+
+    let response = post_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["rejected"], 1);
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("unknown agent_id"),
+        "got {body}"
+    );
+    assert!(
+        env.store
+            .get_agent_fact_summary("agent-ghost")
+            .await
+            .expect("store read")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_an_instance_id_mismatch() {
+    // agentd 重装后 instance_id 会变。若照收，两台机器的观测会混进同一行。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let mut report = fact_report(&["/usr/bin/xcodebuild"]);
+    report.instance_id = "node-b".to_string();
+
+    let response = post_to_ingest_router(&env, &data_plane_record("agent-node-a", &report)).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("instance_id mismatch"),
+        "got {body}"
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_an_envelope_body_disagreement() {
+    // 信封与正文的自称不一致，说明中间环节出了问题 —— 现在两边都不是身份依据，
+    // 但不一致必须显形，而不是挑一个信。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = data_plane_record("agent-other", &fact_report(&["/usr/bin/xcodebuild"]));
+
+    let response = post_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("disagrees with body agent_id"),
+        "got {body}"
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_reports_the_shape_it_received_when_the_record_is_wrong() {
+    // 数据面的记录结构一变，这条错误要能直接指出收到了什么（否则只能靠翻代码猜）。
+    let env = TestEnv::new().await;
+
+    let response = post_to_ingest_router(&env, &serde_json::json!({"hello": "world"})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let failure = body["failures"][0].as_str().expect("failure text");
+    assert!(
+        failure.contains("not a data-plane fact record") && failure.contains("hello"),
+        "got {failure}"
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_a_body_that_is_not_a_fact_summary() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = serde_json::json!({
+        "agent_id": "agent-node-a",
+        "body": "{\"unexpected\": true}",
+    });
+
+    let response = post_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("body is not a ReportAgentFactSummary"),
+        "got {body}"
+    );
+}
+
 #[tokio::test]
 async fn agent_facts_route_refreshes_display_fields_on_duplicate() {
     // 内容（可执行标识集合）没变，机器却换了网、改了名：这是 **duplicate**。
@@ -3462,6 +3644,8 @@ impl TestEnv {
                 std::fs::write(&path, text).expect("write discovery policies");
                 path
             }),
+            // 内部接入端点默认关：测试走 `router()`，明文监听由 main.rs 单独起。
+            ingest_listen_addr: None,
         };
         // A temp-file DB (not `:memory:`) because the router may use several
         // pooled connections; `SqliteStore` is `Clone` and shares the same pool.

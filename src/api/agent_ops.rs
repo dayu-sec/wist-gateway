@@ -340,15 +340,34 @@ pub async fn submit_agent_facts(
     headers: HeaderMap,
     Json(input): Json<ReportAgentFactSummary>,
 ) -> Response {
-    if input.api_version != API_VERSION_V1 || input.kind != REPORT_AGENT_FACT_SUMMARY_KIND {
-        return (StatusCode::BAD_REQUEST, "invalid agent fact summary report").into_response();
-    }
+    // 身份先定：控制面这条路凭**凭据**锚定身份（声明的 agent_id/instance_id 必须与凭据一致）。
     let agent =
         match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await {
             Ok(agent) => agent,
             Err(response) => return response,
         };
-    // 先认证再验内容：不对未认证的请求做多余工。上限由网关自己封顶，不能指望 agent 守规矩。
+    ingest_fact_summary(&state, &agent, input).await
+}
+
+/// 事实摘要「校验 → 判重 → 入库 → 推断」的**共享核心**。
+///
+/// 两条上报路径都收敛到这里，口径只有一份：
+///   - 控制面直报：`POST /api/v1/agent/facts`（凭据认证）；
+///   - 数据面订阅：`POST /api/v1/ingest/agent-facts`（warp-parse 转发，见 [`super::ingest`]）。
+///
+/// **校验放在这里而不是各调用方**：body 上限、条数上限、判重键必须一致，
+/// 否则同一份摘要在两条路径上会得出不同结果。
+///
+/// 调用方负责的只有一件事：**先把 `agent` 钉死**（身份从哪来由路径决定）。
+pub(super) async fn ingest_fact_summary(
+    state: &ApiState,
+    agent: &StoredAgentRegistration,
+    input: ReportAgentFactSummary,
+) -> Response {
+    if input.api_version != API_VERSION_V1 || input.kind != REPORT_AGENT_FACT_SUMMARY_KIND {
+        return (StatusCode::BAD_REQUEST, "invalid agent fact summary report").into_response();
+    }
+    // 上限由网关自己封顶，不能指望 agent 守规矩。
     if let Err(detail) = validate_fact_summary(&input) {
         return (StatusCode::BAD_REQUEST, detail).into_response();
     }
@@ -416,7 +435,7 @@ pub async fn submit_agent_facts(
                 StatusCode::ACCEPTED,
                 Json(FactSummaryAccepted {
                     report_id: input.report_id,
-                    agent_id: agent.agent_id,
+                    agent_id: agent.agent_id.clone(),
                     content_digest: digest,
                     ack_status: FactSummaryAckStatus::Duplicate,
                     suggestion_id,
@@ -460,7 +479,7 @@ pub async fn submit_agent_facts(
             .into_response();
     }
 
-    let suggestion_id = match ensure_fresh_suggestion(&state, &summary, None, &received_at).await {
+    let suggestion_id = match ensure_fresh_suggestion(state, &summary, None, &received_at).await {
         Ok(suggestion) => suggestion.map(|suggestion| suggestion.suggestion_id),
         Err(detail) => {
             eprintln!(

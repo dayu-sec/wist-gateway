@@ -18,6 +18,7 @@ mod admin_ops;
 mod agent_ops;
 mod enrollment;
 mod host_metrics;
+mod ingest;
 mod install;
 // NOTE(hand-added): 安装包的拉取/本地缓存（管理面设置来源地址后网关先拉到本地，
 // 之后统一从网关分发）。对应 jumo 模型 WistGatewayManagementInterface 的
@@ -47,6 +48,7 @@ use agent_ops::{
 };
 use enrollment::enroll_agent;
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
+use ingest::{MAX_INGEST_BODY_BYTES, ingest_agent_facts};
 use install::{
     download_agent_package, get_agent_initial_config_with_token, get_agent_install_code,
     get_agent_install_script, get_agent_install_script_signature,
@@ -114,8 +116,38 @@ pub struct AdminRuntimeState {
 }
 
 pub fn router(config: AdminConfig, store: Arc<dyn Store>) -> Router {
+    router_with_state(build_state(config, store))
+}
+
+/// 装配共享状态。两个监听（对外 HTTPS / 数据面内部 HTTP）**共用同一份**：
+/// 规则表、策略表、会话运行态与限流器都只能有一份，否则两条路径的行为会不一致。
+pub fn build_state(config: AdminConfig, store: Arc<dyn Store>) -> ApiState {
     let purpose_rules = load_purpose_rules(&config);
     let discovery_policies = load_discovery_policies(&config);
+    ApiState {
+        config,
+        store,
+        runtime: Arc::new(Mutex::new(AdminRuntimeState::default())),
+        rate_limits: Arc::new(Mutex::new(rate_limit::RateLimitState::default())),
+        purpose_rules,
+        discovery_policies,
+    }
+}
+
+/// 数据面订阅端的**内部**路由：只含内部接入端点，不挂任何管理面/agent 面路由。
+///
+/// 为什么要单独一个 router：它要挂到**明文**监听上（见 `main.rs` 与 `infra::config` 的 `[ingest]` 段）。
+/// 对外那张监听是 HTTPS（自签证书），而 warp-parse 的 sink 连接器没有 TLS 参数，接不上。
+pub fn ingest_router(state: ApiState) -> Router {
+    Router::new()
+        .route(
+            "/api/v1/ingest/agent-facts",
+            post(ingest_agent_facts).layer(DefaultBodyLimit::max(MAX_INGEST_BODY_BYTES)),
+        )
+        .with_state(state)
+}
+
+pub fn router_with_state(state: ApiState) -> Router {
     Router::new()
         .route("/api/v1/agent/install-code", get(get_agent_install_code))
         .route(
@@ -211,14 +243,7 @@ pub fn router(config: AdminConfig, store: Arc<dyn Store>) -> Router {
             "/api/v1/admin/agents/{agent_id}/credentials:revoke",
             post(revoke_agent_credential),
         )
-        .with_state(ApiState {
-            config,
-            store,
-            runtime: Arc::new(Mutex::new(AdminRuntimeState::default())),
-            rate_limits: Arc::new(Mutex::new(rate_limit::RateLimitState::default())),
-            purpose_rules,
-            discovery_policies,
-        })
+        .with_state(state)
 }
 
 #[cfg(test)]

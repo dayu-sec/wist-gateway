@@ -10,6 +10,8 @@ use super::{load_install_script_public_key_pem, sha256_hex};
 use wist_error::ConfigReason;
 
 const DEFAULT_CONFIG_PATH: &str = "wist-gateway.toml";
+/// `[ingest]` 段缺省时的内部接入端点：只绑环回，避免明文监听被动暴露到网卡上。
+const DEFAULT_INGEST_LISTEN_ADDR: &str = "127.0.0.1:3001";
 const CONFIG_ENV: &str = "WIST_GATEWAY_CONFIG";
 /// 显式设置即覆盖文件值；显式置空 = 回到默认 SQLite 文件存储。
 const ENV_DATABASE_URL: &str = "WIST_GATEWAY_DATABASE_URL";
@@ -54,6 +56,9 @@ pub struct AdminConfig {
     pub purpose_rules_file: Option<PathBuf>,
     /// 发现方向策略表（策展数据）。未配置时：不下发该端点，Agent 回落到自己的内建默认值。
     pub discovery_policies_file: Option<PathBuf>,
+    /// 数据面订阅端的内部接入端点（明文 HTTP，只应绑环回）。
+    /// `None` = 关闭订阅（见 [`RawIngestConfig`]）。
+    pub ingest_listen_addr: Option<String>,
 }
 
 pub use wist_error::ConfigError;
@@ -80,6 +85,22 @@ struct RawAdminConfig {
     purpose: RawPurposeConfig,
     #[serde(default)]
     discovery: RawDiscoveryConfig,
+    #[serde(default)]
+    ingest: RawIngestConfig,
+}
+
+/// `[ingest]` 段：数据面（warp-parse）**订阅端**的内部接入端点。
+///
+/// 为什么不复用 `server.listen_addr`：那张监听是 HTTPS（自签证书），而数据面的 sink
+/// 连接器**没有 TLS 参数**，打不进来。按设计这就是「数据面 → 网关的**内部信任边界**」
+/// （见 doc/design/center/agent-work-delivery-plan.md §4），所以是**明文 HTTP 且只绑环回**。
+///
+/// 缺省（无此段）→ **默认开启**，否则数据面上报落地无处可去；
+/// 显式置空（`listen_addr = ""`）→ 关闭，即网关不订阅数据面。
+#[derive(Debug, Default, Deserialize)]
+struct RawIngestConfig {
+    #[serde(default)]
+    listen_addr: Option<String>,
 }
 
 /// `[purpose]` 段。缺省时不装载规则表：摘要照常入库，但不产出建议。
@@ -237,6 +258,11 @@ impl AdminConfig {
                     .transpose()?,
             )
             .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            ingest_listen_addr: match raw.ingest.listen_addr.as_deref() {
+                // 缺省（无 `[ingest]` 段）= 开，默认只绑环回；显式置空 = 关。
+                None => Some(DEFAULT_INGEST_LISTEN_ADDR.to_string()),
+                Some(value) => normalize_optional(Some(expand_env(value)?)),
+            },
         })
     }
 
@@ -300,6 +326,21 @@ impl AdminConfig {
             return Err(config_validation(format!(
                 "unsupported store.database_url scheme (this build implements SQLite only): {database_url}"
             )));
+        }
+        if let Some(ingest_addr) = self.ingest_listen_addr.as_deref() {
+            // 这个监听器是**明文 HTTP**：地址写错必须在启动时被拒，而不是等到第一个
+            // 数据面帧打进来才发现。也不允许与 TLS 监听撞端口（两者语义完全不同）。
+            if ingest_addr.parse::<std::net::SocketAddr>().is_err() {
+                return Err(config_validation(format!(
+                    "ingest.listen_addr must be host:port, got {ingest_addr}"
+                )));
+            }
+            if ingest_addr == self.listen_addr {
+                return Err(config_validation(format!(
+                    "ingest.listen_addr must differ from server.listen_addr ({ingest_addr}): \
+                     the ingest endpoint is plain HTTP and must not share the TLS listener"
+                )));
+            }
         }
         Ok(())
     }

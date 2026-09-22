@@ -43,3 +43,14 @@ rules_file = ""
 # 注意：**改了策略内容必须同时 bump policy_version**。Agent 靠版本号判断手上那份
 # 是不是同一版；只改值不改版本号，已经拉过表的 Agent 不会重读。
 policies_file = ""
+
+[ingest]
+# 数据面（warp-parse）**订阅端**的内部接入端点。
+#
+# 为什么不复用 server.listen_addr：那张监听是 HTTPS（自签证书），而数据面的 sink
+# 连接器没有 TLS 参数，打不进来。按设计这就是「数据面 → 网关的**内部信任边界**」
+# （doc/design/center/agent-work-delivery-plan.md §4），所以是**明文 HTTP、只绑环回**。
+#
+# 缺省（无本段或本键）→ 默认 127.0.0.1:3001；置空（listen_addr = ""）→ 关闭订阅。
+# 只绑环回；改成其它地址等于把明文端点暴露到网卡上，先想清楚。
+listen_addr = "127.0.0.1:3001"

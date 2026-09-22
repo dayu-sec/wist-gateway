@@ -31,13 +31,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config =
         wist_gateway::infra::AdminConfig::load_from_env().map_err(|err| err.into_boxed_std())?;
     let addr = config.listen_addr.clone();
+    let ingest_addr = config.ingest_listen_addr.clone();
     let store = build_store(&config).await?;
     let tls_config = wist_gateway::infra::load_admin_tls_config(&config)?;
+    // 两个监听共用一份状态：规则表、策略表、会话运行态与限流器都只能有一份。
+    let state = wist_gateway::api::build_state(config, store);
+
+    if let Some(ingest_addr) = ingest_addr {
+        // 数据面（warp-parse）订阅端的**内部**接入端点：明文 HTTP，默认只绑环回。
+        // 为什么不能复用下面的 HTTPS 监听：数据面的 sink 连接器没有 TLS 参数（见 api/ingest.rs）。
+        let ingest_listener = TcpListener::bind(&ingest_addr).await?;
+        println!("wist-gateway ingest listening on http://{ingest_addr} (data plane only)");
+        let ingest_app = wist_gateway::api::ingest_router(state.clone());
+        tokio::spawn(async move {
+            if let Err(err) = axum::serve(ingest_listener, ingest_app).await {
+                // 内部端点挂了不让整个网关跟着退：控制面还能用，只是不再订阅数据面。
+                eprintln!("ingest listener stopped: {err}");
+            }
+        });
+    } else {
+        println!("wist-gateway ingest endpoint disabled ([ingest] listen_addr is empty)");
+    }
+
     let listener = TcpListener::bind(&addr).await?;
     println!("wist-gateway listening on https://{addr}");
     serve_tls(
         listener,
-        wist_gateway::api::router(config, store),
+        wist_gateway::api::router_with_state(state),
         tls_config,
     )
     .await?;
