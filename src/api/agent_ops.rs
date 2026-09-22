@@ -154,7 +154,7 @@ pub async fn poll_control_commands(
 /// 「这台网关从未配置」变得无法区分，而 agentd 必须能分辨才能决定是应用空策略
 /// 还是继续用自己的内建默认值 —— 静默发空表等于把平台的配置缺失伪装成一次成功下发。
 ///
-/// 策略表是幂等内容：拉到的`policy_version` 未变时由 agentd 自行跳过重算。
+/// 策略表是幂等内容：拉到的 `policy_version` 未变时由 agentd 自行跳过重算。
 pub async fn poll_discovery_policies(
     State(state): State<ApiState>,
     headers: HeaderMap,
