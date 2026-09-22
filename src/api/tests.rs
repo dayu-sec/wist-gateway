@@ -984,6 +984,25 @@ fn fact_report_declaring(processes: &[&str], declared: &str) -> ReportAgentFactS
     report
 }
 
+/// 一份带发现展示字段的报文（主机标识 / 主机名 / 网卡地址）。
+///
+/// 展示字段不进内容摘要，所以摘要仍按内容字段算 —— 这正是要锁住的前提。
+fn fact_report_with_display(
+    processes: &[&str],
+    host_id: &str,
+    host_name: &str,
+    network_addresses: &[&str],
+) -> ReportAgentFactSummary {
+    fact_report(processes).with_display(
+        host_id.to_string(),
+        host_name.to_string(),
+        network_addresses
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+    )
+}
+
 /// 注册一个 Agent 并拿回 bearer 凭据（事实上报路径要它）。
 async fn enroll_agent_credential(env: &TestEnv) -> String {
     let token = env.issue_token().await;
@@ -1187,6 +1206,133 @@ async fn agent_facts_route_refreshes_only_marks_on_duplicate() {
 }
 
 #[tokio::test]
+async fn agent_facts_route_stores_host_and_network_discovery_fields() {
+    // agentd 一直在采集发现方向的 host.id / host.name 与网卡地址，以前不上传：
+    // 这三个字段是**展示用留痕**，运维要在用途页上看得见「这台到底是谁」。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    let credential = enroll_agent_credential(&env).await;
+    let report = fact_report_with_display(
+        &["/usr/bin/xcodebuild"],
+        "machine-id-abc123",
+        "macbook-pro",
+        &["en0 192.168.1.5/24", "utun3 10.8.0.2/32"],
+    );
+
+    let accepted = post_facts(&env, &credential, &report).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    assert_eq!(stored.host_id, "machine-id-abc123");
+    assert_eq!(stored.host_name, "macbook-pro");
+    assert_eq!(
+        stored.network_addresses,
+        vec!["en0 192.168.1.5/24", "utun3 10.8.0.2/32"]
+    );
+
+    // 管理面直接序列化同一个结构：这里锁住「自动流过去」，而不是另加一个响应字段。
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["fact_summary"]["host_id"], "machine-id-abc123");
+    assert_eq!(view["fact_summary"]["host_name"], "macbook-pro");
+    assert_eq!(
+        view["fact_summary"]["network_addresses"],
+        serde_json::json!(["en0 192.168.1.5/24", "utun3 10.8.0.2/32"])
+    );
+    // 展示字段没进内容摘要：摘要仍是内容字段算出来的那一份。
+    assert_eq!(view["fact_summary"]["content_digest"], digest_of(&report));
+}
+
+#[tokio::test]
+async fn agent_facts_route_stores_empty_display_fields_for_legacy_agents() {
+    // 旧 agentd 的报文里**根本没有**这三个键：`serde(default)` 必须让上报照常成功，
+    // 库里留空值（页面显示「—」并注明旧版 agentd 不带这些字段）。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    let credential = enroll_agent_credential(&env).await;
+    let mut legacy = serde_json::to_value(fact_report(&["/usr/bin/xcodebuild"])).expect("json");
+    let object = legacy.as_object_mut().expect("report object");
+    object.remove("host_id");
+    object.remove("host_name");
+    object.remove("network_addresses");
+
+    let accepted = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/facts",
+        Some(credential.as_str()),
+        &legacy,
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    assert_eq!(stored.host_id, "");
+    assert_eq!(stored.host_name, "");
+    assert!(stored.network_addresses.is_empty());
+
+    // 管理面也照原样给空值（不是缺键）：页面自己决定怎么显示空。
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["fact_summary"]["host_id"], "");
+    assert_eq!(
+        view["fact_summary"]["network_addresses"],
+        serde_json::json!([])
+    );
+}
+
+#[tokio::test]
+async fn agent_facts_route_refreshes_display_fields_on_duplicate() {
+    // 内容（可执行标识集合）没变，机器却换了网、改了名：这是 **duplicate**。
+    // 展示字段必须跟着刷 —— 否则页面上的 IP 会停在几天前那一轮，而旁边「入库时间」
+    // 写着刚刚，运维会以为采集坏了。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    let credential = enroll_agent_credential(&env).await;
+    let first = fact_report_with_display(
+        &["/usr/bin/xcodebuild"],
+        "machine-id-abc123",
+        "macbook-pro",
+        &["en0 192.168.1.5/24"],
+    );
+    let digest = digest_of(&first);
+    let accepted =
+        decode_json_response::<FactSummaryAccepted>(post_facts(&env, &credential, &first).await)
+            .await;
+    assert_eq!(accepted.ack_status, FactSummaryAckStatus::Accepted);
+    let first_suggestion = accepted.suggestion_id.clone();
+
+    let renamed = first.with_display(
+        "machine-id-abc123".to_string(),
+        "macbook-pro-renamed".to_string(),
+        vec!["en0 10.0.0.9/24".to_string()],
+    );
+    let duplicate =
+        decode_json_response::<FactSummaryAccepted>(post_facts(&env, &credential, &renamed).await)
+            .await;
+    assert_eq!(duplicate.ack_status, FactSummaryAckStatus::Duplicate);
+    // 只有留痕刷新：建议不重算。
+    assert_eq!(duplicate.suggestion_id, first_suggestion);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    assert_eq!(stored.host_name, "macbook-pro-renamed");
+    assert_eq!(stored.network_addresses, vec!["en0 10.0.0.9/24"]);
+    // 内容列与幂等键一格不动。
+    assert_eq!(stored.content_digest, digest);
+    assert_eq!(stored.process_executables, vec!["/usr/bin/xcodebuild"]);
+}
+
+#[tokio::test]
 async fn agent_facts_route_recomputes_when_the_content_changes() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
     let credential = enroll_agent_credential(&env).await;
@@ -1220,6 +1366,34 @@ async fn agent_facts_route_rejects_an_overlong_content_digest() {
     let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
     let credential = enroll_agent_credential(&env).await;
     let report = fact_report_declaring(&["xcodebuild"], &"d".repeat(1024));
+
+    let response = post_facts(&env, &credential, &report).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn agent_facts_route_rejects_an_overlong_host_id() {
+    // 上报体是**被管机器**给的内容，网关必须自己封顶，不能指望 agent 守规矩。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    let credential = enroll_agent_credential(&env).await;
+    let report = fact_report_with_display(&["xcodebuild"], &"h".repeat(1024), "macbook-pro", &[]);
+
+    let response = post_facts(&env, &credential, &report).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn agent_facts_route_rejects_too_many_network_addresses() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    let credential = enroll_agent_credential(&env).await;
+    let addresses: Vec<String> = (0..300)
+        .map(|index| format!("en{index} 10.0.0.1/24"))
+        .collect();
+    let report = fact_report(&["xcodebuild"]).with_display(
+        "machine-id".to_string(),
+        "macbook-pro".to_string(),
+        addresses,
+    );
 
     let response = post_facts(&env, &credential, &report).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);

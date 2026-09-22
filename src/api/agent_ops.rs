@@ -378,6 +378,9 @@ pub async fn submit_agent_facts(
                 revision: input.revision,
                 observed_at: input.observed_at.clone(),
                 process_count: input.process_count,
+                host_id: input.host_id.clone(),
+                host_name: input.host_name.clone(),
+                network_addresses: input.network_addresses.clone(),
                 received_at: received_at.clone(),
             };
             match state
@@ -443,6 +446,9 @@ pub async fn submit_agent_facts(
         process_executables: input.process_executables.clone(),
         packages: input.packages.clone(),
         listen_ports: input.listen_ports.clone(),
+        host_id: input.host_id.clone(),
+        host_name: input.host_name.clone(),
+        network_addresses: input.network_addresses.clone(),
         received_at: received_at.clone(),
     };
     // 先落事实再算建议：规则表坏了不该连带把 Agent 报上来的事实丢掉。
@@ -504,6 +510,13 @@ const MAX_ELEMENT_BYTES: usize = 4096;
 /// `content_digest` 是固定格式的标识符（`fact-v1:sha256:<64 hex>`）。
 /// 封顶是必要的：它会进告警日志，不限长就能让一条上报写出几 MB 的单行日志。
 const MAX_CONTENT_DIGEST_BYTES: usize = 128;
+/// 单个展示字段（`host_id` / `host_name`）的字节上限。主机名按 DNS 上限（253）留余量，
+/// `host_id` 还有 `hostname:<name>` 这种兜底形态，512 足够。不借 `MAX_ELEMENT_BYTES`
+/// （4096）—— 那是给「列表里的一条」的，单值字段用不到那么大，只会让一条上报白写出几 KB。
+const MAX_HOST_FIELD_BYTES: usize = 512;
+/// 网卡条数上限：一台宿主机（含 docker 网桥 / veth / VPN）几十块网卡是常态，256 留足余量。
+/// 上界存在的意义只是让一条上报撑不爆单行与页面，不是去猜机器该有几块网卡。
+const MAX_NETWORK_ADDRESSES: usize = 256;
 
 fn validate_fact_summary(input: &ReportAgentFactSummary) -> Result<(), String> {
     if input.content_digest.len() > MAX_CONTENT_DIGEST_BYTES {
@@ -525,6 +538,24 @@ fn validate_fact_summary(input: &ReportAgentFactSummary) -> Result<(), String> {
     )?;
     check_list("packages", &input.packages, MAX_PACKAGES)?;
     check_list("listen_ports", &input.listen_ports, MAX_LISTEN_PORTS)?;
+    check_value("host_id", &input.host_id, MAX_HOST_FIELD_BYTES)?;
+    check_value("host_name", &input.host_name, MAX_HOST_FIELD_BYTES)?;
+    check_list(
+        "network_addresses",
+        &input.network_addresses,
+        MAX_NETWORK_ADDRESSES,
+    )?;
+    Ok(())
+}
+
+/// 单个值（不是列表）的长度上限：列表用 `check_list`，它还要额外看条数。
+fn check_value(field: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+    if value.len() > max_bytes {
+        return Err(format!(
+            "{field} is {} bytes (limit {max_bytes})",
+            value.len()
+        ));
+    }
     Ok(())
 }
 

@@ -1066,7 +1066,8 @@ impl Store for SqliteStore {
     ) -> StoreResult<Option<StoredAgentFactSummary>> {
         let row = sqlx::query(
             "SELECT agent_id, content_digest, revision, observed_at, os, arch, process_count, \
-             process_executables, packages, listen_ports, received_at \
+             process_executables, packages, listen_ports, host_id, host_name, network_addresses, \
+             received_at \
              FROM agent_fact_summary WHERE agent_id = ?1",
         )
         .bind(agent_id)
@@ -1095,15 +1096,20 @@ impl Store for SqliteStore {
         )?;
         let packages = serialize_json_array(&summary.packages, "serialize packages")?;
         let listen_ports = serialize_json_array(&summary.listen_ports, "serialize listen ports")?;
+        let network_addresses =
+            serialize_json_array(&summary.network_addresses, "serialize network addresses")?;
         sqlx::query(
             "INSERT INTO agent_fact_summary (agent_id, content_digest, revision, observed_at, os, \
-             arch, process_count, process_executables, packages, listen_ports, received_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             arch, process_count, process_executables, packages, listen_ports, host_id, host_name, \
+             network_addresses, received_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
              ON CONFLICT (agent_id) DO UPDATE SET content_digest = excluded.content_digest, \
              revision = excluded.revision, observed_at = excluded.observed_at, os = excluded.os, \
              arch = excluded.arch, process_count = excluded.process_count, \
              process_executables = excluded.process_executables, packages = excluded.packages, \
-             listen_ports = excluded.listen_ports, received_at = excluded.received_at",
+             listen_ports = excluded.listen_ports, host_id = excluded.host_id, \
+             host_name = excluded.host_name, network_addresses = excluded.network_addresses, \
+             received_at = excluded.received_at",
         )
         .bind(&summary.agent_id)
         .bind(&summary.content_digest)
@@ -1115,6 +1121,9 @@ impl Store for SqliteStore {
         .bind(process_executables)
         .bind(packages)
         .bind(listen_ports)
+        .bind(&summary.host_id)
+        .bind(&summary.host_name)
+        .bind(network_addresses)
         .bind(&summary.received_at)
         .execute(&self.pool)
         .await
@@ -1127,14 +1136,20 @@ impl Store for SqliteStore {
         agent_id: &str,
         marks: &AgentFactSummaryMarks,
     ) -> StoreResult<bool> {
+        let network_addresses =
+            serialize_json_array(&marks.network_addresses, "serialize network addresses")?;
         let result = sqlx::query(
             "UPDATE agent_fact_summary SET revision = ?2, observed_at = ?3, \
-             process_count = ?4, received_at = ?5 WHERE agent_id = ?1",
+             process_count = ?4, host_id = ?5, host_name = ?6, network_addresses = ?7, \
+             received_at = ?8 WHERE agent_id = ?1",
         )
         .bind(agent_id)
         .bind(marks.revision)
         .bind(&marks.observed_at)
         .bind(marks.process_count)
+        .bind(&marks.host_id)
+        .bind(&marks.host_name)
+        .bind(network_addresses)
         .bind(&marks.received_at)
         .execute(&self.pool)
         .await
@@ -1202,6 +1217,7 @@ fn fact_summary_from_row(row: &SqliteRow) -> StoreResult<StoredAgentFactSummary>
     let process_executables: String = column!(row, "process_executables");
     let packages: String = column!(row, "packages");
     let listen_ports: String = column!(row, "listen_ports");
+    let network_addresses: String = column!(row, "network_addresses");
     Ok(StoredAgentFactSummary {
         agent_id: column!(row, "agent_id"),
         content_digest: column!(row, "content_digest"),
@@ -1216,6 +1232,9 @@ fn fact_summary_from_row(row: &SqliteRow) -> StoreResult<StoredAgentFactSummary>
         )?,
         packages: deserialize_json_array(&packages, "read packages")?,
         listen_ports: deserialize_json_array(&listen_ports, "read listen ports")?,
+        host_id: column!(row, "host_id"),
+        host_name: column!(row, "host_name"),
+        network_addresses: deserialize_json_array(&network_addresses, "read network addresses")?,
         received_at: column!(row, "received_at"),
     })
 }

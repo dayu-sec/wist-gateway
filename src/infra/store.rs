@@ -237,6 +237,15 @@ pub struct StoredAgentFactSummary {
     pub process_executables: Vec<String>,
     pub packages: Vec<String>,
     pub listen_ports: Vec<String>,
+    /// 发现方向 `host` 的 `host.id`。**留痕/展示**：不进内容摘要、不参与判重。
+    ///
+    /// 与它下面两项一样，值会在内容不变的情况下变（改名、换网），所以 `duplicate`
+    /// 路径也要一起刷 —— 见 [`AgentFactSummaryMarks`]。
+    pub host_id: String,
+    /// `host.name`。
+    pub host_name: String,
+    /// 网卡地址，每块网卡一条，形如 `en0 192.168.1.5/24`。
+    pub network_addresses: Vec<String>,
     pub received_at: String,
 }
 
@@ -274,6 +283,12 @@ pub struct StoredPurposeSuggestion {
 /// 故意不含三个内容列（`process_executables` / `packages` / `listen_ports`）与
 /// `content_digest`：`duplicate` 的前提就是内容没变，重写它们既浪费，
 /// 又会把「损坏列自愈」混进判重路径。
+///
+/// 三个展示字段（`host_id` / `host_name` / `network_addresses`）**要在这里**刷，虽然它们
+/// 同样不进内容摘要：内容（可执行标识集合）没变而机器名、IP 变了是常态 —— DHCP 换地址、
+/// 改机器名，进程集合不会动，于是每轮上报都走 `duplicate`。不在这里一起刷，页面上的网卡
+/// 地址就会停在几天前那一轮，而旁边「入库时间」写着刚刚：两个数字自相矛盾，运维会以为
+/// 采集坏了。它们与 `content_digest` 无关，刷它们不破坏判重语义。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentFactSummaryMarks {
     /// 快照 revision（每轮 refresh 无条件 +1）。
@@ -281,6 +296,10 @@ pub struct AgentFactSummaryMarks {
     pub observed_at: String,
     /// 去重前的进程条数。
     pub process_count: i64,
+    /// 展示字段：仅留痕，可随内容不变而变化。
+    pub host_id: String,
+    pub host_name: String,
+    pub network_addresses: Vec<String>,
     pub received_at: String,
 }
 
@@ -533,8 +552,8 @@ pub trait Store: Send + Sync + fmt::Debug {
     /// 是否重复上报由调用方先查再决，本方法本身是**无条件覆盖**。
     async fn upsert_agent_fact_summary(&self, summary: &StoredAgentFactSummary) -> StoreResult<()>;
 
-    /// 只刷留痕字段（`revision` / `observed_at` / `process_count` / `received_at`），
-    /// **不动**内容列与 `content_digest`。返回是否真的命中了行。
+    /// 只刷留痕字段（`revision` / `observed_at` / `process_count` / `received_at` 与三个
+    /// 展示字段），**不动**内容列与 `content_digest`。返回是否真的命中了行。
     ///
     /// 为什么单独开一个：`duplicate` 路径已经判定内容没变，此时重写整行（含三个 JSON 列）
     /// 纯属浪费；更重要的是，那会把「读坏列 → 拒绝写入」的自愈路径混进判重路径 ——
