@@ -1422,6 +1422,248 @@ impl Store for SqliteStore {
             by_class,
         })
     }
+
+    async fn save_standing_work(&self, work: &StandingWork) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO standing_work (work_id, agent_id, family, spec, catalog_version, \
+             proposal_id, plan_version, effective_from, status, updated_by, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT (work_id) DO UPDATE SET agent_id = excluded.agent_id, \
+             family = excluded.family, spec = excluded.spec, \
+             catalog_version = excluded.catalog_version, proposal_id = excluded.proposal_id, \
+             plan_version = excluded.plan_version, effective_from = excluded.effective_from, \
+             status = excluded.status, updated_by = excluded.updated_by, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(&work.work_id)
+        .bind(&work.agent_id)
+        .bind(&work.family)
+        .bind(&work.spec)
+        .bind(work.catalog_version)
+        .bind(&work.proposal_id)
+        .bind(work.plan_version)
+        .bind(&work.effective_from)
+        .bind(&work.status)
+        .bind(&work.updated_by)
+        .bind(&work.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert standing work"))?;
+        Ok(())
+    }
+
+    async fn get_standing_work(&self, work_id: &str) -> StoreResult<Option<StandingWork>> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {STANDING_WORK_COLUMNS} FROM standing_work WHERE work_id = ?1"
+        )))
+        .bind(work_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select standing work"))?;
+        row.as_ref().map(standing_work_from_row).transpose()
+    }
+
+    async fn list_standing_work(&self, agent_id: &str) -> StoreResult<Vec<StandingWork>> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {STANDING_WORK_COLUMNS} FROM standing_work WHERE agent_id = ?1 \
+             ORDER BY family"
+        )))
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list standing work"))?;
+        rows.iter().map(standing_work_from_row).collect()
+    }
+
+    async fn save_one_shot_work(&self, work: &StoredOneShotWork) -> StoreResult<()> {
+        let item = &work.work;
+        let completed_steps =
+            serialize_json_array(&item.completed_steps, "encode one-shot completed steps")?;
+        sqlx::query(
+            "INSERT INTO one_shot_work (work_id, agent_id, action, spec, scheduled_at, \
+             deadline_at, timeout_seconds, interruptible, status, paused_at, pre_pause_status, \
+             paused_total_seconds, current_step, completed_steps, attempt, issued_by, issued_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
+             ON CONFLICT (work_id) DO UPDATE SET agent_id = excluded.agent_id, \
+             action = excluded.action, spec = excluded.spec, \
+             scheduled_at = excluded.scheduled_at, deadline_at = excluded.deadline_at, \
+             timeout_seconds = excluded.timeout_seconds, \
+             interruptible = excluded.interruptible, status = excluded.status, \
+             paused_at = excluded.paused_at, \
+             pre_pause_status = excluded.pre_pause_status, \
+             paused_total_seconds = excluded.paused_total_seconds, \
+             current_step = excluded.current_step, \
+             completed_steps = excluded.completed_steps, attempt = excluded.attempt, \
+             issued_by = excluded.issued_by, issued_at = excluded.issued_at",
+        )
+        .bind(&item.work_id)
+        .bind(&item.agent_id)
+        .bind(&item.action)
+        .bind(&item.spec)
+        .bind(&item.scheduled_at)
+        .bind(&item.deadline_at)
+        .bind(item.timeout_seconds)
+        .bind(item.interruptible)
+        .bind(&item.status)
+        .bind(&item.paused_at)
+        .bind(&work.pre_pause_status)
+        .bind(item.paused_total_seconds)
+        .bind(&item.current_step)
+        .bind(&completed_steps)
+        .bind(item.attempt)
+        .bind(&item.issued_by)
+        .bind(&item.issued_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert one-shot work"))?;
+        Ok(())
+    }
+
+    async fn get_one_shot_work(&self, work_id: &str) -> StoreResult<Option<StoredOneShotWork>> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {ONE_SHOT_WORK_COLUMNS} FROM one_shot_work WHERE work_id = ?1"
+        )))
+        .bind(work_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select one-shot work"))?;
+        row.as_ref().map(one_shot_work_from_row).transpose()
+    }
+
+    async fn list_one_shot_work(&self, agent_id: &str) -> StoreResult<Vec<StoredOneShotWork>> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {ONE_SHOT_WORK_COLUMNS} FROM one_shot_work WHERE agent_id = ?1 \
+             ORDER BY issued_at"
+        )))
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list one-shot work"))?;
+        rows.iter().map(one_shot_work_from_row).collect()
+    }
+
+    async fn upsert_work_ack(&self, ack: &StoredWorkAck) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO work_ack (work_id, agent_id, work_kind, plan_version, acknowledged_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (work_id) DO UPDATE SET agent_id = excluded.agent_id, \
+             work_kind = excluded.work_kind, plan_version = excluded.plan_version, \
+             acknowledged_at = excluded.acknowledged_at",
+        )
+        .bind(&ack.work_id)
+        .bind(&ack.agent_id)
+        .bind(&ack.work_kind)
+        .bind(ack.plan_version)
+        .bind(&ack.acknowledged_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert work ack"))?;
+        Ok(())
+    }
+
+    async fn get_work_ack(&self, work_id: &str) -> StoreResult<Option<StoredWorkAck>> {
+        let row = sqlx::query(
+            "SELECT work_id, agent_id, work_kind, plan_version, acknowledged_at \
+             FROM work_ack WHERE work_id = ?1",
+        )
+        .bind(work_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select work ack"))?;
+        row.as_ref()
+            .map(|row| {
+                Ok(StoredWorkAck {
+                    work_id: column!(row, "work_id"),
+                    agent_id: column!(row, "agent_id"),
+                    work_kind: column!(row, "work_kind"),
+                    plan_version: column!(row, "plan_version"),
+                    acknowledged_at: column!(row, "acknowledged_at"),
+                })
+            })
+            .transpose()
+    }
+
+    async fn next_work_sequence(&self, agent_id: &str, updated_at: &str) -> StoreResult<i64> {
+        // 用 RETURNING 一次完成「读-改-写」：序号是漂移判定的依据，
+        // 分两次查会在两次查询之间给并发留出「两方拿到同一个号」的缝。
+        let sequence: i64 = sqlx::query_scalar(
+            "INSERT INTO agent_work_sequence (agent_id, sequence, updated_at) \
+             VALUES (?1, 1, ?2) \
+             ON CONFLICT (agent_id) DO UPDATE SET sequence = sequence + 1, \
+             updated_at = excluded.updated_at \
+             RETURNING sequence",
+        )
+        .bind(agent_id)
+        .bind(updated_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "bump work sequence"))?;
+        Ok(sequence)
+    }
+
+    async fn work_sequence(&self, agent_id: &str) -> StoreResult<i64> {
+        let sequence: Option<i64> =
+            sqlx::query_scalar("SELECT sequence FROM agent_work_sequence WHERE agent_id = ?1")
+                .bind(agent_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|err| sql_error(err, "select work sequence"))?;
+        Ok(sequence.unwrap_or(0))
+    }
+}
+
+/// 列清单单独提出来：读单行与读全表必须选同一组列，
+/// 两处各写一遍迟早会漏掉新列（而漏掉的列在那个查询里静默变成默认值）。
+const STANDING_WORK_COLUMNS: &str = "work_id, agent_id, family, spec, catalog_version, proposal_id, \
+     plan_version, effective_from, status, updated_by, updated_at";
+
+const ONE_SHOT_WORK_COLUMNS: &str = "work_id, agent_id, action, spec, scheduled_at, deadline_at, \
+     timeout_seconds, interruptible, status, paused_at, pre_pause_status, paused_total_seconds, \
+     current_step, completed_steps, attempt, issued_by, issued_at";
+
+fn standing_work_from_row(row: &SqliteRow) -> StoreResult<StandingWork> {
+    Ok(StandingWork {
+        work_id: column!(row, "work_id"),
+        agent_id: column!(row, "agent_id"),
+        family: column!(row, "family"),
+        spec: column!(row, "spec"),
+        catalog_version: column!(row, "catalog_version"),
+        proposal_id: column!(row, "proposal_id"),
+        plan_version: column!(row, "plan_version"),
+        effective_from: column!(row, "effective_from"),
+        status: column!(row, "status"),
+        updated_by: column!(row, "updated_by"),
+        updated_at: column!(row, "updated_at"),
+    })
+}
+
+/// SQLite 没有布尔类型，`interruptible` 存 0/1，读回来时映射。
+fn one_shot_work_from_row(row: &SqliteRow) -> StoreResult<StoredOneShotWork> {
+    let completed_steps: String = column!(row, "completed_steps");
+    Ok(StoredOneShotWork {
+        work: OneShotWork {
+            work_id: column!(row, "work_id"),
+            agent_id: column!(row, "agent_id"),
+            action: column!(row, "action"),
+            spec: column!(row, "spec"),
+            scheduled_at: column!(row, "scheduled_at"),
+            deadline_at: column!(row, "deadline_at"),
+            timeout_seconds: column!(row, "timeout_seconds"),
+            interruptible: column!(row, "interruptible"),
+            status: column!(row, "status"),
+            paused_at: column!(row, "paused_at"),
+            paused_total_seconds: column!(row, "paused_total_seconds"),
+            current_step: column!(row, "current_step"),
+            completed_steps: deserialize_json_array(
+                &completed_steps,
+                "read one-shot completed steps",
+            )?,
+            attempt: column!(row, "attempt"),
+            issued_by: column!(row, "issued_by"),
+            issued_at: column!(row, "issued_at"),
+        },
+        pre_pause_status: column!(row, "pre_pause_status"),
+    })
 }
 
 fn fact_summary_from_row(row: &SqliteRow) -> StoreResult<StoredAgentFactSummary> {
@@ -2027,6 +2269,7 @@ mod tests {
     #[tokio::test]
     async fn upserts_and_reads_agent_classification() {
         let store = store().await;
+        // 未判定时为 None（页面看到的是“还没人定”，不是某个默认值）。
         assert!(
             store
                 .get_agent_classification("agent-a")
@@ -2303,5 +2546,174 @@ mod tests {
         let one = store.list_software_holdings(1).await.unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].software_key, "/Applications/Firefox.app");
+    }
+
+    fn standing(work_id: &str, agent_id: &str, family: &str, plan_version: i64) -> StandingWork {
+        StandingWork {
+            work_id: work_id.to_string(),
+            agent_id: agent_id.to_string(),
+            family: family.to_string(),
+            spec: "unit-a".to_string(),
+            catalog_version: 1,
+            proposal_id: None,
+            plan_version,
+            effective_from: "2026-09-23T00:00:00Z".to_string(),
+            status: "active".to_string(),
+            updated_by: "admin".to_string(),
+            updated_at: "2026-09-23T00:00:00Z".to_string(),
+        }
+    }
+
+    fn one_shot(work_id: &str, agent_id: &str, status: &str) -> StoredOneShotWork {
+        StoredOneShotWork {
+            work: OneShotWork {
+                work_id: work_id.to_string(),
+                agent_id: agent_id.to_string(),
+                action: "upgrade".to_string(),
+                spec: "0.1.4".to_string(),
+                scheduled_at: "2026-09-23T00:00:00Z".to_string(),
+                deadline_at: "2026-09-24T00:00:00Z".to_string(),
+                timeout_seconds: 600,
+                interruptible: true,
+                status: status.to_string(),
+                paused_at: Some("2026-09-23T00:10:00Z".to_string()),
+                paused_total_seconds: 42,
+                current_step: Some("install".to_string()),
+                completed_steps: vec!["download".to_string()],
+                attempt: 1,
+                issued_by: "admin".to_string(),
+                issued_at: "2026-09-23T00:00:00Z".to_string(),
+            },
+            pre_pause_status: Some("running".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn stores_standing_work_per_work_id_and_lists_it_per_agent() {
+        let store = store().await;
+        assert!(store.get_standing_work("work-a").await.unwrap().is_none());
+
+        store
+            .save_standing_work(&standing("work-a", "agent-a", "HostMetrics", 1))
+            .await
+            .unwrap();
+        store
+            .save_standing_work(&standing("work-b", "agent-a", "LoginSession", 1))
+            .await
+            .unwrap();
+        store
+            .save_standing_work(&standing("work-c", "agent-b", "HostMetrics", 1))
+            .await
+            .unwrap();
+
+        // 同一 work_id 再存一次 = 改这一份，不是多出一份。
+        store
+            .save_standing_work(&standing("work-a", "agent-a", "HostMetrics", 2))
+            .await
+            .unwrap();
+
+        let loaded = store.get_standing_work("work-a").await.unwrap().unwrap();
+        assert_eq!(loaded.plan_version, 2);
+
+        // 按 agent 取，且**全量**（含暂停/已撤回 —— 留痕要看得到）。
+        let mut revoked = standing("work-b", "agent-a", "LoginSession", 2);
+        revoked.status = "revoked".to_string();
+        store.save_standing_work(&revoked).await.unwrap();
+
+        let works = store.list_standing_work("agent-a").await.unwrap();
+        assert_eq!(works.len(), 2);
+        assert_eq!(works[0].family, "HostMetrics");
+        assert_eq!(works[1].status, "revoked");
+        assert_eq!(store.list_standing_work("agent-b").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn round_trips_one_shot_work_including_the_pause_state_machine() {
+        let store = store().await;
+        let original = one_shot("work-1", "agent-a", "paused");
+        store.save_one_shot_work(&original).await.unwrap();
+
+        let loaded = store.get_one_shot_work("work-1").await.unwrap().unwrap();
+        assert_eq!(loaded, original);
+        // 布尔、JSON 数组、可空字段都得真的过得去（SQLite 没有布尔类型）。
+        assert!(loaded.work.interruptible);
+        assert_eq!(loaded.work.completed_steps, vec!["download".to_string()]);
+        assert_eq!(loaded.work.current_step.as_deref(), Some("install"));
+        assert_eq!(loaded.work.paused_total_seconds, 42);
+        assert_eq!(loaded.pre_pause_status.as_deref(), Some("running"));
+
+        // 终态也留在库里（快照会筛，审计要全）。
+        let mut finished = original.clone();
+        finished.work.status = "succeeded".to_string();
+        finished.work.paused_at = None;
+        finished.pre_pause_status = None;
+        store.save_one_shot_work(&finished).await.unwrap();
+        let works = store.list_one_shot_work("agent-a").await.unwrap();
+        assert_eq!(works.len(), 1);
+        assert_eq!(works[0].work.status, "succeeded");
+        assert_eq!(works[0].pre_pause_status, None);
+    }
+
+    #[tokio::test]
+    async fn work_sequence_is_monotonic_per_agent_and_starts_at_zero() {
+        let store = store().await;
+        // 从未授权过：0（而不是 1 —— 否则首个快照看起来也像“变过了”）。
+        assert_eq!(store.work_sequence("agent-a").await.unwrap(), 0);
+
+        assert_eq!(
+            store
+                .next_work_sequence("agent-a", "2026-09-23T00:00:00Z")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .next_work_sequence("agent-a", "2026-09-23T00:00:01Z")
+                .await
+                .unwrap(),
+            2
+        );
+        // 另一个 agent 自己从 1 开始（序号是 per-agent 的）。
+        assert_eq!(
+            store
+                .next_work_sequence("agent-b", "2026-09-23T00:00:02Z")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.work_sequence("agent-a").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn work_ack_keeps_one_row_per_work() {
+        let store = store().await;
+        assert!(store.get_work_ack("work-1").await.unwrap().is_none());
+
+        store
+            .upsert_work_ack(&StoredWorkAck {
+                work_id: "work-1".to_string(),
+                agent_id: "agent-a".to_string(),
+                work_kind: "Standing".to_string(),
+                plan_version: 1,
+                acknowledged_at: "2026-09-23T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_work_ack(&StoredWorkAck {
+                work_id: "work-1".to_string(),
+                agent_id: "agent-a".to_string(),
+                work_kind: "Standing".to_string(),
+                plan_version: 2,
+                acknowledged_at: "2026-09-23T00:01:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // 一份工作一条：只留最新那次确认（漂移看的是“现在手上是哪一版”）。
+        let ack = store.get_work_ack("work-1").await.unwrap().unwrap();
+        assert_eq!(ack.plan_version, 2);
+        assert_eq!(ack.acknowledged_at, "2026-09-23T00:01:00Z");
     }
 }

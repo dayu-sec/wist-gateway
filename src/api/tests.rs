@@ -31,6 +31,7 @@ use wist_contracts::gateway::{
     POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies, ReportActionResult,
     ReportAgentFactSummary, ResultAttestation,
 };
+use wist_contracts::work::{ACK_WORK_KIND, POLL_WORK_KIND};
 use wist_control::PollControlCommands;
 use wist_control::types::DateTime;
 
@@ -1105,7 +1106,7 @@ async fn fact_summary_ingest_stores_the_summary_and_produces_a_suggestion() {
         view["suggestion"]["signals"][0]["value"],
         "/usr/bin/xcodebuild"
     );
-    // 人工判定端点还没实现，恒为 null。
+    // 没写过判定 → classification 为空（页面看到的是「还没人定」，不是默认值）。
     assert!(view["classification"].is_null());
 }
 
@@ -4301,4 +4302,407 @@ fn unique_suffix() -> u128 {
         .expect("time")
         .as_nanos()
         + seq
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 工作授权（Control.Agent.Work）：授权 → 拉快照 → 确认 → 暂停/恢复/撤回
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 让 agent-node-a 成为一台「有事实、已判定 MacDaily」的机器（派活的两条前置），
+/// 返回它的通讯凭据（Agent 侧拉快照要用）。
+async fn a_classified_macos_agent(env: &TestEnv) -> String {
+    let credential = enroll_agent_credential(env).await;
+    assert_eq!(
+        post_facts(env, &fact_report(&["/usr/bin/xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "MacDaily" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    credential
+}
+
+async fn grant_work(env: &TestEnv, body: serde_json::Value) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &body,
+    )
+    .await
+}
+
+async fn post_work_route(env: &TestEnv, path: &str) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        path,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "reason_code": "测试" }),
+    )
+    .await
+}
+
+/// 拒结类的断言用得上正文文本（理由写在那里，不在日志里）。
+async fn decode_text_response(response: Response) -> String {
+    String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8 body")
+}
+
+async fn get_agent_work(env: &TestEnv) -> serde_json::Value {
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+async fn poll_work(env: &TestEnv, credential: Option<&str>) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/work:poll",
+        credential,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": POLL_WORK_KIND,
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "last_seen_sequence": 0,
+            "wait_ms": 0,
+            "requested_at": "2026-09-23T00:00:00Z",
+        }),
+    )
+    .await
+}
+
+async fn ack_work(
+    env: &TestEnv,
+    credential: Option<&str>,
+    work_id: &str,
+    version: i64,
+) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/work:ack",
+        credential,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": ACK_WORK_KIND,
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "work_id": work_id,
+            "plan_version": version,
+            "acknowledged_at": "2026-09-23T00:00:00Z",
+        }),
+    )
+    .await
+}
+
+/// 没有用途判定就没法派活：判定决定取哪份模板，跳过它就是跳过采集范围的审定。
+#[tokio::test]
+async fn granting_work_without_a_classification_is_rejected() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message = decode_text_response(response).await;
+    assert!(message.contains("先归档用途判定"), "{message}");
+}
+
+/// 常驻工作留空的 spec 由网关**按事实从采集目录展开** —— 这就是「网关决定采什么」。
+#[tokio::test]
+async fn granting_standing_work_derives_the_spec_from_catalog_and_facts() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(receipt["work_kind"], "Standing");
+    assert_eq!(receipt["status"], "accepted");
+    assert_eq!(receipt["plan_version"], 1);
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["sequence"], 1);
+    assert_eq!(view["standing"][0]["family"], "HostMetrics");
+    assert_eq!(view["standing"][0]["spec"], "mac-metrics");
+    assert_eq!(view["standing"][0]["catalog_version"], 1);
+    assert_eq!(view["standing"][0]["status"], "active");
+    assert!(view["standing"][0]["ack"].is_null());
+
+    // 同一面再授一次 = 改这一份（同一个 work_id，版本 +1），不是多出一份。
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let again: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(again["work_id"], work_id.as_str());
+    assert_eq!(again["plan_version"], 2);
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["standing"].as_array().expect("standing").len(), 1);
+    assert_eq!(view["sequence"], 2);
+}
+
+#[tokio::test]
+async fn granting_a_family_that_is_not_ready_is_a_conflict() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    // 测试目录里只有 HostMetrics 的单元；LoginSession 这个面还没规则。
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "LoginSession" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let message = decode_text_response(response).await;
+    assert!(message.contains("rule_not_ready"), "{message}");
+}
+
+#[tokio::test]
+async fn a_hand_written_spec_must_name_units_of_that_family() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({
+            "work_kind": "Standing", "family": "HostMetrics", "spec": "not-a-unit"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message = decode_text_response(response).await;
+    assert!(
+        message.contains("not in the collection catalog"),
+        "{message}"
+    );
+}
+
+/// 授权快照是「现在的期望」：幂等、可重复拉，且只有生效中的才下发。
+#[tokio::test]
+async fn agent_polls_the_work_grant_and_acks_the_plan_version() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+
+    let response = grant_work(
+        &env,
+        serde_json::json!({
+            "work_kind": "OneShot", "action": "upgrade", "spec": "0.1.4",
+            "deadline_at": "2026-09-24T00:00:00Z", "timeout_seconds": 600
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: serde_json::Value = decode_json_response(response).await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    // 拉快照：一次性工作在，状态是 dispatched（还没被确认）。
+    let grant: serde_json::Value =
+        decode_json_response(poll_work(&env, Some(&credential)).await).await;
+    assert_eq!(grant["one_shot"][0]["work_id"], work_id.as_str());
+    assert_eq!(grant["one_shot"][0]["status"], "dispatched");
+
+    // 确认：dispatched → accepted，并留下回执。
+    let acked: serde_json::Value =
+        decode_json_response(ack_work(&env, Some(&credential), &work_id, 1).await).await;
+    assert_eq!(acked["status"], "accepted");
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["one_shot"][0]["status"], "accepted");
+    assert_eq!(view["one_shot"][0]["ack"]["plan_version"], 1);
+}
+
+#[tokio::test]
+async fn acking_a_stale_plan_version_is_reported_in_band_and_not_recorded() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    let receipt: serde_json::Value = decode_json_response(response).await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    let acked: serde_json::Value =
+        decode_json_response(ack_work(&env, Some(&credential), &work_id, 99).await).await;
+    assert_eq!(acked["status"], "stale");
+
+    // 陈旧确认不写回执：否则「Agent 手上是哪一版」会被一个错的数盖掉。
+    let view = get_agent_work(&env).await;
+    assert!(view["standing"][0]["ack"].is_null());
+}
+
+#[tokio::test]
+async fn the_work_grant_needs_an_agent_credential() {
+    let env = TestEnv::new().await;
+    assert_eq!(
+        poll_work(&env, None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        poll_work(&env, Some("forged")).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn standing_work_pauses_resumes_and_leaves_the_grant_only_when_revoked() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            &env,
+            serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+        )
+        .await,
+    )
+    .await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    // 暂停：仍在下发的快照里（期望就是「暂不做」），但状态变了。
+    let paused = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/pause"),
+    )
+    .await;
+    assert_eq!(paused.status(), StatusCode::OK);
+    let grant: serde_json::Value =
+        decode_json_response(poll_work(&env, Some(&credential)).await).await;
+    assert_eq!(grant["standing"][0]["status"], "paused");
+
+    // 恢复不重新审定：版本不动。
+    let before = get_agent_work(&env).await;
+    let version_before = before["standing"][0]["plan_version"].clone();
+    let resumed = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/resume"),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let after = get_agent_work(&env).await;
+    assert_eq!(after["standing"][0]["status"], "active");
+    assert_eq!(after["standing"][0]["plan_version"], version_before);
+
+    // 撤回：不再下发，但留在 retired_standing 里供审计。
+    let revoked = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/revoke"),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let grant: serde_json::Value =
+        decode_json_response(poll_work(&env, Some(&credential)).await).await;
+    assert!(grant["standing"].as_array().expect("standing").is_empty());
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["retired_standing"][0]["status"], "revoked");
+}
+
+/// 不可中断的一次性工作**拒绝**暂停（而不是「尽力暂停」）。
+#[tokio::test]
+async fn an_uninterruptible_one_shot_work_refuses_to_pause() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            &env,
+            serde_json::json!({
+                "work_kind": "OneShot", "action": "upgrade", "spec": "0.1.4",
+                "deadline_at": "2026-09-24T00:00:00Z", "timeout_seconds": 600
+            }),
+        )
+        .await,
+    )
+    .await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    let response = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/pause"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let message = decode_text_response(response).await;
+    assert!(message.contains("not interruptible"), "{message}");
+
+    // 撤回未了结的一次性工作 = 取消（不是 revoked）：它本来就还没做完。
+    let canceled = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/revoke"),
+    )
+    .await;
+    assert_eq!(canceled.status(), StatusCode::OK);
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["settled_one_shot"][0]["status"], "canceled");
+}
+
+#[tokio::test]
+async fn work_routes_need_the_admin_token_and_the_right_agent() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            &env,
+            serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+        )
+        .await,
+    )
+    .await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    // 无 token：401。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        None,
+        &serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 未知 agent：404。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-nope/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // work_id 属于别的 agent：不能拿 A 的路径去改 B 的工作。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/agents/agent-other/work/{work_id}/revoke"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "reason_code": "x" }),
+    )
+    .await;
+    assert!(matches!(response.status(), StatusCode::NOT_FOUND));
 }

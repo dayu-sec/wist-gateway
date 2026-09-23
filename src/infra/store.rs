@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use wist_contracts::gateway::AgentWorkStateChange;
+// `pub use`：SQLite 后端用 `use super::store::*` 取领域类型（与 `StoreError` 同理）。
+pub use wist_contracts::work::{OneShotWork, StandingWork};
 pub use wist_error::{StoreError, StoreReason};
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -302,6 +304,58 @@ pub struct PurposeCoverageCounts {
     pub classified_agents: i64,
     /// `(machine_class, agent_count)`，按类别名排序。
     pub by_class: Vec<(String, i64)>,
+}
+
+/// Agent 的工作确认回执（网关侧留痕，模型里没有对应元素）。
+///
+/// 为什么单独一张表：确认是 **Agent 侧的事实**（我手上是这个版本），与工作自身的
+/// **期望状态**是两回事。两者比对即得漂移 —— 一直没确认的就是漂移。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredWorkAck {
+    pub work_id: String,
+    pub agent_id: String,
+    /// `Standing` | `OneShot`。
+    pub work_kind: String,
+    pub plan_version: i64,
+    pub acknowledged_at: String,
+}
+
+/// 一次性工作的落库形状：契约 [`OneShotWork`] + **网关侧**的状态机器字段。
+///
+/// 为什么要包一层而不是把 `pre_pause_status` 加进契约：恢复要回到暂停前的状态，
+/// 而「暂停前是什么」是**网关自己的状态机**的事，agentd 不需要知道（它只看到 `paused`）。
+/// 加进契约就等于把一个纯网关概念泄露给了两侧。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOneShotWork {
+    pub work: OneShotWork,
+    /// 暂停前的状态（如 `running` / `accepted`）；非暂停态为 `None`。
+    pub pre_pause_status: Option<String>,
+}
+
+pub use wist_contracts::work::{
+    ONE_SHOT_TERMINAL_STATUSES, ONE_SHOT_WORK_STATUSES, STANDING_WORK_STATUSES, WorkKind,
+    WorkReceipt,
+};
+
+/// 未了结的一次性工作（终态的不再出现在快照里）。
+pub fn outstanding_one_shot(works: &[StoredOneShotWork]) -> Vec<OneShotWork> {
+    works
+        .iter()
+        .filter(|stored| stored.work.is_outstanding())
+        .map(|stored| stored.work.clone())
+        .collect()
+}
+
+/// 当前生效的常驻工作：`active` 与 `paused` 都要下发。
+///
+/// 为什么 `paused` 也在快照里：暂停是**期望状态的一部分** —— Agent 处于暂停时「没在做」
+/// 不算漂移，期望就是不做。不下发 paused，Agent 就分不清「暂停」与「授权被撤」。
+pub fn effective_standing(works: &[StandingWork]) -> Vec<StandingWork> {
+    works
+        .iter()
+        .filter(|work| matches!(work.status.as_str(), "active" | "paused"))
+        .cloned()
+        .collect()
 }
 
 /// 事实上报的**留痕**：内容没变时只刷这几项，用来回答「什么时候又见到同一份内容」。
@@ -714,6 +768,39 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 机队用途覆盖度：总台数 / 已判定台数 / 各类别台数。
     async fn purpose_coverage(&self) -> StoreResult<PurposeCoverageCounts>;
+
+    /// 写入/覆盖一份常驻工作（`work_id` 为主键）。
+    ///
+    /// 落库形状直接就是契约类型 `StandingWork`：库里的列与它一一对应，
+    /// 再造一层 `Stored*` 只会多一个会漂移的映射。「更新」也走这里（同一 `work_id`）。
+    async fn save_standing_work(&self, work: &StandingWork) -> StoreResult<()>;
+
+    /// 按 `work_id` 读一份常驻工作。
+    async fn get_standing_work(&self, work_id: &str) -> StoreResult<Option<StandingWork>>;
+
+    /// 某 Agent 的**全部**常驻工作（含暂停/被取代/已撤回 —— 留痕要看得到）。
+    async fn list_standing_work(&self, agent_id: &str) -> StoreResult<Vec<StandingWork>>;
+
+    /// 写入/覆盖一份一次性工作（`work_id` 为主键）。
+    async fn save_one_shot_work(&self, work: &StoredOneShotWork) -> StoreResult<()>;
+
+    /// 按 `work_id` 读一份一次性工作。
+    async fn get_one_shot_work(&self, work_id: &str) -> StoreResult<Option<StoredOneShotWork>>;
+
+    /// 某 Agent 的**全部**一次性工作（含终态 —— 快照要筛，审计要全）。
+    async fn list_one_shot_work(&self, agent_id: &str) -> StoreResult<Vec<StoredOneShotWork>>;
+
+    /// 写工作确认回执（一份工作一条，覆盖旧的）。
+    async fn upsert_work_ack(&self, ack: &StoredWorkAck) -> StoreResult<()>;
+
+    /// 读某份工作的确认回执；从未确认过返回 `None`（那就是漂移）。
+    async fn get_work_ack(&self, work_id: &str) -> StoreResult<Option<StoredWorkAck>>;
+
+    /// 授权序号自增并返回新值（首次从 1 开始）。
+    async fn next_work_sequence(&self, agent_id: &str, updated_at: &str) -> StoreResult<i64>;
+
+    /// 读授权序号；从未授权过任何工作时返回 0。
+    async fn work_sequence(&self, agent_id: &str) -> StoreResult<i64>;
 
     /// 满足同一过滤条件的 Agent 总数（分页用）。
     async fn count_agents(&self, query: &AgentQuery) -> StoreResult<u64>;

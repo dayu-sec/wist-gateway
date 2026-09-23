@@ -7,8 +7,8 @@ use axum::{
 
 use crate::infra::{
     AgentFactSummaryMarks, AgentStatusUpdate, RenewCredential, StoredAgentFactSummary,
-    StoredAgentRegistration, StoredCredentialStatus, StoredPurposeSuggestion, new_secret_token,
-    sha256_hex,
+    StoredAgentRegistration, StoredCredentialStatus, StoredPurposeSuggestion, effective_standing,
+    new_secret_token, outstanding_one_shot, sha256_hex,
     victoria_metrics::{import_lines, metric_line},
 };
 use wist_contracts::API_VERSION_V1;
@@ -20,6 +20,9 @@ use wist_contracts::gateway::{
     ActionResultAck, AgentStatusAck, AgentStatusReport, DiscoveryPoliciesReturned,
     FactSummaryAccepted, FactSummaryAckStatus, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
     REPORT_AGENT_FACT_SUMMARY_KIND, ReportActionResult, ReportAgentFactSummary,
+};
+use wist_contracts::work::{
+    ACK_WORK_KIND, AckWork, POLL_WORK_KIND, PollWork, WorkAccepted, WorkGrant,
 };
 use wist_control::types::DateTime;
 use wist_control::{AgentControlCommandsReturned, PollControlCommands};
@@ -217,6 +220,144 @@ pub async fn poll_discovery_policies(
         )
             .into_response(),
     }
+}
+
+/// agentd → 网关：拉取工作授权快照（`PollWork`）。
+///
+/// 幂等：同一份拉两次得到同一份（除了 `granted_at`）。不承担「指令重放」的语义 ——
+/// 正因如此，agentd 断网重启后只需重新拉一次就回到期望，网关不用记「推到哪了」。
+pub async fn poll_work(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<PollWork>,
+) -> Response {
+    if input.api_version != API_VERSION_V1 || input.kind != POLL_WORK_KIND {
+        return (StatusCode::BAD_REQUEST, "invalid work poll").into_response();
+    }
+    if let Err(response) =
+        authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await
+    {
+        return response;
+    }
+    match build_work_grant(&state, &input.agent_id).await {
+        Ok(grant) => Json(grant).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to build work grant: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 组装某 Agent 的授权快照（下发与查看共用同一份口径）。
+///
+/// 只带**当前生效**的：常驻 `active`/`paused`、一次性未了结。被取代/已撤回/已了结的
+/// 留在库里供审计，但不发给 Agent —— 快照是「现在的期望」，不是历史。
+pub async fn build_work_grant(
+    state: &ApiState,
+    agent_id: &str,
+) -> Result<WorkGrant, crate::infra::StoreError> {
+    let standing = effective_standing(&state.store.list_standing_work(agent_id).await?);
+    let one_shot = outstanding_one_shot(&state.store.list_one_shot_work(agent_id).await?);
+    let sequence = state.store.work_sequence(agent_id).await?;
+    Ok(WorkGrant {
+        agent_id: agent_id.to_string(),
+        standing,
+        one_shot,
+        sequence,
+        granted_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// agentd → 网关：确认收到某份工作（`AckWork`）。
+///
+/// 三种结果**在体内**回报（`accepted` / `stale` / `unknown`），而不是全用 HTTP 状态码：
+/// 对 Agent 而言这三者都是「我收到了回音、接下来该怎么做」的同一类事件，
+/// 用 200+status 让它的处理分支集中在一处（而不是在 HTTP 错误码与重试策略之间拼）。
+///
+/// 常驻工作带 `plan_version`：对不上就是 `stale`（网关已经改过版，请重新拉快照）。
+/// 一次性工作被确认时从 `dispatched` 进到 `accepted` —— 这正是那个状态存在的意义。
+pub async fn ack_work(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<AckWork>,
+) -> Response {
+    if input.api_version != API_VERSION_V1 || input.kind != ACK_WORK_KIND {
+        return (StatusCode::BAD_REQUEST, "invalid work ack").into_response();
+    }
+    if let Err(response) =
+        authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await
+    {
+        return response;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let (status, work_kind) = match state.store.get_standing_work(&input.work_id).await {
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load standing work: {err}"),
+            )
+                .into_response();
+        }
+        Ok(Some(work)) if work.agent_id == input.agent_id => {
+            let status = if work.plan_version == input.plan_version {
+                "accepted"
+            } else {
+                // 版本对不上：不是错误，是「你手上那份旧了」。如实回报，不篡改期望版本。
+                "stale"
+            };
+            (status, "Standing")
+        }
+        Ok(_) => match state.store.get_one_shot_work(&input.work_id).await {
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to load one-shot work: {err}"),
+                )
+                    .into_response();
+            }
+            Ok(Some(stored)) if stored.work.agent_id == input.agent_id => {
+                if stored.work.status == "dispatched" {
+                    let mut accepted = stored;
+                    accepted.work.status = "accepted".to_string();
+                    accepted.work.attempt += 1;
+                    if let Err(err) = state.store.save_one_shot_work(&accepted).await {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("failed to store one-shot work: {err}"),
+                        )
+                            .into_response();
+                    }
+                }
+                // 一次性工作不按 `plan_version` 比：它是命令式的，版本由网关自己推，
+                // 对不上也只说明 Agent 报了另一个数，不影响「它已经收到」这个事实。
+                ("accepted", "OneShot")
+            }
+            Ok(_) => ("unknown", "Unknown"),
+        },
+    };
+    if status == "accepted" {
+        let ack = crate::infra::StoredWorkAck {
+            work_id: input.work_id.clone(),
+            agent_id: input.agent_id.clone(),
+            work_kind: work_kind.to_string(),
+            plan_version: input.plan_version,
+            acknowledged_at: now.clone(),
+        };
+        if let Err(err) = state.store.upsert_work_ack(&ack).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to store work ack: {err}"),
+            )
+                .into_response();
+        }
+    }
+    Json(WorkAccepted {
+        work_id: input.work_id,
+        status: status.to_string(),
+        accepted_at: now,
+    })
+    .into_response()
 }
 
 pub async fn renew_agent_credential(

@@ -10,11 +10,15 @@ use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 use wist_control::types::{AgentRuntimeStatus, DateTime};
 
 use crate::app::content::{MACHINE_CLASSES, platform_for_machine_class};
+use crate::app::work as work_rules;
+use crate::app::work::WorkRejection;
 use crate::infra::{
     AgentQuery, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
     DEFAULT_INSTALL_PACKAGE_SETTING_ID, StoredAgentClassification, StoredAgentFactSummary,
-    StoredAgentInstallPackageAddress, StoredAgentUplinkAddress, StoredPurposeSuggestion,
+    StoredAgentInstallPackageAddress, StoredAgentUplinkAddress, StoredOneShotWork,
+    StoredPurposeSuggestion, StoredWorkAck, effective_standing, outstanding_one_shot,
 };
+use wist_contracts::work::{OneShotWork, StandingWork, WorkKind, WorkReceipt};
 
 use super::install_package::{PackageFetchError, fetch_into_cache};
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
@@ -375,6 +379,837 @@ struct PurposeCoverageResponse {
     unclassified_agents: i64,
     by_class: Vec<MachineClassCountResponse>,
     generated_at: String,
+}
+
+/// 把授权/撤回被拒的原因映射成 HTTP 状态。
+///
+/// 三档分开是有意的：
+///   * `BadRequest` —— 请求本身不成立（写错了面名、把 macOS 专有面派给 Linux 机器）；
+///   * `Conflict` —— 请求成立但与当前状态冲突（规则未就绪、版本回退、不可中断却要暂停）：
+///     它是「现在不行」，人该做的是等规则就绪或换个动作，而不是改请求；
+///   * `NotFound` —— 目标不存在。
+fn rejection_response(rejection: WorkRejection) -> Response {
+    let status = match &rejection {
+        WorkRejection::NotFound(_) => StatusCode::NOT_FOUND,
+        WorkRejection::BadRequest(_) => StatusCode::BAD_REQUEST,
+        WorkRejection::Conflict(_) => StatusCode::CONFLICT,
+    };
+    (status, rejection.message().to_string()).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GrantWorkRequest {
+    /// `Standing` | `OneShot`（与模型 `WorkKind` 同形）。
+    pub work_kind: String,
+    /// 常驻工作按**面**授权（`Standing` 时必填）。
+    #[serde(default)]
+    pub family: Option<String>,
+    /// 一次性工作按**动作**授权（`OneShot` 时必填）。
+    #[serde(default)]
+    pub action: Option<String>,
+    /// 常驻：留空 = 由网关按事实从采集目录展开；写了 = 必须是该面上的目录单元。
+    #[serde(default)]
+    pub spec: String,
+    #[serde(default)]
+    pub plan_version: Option<i64>,
+    #[serde(default)]
+    pub scheduled_at: Option<String>,
+    #[serde(default)]
+    pub deadline_at: Option<String>,
+    #[serde(default)]
+    pub timeout_seconds: Option<i64>,
+}
+
+/// 授权或更新某 Agent 的工作（`AdminGrantWork`）。
+///
+/// `work_kind` 决定哪些字段必填 —— 这层校验必须在实现里，且要报得清楚：
+/// 「派一份常驻工作」与「派一件升级」需要的东西不一样，共用一个模糊的接口只会
+/// 让人对着 400 猜自己漏了什么。
+pub async fn grant_work(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Json(input): Json<GrantWorkRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    match input.work_kind.trim() {
+        "Standing" => grant_standing_work(&state, &agent_id, &input).await,
+        "OneShot" => grant_one_shot_work(&state, &agent_id, &input).await,
+        other => (
+            StatusCode::BAD_REQUEST,
+            format!("unknown work_kind {other:?} (Standing | OneShot)"),
+        )
+            .into_response(),
+    }
+}
+
+/// 派一份常驻工作：面就绪度闸门 → 用途判定 → 按事实展开或校验 spec → 落库。
+///
+/// 顺序不是随意排的：先要判定（否则不知道是哪类机器、取不到模板），再要规则就绪
+/// （否则展开出来的单元落不了数据面），最后才谈内容。
+async fn grant_standing_work(
+    state: &ApiState,
+    agent_id: &str,
+    input: &GrantWorkRequest,
+) -> Response {
+    let Some(content) = state.content.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "collection content is not loaded: 配置 [content] 三件套后重启网关",
+        )
+            .into_response();
+    };
+    let family = match input.family.as_deref().map(str::trim) {
+        Some(family) if !family.is_empty() => family,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "family is required for work_kind = Standing",
+            )
+                .into_response();
+        }
+    };
+    let classification = match state.store.get_agent_classification(agent_id).await {
+        Ok(classification) => classification,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load agent classification: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let Some(classification) = classification else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "cannot grant work to {agent_id}: 先归档用途判定（AgentClassification）—— 它决定取哪份模板"
+            ),
+        )
+            .into_response();
+    };
+    let Some(platform) = platform_for_machine_class(&classification.machine_class) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "machine class {:?} maps to no platform",
+                classification.machine_class
+            ),
+        )
+            .into_response();
+    };
+    if let Err(rejection) = work_rules::check_family_grantable(content, family, platform) {
+        return rejection_response(rejection);
+    }
+    let existing = match state.store.list_standing_work(agent_id).await {
+        Ok(works) => works.into_iter().find(|work| work.family == family),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load standing work: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let requested_spec = input.spec.trim();
+    let spec_result = if requested_spec.is_empty() {
+        let facts = match state.store.get_agent_fact_summary(agent_id).await {
+            Ok(facts) => facts,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to load agent fact summary: {err}"),
+                )
+                    .into_response();
+            }
+        };
+        let Some(facts) = facts else {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "cannot derive the work spec for {agent_id}: 还没有事实摘要（无事实就无从裁剪）"
+                ),
+            )
+                .into_response();
+        };
+        work_rules::derive_spec(
+            content,
+            &classification.machine_class,
+            platform,
+            family,
+            &facts,
+        )
+    } else {
+        work_rules::validate_spec(content, platform, family, requested_spec)
+    };
+    let (spec, catalog_version) = match spec_result {
+        Ok(pair) => pair,
+        Err(rejection) => return rejection_response(rejection),
+    };
+    let plan_version = match work_rules::next_plan_version(
+        existing.as_ref().map(|work| work.plan_version),
+        input.plan_version,
+    ) {
+        Ok(version) => version,
+        Err(rejection) => return rejection_response(rejection),
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let work = StandingWork {
+        work_id: existing
+            .as_ref()
+            .map(|work| work.work_id.clone())
+            .unwrap_or_else(|| standing_work_id(agent_id, family)),
+        agent_id: agent_id.to_string(),
+        family: family.to_string(),
+        spec,
+        catalog_version,
+        proposal_id: None,
+        plan_version,
+        effective_from: now.clone(),
+        status: "active".to_string(),
+        updated_by: "admin".to_string(),
+        updated_at: now.clone(),
+    };
+    if let Err(err) = state.store.save_standing_work(&work).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store standing work: {err}"),
+        )
+            .into_response();
+    }
+    finish_work_mutation(
+        state,
+        agent_id,
+        WorkReceipt {
+            work_id: work.work_id.clone(),
+            agent_id: agent_id.to_string(),
+            work_kind: WorkKind::Standing,
+            status: "accepted".to_string(),
+            plan_version: work.plan_version,
+            created_at: now,
+        },
+    )
+    .await
+}
+
+/// 派一件一次性工作：动作 + 期限 + 预算，落库为 `dispatched` 等 Agent 确认。
+async fn grant_one_shot_work(
+    state: &ApiState,
+    agent_id: &str,
+    input: &GrantWorkRequest,
+) -> Response {
+    let action = match input.action.as_deref().map(str::trim) {
+        Some(action) if !action.is_empty() => action,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "action is required for work_kind = OneShot",
+            )
+                .into_response();
+        }
+    };
+    if input.spec.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "spec is required for work_kind = OneShot",
+        )
+            .into_response();
+    }
+    // 绝对截止是必填：没有截止的「一次性工作」与常驻工作无从分辨，
+    // 而两者的暂停、恢复、结算语义完全不同。
+    let Some(deadline_at) = input
+        .deadline_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "deadline_at is required for work_kind = OneShot",
+        )
+            .into_response();
+    };
+    if chrono::DateTime::parse_from_rfc3339(deadline_at).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("deadline_at must be RFC3339, got {deadline_at:?}"),
+        )
+            .into_response();
+    }
+    let timeout_seconds = match input.timeout_seconds {
+        Some(value) if value > 0 => value,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "timeout_seconds must be a positive number of seconds",
+            )
+                .into_response();
+        }
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let scheduled_at = input
+        .scheduled_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&now)
+        .to_string();
+    if chrono::DateTime::parse_from_rfc3339(&scheduled_at).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("scheduled_at must be RFC3339, got {scheduled_at:?}"),
+        )
+            .into_response();
+    }
+    // `interruptible` 不在请求体里（模型消息也没这个字段）：一件活能不能中途暂停是
+    // **动作目录的属性**，不该由每次派发的人各自声明 —— 否则同一种动作会因为两次派发
+    // 的口径不同而行为不一。动作目录就位前，一律按不可中断收（宁可拒绝暂停，
+    // 也不给人一个「以为暂停了、其实半个进程挂着」的假象）。
+    let work = OneShotWork {
+        work_id: one_shot_work_id(agent_id, action, &now),
+        agent_id: agent_id.to_string(),
+        action: action.to_string(),
+        spec: input.spec.trim().to_string(),
+        scheduled_at,
+        deadline_at: deadline_at.to_string(),
+        timeout_seconds,
+        interruptible: false,
+        status: "dispatched".to_string(),
+        paused_at: None,
+        paused_total_seconds: 0,
+        current_step: None,
+        completed_steps: Vec::new(),
+        attempt: 0,
+        issued_by: "admin".to_string(),
+        issued_at: now.clone(),
+    };
+    let plan_version = 1;
+    if let Err(err) = state
+        .store
+        .save_one_shot_work(&StoredOneShotWork {
+            work: work.clone(),
+            pre_pause_status: None,
+        })
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store one-shot work: {err}"),
+        )
+            .into_response();
+    }
+    finish_work_mutation(
+        state,
+        agent_id,
+        WorkReceipt {
+            work_id: work.work_id.clone(),
+            agent_id: agent_id.to_string(),
+            work_kind: WorkKind::OneShot,
+            status: "accepted".to_string(),
+            plan_version,
+            created_at: now,
+        },
+    )
+    .await
+}
+
+/// 撤回一份工作：常驻 → `revoked`（撤销授权），一次性 → `canceled`（取消未了结的活）。
+///
+/// 为什么两种工作共用一条路由：对运维而言「別再做了」是一个动作；分两条路只是因为
+/// 落地状态不同。参数里带 `reason_code` 是为了留痕 —— 「谁撤的」好查，「为什么撤」
+/// 只能靠当时记的那一句。
+#[derive(Debug, Deserialize)]
+pub struct RevokeWorkRequest {
+    #[serde(default)]
+    pub reason_code: String,
+}
+
+pub async fn revoke_work(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path((agent_id, work_id)): Path<(String, String)>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Json(input): Json<RevokeWorkRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let reason = input.reason_code.trim();
+    match load_work(&state, &agent_id, &work_id).await {
+        Err(response) => *response,
+        Ok(LoadedWork::Standing(work)) => {
+            if work.status == "revoked" {
+                return (
+                    StatusCode::CONFLICT,
+                    format!("standing work {work_id} is already revoked"),
+                )
+                    .into_response();
+            }
+            let revoked = StandingWork {
+                status: "revoked".to_string(),
+                updated_at: now.clone(),
+                ..work
+            };
+            if let Err(err) = state.store.save_standing_work(&revoked).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to store standing work: {err}"),
+                )
+                    .into_response();
+            }
+            // `reason_code` 收下但暂不落库：审计事件（WorkRevoked）还没建。
+            // 宁可在回执里如实回报，也不凭一个没人读的列假装留了痕。
+            let _ = reason;
+            finish_work_mutation(
+                &state,
+                &agent_id,
+                WorkReceipt {
+                    work_id: revoked.work_id.clone(),
+                    agent_id: agent_id.clone(),
+                    work_kind: WorkKind::Standing,
+                    status: "revoked".to_string(),
+                    plan_version: revoked.plan_version,
+                    created_at: now,
+                },
+            )
+            .await
+        }
+        Ok(LoadedWork::OneShot(stored)) => {
+            if !stored.work.is_outstanding() {
+                return (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "one-shot work {work_id} is already {} (terminal)",
+                        stored.work.status
+                    ),
+                )
+                    .into_response();
+            }
+            let mut canceled = stored;
+            canceled.work.status = "canceled".to_string();
+            canceled.work.paused_at = None;
+            canceled.pre_pause_status = None;
+            if let Err(err) = state.store.save_one_shot_work(&canceled).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to store one-shot work: {err}"),
+                )
+                    .into_response();
+            }
+            finish_work_mutation(
+                &state,
+                &agent_id,
+                WorkReceipt {
+                    work_id: canceled.work.work_id.clone(),
+                    agent_id: agent_id.clone(),
+                    work_kind: WorkKind::OneShot,
+                    status: "revoked".to_string(),
+                    plan_version: 1,
+                    created_at: now,
+                },
+            )
+            .await
+        }
+    }
+}
+
+pub async fn pause_work(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path((agent_id, work_id)): Path<(String, String)>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    match load_work(&state, &agent_id, &work_id).await {
+        Err(response) => *response,
+        Ok(LoadedWork::Standing(work)) => {
+            if work.status != "active" {
+                return (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "standing work {work_id} is {}; only active work can be paused",
+                        work.status
+                    ),
+                )
+                    .into_response();
+            }
+            let paused = StandingWork {
+                status: "paused".to_string(),
+                updated_by: "admin".to_string(),
+                updated_at: now.clone(),
+                ..work
+            };
+            if let Err(err) = state.store.save_standing_work(&paused).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to store standing work: {err}"),
+                )
+                    .into_response();
+            }
+            finish_work_mutation(
+                &state,
+                &agent_id,
+                WorkReceipt {
+                    work_id: paused.work_id.clone(),
+                    agent_id: agent_id.clone(),
+                    work_kind: WorkKind::Standing,
+                    status: "paused".to_string(),
+                    plan_version: paused.plan_version,
+                    created_at: now,
+                },
+            )
+            .await
+        }
+        Ok(LoadedWork::OneShot(stored)) => {
+            let paused = match work_rules::pause_one_shot(&stored, &now) {
+                Ok(paused) => paused,
+                Err(rejection) => return rejection_response(rejection),
+            };
+            if let Err(err) = state.store.save_one_shot_work(&paused).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to store one-shot work: {err}"),
+                )
+                    .into_response();
+            }
+            finish_work_mutation(
+                &state,
+                &agent_id,
+                WorkReceipt {
+                    work_id: paused.work.work_id.clone(),
+                    agent_id: agent_id.clone(),
+                    work_kind: WorkKind::OneShot,
+                    status: "paused".to_string(),
+                    plan_version: 1,
+                    created_at: now,
+                },
+            )
+            .await
+        }
+    }
+}
+
+pub async fn resume_work(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path((agent_id, work_id)): Path<(String, String)>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    let now = chrono::Utc::now();
+    let now_text = now.to_rfc3339();
+    match load_work(&state, &agent_id, &work_id).await {
+        Err(response) => *response,
+        Ok(LoadedWork::Standing(work)) => {
+            if work.status != "paused" {
+                return (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "standing work {work_id} is {}; only paused work can be resumed",
+                        work.status
+                    ),
+                )
+                    .into_response();
+            }
+            // 恢复**不重新审定**：仍用暂停前的同一版本（`plan_version` 不动）。
+            let resumed = StandingWork {
+                status: "active".to_string(),
+                updated_by: "admin".to_string(),
+                updated_at: now_text.clone(),
+                ..work
+            };
+            if let Err(err) = state.store.save_standing_work(&resumed).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to store standing work: {err}"),
+                )
+                    .into_response();
+            }
+            finish_work_mutation(
+                &state,
+                &agent_id,
+                WorkReceipt {
+                    work_id: resumed.work_id.clone(),
+                    agent_id: agent_id.clone(),
+                    work_kind: WorkKind::Standing,
+                    status: "resumed".to_string(),
+                    plan_version: resumed.plan_version,
+                    created_at: now_text,
+                },
+            )
+            .await
+        }
+        Ok(LoadedWork::OneShot(stored)) => {
+            let resumed = match work_rules::resume_one_shot(&stored, now.timestamp_millis()) {
+                Ok(resumed) => resumed,
+                Err(rejection) => return rejection_response(rejection),
+            };
+            if let Err(err) = state.store.save_one_shot_work(&resumed).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to store one-shot work: {err}"),
+                )
+                    .into_response();
+            }
+            let receipt = WorkReceipt {
+                work_id: resumed.work.work_id.clone(),
+                agent_id: agent_id.clone(),
+                work_kind: WorkKind::OneShot,
+                status: "resumed".to_string(),
+                plan_version: 1,
+                created_at: now_text,
+            };
+            finish_work_mutation(&state, &agent_id, receipt).await
+        }
+    }
+}
+
+enum LoadedWork {
+    Standing(StandingWork),
+    OneShot(StoredOneShotWork),
+}
+
+/// 按 `work_id` 找一份工作（两种都找）。找不到或不属于该 agent 都回 404。
+///
+/// 为什么要检查归属：路由里既有 agent 又有 work，只按 work_id 找就会让
+/// 「用 A 机器的路径去改 B 机器的工作」这种错操作合法化。
+///
+/// 错误类型用 `Box<Response>`：`Response` 很大，直接当 `Err` 会让整条
+/// `Result` 变胖（clippy 的 `result_large_err`），而这个返回值每次都在热路径上。
+async fn load_work(
+    state: &ApiState,
+    agent_id: &str,
+    work_id: &str,
+) -> Result<LoadedWork, Box<Response>> {
+    let standing = state
+        .store
+        .get_standing_work(work_id)
+        .await
+        .map_err(|err| {
+            Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to load standing work: {err}"),
+                )
+                    .into_response(),
+            )
+        })?;
+    if let Some(work) = standing {
+        if work.agent_id != agent_id {
+            return Err(Box::new(not_found_work(agent_id, work_id)));
+        }
+        return Ok(LoadedWork::Standing(work));
+    }
+    let one_shot = state
+        .store
+        .get_one_shot_work(work_id)
+        .await
+        .map_err(|err| {
+            Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to load one-shot work: {err}"),
+                )
+                    .into_response(),
+            )
+        })?;
+    match one_shot {
+        Some(work) if work.work.agent_id == agent_id => Ok(LoadedWork::OneShot(work)),
+        _ => Err(Box::new(not_found_work(agent_id, work_id))),
+    }
+}
+
+fn not_found_work(agent_id: &str, work_id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!("unknown work {work_id} on agent {agent_id}"),
+    )
+        .into_response()
+}
+
+/// 改完工作后统一收尾：推进授权序号并把回执交给调用方。
+///
+/// 序号在这里推（而不是各 handler 自己推）是为了不漏：漏推一次的后果是
+/// Agent 认为快照没变，于是期望与实际安静地不一致。
+async fn finish_work_mutation(state: &ApiState, agent_id: &str, receipt: WorkReceipt) -> Response {
+    if let Err(err) = state
+        .store
+        .next_work_sequence(agent_id, &receipt.created_at)
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to bump work sequence: {err}"),
+        )
+            .into_response();
+    }
+    Json(receipt).into_response()
+}
+
+/// 常驻工作的 id 是**确定性**的：一台机器的一个面就一份工作。
+///
+/// 用确定性 id 而不是随机 id，是为了让「改一份已有的授权」天然幂等 ——
+/// 否则每次改动都会多出一份「同一面的历史版本」，而它们都还停在 active 上。
+fn standing_work_id(agent_id: &str, family: &str) -> String {
+    format!("work-{agent_id}-{family}")
+}
+
+/// 一次性工作的 id 带时间戳与内容摘要：同一动作可以派多次，各自独立结算。
+fn one_shot_work_id(agent_id: &str, action: &str, issued_at: &str) -> String {
+    let digest = crate::infra::sha256_hex(&format!("{agent_id}|{action}|{issued_at}"));
+    format!("work-{agent_id}-{action}-{}", &digest[..12])
+}
+
+#[derive(Debug, Serialize)]
+struct StandingWorkView {
+    #[serde(flatten)]
+    work: StandingWork,
+    /// Agent 最近一次确认；从未确认过是 `None`（那就是漂移）。
+    ack: Option<StoredWorkAck>,
+}
+
+#[derive(Debug, Serialize)]
+struct OneShotWorkView {
+    #[serde(flatten)]
+    work: OneShotWork,
+    ack: Option<StoredWorkAck>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentWorkView {
+    agent_id: String,
+    /// 授权序号：与 Agent 手上那份比对即知是否变化。
+    sequence: i64,
+    /// **只看当前生效的**（active/paused）。历史版本靠下面两个列表看。
+    standing: Vec<StandingWorkView>,
+    one_shot: Vec<OneShotWorkView>,
+    /// 已撤回/被取代的常驻工作（审计用，不下发）。
+    retired_standing: Vec<StandingWork>,
+    /// 已了结的一次性工作（审计用，不下发）。
+    settled_one_shot: Vec<OneShotWork>,
+    generated_at: String,
+}
+
+/// 查看某 Agent 的工作（**手加端点**：模型里只有授权/撤回，没有查看）。
+///
+/// 为什么必须有：授权是个「声明」，运维看不到声明就等于没有控制。页面上的
+/// 「暂停一下」「撤掉」都得先看到手上有什么；`ack` 一并给出，是为了让漂移
+/// （期望版本 vs 确认版本）当场可见，不用去别处对时间戳。
+pub async fn view_agent_work(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    let standing = match state.store.list_standing_work(&agent_id).await {
+        Ok(works) => works,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load standing work: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let one_shot = match state.store.list_one_shot_work(&agent_id).await {
+        Ok(works) => works,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load one-shot work: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let mut standing_views = Vec::new();
+    for work in effective_standing(&standing) {
+        let ack = match load_ack(&state, &work.work_id).await {
+            Ok(ack) => ack,
+            Err(response) => return *response,
+        };
+        standing_views.push(StandingWorkView { work, ack });
+    }
+    let mut one_shot_views = Vec::new();
+    for work in outstanding_one_shot(&one_shot) {
+        let ack = match load_ack(&state, &work.work_id).await {
+            Ok(ack) => ack,
+            Err(response) => return *response,
+        };
+        one_shot_views.push(OneShotWorkView { work, ack });
+    }
+    let retired_standing = standing
+        .into_iter()
+        .filter(|work| !matches!(work.status.as_str(), "active" | "paused"))
+        .collect();
+    let settled_one_shot = one_shot
+        .into_iter()
+        .filter(|work| !work.work.is_outstanding())
+        .map(|work| work.work)
+        .collect();
+    let sequence = match state.store.work_sequence(&agent_id).await {
+        Ok(sequence) => sequence,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load work sequence: {err}"),
+            )
+                .into_response();
+        }
+    };
+    Json(AgentWorkView {
+        agent_id,
+        sequence,
+        standing: standing_views,
+        one_shot: one_shot_views,
+        retired_standing,
+        settled_one_shot,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+    })
+    .into_response()
+}
+
+async fn load_ack(state: &ApiState, work_id: &str) -> Result<Option<StoredWorkAck>, Box<Response>> {
+    state.store.get_work_ack(work_id).await.map_err(|err| {
+        Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load work ack: {err}"),
+            )
+                .into_response(),
+        )
+    })
 }
 
 /// 机队用途覆盖度：各类别台数 + 未归类台数。

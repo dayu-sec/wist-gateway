@@ -22,3 +22,8 @@ pub mod inventory;
 // 「按面展开」。对应模型 Control.Agent.Content；与 purpose/discovery_policy 同类，
 // 值留 content/、只读不内嵌。重新生成控制面代码时需回补本模块。
 pub mod content;
+
+// NOTE(hand-added): 工作授权（模型 Control.Agent.Work）的校验与状态机：
+// 面就绪度闸门、spec 由目录展开/逐条校验、暂停与恢复的边界。
+// 重新生成控制面代码时需回补本模块。
+pub mod work;

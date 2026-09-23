@@ -608,6 +608,24 @@ pub fn platform_for_machine_class(machine_class: &str) -> Option<&'static str> {
     }
 }
 
+/// 某个采集面是否可能出现在某平台上（照 `families.mju` 的分类）。
+///
+/// 与 [`ContentSet::is_family_ready`] 分工不同：那个回答「规则写好了吗」，
+/// 这个回答「这个面在这类机器上存不存在」。派活时要分开报 —— 对一台 Linux 机器说
+/// 「TCC 面规则未就绪」是把**不适用**说成了**没写好**，会把人引向错误的下一步。
+pub fn family_applies_to(family: &str, platform: &str) -> bool {
+    if !FAMILIES.contains(&family) || !PLATFORMS.contains(&platform) {
+        return false;
+    }
+    if MACOS_ONLY_FAMILIES.contains(&family) {
+        return platform == "macos";
+    }
+    if LINUX_ONLY_FAMILIES.contains(&family) {
+        return platform == "linux";
+    }
+    true
+}
+
 /// 由 `pack_refs` 派生 `(family_scope, capability_scope)`（保持稳定顺序）。
 fn derive_scope(
     pack_refs: &[String],

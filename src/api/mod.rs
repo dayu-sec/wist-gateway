@@ -45,13 +45,14 @@ pub mod wist_agentd_online_registration_interface;
 pub use wist_agentd_online_registration_interface::WistAgentdOnlineRegistrationInterface;
 
 use admin_ops::{
-    classify_agent, get_agent_runtime_status, list_agents, revoke_agent_credential,
-    set_agent_install_package, set_agent_uplink, view_agent_install_package, view_agent_purpose,
-    view_agent_uplink, view_discovery_policies, view_purpose_coverage,
+    classify_agent, get_agent_runtime_status, grant_work, list_agents, pause_work, resume_work,
+    revoke_agent_credential, revoke_work, set_agent_install_package, set_agent_uplink,
+    view_agent_install_package, view_agent_purpose, view_agent_uplink, view_agent_work,
+    view_discovery_policies, view_purpose_coverage,
 };
 use agent_ops::{
-    poll_control_commands, poll_discovery_policies, renew_agent_credential, report_action_result,
-    submit_agent_status,
+    ack_work, poll_control_commands, poll_discovery_policies, poll_work, renew_agent_credential,
+    report_action_result, submit_agent_status,
 };
 use content_ops::view_content;
 use enrollment::enroll_agent;
@@ -221,6 +222,11 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/agent/discovery-policies:poll",
             post(poll_discovery_policies),
         )
+        // NOTE(hand-added): 工作授权快照的拉取与确认（jumo 模型
+        // WistAgentdOnlineRegistrationInterface 的 PollWork / AckWork）。
+        // 与策略表同类：幂等内容、可重复拉取；断网重启后重新拉一次就回到期望状态。
+        .route("/api/v1/agent/work:poll", post(poll_work))
+        .route("/api/v1/agent/work:ack", post(ack_work))
         .route("/api/v1/admin/agents/overview", get(get_agent_overview))
         .route(
             "/api/v1/admin/agents/host-metrics",
@@ -245,6 +251,25 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agents/purpose-coverage",
             get(view_purpose_coverage),
+        )
+        // NOTE(hand-added): 工作授权／撤回／暂停／继续 + 查看（jumo 模型
+        // WistGatewayManagementInterface 的 AdminGrantWork / AdminRevokeWork /
+        // AdminPauseWork / AdminResumeWork）。查看了模型里没有，是为了“看得到才能控制”。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/work",
+            get(view_agent_work).post(grant_work),
+        )
+        .route(
+            "/api/v1/admin/agents/{agent_id}/work/{work_id}/revoke",
+            post(revoke_work),
+        )
+        .route(
+            "/api/v1/admin/agents/{agent_id}/work/{work_id}/pause",
+            post(pause_work),
+        )
+        .route(
+            "/api/v1/admin/agents/{agent_id}/work/{work_id}/resume",
+            post(resume_work),
         )
         .route(
             "/api/v1/admin/agents/{agent_id}/host-metrics",
