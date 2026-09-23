@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::app::content::ContentSet;
 use crate::app::purpose::PurposeRuleTable;
 use crate::infra::{AdminConfig, Store};
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
@@ -30,6 +31,9 @@ mod overview;
 // 同一模式（模型里也没有 host-metrics 路由）。重新生成控制面代码时需回补本模块与下方路由。
 mod pipeline;
 mod rate_limit;
+// NOTE(hand-added): 采集内容目录的只读视图（模板组成 + 面就绪度）。不在 jumo 静态模型
+// binding.mju 的声明里，与 software_ops 同一模式。重新生成控制面代码时需回补本模块与路由。
+mod content_ops;
 // NOTE(hand-added): L1a 机械资产清单（从事实摘要派生）。不在 jumo 静态模型 binding.mju
 // 的声明里，与 host_metrics / pipeline 同一模式。重新生成控制面代码时需回补本模块与下方路由。
 mod software_ops;
@@ -49,6 +53,7 @@ use agent_ops::{
     poll_control_commands, poll_discovery_policies, renew_agent_credential, report_action_result,
     submit_agent_status,
 };
+use content_ops::view_content;
 use enrollment::enroll_agent;
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
 use ingest::{MAX_INGEST_BODY_BYTES, ingest_agent_facts};
@@ -76,6 +81,11 @@ pub struct ApiState {
     /// 与规则表同理：启动时装载一次并缓存（改策略通过重启生效）。`None` 时下发端点
     /// 回 503，而不是发一份空表 —— 空表会让「平台没发布策略」与「从未配置」无法区分。
     pub discovery_policies: Option<Arc<DiscoveryAspectPolicySet>>,
+    /// 已装载的采集内容集（catalog + packs + templates）；三者缺一则为 `None`。
+    ///
+    /// 与规则表/策略表同理：启动时装载一次并缓存（改内容通过重启生效）。`None` 时
+    /// 内容相关能力（模板展开）不可用，但不影响事实入库 / 用途推断 / 资产清单。
+    pub content: Option<Arc<ContentSet>>,
 }
 
 /// 启动时装载规则表。
@@ -114,6 +124,23 @@ fn load_discovery_policies(config: &AdminConfig) -> Option<Arc<DiscoveryAspectPo
     }
 }
 
+/// 启动时装载采集内容三件套（catalog / packs / templates）。
+///
+/// 与规则表/策略表同样的退化策略：`AdminConfig::validate` 已用真实装载器校验过一次
+/// （内容写错就起不来），走到这里还失败说明文件在启动后被改动过 —— 记警告并当作“未装载”。
+fn load_content(config: &AdminConfig) -> Option<Arc<ContentSet>> {
+    let catalog = config.content_catalog_file.as_deref()?;
+    let packs = config.content_packs_file.as_deref()?;
+    let templates = config.content_templates_file.as_deref()?;
+    match crate::app::content::load_content(catalog, packs, templates) {
+        Ok(set) => Some(Arc::new(set)),
+        Err(err) => {
+            eprintln!("warning: failed to load collection content: {err}");
+            None
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AdminRuntimeState {
     pub recent_online_agents: Vec<RecentOnlineRegisteredAgent>,
@@ -128,6 +155,7 @@ pub fn router(config: AdminConfig, store: Arc<dyn Store>) -> Router {
 pub fn build_state(config: AdminConfig, store: Arc<dyn Store>) -> ApiState {
     let purpose_rules = load_purpose_rules(&config);
     let discovery_policies = load_discovery_policies(&config);
+    let content = load_content(&config);
     ApiState {
         config,
         store,
@@ -135,6 +163,7 @@ pub fn build_state(config: AdminConfig, store: Arc<dyn Store>) -> ApiState {
         rate_limits: Arc::new(Mutex::new(rate_limit::RateLimitState::default())),
         purpose_rules,
         discovery_policies,
+        content,
     }
 }
 
@@ -224,6 +253,9 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/admin/agents/{agent_id}/software",
             get(view_agent_software),
         )
+        // NOTE(hand-added): 采集内容目录的只读视图（模板组成 + 面就绪度）。见
+        // api/content_ops.rs 顶部说明。
+        .route("/api/v1/admin/content", get(view_content))
         // NOTE(hand-added): wist-agentd 安装包地址的读取/设置。已在 jumo 模型
         // WistGatewayManagementInterface（AdminViewAgentInstallPackageAddress /
         // AdminSetAgentInstallPackageAddress）中声明。

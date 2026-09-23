@@ -3799,6 +3799,80 @@ fn enrollment_request(token: &str) -> EnrollmentRequest {
     }
 }
 
+const TEST_CONTENT_CATALOG: &str = r#"
+catalog_version = 1
+origin = "Gateway"
+published_at = "2026-09-22T00:00:00Z"
+
+[[units]]
+unit_id = "mac-metrics"
+family = "HostMetrics"
+capability = "collect_metrics"
+platform = "macos"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "none"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+
+[[units]]
+unit_id = "linux-metrics"
+family = "HostMetrics"
+capability = "collect_metrics"
+platform = "linux"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "root"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+"#;
+
+const TEST_CONTENT_PACKS: &str = r#"
+[[pack]]
+pack_id = "macos-base"
+platform = "macos"
+kind = "Baseline"
+families = ["HostMetrics"]
+unit_refs = ["mac-metrics"]
+catalog_version = 1
+status = "active"
+
+[[pack]]
+pack_id = "linux-base"
+platform = "linux"
+kind = "Baseline"
+families = ["HostMetrics"]
+unit_refs = ["linux-metrics"]
+catalog_version = 1
+status = "active"
+"#;
+
+const TEST_CONTENT_TEMPLATES: &str = r#"
+[[template]]
+template_id = "macos-daily"
+machine_class = "MacDaily"
+platform = "macos"
+pack_refs = ["macos-base"]
+catalog_version = 1
+template_version = 1
+status = "active"
+
+[[template]]
+template_id = "linux-compute"
+machine_class = "LinuxCompute"
+platform = "linux"
+pack_refs = ["linux-base"]
+catalog_version = 1
+template_version = 1
+status = "active"
+"#;
+
 struct TestEnv {
     config: AdminConfig,
     store: SqliteStore,
@@ -3809,24 +3883,30 @@ struct TestEnv {
 
 impl TestEnv {
     async fn new() -> Self {
-        Self::new_with_purpose_rules(None).await
+        Self::new_with_policy_files(None, None, true).await
+    }
+
+    /// 不装载内容目录的用例用这个（`/api/v1/admin/content` 回 503）。
+    async fn new_without_content() -> Self {
+        Self::new_with_policy_files(None, None, false).await
     }
 
     /// 需要用途推断的用例用这个：把规则表写进 temp 目录并挂到配置上。
     /// `None` = 模拟「尚未配置规则表」 （事实照常入库，但不产出建议）。
     async fn new_with_purpose_rules(purpose_rules_toml: Option<&str>) -> Self {
-        Self::new_with_policy_files(purpose_rules_toml, None).await
+        Self::new_with_policy_files(purpose_rules_toml, None, true).await
     }
 
     /// 需要发现方向策略表的用例用这个：把策略表写进 temp 目录并挂到配置上。
     /// `None` = 模拟「尚未配置策略表」（poll 回 503，agentd 回落内建默认值）。
     async fn new_with_discovery_policies(discovery_policies_toml: Option<&str>) -> Self {
-        Self::new_with_policy_files(None, discovery_policies_toml).await
+        Self::new_with_policy_files(None, discovery_policies_toml, true).await
     }
 
     async fn new_with_policy_files(
         purpose_rules_toml: Option<&str>,
         discovery_policies_toml: Option<&str>,
+        content: bool,
     ) -> Self {
         let root = std::env::temp_dir().join(format!("wist-gateway-test-{}", unique_suffix()));
         std::fs::create_dir_all(&root).expect("create root");
@@ -3841,6 +3921,19 @@ impl TestEnv {
         let install_script_signing_public_key_pem =
             load_install_script_public_key_pem(&install_signing_private_key_file)
                 .expect("derive install signing public key");
+        let (content_catalog_file, content_packs_file, content_templates_file) = if content {
+            let content_dir = root.join("content");
+            std::fs::create_dir_all(&content_dir).expect("create content dir");
+            let catalog = content_dir.join("catalog.toml");
+            std::fs::write(&catalog, TEST_CONTENT_CATALOG).expect("write catalog");
+            let packs = content_dir.join("packs.toml");
+            std::fs::write(&packs, TEST_CONTENT_PACKS).expect("write packs");
+            let templates = content_dir.join("templates.toml");
+            std::fs::write(&templates, TEST_CONTENT_TEMPLATES).expect("write templates");
+            (Some(catalog), Some(packs), Some(templates))
+        } else {
+            (None, None, None)
+        };
         let config = AdminConfig {
             listen_addr: "127.0.0.1:3000".to_string(),
             public_base_url: "https://127.0.0.1:3000".to_string(),
@@ -3869,6 +3962,9 @@ impl TestEnv {
                 std::fs::write(&path, text).expect("write discovery policies");
                 path
             }),
+            content_catalog_file,
+            content_packs_file,
+            content_templates_file,
             // 内部接入端点默认关：测试走 `router()`，明文监听由 main.rs 单独起。
             ingest_listen_addr: None,
         };
@@ -3900,6 +3996,7 @@ async fn test_state() -> ApiState {
     ApiState {
         purpose_rules: super::load_purpose_rules(&env.config),
         discovery_policies: super::load_discovery_policies(&env.config),
+        content: super::load_content(&env.config),
         config: env.config.clone(),
         store: Arc::clone(&env.store_handle),
         runtime: Arc::new(Mutex::new(AdminRuntimeState::default())),
@@ -3916,6 +4013,69 @@ async fn issue_token_for_state(state: &ApiState) -> String {
 
 fn enrollment_request_json(token: &str) -> String {
     serde_json::to_string(&enrollment_request(token)).expect("serialize request")
+}
+
+/// 采集内容只读视图：模板组成 + 各平台的面就绪度（“部分可用”的可见面）。
+#[tokio::test]
+async fn admin_content_view_lists_readiness_and_templates() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/content",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["catalog_version"], 1);
+    let templates = view["templates"].as_array().expect("templates array");
+    assert!(
+        templates
+            .iter()
+            .any(|template| template["template_id"] == "macos-daily")
+    );
+
+    let readiness = view["readiness"].as_array().expect("readiness array");
+    let macos = readiness
+        .iter()
+        .find(|entry| entry["platform"] == "macos")
+        .expect("macos readiness");
+    let host_metrics = macos["families"]
+        .as_array()
+        .expect("families array")
+        .iter()
+        .find(|family| family["family"] == "HostMetrics")
+        .expect("HostMetrics readiness");
+    assert_eq!(host_metrics["ready"], serde_json::Value::Bool(true));
+    assert_eq!(host_metrics["active_units"], 1);
+}
+
+#[tokio::test]
+async fn admin_content_view_requires_admin_bearer() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/content",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_content_view_reports_not_configured() {
+    // 端点存在、但这台网关没配内容目录 —— 与“没发布”区分开，回 503。
+    let env = TestEnv::new_without_content().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/content",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 async fn get_to_router(

@@ -56,6 +56,11 @@ pub struct AdminConfig {
     pub purpose_rules_file: Option<PathBuf>,
     /// 发现方向策略表（策展数据）。未配置时：不下发该端点，Agent 回落到自己的内建默认值。
     pub discovery_policies_file: Option<PathBuf>,
+    /// 采集内容三件套（catalog / packs / templates，策展数据）。
+    /// 三者**要么都给、要么都不给** —— 内容集内部互相引用，缺一不可。
+    pub content_catalog_file: Option<PathBuf>,
+    pub content_packs_file: Option<PathBuf>,
+    pub content_templates_file: Option<PathBuf>,
     /// 数据面订阅端的内部接入端点（明文 HTTP，只应绑环回）。
     /// `None` = 关闭订阅（见 [`RawIngestConfig`]）。
     pub ingest_listen_addr: Option<String>,
@@ -85,6 +90,8 @@ struct RawAdminConfig {
     purpose: RawPurposeConfig,
     #[serde(default)]
     discovery: RawDiscoveryConfig,
+    #[serde(default)]
+    content: RawContentConfig,
     #[serde(default)]
     ingest: RawIngestConfig,
 }
@@ -119,6 +126,21 @@ struct RawDiscoveryConfig {
     /// 为什么不做内嵌默认副本：那会有两份真相，改策略时必然漂移。
     #[serde(default)]
     policies_file: Option<String>,
+}
+
+/// `[content]` 段。缺省时不装载内容目录（不影响事实 / 用途 / 清单）。
+/// 三份文件互相引用，**要么都给、要么都不给**（校验在 `validate` 里）。
+#[derive(Debug, Default, Deserialize)]
+struct RawContentConfig {
+    /// 源头是 jumo 模型仓的 `jumo/model/content/catalog.toml`。
+    #[serde(default)]
+    catalog_file: Option<String>,
+    /// `jumo/model/content/packs.toml`。
+    #[serde(default)]
+    packs_file: Option<String>,
+    /// `jumo/model/content/templates.toml`。
+    #[serde(default)]
+    templates_file: Option<String>,
 }
 
 /// `[store]` 段。缺省（旧配置无此段）时回退到本地 SQLite 文件。
@@ -258,6 +280,30 @@ impl AdminConfig {
                     .transpose()?,
             )
             .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            content_catalog_file: normalize_optional(
+                raw.content
+                    .catalog_file
+                    .as_deref()
+                    .map(expand_env)
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            content_packs_file: normalize_optional(
+                raw.content
+                    .packs_file
+                    .as_deref()
+                    .map(expand_env)
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            content_templates_file: normalize_optional(
+                raw.content
+                    .templates_file
+                    .as_deref()
+                    .map(expand_env)
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
             ingest_listen_addr: match raw.ingest.listen_addr.as_deref() {
                 // 缺省（无 `[ingest]` 段）= 开，默认只绑环回；显式置空 = 关。
                 None => Some(DEFAULT_INGEST_LISTEN_ADDR.to_string()),
@@ -319,6 +365,32 @@ impl AdminConfig {
                     policies_file.display()
                 ))
             })?;
+        }
+        // 内容三件套：要么都给、要么都不给；给了就逐一存在 + 用**真实装载器**校验
+        // （模板引用写错必须在启动时被拒，而不是等到展开时才发现）。
+        let content_provided = [
+            self.content_catalog_file.is_some(),
+            self.content_packs_file.is_some(),
+            self.content_templates_file.is_some(),
+        ]
+        .iter()
+        .filter(|present| **present)
+        .count();
+        if content_provided != 0 && content_provided != 3 {
+            return Err(config_validation(
+                "content.*: catalog_file / packs_file / templates_file 必须同时提供（缺一不可）",
+            ));
+        }
+        if let (Some(catalog), Some(packs), Some(templates)) = (
+            self.content_catalog_file.as_deref(),
+            self.content_packs_file.as_deref(),
+            self.content_templates_file.as_deref(),
+        ) {
+            require_existing_file("content.catalog_file", catalog)?;
+            require_existing_file("content.packs_file", packs)?;
+            require_existing_file("content.templates_file", templates)?;
+            crate::app::content::load_content(catalog, packs, templates)
+                .map_err(|err| config_validation(format!("content: {err}")))?;
         }
         if let Some(database_url) = self.database_url.as_deref()
             && !database_url.starts_with("sqlite:")

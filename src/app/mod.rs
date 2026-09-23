@@ -17,3 +17,8 @@ pub mod discovery_policy;
 // agent-work-delivery-plan.md §8.2）。只做机械归并，不做识别（识别在采集侧）。
 // 重新生成控制面代码时需回补本模块。
 pub mod inventory;
+
+// NOTE(hand-added): 采集内容目录（catalog / packs / templates）的装载、校验与
+// 「按面展开」。对应模型 Control.Agent.Content；与 purpose/discovery_policy 同类，
+// 值留 content/、只读不内嵌。重新生成控制面代码时需回补本模块。
+pub mod content;
