@@ -344,7 +344,8 @@ pub struct StoredSoftwareHolding {
 }
 
 /// 某台机器上的某条路径。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Control", module = "Control.Agent.Inventory")]
 pub struct SoftwareHolder {
     pub agent_id: String,
     pub path: String,
