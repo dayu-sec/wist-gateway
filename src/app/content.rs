@@ -231,7 +231,8 @@ pub struct Template {
 }
 
 /// 某采集面在某平台上的就绪度（派生）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Control", module = "Control.Agent.Content")]
 pub struct FamilyReadiness {
     pub family: String,
     pub platform: String,
