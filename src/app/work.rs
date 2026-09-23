@@ -13,7 +13,7 @@
 
 use crate::app::content::{ContentSet, FAMILIES, family_applies_to};
 use crate::infra::{StoredAgentFactSummary, StoredOneShotWork};
-use wist_contracts::work::OneShotWork;
+use wist_contracts::work::{OneShotWork, WorkSpec, WorkSpecSource, WorkSpecUnit};
 
 /// 授权/撤回被拒的原因。映射成 HTTP 状态码是 api 层的事。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +118,42 @@ pub fn derive_spec(
         };
         return Err(WorkRejection::Conflict(detail));
     };
-    Ok((work.selected_units.join(","), work.catalog_version))
+    materialize_spec(content, &work.selected_units).map(|spec| (spec, work.catalog_version))
+}
+
+/// 把选中的单元**物化**成工作参数（`spec` 的内容）。
+///
+/// 为什么要物化而不是只存一串 `unit_id`：agentd 拿到工作要能直接照做，
+/// 而「采什么（来源）」与「用什么规则解析（`rule_ref`）」只存在网关的采集目录里。
+/// 详见 `wist_contracts::work::WorkSpec` 的注释。
+fn materialize_spec(content: &ContentSet, unit_ids: &[String]) -> Result<String, WorkRejection> {
+    let mut units = Vec::with_capacity(unit_ids.len());
+    for unit_id in unit_ids {
+        let Some(unit) = content.units().find(|unit| unit.unit_id == *unit_id) else {
+            // 展开出来的单元不在目录里 —— 这是网关自己的不变式被破坏，
+            // 不能当无事发生发出去（工作参数里的单元必须是能落地的真单元）。
+            return Err(WorkRejection::Conflict(format!(
+                "selected unit {unit_id:?} is not in the collection catalog"
+            )));
+        };
+        units.push(WorkSpecUnit {
+            unit_id: unit.unit_id.clone(),
+            capability: unit.capability.clone(),
+            rule_ref: unit.rule_ref.clone(),
+            requires_privilege: unit.requires_privilege.clone(),
+            sources: unit
+                .sources
+                .iter()
+                .map(|(kind, target)| WorkSpecSource {
+                    kind: kind.clone(),
+                    target: target.clone(),
+                })
+                .collect(),
+        });
+    }
+    WorkSpec { units }
+        .encode()
+        .map_err(|err| WorkRejection::Conflict(format!("failed to encode work spec: {err}")))
 }
 
 /// 校验人工给定的 `spec`：**逐条**必须是该面在该平台上的目录单元。
@@ -155,7 +190,7 @@ pub fn validate_spec(
             "spec must name at least one collection unit (或留空，由网关按事实展开)".to_string(),
         ));
     }
-    Ok((selected.join(","), content.catalog_version))
+    materialize_spec(content, &selected).map(|spec| (spec, content.catalog_version))
 }
 
 /// 定出这次授权的期望版本。
@@ -569,7 +604,16 @@ status = "active"
             &facts(&["postgresql"]),
         )
         .unwrap();
-        assert_eq!(spec, "linux-db");
+        // spec 是**物化**的工作参数：agentd 要能拿着它直接采（含来源与规则标识）。
+        let spec = WorkSpec::parse(&spec).expect("spec 是可解析的工作参数");
+        assert_eq!(spec.units.len(), 1);
+        assert_eq!(spec.units[0].unit_id, "linux-db");
+        assert_eq!(spec.units[0].capability, "collect_logs");
+        assert_eq!(spec.units[0].rule_ref, "linux/db");
+        assert_eq!(spec.units[0].requires_privilege, "root");
+        assert_eq!(spec.units[0].sources.len(), 1);
+        assert_eq!(spec.units[0].sources[0].kind, "FileGlob");
+        assert_eq!(spec.units[0].sources[0].target, "/var/log/postgresql/*");
         assert_eq!(catalog_version, 1);
     }
 
@@ -618,7 +662,10 @@ status = "active"
     fn hand_written_spec_must_name_units_of_that_family_on_that_platform() {
         let content = content();
         let (spec, _) = validate_spec(&content, "macos", "HostMetrics", " mac-metrics ").unwrap();
-        assert_eq!(spec, "mac-metrics");
+        let spec = WorkSpec::parse(&spec).expect("spec 是可解析的工作参数");
+        assert_eq!(spec.units.len(), 1);
+        assert_eq!(spec.units[0].unit_id, "mac-metrics");
+        assert_eq!(spec.metric_interval_seconds(), Some(15));
 
         let err = validate_spec(&content, "macos", "HostMetrics", "nope").unwrap_err();
         assert!(err.message().contains("not in the collection catalog"));

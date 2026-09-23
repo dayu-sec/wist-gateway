@@ -31,7 +31,7 @@ use wist_contracts::gateway::{
     POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies, ReportActionResult,
     ReportAgentFactSummary, ResultAttestation,
 };
-use wist_contracts::work::{ACK_WORK_KIND, POLL_WORK_KIND};
+use wist_contracts::work::{ACK_WORK_KIND, POLL_WORK_KIND, WorkSpec};
 use wist_control::PollControlCommands;
 use wist_control::types::DateTime;
 
@@ -4447,8 +4447,17 @@ async fn granting_standing_work_derives_the_spec_from_catalog_and_facts() {
 
     let view = get_agent_work(&env).await;
     assert_eq!(view["sequence"], 1);
+    // 断言落库/下发的是**物化过**的工作参数：agentd 拿着它就能直接采。
+    let spec = WorkSpec::parse(
+        view["standing"][0]["spec"]
+            .as_str()
+            .expect("spec is a string"),
+    )
+    .expect("spec 是可解析的工作参数");
+    assert_eq!(spec.units[0].unit_id, "mac-metrics");
+    assert_eq!(spec.units[0].capability, "collect_metrics");
+    assert_eq!(spec.units[0].sources[0].kind, "MetricInterval");
     assert_eq!(view["standing"][0]["family"], "HostMetrics");
-    assert_eq!(view["standing"][0]["spec"], "mac-metrics");
     assert_eq!(view["standing"][0]["catalog_version"], 1);
     assert_eq!(view["standing"][0]["status"], "active");
     assert!(view["standing"][0]["ack"].is_null());
