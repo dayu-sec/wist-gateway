@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 use wist_control::types::{AgentRuntimeStatus, DateTime};
 
+use crate::app::content::{MACHINE_CLASSES, platform_for_machine_class};
 use crate::infra::{
     AgentQuery, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
-    DEFAULT_INSTALL_PACKAGE_SETTING_ID, StoredAgentFactSummary, StoredAgentInstallPackageAddress,
-    StoredAgentUplinkAddress, StoredPurposeSuggestion,
+    DEFAULT_INSTALL_PACKAGE_SETTING_ID, StoredAgentClassification, StoredAgentFactSummary,
+    StoredAgentInstallPackageAddress, StoredAgentUplinkAddress, StoredPurposeSuggestion,
 };
 
 use super::install_package::{PackageFetchError, fetch_into_cache};
@@ -163,8 +164,8 @@ pub struct AgentPurposeResponse {
     pub agent_id: String,
     pub fact_summary: Option<StoredAgentFactSummary>,
     pub suggestion: Option<StoredPurposeSuggestion>,
-    /// 人工判定：管理面的写入端点还没实现（模型已定），因此恒为 null。
-    pub classification: Option<serde_json::Value>,
+    /// 人工判定：采纳建议或改判后落库（采集范围变更的前置）。
+    pub classification: Option<StoredAgentClassification>,
     pub generated_at: DateTime,
 }
 
@@ -253,12 +254,167 @@ pub async fn view_agent_purpose(
         }
     };
     let suggestion = refresh_suggestion_for_read(&state, fact_summary.as_ref(), suggestion).await;
+    let classification = match state.store.get_agent_classification(&agent_id).await {
+        Ok(classification) => classification,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load agent classification: {err}"),
+            )
+                .into_response();
+        }
+    };
     Json(AgentPurposeResponse {
         agent_id,
         fact_summary,
         suggestion,
-        classification: None,
+        classification,
         generated_at: DateTime::now(),
+    })
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClassifyAgentRequest {
+    pub machine_class: String,
+    #[serde(default)]
+    pub suggestion_id: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// 归档某台 Agent 的用途判定（人工判定）。
+///
+/// 采集范围是合规边界：判定是授权工作模板的前置，必须由人落这一笔。
+/// 分类必须与该机器**已观测到的平台**一致（MacDaily/MacDev → macos，Linux* → linux）。
+/// 平台只能从事实摘要的 `os` 判定：**没上报过事实就不放行**，而不是默认通过。
+pub async fn classify_agent(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Json(input): Json<ClassifyAgentRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    let machine_class = input.machine_class.trim();
+    if !MACHINE_CLASSES.contains(&machine_class) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("unknown machine_class {machine_class:?}"),
+        )
+            .into_response();
+    }
+    let expected_platform =
+        platform_for_machine_class(machine_class).expect("validated machine class has a platform");
+    let summary = match state.store.get_agent_fact_summary(&agent_id).await {
+        Ok(summary) => summary,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load agent fact summary: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let Some(summary) = summary else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("cannot classify {agent_id}: no observed platform yet (no fact summary)"),
+        )
+            .into_response();
+    };
+    if summary.os != expected_platform {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "machine_class {machine_class} belongs to {expected_platform}, but the agent platform is {}",
+                summary.os
+            ),
+        )
+            .into_response();
+    }
+    let classification = StoredAgentClassification {
+        agent_id: agent_id.clone(),
+        machine_class: machine_class.to_string(),
+        suggestion_id: input.suggestion_id.filter(|value| !value.trim().is_empty()),
+        note: input.note.filter(|value| !value.trim().is_empty()),
+        // 网关只校验共享 admin token，暂无主体身份；先记 "admin"（模型里是 actor_identity）。
+        decided_by: "admin".to_string(),
+        decided_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Err(err) = state
+        .store
+        .upsert_agent_classification(&classification)
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store agent classification: {err}"),
+        )
+            .into_response();
+    }
+    Json(classification).into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct MachineClassCountResponse {
+    machine_class: String,
+    agent_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct PurposeCoverageResponse {
+    total_agents: i64,
+    classified_agents: i64,
+    unclassified_agents: i64,
+    by_class: Vec<MachineClassCountResponse>,
+    generated_at: String,
+}
+
+/// 机队用途覆盖度：各类别台数 + 未归类台数。
+///
+/// 存在的意义就是把“4 类覆盖约 80%”从**断言**变成**可度量的数**：要挑下一个 MachineClass，
+/// 看 `by_class` 分布与 `unclassified_agents`，而不是拍一个比例。
+pub async fn view_purpose_coverage(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let counts = match state.store.purpose_coverage().await {
+        Ok(counts) => counts,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load purpose coverage: {err}"),
+            )
+                .into_response();
+        }
+    };
+    // 未归类 = 总数 − 已判定；用 max(0) 防脏数据把负数漏到页面上。
+    let unclassified_agents = (counts.total_agents - counts.classified_agents).max(0);
+    Json(PurposeCoverageResponse {
+        total_agents: counts.total_agents,
+        classified_agents: counts.classified_agents,
+        unclassified_agents,
+        by_class: counts
+            .by_class
+            .into_iter()
+            .map(|(machine_class, agent_count)| MachineClassCountResponse {
+                machine_class,
+                agent_count,
+            })
+            .collect(),
+        generated_at: chrono::Utc::now().to_rfc3339(),
     })
     .into_response()
 }

@@ -4078,6 +4078,114 @@ async fn admin_content_view_reports_not_configured() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
+/// 人工判定：写入后落到用途视图里（采集范围变更的前置）。
+#[tokio::test]
+async fn admin_classify_agent_stores_the_decision() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    assert_eq!(
+        post_facts(&env, &fact_report(&["/usr/bin/xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "MacDev", "note": "人看过" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["machine_class"], "MacDev");
+    assert_eq!(body["decided_by"], "admin");
+
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["classification"]["machine_class"], "MacDev");
+    assert_eq!(view["classification"]["note"], "人看过");
+}
+
+#[tokio::test]
+async fn admin_classify_agent_rejects_a_platform_mismatch() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    // 事实摘要是 macOS 的：Linux 类别必须被拒（分类必须与机器平台一致）。
+    post_facts(&env, &fact_report(&["xcodebuild"])).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "LinuxData" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_classify_agent_rejects_an_unobserved_agent() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    // 没有事实摘要 → 平台未知 → 拒（不是默认通过）。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "MacDaily" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_classify_agent_requires_admin_bearer() {
+    let env = TestEnv::new().await;
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        None,
+        &serde_json::json!({ "machine_class": "MacDev" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_purpose_coverage_counts_classified_and_unclassified() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    post_facts(&env, &fact_report(&["xcodebuild"])).await;
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "MacDev" }),
+    )
+    .await;
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/purpose-coverage",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["total_agents"], 1);
+    assert_eq!(view["classified_agents"], 1);
+    assert_eq!(view["unclassified_agents"], 0);
+    assert_eq!(view["by_class"][0]["machine_class"], "MacDev");
+    assert_eq!(view["by_class"][0]["agent_count"], 1);
+}
+
 async fn get_to_router(
     config: &AdminConfig,
     store: &Arc<dyn Store>,

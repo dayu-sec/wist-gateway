@@ -1356,6 +1356,72 @@ impl Store for SqliteStore {
             .map_err(|err| sql_error(err, "clear agent purpose suggestion"))?;
         Ok(result.rows_affected() > 0)
     }
+
+    async fn get_agent_classification(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<StoredAgentClassification>> {
+        let row = sqlx::query(
+            "SELECT agent_id, machine_class, suggestion_id, note, decided_by, decided_at \
+             FROM agent_classification WHERE agent_id = ?1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select agent classification"))?;
+        row.as_ref().map(classification_from_row).transpose()
+    }
+
+    async fn upsert_agent_classification(
+        &self,
+        classification: &StoredAgentClassification,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO agent_classification (agent_id, machine_class, suggestion_id, note, \
+             decided_by, decided_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (agent_id) DO UPDATE SET machine_class = excluded.machine_class, \
+             suggestion_id = excluded.suggestion_id, note = excluded.note, \
+             decided_by = excluded.decided_by, decided_at = excluded.decided_at",
+        )
+        .bind(&classification.agent_id)
+        .bind(&classification.machine_class)
+        .bind(&classification.suggestion_id)
+        .bind(&classification.note)
+        .bind(&classification.decided_by)
+        .bind(&classification.decided_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert agent classification"))?;
+        Ok(())
+    }
+
+    async fn purpose_coverage(&self) -> StoreResult<PurposeCoverageCounts> {
+        let total_agents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "count agents"))?;
+        let classified_agents: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_classification")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|err| sql_error(err, "count agent classifications"))?;
+        let rows = sqlx::query(
+            "SELECT machine_class, COUNT(*) AS agent_count FROM agent_classification \
+             GROUP BY machine_class ORDER BY machine_class",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "group agent classifications"))?;
+        let mut by_class = Vec::with_capacity(rows.len());
+        for row in &rows {
+            by_class.push((column!(row, "machine_class"), column!(row, "agent_count")));
+        }
+        Ok(PurposeCoverageCounts {
+            total_agents,
+            classified_agents,
+            by_class,
+        })
+    }
 }
 
 fn fact_summary_from_row(row: &SqliteRow) -> StoreResult<StoredAgentFactSummary> {
@@ -1381,6 +1447,17 @@ fn fact_summary_from_row(row: &SqliteRow) -> StoreResult<StoredAgentFactSummary>
         host_name: column!(row, "host_name"),
         network_addresses: deserialize_json_array(&network_addresses, "read network addresses")?,
         received_at: column!(row, "received_at"),
+    })
+}
+
+fn classification_from_row(row: &SqliteRow) -> StoreResult<StoredAgentClassification> {
+    Ok(StoredAgentClassification {
+        agent_id: column!(row, "agent_id"),
+        machine_class: column!(row, "machine_class"),
+        suggestion_id: column!(row, "suggestion_id"),
+        note: column!(row, "note"),
+        decided_by: column!(row, "decided_by"),
+        decided_at: column!(row, "decided_at"),
     })
 }
 
@@ -1945,6 +2022,50 @@ mod tests {
         assert!(!store.import_legacy_json(&legacy_path).await.unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn upserts_and_reads_agent_classification() {
+        let store = store().await;
+        assert!(
+            store
+                .get_agent_classification("agent-a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let first = StoredAgentClassification {
+            agent_id: "agent-a".to_string(),
+            machine_class: "MacDev".to_string(),
+            suggestion_id: Some("sug-1".to_string()),
+            note: Some("人看过".to_string()),
+            decided_by: "admin".to_string(),
+            decided_at: "2026-09-23T00:00:00Z".to_string(),
+        };
+        store.upsert_agent_classification(&first).await.unwrap();
+        assert_eq!(
+            store.get_agent_classification("agent-a").await.unwrap(),
+            Some(first.clone())
+        );
+
+        // 改判即覆盖（一台一条）。
+        let second = StoredAgentClassification {
+            machine_class: "MacDaily".to_string(),
+            suggestion_id: None,
+            ..first
+        };
+        store.upsert_agent_classification(&second).await.unwrap();
+        assert_eq!(
+            store.get_agent_classification("agent-a").await.unwrap(),
+            Some(second)
+        );
+
+        // 覆盖度：库里没有 agents 行 → total 0，但已判定 1 台（不崩、不自相矛盾）。
+        let coverage = store.purpose_coverage().await.unwrap();
+        assert_eq!(coverage.total_agents, 0);
+        assert_eq!(coverage.classified_agents, 1);
+        assert_eq!(coverage.by_class, vec![("MacDaily".to_string(), 1)]);
     }
 
     #[tokio::test]

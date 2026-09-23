@@ -278,6 +278,32 @@ pub struct StoredPurposeSuggestion {
     pub computed_at: String,
 }
 
+/// 人工判定（对应模型 `AgentClassification`）：一台一条，改判即更新并留痕。
+///
+/// 与 `StoredPurposeSuggestion` 分表：建议是**机器算的、可变可过期**；判定是**人定的、要留痕**的。
+/// 两者会并存且不一致（冲突以判定为准，但并列展示）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredAgentClassification {
+    pub agent_id: String,
+    /// `MachineClass` 裸名（MacDaily / MacDev / LinuxCompute / LinuxData）。
+    pub machine_class: String,
+    /// 采纳了哪次建议；人工直判/推翻建议时为空。
+    pub suggestion_id: Option<String>,
+    pub note: Option<String>,
+    pub decided_by: String,
+    pub decided_at: String,
+}
+
+/// 机队用途覆盖度（派生统计）：让“4 类覆盖多少”从断言变成一个可度量的数。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PurposeCoverageCounts {
+    pub total_agents: i64,
+    /// 已有人工判定的台数。
+    pub classified_agents: i64,
+    /// `(machine_class, agent_count)`，按类别名排序。
+    pub by_class: Vec<(String, i64)>,
+}
+
 /// 事实上报的**留痕**：内容没变时只刷这几项，用来回答「什么时候又见到同一份内容」。
 ///
 /// 故意不含三个内容列（`process_executables` / `packages` / `listen_ports`）与
@@ -345,7 +371,11 @@ pub struct StoredSoftwareHolding {
 
 /// 某台机器上的某条路径。
 #[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
-#[jumo(kind = "struct", domain = "Control", module = "Control.Agent.Inventory")]
+#[jumo(
+    kind = "struct",
+    domain = "Control",
+    module = "Control.Agent.Inventory"
+)]
 pub struct SoftwareHolder {
     pub agent_id: String,
     pub path: String,
@@ -669,6 +699,21 @@ pub trait Store: Send + Sync + fmt::Debug {
     /// 新事实确实不该产出建议时（无规则册命中且无基线）用它：留着照旧事实算出的
     /// 旧结论比没有结论更误导。
     async fn clear_purpose_suggestion(&self, agent_id: &str) -> StoreResult<bool>;
+
+    /// 读取人工判定；未判定返回 `None`。
+    async fn get_agent_classification(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<StoredAgentClassification>>;
+
+    /// 写入/覆盖人工判定（一台一条）。
+    async fn upsert_agent_classification(
+        &self,
+        classification: &StoredAgentClassification,
+    ) -> StoreResult<()>;
+
+    /// 机队用途覆盖度：总台数 / 已判定台数 / 各类别台数。
+    async fn purpose_coverage(&self) -> StoreResult<PurposeCoverageCounts>;
 
     /// 满足同一过滤条件的 Agent 总数（分页用）。
     async fn count_agents(&self, query: &AgentQuery) -> StoreResult<u64>;

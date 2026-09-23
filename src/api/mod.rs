@@ -45,9 +45,9 @@ pub mod wist_agentd_online_registration_interface;
 pub use wist_agentd_online_registration_interface::WistAgentdOnlineRegistrationInterface;
 
 use admin_ops::{
-    get_agent_runtime_status, list_agents, revoke_agent_credential, set_agent_install_package,
-    set_agent_uplink, view_agent_install_package, view_agent_purpose, view_agent_uplink,
-    view_discovery_policies,
+    classify_agent, get_agent_runtime_status, list_agents, revoke_agent_credential,
+    set_agent_install_package, set_agent_uplink, view_agent_install_package, view_agent_purpose,
+    view_agent_uplink, view_discovery_policies, view_purpose_coverage,
 };
 use agent_ops::{
     poll_control_commands, poll_discovery_policies, renew_agent_credential, report_action_result,
@@ -235,6 +235,16 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agents/{agent_id}/purpose",
             get(view_agent_purpose),
+        )
+        // NOTE(hand-added): 用途判定的写入（人工判定）与机队覆盖度。已在 jumo 模型
+        // WistGatewayManagementInterface（AdminClassifyAgent / AdminViewPurposeCoverage）声明。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/classification",
+            post(classify_agent),
+        )
+        .route(
+            "/api/v1/admin/agents/purpose-coverage",
+            get(view_purpose_coverage),
         )
         .route(
             "/api/v1/admin/agents/{agent_id}/host-metrics",
