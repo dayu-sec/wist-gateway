@@ -1191,6 +1191,72 @@ environment_id = "env-default"
         let _ = fs::remove_file(package_file);
     }
 
+    // ── `[content]` 三件套 ────────────────────────────────────────────
+
+    /// 把三份内容写进 temp 目录（与 `write_temp_config` 同目录），再用相对路径引用。
+    fn config_with_content(catalog: &str, packs: &str, templates: &str) -> String {
+        let package_file = write_temp_file("wist-agentd");
+        let catalog_file = write_temp_file(catalog);
+        let packs_file = write_temp_file(packs);
+        let templates_file = write_temp_file(templates);
+        let rel = |path: &PathBuf| {
+            path.file_name()
+                .expect("name")
+                .to_string_lossy()
+                .to_string()
+        };
+        format!(
+            "[content]\ncatalog_file = \"{}\"\npacks_file = \"{}\"\ntemplates_file = \"{}\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+            rel(&catalog_file),
+            rel(&packs_file),
+            rel(&templates_file),
+            package_file.display()
+        )
+    }
+
+    #[test]
+    fn content_files_are_none_when_unset_or_blank() {
+        let unset = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&unset).expect("config loads");
+        assert_eq!(config.content_catalog_file, None);
+        assert_eq!(config.content_packs_file, None);
+        assert_eq!(config.content_templates_file, None);
+
+        let blank = {
+            let package_file = write_temp_file("wist-agentd");
+            write_temp_config(&format!(
+                "[content]\ncatalog_file = \"\"\npacks_file = \"\"\ntemplates_file = \"\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+                package_file.display()
+            ))
+        };
+        let config = AdminConfig::load_from_path(&blank).expect("blank content loads as unset");
+        assert_eq!(config.content_catalog_file, None);
+    }
+
+    #[test]
+    fn content_files_must_all_be_provided() {
+        // 只给一份：内容集内部互相引用（模板 → 包 → 单元），缺一不可。
+        let catalog_file = write_temp_file("catalog_version = 1\nunits = []\n");
+        let package_file = write_temp_file("wist-agentd");
+        let body = format!(
+            "[content]\ncatalog_file = \"{}\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+            catalog_file.file_name().expect("name").to_string_lossy(),
+            package_file.display()
+        );
+        let path = write_temp_config(&body);
+        let err = AdminConfig::load_from_path(&path).expect_err("partial content must be rejected");
+        assert!(err.to_string().contains("同时提供"), "{err}");
+    }
+
+    #[test]
+    fn content_files_are_validated_at_load() {
+        // 三份都在，但内容不合法（这里 catalog 无单元）→ 启动就被拒，而不是静默不装载。
+        let body = config_with_content("catalog_version = 1\nunits = []\n", "", "");
+        let path = write_temp_config(&body);
+        let err = AdminConfig::load_from_path(&path).expect_err("invalid content must be rejected");
+        assert!(err.to_string().contains("content"), "{err}");
+    }
+
     fn write_temp_config(content: &str) -> PathBuf {
         let path = env::temp_dir().join(format!("wist-gateway-{}.toml", unique_suffix()));
         let key_path = path.with_extension("ed25519.pkcs8.pem");
