@@ -144,9 +144,12 @@ fn materialize_spec(content: &ContentSet, unit_ids: &[String]) -> Result<String,
             sources: unit
                 .sources
                 .iter()
-                .map(|(kind, target)| WorkSpecSource {
-                    kind: kind.clone(),
-                    target: target.clone(),
+                .map(|source| WorkSpecSource {
+                    kind: source.kind.clone(),
+                    target: source.target.clone(),
+                    // 「怎么读这条来源」跟工作内容一起发出去：agentd 不该自己去猜文件格式，
+                    // 策展在目录里已经知道并声明了。
+                    multiline: source.multiline.clone(),
                 })
                 .collect(),
         });
@@ -614,7 +617,31 @@ status = "active"
         assert_eq!(spec.units[0].sources.len(), 1);
         assert_eq!(spec.units[0].sources[0].kind, "FileGlob");
         assert_eq!(spec.units[0].sources[0].target, "/var/log/postgresql/*");
+        // 目录没声明读法 → 一行一条。
+        assert_eq!(spec.units[0].sources[0].multiline, "none");
         assert_eq!(catalog_version, 1);
+    }
+
+    #[test]
+    fn a_sources_read_mode_travels_with_the_work_spec() {
+        // 「怎么读这条来源」是工作内容的一部分：策展在目录里声明，agentd 不自己猜。
+        let catalog = CATALOG.replacen(
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"\nmultiline = \"indented\"",
+            1,
+        );
+        let content =
+            crate::app::content::parse_content(&catalog, PACKS, TEMPLATES).expect("fixture parses");
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts(&["postgresql"]),
+        )
+        .expect("derives");
+        let spec = WorkSpec::parse(&spec).expect("parse");
+        assert_eq!(spec.units[0].sources[0].multiline, "indented");
     }
 
     #[test]

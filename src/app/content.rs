@@ -66,6 +66,8 @@ pub const SOURCE_KINDS: &[&str] = &[
     "UnifiedLogPredicate",
     "MetricInterval",
 ];
+/// 来源的读法闭集（与 agentd `MultilineMode` 一致）。
+pub const MULTILINE_MODES: &[&str] = &["none", "indented"];
 /// 权限闭集。
 pub const PRIVILEGES: &[&str] = &["none", "root", "fda"];
 /// 单元规则就绪度。
@@ -122,6 +124,12 @@ struct UnitRow {
 struct SourceRow {
     kind: String,
     target: String,
+    #[serde(default = "default_multiline")]
+    multiline: String,
+}
+
+fn default_multiline() -> String {
+    "none".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,8 +201,17 @@ pub struct Unit {
     pub requires_privilege: String,
     /// `active` = 规则已就绪、能落数据面。授权闸门看它。
     pub status: String,
-    /// `(kind, target)`。
-    pub sources: Vec<(String, String)>,
+    /// 采集来源（一个单元可有多条）。
+    pub sources: Vec<UnitSource>,
+}
+
+/// 已装载的采集来源：类型 + 取值 + **怎么读它**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitSource {
+    pub kind: String,
+    pub target: String,
+    /// `none`（一行一条）| `indented`（行首缩进是上一条的续行）。
+    pub multiline: String,
 }
 
 impl Unit {
@@ -309,7 +326,11 @@ fn build_content(
                 sources: row
                     .sources
                     .into_iter()
-                    .map(|source| (source.kind, source.target))
+                    .map(|source| UnitSource {
+                        kind: source.kind,
+                        target: source.target,
+                        multiline: source.multiline,
+                    })
                     .collect(),
             };
             (unit.unit_id.clone(), unit)
@@ -410,6 +431,20 @@ fn validate_unit(unit: &UnitRow) -> ConfigResult<()> {
             return Err(invalid(format!(
                 "unit {id}: source {} has empty target",
                 source.kind
+            )));
+        }
+        if !MULTILINE_MODES.contains(&source.multiline.as_str()) {
+            return Err(invalid(format!(
+                "unit {id}: source {} has unknown multiline {:?}",
+                source.kind, source.multiline
+            )));
+        }
+        // 多行归并只对可 tail 的文件来源有意义。写在别的 kind 上不是“多一个无害的字段”，
+        // 而是对人误导读它的人 —— 要么策展想表达别的意思，要么放错了位置。
+        if source.multiline != "none" && source.kind != "FileGlob" {
+            return Err(invalid(format!(
+                "unit {id}: source {} cannot declare multiline {:?} (只对 FileGlob 有意义)",
+                source.kind, source.multiline
             )));
         }
     }
@@ -1089,11 +1124,22 @@ status = "active"
         let expansion = set
             .expand("macos-daily", &facts("macos", &[]))
             .expect("expand");
-        // 只有 HostMetrics 就绪 → 只展开这一面；其余 9 个面全部 is rule_not_ready 留痕。
-        assert_eq!(expansion.works.len(), 1);
-        assert_eq!(expansion.works[0].family, "HostMetrics");
-        assert_eq!(expansion.works[0].selected_units, vec!["mac-host-metrics"]);
-        assert_eq!(expansion.excluded_units.len(), 9);
+        // 就绪的面按包内行序展开（macos-base 里 SoftwareChange 在 HostMetrics 前）；
+        // 其余 8 个面全部 is rule_not_ready 留痕。
+        assert_eq!(
+            expansion
+                .works
+                .iter()
+                .map(|work| work.family.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SoftwareChange", "HostMetrics"]
+        );
+        assert_eq!(
+            expansion.works[0].selected_units,
+            vec!["mac-software-change"]
+        );
+        assert_eq!(expansion.works[1].selected_units, vec!["mac-host-metrics"]);
+        assert_eq!(expansion.excluded_units.len(), 8);
         assert!(
             expansion
                 .excluded_units
@@ -1176,6 +1222,53 @@ status = "active"
         let catalog = CATALOG.replacen("kind = \"MetricInterval\"", "kind = \"Glob\"", 1);
         let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("unknown source kind");
         assert!(err.to_string().contains("unknown source kind"), "{err}");
+    }
+
+    #[test]
+    fn loads_a_sources_read_mode_and_defaults_it_to_single_line() {
+        let set = parse_with(CATALOG, PACKS, TEMPLATES).expect("fixture parses");
+        let unit = set
+            .units()
+            .find(|unit| unit.unit_id == "linux-db")
+            .expect("linux-db");
+        // 未声明 → 一行一条。取错默认值会把多行日志粘成一条（无声的内容损坏）。
+        assert_eq!(unit.sources[0].multiline, "none");
+
+        let catalog = CATALOG.replacen(
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"\nmultiline = \"indented\"",
+            1,
+        );
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("parses");
+        let unit = set
+            .units()
+            .find(|unit| unit.unit_id == "linux-db")
+            .expect("linux-db");
+        assert_eq!(unit.sources[0].multiline, "indented");
+    }
+
+    #[test]
+    fn rejects_an_unknown_multiline_mode() {
+        let catalog = CATALOG.replacen(
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"\nmultiline = \"guessed\"",
+            1,
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("unknown multiline");
+        assert!(err.to_string().contains("unknown multiline"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_read_mode_on_a_source_that_is_not_a_file() {
+        // 多行归并只对可 tail 的文件有意义。写在指标来源上不是“多一个无害的字段”，
+        // 而是错——要么策展想表达别的意思，要么放错了位置。
+        let catalog = CATALOG.replacen(
+            "kind = \"MetricInterval\"\ntarget = \"15s\"",
+            "kind = \"MetricInterval\"\ntarget = \"15s\"\nmultiline = \"indented\"",
+            1,
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("multiline on MetricInterval");
+        assert!(err.to_string().contains("只对 FileGlob 有意义"), "{err}");
     }
 
     #[test]
