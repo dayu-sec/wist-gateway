@@ -836,6 +836,7 @@ async fn agent_status_route_requires_bearer_credential() {
             version: "v0.2.0".to_string(),
             memory_bytes: None,
             cpu_percent: None,
+            cpu_cores: None,
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: None,
@@ -855,6 +856,7 @@ async fn agent_status_route_requires_bearer_credential() {
             version: "v0.2.0".to_string(),
             memory_bytes: None,
             cpu_percent: None,
+            cpu_cores: None,
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: None,
@@ -893,6 +895,7 @@ async fn agent_status_route_persists_reported_metrics() {
             version: "v0.2.0".to_string(),
             memory_bytes: Some(12_345_678),
             cpu_percent: Some(7.5),
+            cpu_cores: Some(4),
             admin_latency_ms: Some(42),
             discovery_policy_version: None,
             work_state_changes: None,
@@ -909,7 +912,76 @@ async fn agent_status_route_persists_reported_metrics() {
         .expect("agent");
     assert_eq!(stored.last_memory_bytes, Some(12_345_678));
     assert_eq!(stored.last_cpu_percent, Some(7.5));
+    assert_eq!(stored.last_cpu_cores, Some(4));
     assert_eq!(stored.last_admin_latency_ms, Some(42));
+}
+
+/// 发一次带 CPU 字段的状态上报（只关心 `cpu_percent` / `cpu_cores`）。
+async fn post_agent_status_cpu(
+    env: &TestEnv,
+    credential: &str,
+    cpu_percent: Option<f64>,
+    cpu_cores: Option<u32>,
+) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(credential),
+        &AgentStatusReport {
+            agent_id: "agent-node-a".to_string(),
+            instance_id: "node-a".to_string(),
+            version: "v0.2.0".to_string(),
+            memory_bytes: None,
+            cpu_percent,
+            cpu_cores,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+        },
+    )
+    .await
+}
+
+/// GET 管理面 Agent 列表（已带 admin token）。
+async fn admin_agent_list(env: &TestEnv) -> serde_json::Value {
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+#[tokio::test]
+async fn admin_agent_list_derives_machine_cpu_percent_from_cores() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_at_node(&env, "node-a").await;
+
+    // 单核口径 50% ÷ 4 核 = 整机 12.5%。
+    let accepted = post_agent_status_cpu(&env, &credential, Some(50.0), Some(4)).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let body = admin_agent_list(&env).await;
+    assert_eq!(body["agents"][0]["cpu_percent"], 50.0);
+    assert_eq!(body["agents"][0]["cpu_cores"], 4);
+    assert_eq!(body["agents"][0]["cpu_percent_of_machine"], 12.5);
+
+    // 老版本 agentd 没报核数（None）→ 算不出，返回 null，而不是 0。
+    let accepted = post_agent_status_cpu(&env, &credential, Some(50.0), None).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let body = admin_agent_list(&env).await;
+    assert!(body["agents"][0]["cpu_cores"].is_null());
+    assert!(body["agents"][0]["cpu_percent_of_machine"].is_null());
+
+    // 核数为 0（非法）→ 不除零，同样返回 null。
+    let accepted = post_agent_status_cpu(&env, &credential, Some(50.0), Some(0)).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let body = admin_agent_list(&env).await;
+    assert_eq!(body["agents"][0]["cpu_cores"], 0);
+    assert!(body["agents"][0]["cpu_percent_of_machine"].is_null());
 }
 
 // ── 事实上报（摘要）与用途推断 ──────────────────────────────────────────
@@ -1337,6 +1409,14 @@ fn data_plane_record(envelope_agent: &str, report: &ReportAgentFactSummary) -> s
 }
 
 async fn post_to_ingest_router(env: &TestEnv, payload: &serde_json::Value) -> Response {
+    post_to_ingest_uri(env, "/api/v1/ingest/agent-facts", payload).await
+}
+
+async fn post_logs_to_ingest_router(env: &TestEnv, payload: &serde_json::Value) -> Response {
+    post_to_ingest_uri(env, "/api/v1/ingest/agent-logs", payload).await
+}
+
+async fn post_to_ingest_uri(env: &TestEnv, uri: &str, payload: &serde_json::Value) -> Response {
     super::ingest_router(super::build_state(
         env.config.clone(),
         Arc::clone(&env.store_handle),
@@ -1344,7 +1424,7 @@ async fn post_to_ingest_router(env: &TestEnv, payload: &serde_json::Value) -> Re
     .oneshot(
         Request::builder()
             .method("POST")
-            .uri("/api/v1/ingest/agent-facts")
+            .uri(uri)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_string(payload).expect("body")))
             .expect("request"),
@@ -1496,6 +1576,293 @@ async fn ingest_endpoint_rejects_a_body_that_is_not_a_fact_summary() {
             .contains("body is not a ReportAgentFactSummary"),
         "got {body}"
     );
+}
+
+// ── 采集日志的本地落盘（数据面 → 网关内部接入）────────────────────────────
+//
+// 日志与事实走同一条上行通道，但**落点不同**：事实进 SQLite，日志落本地 NDJSON 文件。
+// 这里测的是「文件真的写进去了、能按台筛、读得回来」。
+
+/// 一份日志记录的数据面落盘形状（`macos-agent/json` sink）。
+/// 形状取自真实输出：`{"schema","agent_id","observed_at","seq","category","log_desc","raw",…}`。
+fn data_plane_log_record(envelope_agent: &str, raw: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "v1",
+        "agent_id": envelope_agent,
+        "observed_at": "2026-09-23T12:24:27.734612Z",
+        "seq": 292,
+        "category": "agent.log",
+        "log_desc": "Agent 日志-原文",
+        "raw": raw,
+    })
+}
+
+/// 读回落盘的日志记录（文件不存在 = 空）。
+fn log_file_records(env: &TestEnv) -> Vec<crate::infra::AgentLogRecord> {
+    let path = env.config.agent_log_file();
+    if !path.is_file() {
+        return Vec::new();
+    }
+    std::fs::read_to_string(&path)
+        .expect("read log file")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log record"))
+        .collect()
+}
+
+/// 数据面记录（**新版 agentd**：信封里带 `family`/`unit`，落到记录的这两个字段）。
+fn data_plane_log_record_with_family(
+    envelope_agent: &str,
+    family: &str,
+    unit: &str,
+    raw: &str,
+) -> serde_json::Value {
+    let mut record = data_plane_log_record(envelope_agent, raw);
+    let object = record.as_object_mut().expect("record object");
+    object.insert("family".to_string(), serde_json::json!(family));
+    object.insert("unit".to_string(), serde_json::json!(unit));
+    record
+}
+
+async fn get_admin(env: &TestEnv, uri: &str) -> Response {
+    get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn ingest_endpoint_appends_agent_logs_to_the_local_file() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let raw = "2026-09-23 20:24:24+08 MacBook-Pro-2 softwareupdated[565]: SUOSUPowerEventObserver: System will sleep";
+
+    let response =
+        post_logs_to_ingest_router(&env, &data_plane_log_record("agent-node-a", raw)).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["ingested"], 1);
+    assert_eq!(body["rejected"], 0);
+
+    let stored = log_file_records(&env);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].agent_id, "agent-node-a");
+    assert_eq!(stored[0].raw, raw);
+    assert_eq!(stored[0].seq, 292);
+    assert_eq!(stored[0].category, "agent.log");
+    assert_eq!(stored[0].log_desc, "Agent 日志-原文");
+    assert_eq!(stored[0].observed_at, "2026-09-23T12:24:27.734612Z");
+    assert!(!stored[0].received_at.is_empty());
+}
+
+#[tokio::test]
+async fn ingest_endpoint_keeps_a_multiline_record_on_a_single_ndjson_line() {
+    // 一条多行记录在文件里仍占**一行** NDJSON：`raw` 里的换行被 JSON 转义，
+    // 读回来还是多行 —— 这正是「一条记录」在落盘层的形状。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let raw = "REC-A start\n\tcontinuation A1\n\tcontinuation A2";
+
+    let response =
+        post_logs_to_ingest_router(&env, &data_plane_log_record("agent-node-a", raw)).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let text = std::fs::read_to_string(env.config.agent_log_file()).expect("read log file");
+    assert_eq!(text.lines().count(), 1, "one record must be one line");
+    assert_eq!(log_file_records(&env)[0].raw, raw);
+}
+
+#[tokio::test]
+async fn ingest_endpoint_accepts_a_batch_of_log_records() {
+    // sink 的 `batch_size` 将来调大就会出现数组，这里先钉住形状。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let batch = serde_json::json!([
+        data_plane_log_record("agent-node-a", "first"),
+        data_plane_log_record("agent-node-a", "second"),
+    ]);
+
+    let response = post_logs_to_ingest_router(&env, &batch).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(log_file_records(&env).len(), 2);
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_logs_from_an_unregistered_agent() {
+    // 登记表是这条路径唯一的身份锚：不存在的机器不得被写进日志文件。
+    let env = TestEnv::new().await;
+
+    let response =
+        post_logs_to_ingest_router(&env, &data_plane_log_record("agent-ghost", "hello")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("unknown agent_id agent-ghost"),
+        "got {body}"
+    );
+    assert!(
+        log_file_records(&env).is_empty(),
+        "a rejected record must not reach the file"
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_reports_the_shape_it_received_when_the_log_record_is_wrong() {
+    let env = TestEnv::new().await;
+
+    let response = post_logs_to_ingest_router(&env, &serde_json::json!({"hello": "world"})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let failure = body["failures"][0].as_str().expect("failure text");
+    assert!(
+        failure.contains("not a data-plane log record") && failure.contains("hello"),
+        "got {failure}"
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_a_log_record_without_a_body() {
+    // 没有 `raw` 的「日志」没有意义：宁可显形，也不要写一行空正文进去。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = serde_json::json!({ "agent_id": "agent-node-a", "category": "agent.log" });
+
+    let response = post_logs_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("not a data-plane log record"),
+        "got {body}"
+    );
+    assert!(log_file_records(&env).is_empty());
+}
+
+#[tokio::test]
+async fn admin_logs_route_requires_admin_bearer() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(&env.config, &env.store_handle, "/api/v1/admin/logs", None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_logs_route_returns_the_stored_records() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    for raw in ["first", "second", "third"] {
+        let response =
+            post_logs_to_ingest_router(&env, &data_plane_log_record("agent-node-a", raw)).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/logs").await).await;
+    assert_eq!(body["limit"], 200);
+    assert_eq!(body["truncated"], false);
+    assert_eq!(
+        body["logs"]
+            .as_array()
+            .expect("logs")
+            .iter()
+            .map(|log| log["raw"].as_str().expect("raw"))
+            .collect::<Vec<_>>(),
+        vec!["first", "second", "third"]
+    );
+    assert!(
+        body["file"]
+            .as_str()
+            .expect("file")
+            .ends_with("agent-logs.ndjson"),
+        "ops needs to know where the file is: {body}"
+    );
+}
+
+#[tokio::test]
+async fn admin_logs_route_filters_by_agent_and_keeps_the_newest_limit() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    for raw in ["first", "second", "third"] {
+        let response =
+            post_logs_to_ingest_router(&env, &data_plane_log_record("agent-node-a", raw)).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    // 没采过的这台给空表，而不是 404：这里是筛选，不是按 id 取某一台的视图。
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/logs?agent_id=agent-other").await)
+            .await;
+    assert_eq!(body["logs"], serde_json::json!([]));
+
+    // limit 取**最新** N 条，且按写入顺序回给调用方。
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/logs?limit=2").await).await;
+    assert_eq!(body["limit"], 2);
+    assert_eq!(
+        body["logs"]
+            .as_array()
+            .expect("logs")
+            .iter()
+            .map(|log| log["raw"].as_str().expect("raw"))
+            .collect::<Vec<_>>(),
+        vec!["second", "third"]
+    );
+}
+
+#[tokio::test]
+async fn the_collection_family_travels_with_the_record_and_can_be_filtered_on() {
+    // 正文规则未就绪时 `category` 恒为泛化的 `agent.log`（两个面长一模一样），
+    // **面是唯一能把它们分开的字段** —— 它得一路落盘、能筛。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    for (family, unit, raw) in [
+        ("ServiceLifecycle", "mac-launchd-service", "from launchd"),
+        ("NetworkFirewall", "mac-network-wifi", "from wifi"),
+    ] {
+        let response = post_logs_to_ingest_router(
+            &env,
+            &data_plane_log_record_with_family("agent-node-a", family, unit, raw),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    let stored = log_file_records(&env);
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].family, "ServiceLifecycle");
+    assert_eq!(stored[0].unit, "mac-launchd-service");
+
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/logs?family=NetworkFirewall").await)
+            .await;
+    let logs = body["logs"].as_array().expect("logs");
+    assert_eq!(logs.len(), 1, "{body}");
+    assert_eq!(logs[0]["raw"], "from wifi");
+    assert_eq!(logs[0]["unit"], "mac-network-wifi");
+}
+
+#[tokio::test]
+async fn a_record_without_a_family_still_lands_and_matches_no_family_filter() {
+    // 旧版 agentd、以及本机运维手工配置的输入都不带这两个字段：**不能因此被拒收**，
+    // 但要如实留空（“不是平台派活来的”本身就是信息），并且按面筛时不该被任何面捞出来。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let response =
+        post_logs_to_ingest_router(&env, &data_plane_log_record("agent-node-a", "legacy")).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(log_file_records(&env)[0].family, "");
+
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/logs?family=ServiceLifecycle").await)
+            .await;
+    assert_eq!(body["logs"], serde_json::json!([]));
 }
 
 // ── L1a 机械资产清单（从事实摘要派生）────────────────────────────
@@ -2056,6 +2423,7 @@ async fn post_agent_status(
             version: "v0.2.0".to_string(),
             memory_bytes: None,
             cpu_percent: None,
+            cpu_cores: None,
             admin_latency_ms: None,
             discovery_policy_version: Some(version),
             work_state_changes: None,
@@ -2283,6 +2651,7 @@ async fn agent_status_metric_reports_policy_version_only_when_present() {
         None,
         None,
         None,
+        None,
         Some(2),
         1_700_000_000_000,
     );
@@ -2300,9 +2669,46 @@ async fn agent_status_metric_reports_policy_version_only_when_present() {
         None,
         None,
         None,
+        None,
         1_700_000_000_000,
     );
     assert!(without.is_empty(), "{without:?}");
+}
+
+#[tokio::test]
+async fn agent_status_metric_reports_cpu_cores_when_present() {
+    // 核数是整机占比的分母，随状态上报一起进时序；缺值同样不发线（与 cpu.percent 同一规矩）。
+    let with = super::agent_ops::agent_status_metric_lines(
+        "agent-node-a",
+        None,
+        Some(50.0),
+        Some(4),
+        None,
+        None,
+        1_700_000_000_000,
+    );
+    let cores_line = with
+        .iter()
+        .find(|line| line["metric"]["__name__"] == "agent.cpu.cores")
+        .expect("cpu cores metric line");
+    assert_eq!(cores_line["values"][0], 4.0);
+    assert_eq!(cores_line["metric"]["agent"], "agent-node-a");
+
+    let without = super::agent_ops::agent_status_metric_lines(
+        "agent-node-a",
+        None,
+        Some(50.0),
+        None,
+        None,
+        None,
+        1_700_000_000_000,
+    );
+    assert!(
+        without
+            .iter()
+            .all(|line| line["metric"]["__name__"] != "agent.cpu.cores"),
+        "{without:?}"
+    );
 }
 
 /// 用**真实策展策略表**跑通下发：装载校验通过，且下发的是七个方向那一版。
@@ -2519,6 +2925,7 @@ async fn agent_status_route_persists_work_state_changes() {
             version: "v0.2.0".to_string(),
             memory_bytes: None,
             cpu_percent: None,
+            cpu_cores: None,
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: Some(vec![AgentWorkStateChange {
@@ -2591,6 +2998,7 @@ async fn agent_status_route_rejects_expired_bearer_credential() {
             version: "v0.2.0".to_string(),
             memory_bytes: None,
             cpu_percent: None,
+            cpu_cores: None,
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: None,
@@ -2653,6 +3061,7 @@ async fn credential_renewal_replaces_previous_credential() {
             version: "v0.2.0".to_string(),
             memory_bytes: None,
             cpu_percent: None,
+            cpu_cores: None,
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: None,
@@ -2672,6 +3081,7 @@ async fn credential_renewal_replaces_previous_credential() {
             version: "v0.2.0".to_string(),
             memory_bytes: None,
             cpu_percent: None,
+            cpu_cores: None,
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: None,
@@ -4050,6 +4460,10 @@ async fn admin_content_view_lists_readiness_and_templates() {
         .expect("HostMetrics readiness");
     assert_eq!(host_metrics["ready"], serde_json::Value::Bool(true));
     assert_eq!(host_metrics["active_units"], 1);
+    // 两个轴都要出得来：只报一个会让「采到了但认不出是谁」看着像已就绪。
+    assert_eq!(host_metrics["parse_ready"], serde_json::Value::Bool(true));
+    assert_eq!(host_metrics["parse_ready_units"], 1);
+    assert_eq!(host_metrics["total_units"], 1);
 }
 
 #[tokio::test]
@@ -4481,7 +4895,8 @@ async fn granting_standing_work_derives_the_spec_from_catalog_and_facts() {
 async fn granting_a_family_that_is_not_ready_is_a_conflict() {
     let env = TestEnv::new().await;
     a_classified_macos_agent(&env).await;
-    // 测试目录里只有 HostMetrics 的单元；LoginSession 这个面还没规则。
+    // 测试目录里只有 HostMetrics 的单元；LoginSession 这个面还没有采集就绪的单元
+    // （它的来源是导出器/导出式采集，不是 agentd 现在能执行的东西）。
     let response = grant_work(
         &env,
         serde_json::json!({ "work_kind": "Standing", "family": "LoginSession" }),
@@ -4489,7 +4904,7 @@ async fn granting_a_family_that_is_not_ready_is_a_conflict() {
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let message = decode_text_response(response).await;
-    assert!(message.contains("rule_not_ready"), "{message}");
+    assert!(message.contains("collect_not_ready"), "{message}");
 }
 
 #[tokio::test]

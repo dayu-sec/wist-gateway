@@ -440,6 +440,16 @@ impl AdminConfig {
         let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
         state_dir.join("install-package").join("agent-package")
     }
+
+    /// 采集日志（数据面转发的 `LOGRAW:` 记录）的本地落盘文件。
+    ///
+    /// 与安装包缓存同一约定：放在 SQLite 库同目录（`state/`）下，随 `state/` 一起备份或清理。
+    /// 为什么先落文件而不是入库：日志是无界的观测流，保留期与索引键尚未定档 ——
+    /// 先落 NDJSON（可以 `tail`、可以 `grep`），等保留策略定了再考虑入库。
+    pub fn agent_log_file(&self) -> PathBuf {
+        let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
+        state_dir.join("logs").join("agent-logs.ndjson")
+    }
 }
 
 fn default_bootstrap_token_ttl_seconds() -> i64 {

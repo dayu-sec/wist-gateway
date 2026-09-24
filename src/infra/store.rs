@@ -149,7 +149,16 @@ pub struct StoredAgentRegistration {
     /// 一次状态都没报过”的判据 —— 管理面用它把 `last_seen_at` 显示成空串。
     pub started_at: String,
     pub last_memory_bytes: Option<u64>,
+    /// 最近一次上报的 CPU 占用，**单核口径**（100% = 占满一个核；多线程进程可 >100）。
+    ///
+    /// 只统计 agent 进程**自己**的 CPU 时间，不代表整机负载。整机占比由
+    /// `cpu_percent / cpu_cores` 派生（管理面读投影）。
     pub last_cpu_percent: Option<f64>,
+    /// 最近一次上报的**逻辑核数**（agent 所在机器）；`None` = 老版本 agentd 没报。
+    ///
+    /// `None` 与 `Some(0)` 不同：前者是「不知道核数」，后者是「报了非法值」，两者都不能
+    /// 拿来做整机占比的除数（`cpu_percent_of_machine` 由此返回 `None`）。
+    pub last_cpu_cores: Option<u32>,
     pub last_admin_latency_ms: Option<u64>,
     /// 本机**实际生效**的发现方向策略版本；`None` = 还没拿到策略表（在用内建默认周期）。
     pub last_discovery_policy_version: Option<i64>,
@@ -204,13 +213,25 @@ pub struct StoredAgentInstallPackageAddress {
 }
 
 /// 时序指标样本 DTO（历史在 VictoriaMetrics，库里只留最近值）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentMetricSample {
+///
+/// 带 `#[jumo]` 注解是因为它作为 `RecentOnlineRegisteredAgent.metrics_history` 的
+/// 元素类型出现在模型里（`Control.Agent.Status`）—— 不注它，模型侧就是一个「只在代码里存在」
+/// 的黑盒子，字段对不上没人会发现。
+#[derive(Debug, Clone, Serialize, Deserialize, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Control", module = "Control.Agent.Status")]
+pub struct AgentStatusMetricSample {
     pub at: String,
     #[serde(default)]
     pub memory_bytes: Option<u64>,
+    /// 单核口径的进程 CPU 占比（100% = 占满一个核，可能 >100），只统计 agent 进程自身。
     #[serde(default)]
     pub cpu_percent: Option<f64>,
+    /// 整机口径的 CPU 占比（0..100），由 `cpu_percent / cpu_cores` 派生；算不出时为 `None`。
+    #[serde(default)]
+    pub cpu_percent_of_machine: Option<f64>,
+    /// agent 所在机器的逻辑核数；`None` = 该采样点没有核数（老版本 agentd 没报）。
+    #[serde(default)]
+    pub cpu_cores: Option<u32>,
     #[serde(default)]
     pub admin_latency_ms: Option<u64>,
 }
@@ -570,7 +591,10 @@ pub struct AgentStatusUpdate<'a> {
     pub version: &'a str,
     pub last_seen_at: &'a str,
     pub memory_bytes: Option<u64>,
+    /// CPU 占用，**单核口径**（100% = 占满一个核；多线程进程可 >100），只统计 agent 进程自身。
     pub cpu_percent: Option<f64>,
+    /// agent 所在机器的**逻辑核数**；`None` = 老版本 agentd 没报（与 `Some(0)` 区分）。
+    pub cpu_cores: Option<u32>,
     pub admin_latency_ms: Option<u64>,
     /// 本机**实际生效**的发现方向策略版本；`None` = 还没拿到策略表（区别于「生效了第 0 版」）。
     pub discovery_policy_version: Option<i64>,

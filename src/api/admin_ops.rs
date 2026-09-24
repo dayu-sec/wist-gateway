@@ -7,7 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
-use wist_control::types::{AgentRuntimeStatus, DateTime};
+use wist_control::types::DateTime;
 
 use crate::app::content::{MACHINE_CLASSES, platform_for_machine_class};
 use crate::app::work as work_rules;
@@ -67,7 +67,12 @@ pub struct AgentListEntry {
     pub registered_at: String,
     pub last_seen_at: DateTime,
     pub memory_bytes: Option<i64>,
+    /// 单核口径的进程 CPU 占比（100% = 占满一个核，可能 >100），只统计 agent 进程自身。
     pub cpu_percent: Option<f64>,
+    /// agent 所在机器的逻辑核数；null = 老版本 agentd 没报（与 0 区分）。
+    pub cpu_cores: Option<u32>,
+    /// 整机口径的 CPU 占比（0..100），由 `cpu_percent / cpu_cores` 派生；算不出时为 null。
+    pub cpu_percent_of_machine: Option<f64>,
     pub admin_latency_ms: Option<i64>,
 }
 
@@ -205,6 +210,7 @@ pub async fn get_agent_runtime_status(
         &agent.last_seen_at,
         agent.last_memory_bytes,
         agent.last_cpu_percent,
+        agent.last_cpu_cores,
         agent.last_admin_latency_ms,
     ))
     .into_response()
@@ -1412,6 +1418,11 @@ fn agent_list_entry(agent: &crate::infra::StoredAgentRegistration) -> AgentListE
         last_seen_at: DateTime::from_rfc3339(&agent.last_seen_at).unwrap_or_else(DateTime::now),
         memory_bytes: agent.last_memory_bytes.map(|value| value as i64),
         cpu_percent: agent.last_cpu_percent,
+        cpu_cores: agent.last_cpu_cores,
+        cpu_percent_of_machine: cpu_percent_of_machine(
+            agent.last_cpu_percent,
+            agent.last_cpu_cores,
+        ),
         admin_latency_ms: agent.last_admin_latency_ms.map(|value| value as i64),
     }
 }
@@ -1750,9 +1761,10 @@ fn runtime_status(
     last_seen_at: &str,
     memory_bytes: Option<u64>,
     cpu_percent: Option<f64>,
+    cpu_cores: Option<u32>,
     admin_latency_ms: Option<u64>,
-) -> AgentRuntimeStatus {
-    AgentRuntimeStatus {
+) -> AgentRuntimeStatusView {
+    AgentRuntimeStatusView {
         agent_id: agent_id.to_string(),
         instance_id: instance_id.to_string(),
         version: version.to_string(),
@@ -1760,7 +1772,46 @@ fn runtime_status(
         health: health.to_string(),
         memory_bytes: memory_bytes.map(|value| value as i64),
         cpu_percent,
+        cpu_cores,
+        cpu_percent_of_machine: cpu_percent_of_machine(cpu_percent, cpu_cores),
         admin_latency_ms: admin_latency_ms.map(|value| value as i64),
         last_seen_at: DateTime::from_rfc3339(last_seen_at).unwrap_or_else(DateTime::now),
     }
+}
+
+/// 把单核口径的进程 CPU 占比换算成整机口径（0..100）。
+///
+/// **派生只此一处**：`cpu_percent` 是单核口径（100% = 占满一个核，多线程进程可 >100），
+/// 整机占比 = `cpu_percent / cpu_cores`。`cpu_cores` 为 `None`（老版本 agentd 没报）或
+/// `0`（上报了非法核数）时返回 `None`：既不除零，也不默认成 0 —— 把「测不到」写成 0
+/// 会在页面上伪造出一段「整机空闲」的假读数。`cpu_percent` 缺失时同样返回 `None`。
+pub(super) fn cpu_percent_of_machine(
+    cpu_percent: Option<f64>,
+    cpu_cores: Option<u32>,
+) -> Option<f64> {
+    let cores = cpu_cores.filter(|cores| *cores > 0)?;
+    Some(cpu_percent? / f64::from(cores))
+}
+
+/// 单台 Agent 运行态视图（对应模型 `AgentRuntimeStatus` 的读投影形状）。
+///
+/// 为什么在实现层派生：管理面还要呈现网关**派生**的整机 CPU 占比（`cpu_percent_of_machine`）
+/// 与派生所需的口径字段（`cpu_cores`），模型 `AgentRuntimeStatus` 里没有这两个字段。
+/// 与 `AgentListEntry` 同一约定：运行态字段取自模型，管理面额外需要的字段由实现层补出。
+#[derive(Debug, Serialize)]
+pub struct AgentRuntimeStatusView {
+    pub agent_id: String,
+    pub instance_id: String,
+    pub version: String,
+    pub status: String,
+    pub health: String,
+    pub last_seen_at: DateTime,
+    pub memory_bytes: Option<i64>,
+    /// 单核口径的进程 CPU 占比（100% = 占满一个核，可能 >100），只统计 agent 进程自身。
+    pub cpu_percent: Option<f64>,
+    /// agent 所在机器的逻辑核数；null = 老版本 agentd 没报（与 0 区分）。
+    pub cpu_cores: Option<u32>,
+    /// 整机口径的 CPU 占比（0..100），由 `cpu_percent / cpu_cores` 派生；算不出时为 null。
+    pub cpu_percent_of_machine: Option<f64>,
+    pub admin_latency_ms: Option<i64>,
 }

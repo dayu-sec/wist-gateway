@@ -41,6 +41,7 @@ pub async fn submit_agent_status(
             let timestamp_ms = now_utc.timestamp_millis();
             let memory_bytes = input.memory_bytes;
             let cpu_percent = input.cpu_percent;
+            let cpu_cores = input.cpu_cores;
             let admin_latency_ms = input.admin_latency_ms;
             let discovery_policy_version = input.discovery_policy_version;
             let status_result = state
@@ -53,6 +54,7 @@ pub async fn submit_agent_status(
                     last_seen_at: &last_seen_at,
                     memory_bytes,
                     cpu_percent,
+                    cpu_cores,
                     admin_latency_ms,
                     discovery_policy_version,
                     work_state_changes: input.work_state_changes.clone(),
@@ -82,6 +84,7 @@ pub async fn submit_agent_status(
                 &agent.agent_id,
                 memory_bytes,
                 cpu_percent,
+                cpu_cores,
                 admin_latency_ms,
                 discovery_policy_version,
                 timestamp_ms,
@@ -113,10 +116,15 @@ pub async fn submit_agent_status(
 /// 缺值（`None`）**不产生行、更不补 0**：把「没上报」写成 0 会在图上伪造出一段真实读数。
 /// 对 `discovery_policy_version` 尤其致命 —— 0 代表确实生效了第 0 版，与「还没拉到策略表」
 /// 是两回事，混为一谈正好毁掉运维要回答的那句「哪些机器还没生效」。
+///
+/// 注意 `agent.cpu.percent` 是**单核口径**（100% = 占满一个核，多线程进程可 >100），
+/// 只统计 agent 进程自身；整机占比由管理面读投影按 `cpu_percent / cpu_cores` 派生，
+/// 不在这条上报链路上另发一条线。
 pub(super) fn agent_status_metric_lines(
     agent_id: &str,
     memory_bytes: Option<u64>,
     cpu_percent: Option<f64>,
+    cpu_cores: Option<u32>,
     admin_latency_ms: Option<u64>,
     discovery_policy_version: Option<i64>,
     timestamp_ms: i64,
@@ -137,6 +145,16 @@ pub(super) fn agent_status_metric_lines(
                 agent_id,
                 "agent_metrics",
                 value,
+                timestamp_ms,
+            )
+        }),
+        cpu_cores.map(|value| {
+            metric_line(
+                // 单位=个（逻辑核数）：gauge 型。整机占比的分母，随状态上报一起进时序。
+                "agent.cpu.cores",
+                agent_id,
+                "agent_metrics",
+                value as f64,
                 timestamp_ms,
             )
         }),

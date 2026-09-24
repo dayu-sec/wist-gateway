@@ -9,8 +9,10 @@
 //!   常驻工作模板 WorkTemplate —— 这类机器该采什么 = 平台基线包 ⊕ 特征包（**组合，非继承**）。
 //!
 //! 两条关键设计在这里落实：
-//!   1. **就绪度两义**：单元的 `status` 是「规则就绪度」，包/模板的 `status` 是「策展成熟度」。
-//!      授权闸门是**面就绪度**（该面至少一个 `active` 单元），未就绪的面**不展开**并留痕。
+//!   1. **就绪度分三层，不再混成一个**：单元的 `status` 是「**采集就绪度**」（能不能派下去采原文），
+//!      单元的 `rule_ref` 是「**解析就绪度**」（采下来能不能归类、抽字段 —— 独立信号，**不是**闸门），
+//!      包/模板的 `status` 是「策展成熟度」。授权闸门是**面就绪度**（该面至少一个 `active` 单元），
+//!      未就绪的面**不展开**并留痕。
 //!   2. **事实缺位 ≠ 条件不满足**：`match` 求值三态，探针没采到时报「无法判定」，不冒充「没装」。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,13 +21,19 @@ use std::path::Path;
 use orion_error::conversion::ToStructError;
 use orion_error::prelude::*;
 use serde::Deserialize;
+use wist_contracts::work::{EXECUTABLE_SOURCE_KINDS, is_executable_source};
 use wist_error::{ConfigError, ConfigReason, ConfigResult};
 
 use crate::infra::StoredAgentFactSummary;
 
 /// 平台闭集（与 agentd 上报的 `os` 同源）。
 pub const PLATFORMS: &[&str] = &["macos", "linux"];
-/// 采集面闭集（与模型 `variant CollectionFamily` 一致）。
+/// 采集面闭集（与模型 `families.mju` 的 `variant CollectionFamily` **逐字一致**）。
+///
+/// 为什么以常量形式放在这里：网关装载采集目录时要**拒掉未知的面**（面名写错不能静默收下），
+/// 而运行期不能去读模型仓。两侧的一致性由测试钉住
+/// （`the_family_closed_set_matches_the_model`）—— 加面/改名要同时改两处。
+/// 含义与维护规矩（**只增不改名**）见 `doc/design/center/collection-families.md`。
 pub const FAMILIES: &[&str] = &[
     "LoginSession",
     "PrivilegeExecution",
@@ -70,7 +78,7 @@ pub const SOURCE_KINDS: &[&str] = &[
 pub const MULTILINE_MODES: &[&str] = &["none", "indented"];
 /// 权限闭集。
 pub const PRIVILEGES: &[&str] = &["none", "root", "fda"];
-/// 单元规则就绪度。
+/// 单元**采集就绪度**（能不能派下去采原文；与解析规则无关）。
 pub const UNIT_STATUSES: &[&str] = &["active", "draft", "deprecated"];
 /// 包的性质。
 pub const PACK_KINDS: &[&str] = &["Baseline", "Feature"];
@@ -197,9 +205,16 @@ pub struct Unit {
     pub capability: String,
     pub platform: String,
     pub match_expr: String,
+    /// **解析就绪度**（独立信号，**不参与**派活闸门）：非空 = 有解析规则，采下来的记录能被
+    /// 归类、抽字段；空 = 只落原文 —— 帧进得来、落得下，但下游只能拿到未归类的原文。
+    ///
+    /// 为什么不拿它当闸门：**能采 ≠ 能解析**。采集就是 tail 一个文件、把原文发出去，
+    /// 它不需要任何解析规则；规则是数据面的事。卡在这里会把「先收原文样本、后补规则」
+    /// 这条最省的路堵死。
     pub rule_ref: String,
     pub requires_privilege: String,
-    /// `active` = 规则已就绪、能落数据面。授权闸门看它。
+    /// **采集就绪度**：`active` = 采集要素齐（有来源，且至少一条来源 agentd 真能执行）
+    /// → 可以派下去采原文。派活闸门看的就是它。
     pub status: String,
     /// 采集来源（一个单元可有多条）。
     pub sources: Vec<UnitSource>,
@@ -215,8 +230,14 @@ pub struct UnitSource {
 }
 
 impl Unit {
-    pub fn is_ready(&self) -> bool {
+    /// 采集就绪（`status = active`）：能不能派下去采。
+    pub fn collect_ready(&self) -> bool {
         self.status == "active"
+    }
+
+    /// 解析就绪（`rule_ref` 非空）：采下来能不能归类、抽字段。
+    pub fn parse_ready(&self) -> bool {
+        !self.rule_ref.trim().is_empty()
     }
 }
 
@@ -248,19 +269,35 @@ pub struct Template {
 }
 
 /// 某采集面在某平台上的就绪度（派生）。
+///
+/// **两个轴分开报**，因为它们回答的是不同的问题：
+///   - 采集（`active_units` / [`Self::collect_ready`]）：能不能派下去把原文拿回来；
+///   - 解析（`parse_ready_units` / [`Self::parse_ready`]）：拿回来的东西能不能被归类、抽字段。
+///
+/// 只看前者会把「采到了但认不出是谁」当成已就绪，只看后者会拿规则去卡采集。
 #[derive(Debug, Clone, PartialEq, Eq, ::jumo_derive::Jumo)]
 #[jumo(kind = "struct", domain = "Control", module = "Control.Agent.Content")]
 pub struct FamilyReadiness {
     pub family: String,
     pub platform: String,
-    /// 该面上 `status = active` 的单元数。
+    /// 该面上**采集就绪**的单元数（`status = active`）。
     pub active_units: usize,
+    /// 该面上**解析就绪**的 `active` 单元数（`rule_ref` 非空）。
+    pub parse_ready_units: usize,
     pub total_units: usize,
 }
 
 impl FamilyReadiness {
-    pub fn is_ready(&self) -> bool {
+    /// 采集就绪：这个面能被派下去采。
+    pub fn collect_ready(&self) -> bool {
         self.active_units > 0
+    }
+
+    /// 解析就绪：这个面采下来的记录能被归类、抽字段。
+    ///
+    /// **不参与闸门**：`false` 只意味着记录会以未归类的原文落地（当前是单个 `agent.log` 类）。
+    pub fn parse_ready(&self) -> bool {
+        self.parse_ready_units > 0
     }
 }
 
@@ -448,10 +485,22 @@ fn validate_unit(unit: &UnitRow) -> ConfigResult<()> {
             )));
         }
     }
-    // 「规则就绪」不能只靠人喊：`active` 必须带解析规则（rule_ref 非空）。
-    if unit.status == "active" && unit.rule_ref.trim().is_empty() {
+    // 「采集就绪」不能只靠人喊：`active` 必须有一条**agentd 今天真能采**的来源。
+    //
+    // 这里刻意**不看** `rule_ref`：采原文不需要解析规则，拿它当闸门是把「能解析」当成「能采」。
+    // 卡住的是「这条来源采集端到底能不能执行」（`is_executable_source`，与 agentd 同源：
+    // kind 要能执行，`FileGlob` 的 target 还要是**显式绝对路径** —— 通配与 `~` 采集端还没实现）。
+    // 否则就会出现「网关说可采、agent 拿到后报 unsupported」这种自相矛盾的运行态。
+    if unit.status == "active"
+        && !unit
+            .sources
+            .iter()
+            .any(|source| is_executable_source(&source.kind, &source.target))
+    {
         return Err(invalid(format!(
-            "unit {id}: status = active but rule_ref is empty (规则未就绪的单元不能标 active)"
+            "unit {id}: status = active but no source agentd can collect \
+             (kind 要去 {EXECUTABLE_SOURCE_KINDS:?}，且 FileGlob 的 target 必须是显式绝对路径：\
+              通配与 `~` 采集端尚未实现，见 wist-agentd/docs/design/log-file-input-spec.md §2)"
         )));
     }
     Ok(())
@@ -645,9 +694,9 @@ pub fn platform_for_machine_class(machine_class: &str) -> Option<&'static str> {
 
 /// 某个采集面是否可能出现在某平台上（照 `families.mju` 的分类）。
 ///
-/// 与 [`ContentSet::is_family_ready`] 分工不同：那个回答「规则写好了吗」，
+/// 与 [`ContentSet::is_family_ready`] 分工不同：那个回答「采集要素齐不齐」，
 /// 这个回答「这个面在这类机器上存不存在」。派活时要分开报 —— 对一台 Linux 机器说
-/// 「TCC 面规则未就绪」是把**不适用**说成了**没写好**，会把人引向错误的下一步。
+/// 「TCC 面采集未就绪」是把**不适用**说成了**没准备好**，会把人引向错误的下一步。
 pub fn family_applies_to(family: &str, platform: &str) -> bool {
     if !FAMILIES.contains(&family) || !PLATFORMS.contains(&platform) {
         return false;
@@ -715,41 +764,49 @@ impl ContentSet {
             .find(|template| template.machine_class == machine_class)
     }
 
-    /// 某平台所有（出现过的）面的就绪度。
+    /// 某平台所有（出现过的）面的就绪度（采集轴 + 解析轴）。
     pub fn family_readiness(&self, platform: &str) -> Vec<FamilyReadiness> {
-        let mut per_family: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        // (采集就绪数, 解析就绪数, 总数)
+        let mut per_family: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
         for unit in self.units.values().filter(|unit| unit.platform == platform) {
-            let entry = per_family.entry(unit.family.as_str()).or_insert((0, 0));
-            entry.1 += 1;
-            if unit.is_ready() {
+            let entry = per_family.entry(unit.family.as_str()).or_insert((0, 0, 0));
+            entry.2 += 1;
+            if unit.collect_ready() {
                 entry.0 += 1;
+                if unit.parse_ready() {
+                    entry.1 += 1;
+                }
             }
         }
         per_family
             .into_iter()
-            .map(|(family, (active, total))| FamilyReadiness {
+            .map(|(family, (active, parse_ready, total))| FamilyReadiness {
                 family: family.to_string(),
                 platform: platform.to_string(),
                 active_units: active,
+                parse_ready_units: parse_ready,
                 total_units: total,
             })
             .collect()
     }
 
-    /// 面在某平台上是否就绪（至少一个 `active` 单元）。
+    /// 面在某平台上是否**采集就绪**（至少一个 `active` 单元）——「能不能派下去采」。
     pub fn is_family_ready(&self, platform: &str, family: &str) -> bool {
         self.units
             .values()
-            .any(|unit| unit.platform == platform && unit.family == family && unit.is_ready())
+            .any(|unit| unit.platform == platform && unit.family == family && unit.collect_ready())
     }
 
     /// 按模板把一台机器展开成「一面一份」的常驻工作（**未落库**，纯计算）。
     ///
     /// 规则：
-    ///   - 就绪的面才展开成工作；未就绪的面的单元进 `excluded_units(rule_not_ready)`；
+    ///   - **采集就绪**的面才展开成工作；未就绪的面（没有 `active` 单元）的单元进
+    ///     `excluded_units(collect_not_ready)`；
     ///   - 就绪面里，`match` 三态过滤：命中 → 选中；不命中 → `match_unsatisfied`；
     ///     无法判定（事实没采到）→ `fact_not_collected`；
     ///   - 选中集为空的面不产生工作（但排除项仍留痕）。
+    ///
+    /// **不**看 `rule_ref`：能不能采与能不能解析是两件事（见 [`Unit::parse_ready`]）。
     pub fn expand(
         &self,
         template_id: &str,
@@ -774,7 +831,7 @@ impl ContentSet {
                 for unit in units {
                     excluded.push(ExcludedUnit {
                         unit_id: unit.unit_id.clone(),
-                        reason_code: "rule_not_ready".to_string(),
+                        reason_code: "collect_not_ready".to_string(),
                         condition: None,
                     });
                 }
@@ -849,7 +906,7 @@ pub struct ExpandedWork {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExcludedUnit {
     pub unit_id: String,
-    /// `rule_not_ready` | `match_unsatisfied` | `fact_not_collected`。
+    /// `collect_not_ready` | `match_unsatisfied` | `fact_not_collected`。
     pub reason_code: String,
     /// 不满足/无法判定的那条条件（如 `installed:postgresql`）。
     pub condition: Option<String>,
@@ -1006,7 +1063,7 @@ status = "active"
 
 [[units.sources]]
 kind = "FileGlob"
-target = "/var/log/postgresql/*"
+target = "/var/log/postgresql.log"
 "#;
 
     const PACKS: &str = r#"
@@ -1071,6 +1128,75 @@ status = "active"
     }
 
     #[test]
+    fn the_family_closed_set_matches_the_model() {
+        // 采集面是**闭集**：网关白名单与模型必须逐字一致，否则会出现
+        // 「模型里有个面、网关拒了它」或「网关放行了一个模型里不存在的面」。
+        // 靠人守必然漂（现在就有一个：launchd 的归属两处说法不同），所以钉在这里。
+        let path = Path::new(
+            "../../wist-design/jumo/model/static/control/module/agent/content/families.mju",
+        );
+        if !path.exists() {
+            // 未随模型仓部署时跳过（与 `reads_the_checked_in_content_set` 同一取舍）。
+            return;
+        }
+        let text = std::fs::read_to_string(path).expect("read families.mju");
+        let mut model = parse_family_variant(&text);
+        assert!(
+            !model.is_empty(),
+            "一个面都没解析出来：families.mju 的写法变了？"
+        );
+        model.sort();
+        let mut model_unique = model.clone();
+        model_unique.dedup();
+        assert_eq!(model_unique.len(), model.len(), "模型里有重复的面名");
+
+        let mut gateway: Vec<String> = FAMILIES
+            .iter()
+            .map(|family| (*family).to_string())
+            .collect();
+        gateway.sort();
+        assert_eq!(
+            model_unique, gateway,
+            "面闭集两边不一致：模型 families.mju vs 网关 FAMILIES"
+        );
+    }
+
+    /// 从 `families.mju` 里取出 `variant CollectionFamily` 的成员名。
+    ///
+    /// 故意写得很笨（按行 + 括号计数）：这个文件是固定写法，**写法一变就让测试红**，
+    /// 比引一个 `.mju` 解析器划算。
+    fn parse_family_variant(text: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut in_variant = false;
+        let mut in_meta = false;
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if !in_variant {
+                in_variant = line.starts_with("variant CollectionFamily");
+                continue;
+            }
+            if in_meta {
+                if line.starts_with('}') {
+                    in_meta = false;
+                }
+                continue;
+            }
+            if line.starts_with("meta") {
+                in_meta = true;
+                continue;
+            }
+            if line.starts_with('}') {
+                break;
+            }
+            names.extend(line.split_whitespace().map(str::to_string));
+        }
+        names
+    }
+
+    #[test]
     fn parses_a_minimal_valid_content_set() {
         let set = minimal();
         assert_eq!(set.catalog_version, 1);
@@ -1095,7 +1221,8 @@ status = "active"
             &dir.join("templates.toml"),
         )
         .expect("load checked-in content");
-        assert_eq!(set.catalog_version, 1);
+        // 目录版本要随内容一起抬（见 catalog.toml 头部约定）：旧工作锁在它展开时那一版上。
+        assert_eq!(set.catalog_version, 2);
         assert_eq!(set.templates().count(), 4);
         assert_eq!(
             set.template("macos-daily")
@@ -1104,13 +1231,44 @@ status = "active"
                 .len(),
             10
         );
-        // 就绪度：当前只有 HostMetrics 这一面有 active 单元。
+        // 采集就绪与解析就绪是**两个轴**，分开看：
+        //   采集就绪（显式单路径 / 指标周期）：SoftwareChange / NetworkFirewall /
+        //     ServiceLifecycle / RebootPower / HostMetrics —— 注意 NetworkFirewall 与
+        //     ServiceLifecycle 都是**会轮转**的文件族，靠**显式路径 + inode 跟踪**采，
+        //     不是靠 `wifi.log*` 这种通配（通配会把历史轮转产物也纳进来）；
+        //   RebootPower 的 rule_ref 为空 → **解析未就绪**，但照样可采；
+        //   PrivacyTcc 的来源是 Exporter（agentd 还没实现）。
         assert!(set.is_family_ready("macos", "HostMetrics"));
+        assert!(set.is_family_ready("macos", "SoftwareChange"));
+        assert!(set.is_family_ready("macos", "RebootPower"));
+        assert!(set.is_family_ready("macos", "NetworkFirewall"));
+        assert!(set.is_family_ready("macos", "ServiceLifecycle"));
+        assert!(!set.is_family_ready("macos", "PrivacyTcc"));
         assert!(!set.is_family_ready("macos", "CrashPanic"));
+
+        let readiness = set.family_readiness("macos");
+        let by_family = |family: &str| {
+            readiness
+                .iter()
+                .find(|entry| entry.family == family)
+                .unwrap_or_else(|| panic!("no readiness for {family}"))
+        };
+        let reboot = by_family("RebootPower");
+        assert_eq!(
+            (
+                reboot.active_units,
+                reboot.parse_ready_units,
+                reboot.total_units
+            ),
+            (1, 0, 1)
+        );
+        assert!(reboot.collect_ready() && !reboot.parse_ready());
+        let tcc = by_family("PrivacyTcc");
+        assert!(!tcc.collect_ready());
     }
 
     #[test]
-    fn expands_only_ready_families_and_records_the_rest() {
+    fn expands_the_collect_ready_families_and_records_the_rest() {
         let dir = Path::new("../../wist-design/jumo/model/content");
         if !dir.exists() {
             return;
@@ -1124,27 +1282,47 @@ status = "active"
         let expansion = set
             .expand("macos-daily", &facts("macos", &[]))
             .expect("expand");
-        // 就绪的面按包内行序展开（macos-base 里 SoftwareChange 在 HostMetrics 前）；
-        // 其余 8 个面全部 is rule_not_ready 留痕。
+        // 采集就绪的面按包内行序展开（macos-base 的 unit_refs 顺序）；
+        // 剩下 5 个面的单元留痕 —— 事件型（`.ips`）、目录型、或来源类型未实现。
         assert_eq!(
             expansion
                 .works
                 .iter()
                 .map(|work| work.family.as_str())
                 .collect::<Vec<_>>(),
-            vec!["SoftwareChange", "HostMetrics"]
+            vec![
+                "SoftwareChange",
+                "NetworkFirewall",
+                "ServiceLifecycle",
+                "RebootPower",
+                "HostMetrics"
+            ]
         );
         assert_eq!(
             expansion.works[0].selected_units,
             vec!["mac-software-change"]
         );
-        assert_eq!(expansion.works[1].selected_units, vec!["mac-host-metrics"]);
-        assert_eq!(expansion.excluded_units.len(), 8);
+        assert_eq!(expansion.works[1].selected_units, vec!["mac-network-wifi"]);
+        assert_eq!(expansion.works[4].selected_units, vec!["mac-host-metrics"]);
+        assert_eq!(
+            expansion
+                .excluded_units
+                .iter()
+                .map(|unit| unit.unit_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "mac-login-session",
+                "mac-crash-panic",
+                "mac-privacy-tcc",
+                "mac-gatekeeper",
+                "mac-misc-system"
+            ]
+        );
         assert!(
             expansion
                 .excluded_units
                 .iter()
-                .all(|unit| unit.reason_code == "rule_not_ready")
+                .all(|unit| unit.reason_code == "collect_not_ready")
         );
     }
 
@@ -1191,10 +1369,28 @@ status = "active"
     }
 
     #[test]
-    fn rejects_an_active_unit_without_a_rule_ref() {
+    fn accepts_an_active_unit_without_a_rule_ref() {
+        // 采原文不需要解析规则：空 `rule_ref` 不再是错误（见 catalog.toml 头部约定）。
         let catalog = CATALOG.replacen("rule_ref = \"agent_uplink\"", "rule_ref = \"\"", 1);
-        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("active without rule_ref");
-        assert!(err.to_string().contains("active"), "{err}");
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("active without rule_ref");
+        let unit = set
+            .units()
+            .find(|unit| unit.unit_id == "mac-metrics")
+            .expect("mac-metrics");
+        assert!(unit.collect_ready());
+        assert!(!unit.parse_ready(), "解析未就绪只影响归类，不影响能不能采");
+    }
+
+    #[test]
+    fn rejects_an_active_unit_whose_sources_agentd_cannot_execute() {
+        // 反过来：「采集就绪」不能只靠人喊 —— 唯一来源换成 Exporter（agentd 还没实现）就拦。
+        let catalog = CATALOG.replacen("kind = \"MetricInterval\"", "kind = \"Exporter\"", 1);
+        let err = parse_with(&catalog, PACKS, TEMPLATES)
+            .expect_err("active without an executable source");
+        assert!(
+            err.to_string().contains("no source agentd can collect"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1235,8 +1431,8 @@ status = "active"
         assert_eq!(unit.sources[0].multiline, "none");
 
         let catalog = CATALOG.replacen(
-            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"",
-            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"\nmultiline = \"indented\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"\nmultiline = \"indented\"",
             1,
         );
         let set = parse_with(&catalog, PACKS, TEMPLATES).expect("parses");
@@ -1250,8 +1446,8 @@ status = "active"
     #[test]
     fn rejects_an_unknown_multiline_mode() {
         let catalog = CATALOG.replacen(
-            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"",
-            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"\nmultiline = \"guessed\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"\nmultiline = \"guessed\"",
             1,
         );
         let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("unknown multiline");

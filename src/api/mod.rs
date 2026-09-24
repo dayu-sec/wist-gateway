@@ -26,6 +26,10 @@ mod install;
 // AdminSetAgentInstallPackageAddress 与 AgentInstallPackageAddress；新路由未变，
 // 只是 POST 的语义落实到本模块。重新生成控制面代码时需回补本模块。
 mod install_package;
+// NOTE(hand-added): 采集日志的本地落盘与查看（数据面转发 + 管理面读文件）。
+// 不在 jumo 静态模型 binding.mju 的声明里，与 host_metrics / pipeline 同一模式。
+// 重新生成控制面代码时需回补本模块与下方路由。
+mod logs;
 mod overview;
 // NOTE(hand-added): pipeline 不在 jumo 静态模型 binding.mju 的声明里，与 host_metrics
 // 同一模式（模型里也没有 host-metrics 路由）。重新生成控制面代码时需回补本模块与下方路由。
@@ -62,6 +66,7 @@ use install::{
     download_agent_package, get_agent_initial_config_with_token, get_agent_install_code,
     get_agent_install_script, get_agent_install_script_signature,
 };
+use logs::{MAX_LOG_INGEST_BODY_BYTES, ingest_agent_logs, view_agent_logs};
 use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
 use pipeline::get_pipeline_topology;
 use software_ops::{view_agent_software, view_software_holdings};
@@ -178,6 +183,11 @@ pub fn ingest_router(state: ApiState) -> Router {
             "/api/v1/ingest/agent-facts",
             post(ingest_agent_facts).layer(DefaultBodyLimit::max(MAX_INGEST_BODY_BYTES)),
         )
+        // NOTE(hand-added): 采集日志的落盘（同一张内部监听，见 api/logs.rs）。
+        .route(
+            "/api/v1/ingest/agent-logs",
+            post(ingest_agent_logs).layer(DefaultBodyLimit::max(MAX_LOG_INGEST_BODY_BYTES)),
+        )
         .with_state(state)
 }
 
@@ -291,6 +301,8 @@ pub fn router_with_state(state: ApiState) -> Router {
         // NOTE(hand-added): 采集内容目录的只读视图（模板组成 + 面就绪度）。见
         // api/content_ops.rs 顶部说明。
         .route("/api/v1/admin/content", get(view_content))
+        // NOTE(hand-added): 采集日志的查看（读本地落盘文件）。见 api/logs.rs 顶部说明。
+        .route("/api/v1/admin/logs", get(view_agent_logs))
         // NOTE(hand-added): wist-agentd 安装包地址的读取/设置。已在 jumo 模型
         // WistGatewayManagementInterface（AdminViewAgentInstallPackageAddress /
         // AdminSetAgentInstallPackageAddress）中声明。

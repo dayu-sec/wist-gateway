@@ -46,10 +46,12 @@ pub fn check_family(family: &str) -> Result<(), WorkRejection> {
     )))
 }
 
-/// 面在该平台上是否**可授权**：先看适不适用，再看规则就绪度。
+/// 面在该平台上是否**可授权**：先看适不适用，再看**采集就绪度**。
 ///
 /// 两步分开报，是因为它们是两件事：不适用是**配置错误**（人该换个面），
-/// 未就绪是**进度问题**（人该等规则或先补规则）—— 混成一句话就会把人引向错误的下一步。
+/// 采集未就绪是**进度问题**（人该等采集要素齐）—— 混成一句话就会把人引向错误的下一步。
+///
+/// 注意这里**不**看 `rule_ref`（解析就绪）：采原文不需要解析规则。
 pub fn check_family_grantable(
     content: &ContentSet,
     family: &str,
@@ -63,7 +65,7 @@ pub fn check_family_grantable(
     }
     if !content.is_family_ready(platform, family) {
         return Err(WorkRejection::Conflict(format!(
-            "collection family {family} is not ready on {platform} (rule_not_ready): \
+            "collection family {family} is not ready on {platform} (collect_not_ready): \
              该面还没有 status = active 的采集单元"
         )));
     }
@@ -430,9 +432,16 @@ rule_ref = "macos/tcc"
 requires_privilege = "fda"
 status = "active"
 
+# 混合来源：统一日志谓词（agentd 还没实现）+ 一份可直接 tail 的文件。
+# 只要有一条来源 agentd 能执行，这个单元就算**采集就绪** —— 另一条接不了的
+# 由 agentd 如实报成 unsupported，不影响这个面能被派下去。
 [[units.sources]]
 kind = "UnifiedLogPredicate"
 target = "subsystem == tccd"
+
+[[units.sources]]
+kind = "FileGlob"
+target = "/var/log/tcc.log"
 
 [[units]]
 unit_id = "linux-metrics"
@@ -460,7 +469,7 @@ status = "active"
 
 [[units.sources]]
 kind = "FileGlob"
-target = "/var/log/postgresql/*"
+target = "/var/log/postgresql.log"
 
 [[units]]
 unit_id = "linux-compute-draft"
@@ -569,8 +578,8 @@ status = "active"
 
     #[test]
     fn a_platform_specific_family_is_not_grantable_on_the_other_platform() {
-        // PrivacyTcc 是 macOS 专有面。对一台 Linux 机器报「规则未就绪」是把
-        // 「不适用」说成了「没写好」，会把人引向错误的下一步。
+        // PrivacyTcc 是 macOS 专有面。对一台 Linux 机器报「采集未就绪」是把
+        // 「不适用」说成了「没准备好」，会把人引向错误的下一步。
         let content = content();
         let err = check_family_grantable(&content, "PrivacyTcc", "linux").unwrap_err();
         assert!(matches!(err, WorkRejection::BadRequest(_)));
@@ -580,11 +589,11 @@ status = "active"
     }
 
     #[test]
-    fn a_family_without_active_units_is_blocked_as_rule_not_ready() {
+    fn a_family_without_active_units_is_blocked_as_collect_not_ready() {
         let content = content();
         let err = check_family_grantable(&content, "ComputeWorkload", "linux").unwrap_err();
         assert!(matches!(err, WorkRejection::Conflict(_)));
-        assert!(err.message().contains("rule_not_ready"));
+        assert!(err.message().contains("collect_not_ready"));
     }
 
     #[test]
@@ -616,7 +625,7 @@ status = "active"
         assert_eq!(spec.units[0].requires_privilege, "root");
         assert_eq!(spec.units[0].sources.len(), 1);
         assert_eq!(spec.units[0].sources[0].kind, "FileGlob");
-        assert_eq!(spec.units[0].sources[0].target, "/var/log/postgresql/*");
+        assert_eq!(spec.units[0].sources[0].target, "/var/log/postgresql.log");
         // 目录没声明读法 → 一行一条。
         assert_eq!(spec.units[0].sources[0].multiline, "none");
         assert_eq!(catalog_version, 1);
@@ -626,8 +635,8 @@ status = "active"
     fn a_sources_read_mode_travels_with_the_work_spec() {
         // 「怎么读这条来源」是工作内容的一部分：策展在目录里声明，agentd 不自己猜。
         let catalog = CATALOG.replacen(
-            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"",
-            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*\"\nmultiline = \"indented\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"\nmultiline = \"indented\"",
             1,
         );
         let content =

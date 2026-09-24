@@ -137,7 +137,7 @@ async fn ingest_one(state: &ApiState, raw: &Value) -> Result<(), String> {
 }
 
 /// 截断后的原始输入预览，用于诊断「数据面记录结构变了」这类问题。
-fn preview(raw: &Value) -> String {
+pub(super) fn preview(raw: &Value) -> String {
     const LIMIT: usize = 200;
     let text = raw.to_string();
     if text.len() <= LIMIT {

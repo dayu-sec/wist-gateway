@@ -40,7 +40,7 @@ const AGENT_PROJECTION: &str = "SELECT a.agent_id, a.tenant_id, a.environment_id
      COALESCE(i.version, '') AS version, \
      COALESCE(i.last_seen_at, '') AS last_seen_at, \
      COALESCE(i.started_at, '') AS started_at, \
-     i.memory_bytes, i.cpu_percent, i.admin_latency_ms, i.work_state_changes, \
+     i.memory_bytes, i.cpu_percent, i.cpu_cores, i.admin_latency_ms, i.work_state_changes, \
      i.discovery_policy_version, \
      COALESCE(a.current_credential_id, '') AS credential_id, \
      COALESCE(c.token_hash, '') AS credential_token_hash, \
@@ -234,8 +234,8 @@ impl SqliteStore {
                 sqlx::query(
                     "INSERT OR REPLACE INTO agent_instances (instance_id, agent_id, boot_id, \
                      version, started_at, last_seen_at, memory_bytes, cpu_percent, \
-                     admin_latency_ms, work_state_changes) \
-                     VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     cpu_cores, admin_latency_ms, work_state_changes) \
+                     VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 )
                 .bind(&instance_id)
                 .bind(&agent.agent_id)
@@ -244,6 +244,7 @@ impl SqliteStore {
                 .bind(&last_seen_at)
                 .bind(to_sql_int(agent.last_memory_bytes))
                 .bind(agent.last_cpu_percent)
+                .bind(agent.last_cpu_cores)
                 .bind(to_sql_int(agent.last_admin_latency_ms))
                 .bind(work_state_changes)
                 .execute(&mut *tx)
@@ -406,6 +407,7 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
         started_at: column!(row, "started_at"),
         last_memory_bytes: column!(row, "memory_bytes"),
         last_cpu_percent: column!(row, "cpu_percent"),
+        last_cpu_cores: column!(row, "cpu_cores"),
         last_admin_latency_ms: column!(row, "admin_latency_ms"),
         last_discovery_policy_version: column!(row, "discovery_policy_version"),
         work_state_changes: deserialize_work_state_changes(work_state_changes),
@@ -928,14 +930,15 @@ impl Store for SqliteStore {
             // 实例行不存在则新建（Agentd 重启换 boot_id / instance_id 时保留历史）。
             sqlx::query(
                 "INSERT INTO agent_instances (instance_id, agent_id, boot_id, version, \
-                 started_at, last_seen_at, memory_bytes, cpu_percent, admin_latency_ms, \
+                 started_at, last_seen_at, memory_bytes, cpu_percent, cpu_cores, admin_latency_ms, \
                  work_state_changes, discovery_policy_version) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT (instance_id) DO UPDATE SET version = excluded.version, \
                  boot_id = CASE WHEN excluded.boot_id = '' THEN agent_instances.boot_id \
                  ELSE excluded.boot_id END, \
                  last_seen_at = excluded.last_seen_at, \
                  memory_bytes = excluded.memory_bytes, cpu_percent = excluded.cpu_percent, \
+                 cpu_cores = excluded.cpu_cores, \
                  admin_latency_ms = excluded.admin_latency_ms, \
                  work_state_changes = excluded.work_state_changes, \
                  discovery_policy_version = excluded.discovery_policy_version",
@@ -947,6 +950,7 @@ impl Store for SqliteStore {
             .bind(update.last_seen_at)
             .bind(to_sql_int(update.memory_bytes))
             .bind(update.cpu_percent)
+            .bind(update.cpu_cores)
             .bind(to_sql_int(update.admin_latency_ms))
             .bind(work_state_changes)
             .bind(update.discovery_policy_version)
@@ -1964,6 +1968,7 @@ mod tests {
                 last_seen_at: "2026-01-02T00:00:00+00:00",
                 memory_bytes: None,
                 cpu_percent: None,
+                cpu_cores: None,
                 admin_latency_ms: None,
                 discovery_policy_version: None,
                 work_state_changes: None,
@@ -1986,6 +1991,7 @@ mod tests {
                     last_seen_at: seen_at,
                     memory_bytes: memory,
                     cpu_percent: Some(1.5),
+                    cpu_cores: None,
                     admin_latency_ms: Some(7),
                     discovery_policy_version: None,
                     work_state_changes: None,
@@ -2024,6 +2030,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_adds_agent_cpu_cores_column() {
+        // 迁移 0010 同样只是 ALTER TABLE ADD COLUMN（SQLite 不支持 ADD COLUMN IF NOT EXISTS），
+        // 直接查 pragma 确认列真存在，而不是只靠“插得进去”。
+        let store = store().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('agent_instances')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            columns.iter().any(|name| name == "cpu_cores"),
+            "{columns:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn stores_agent_discovery_policy_version_and_distinguishes_none_from_zero() {
         let store = store().await;
         register(&store, "hash-l", "agent-1", "inst-1").await;
@@ -2038,6 +2060,7 @@ mod tests {
                 last_seen_at: "2026-01-02T00:00:00+00:00",
                 memory_bytes: None,
                 cpu_percent: None,
+                cpu_cores: None,
                 admin_latency_ms: None,
                 discovery_policy_version: None,
                 work_state_changes: None,
@@ -2058,6 +2081,7 @@ mod tests {
                 last_seen_at: "2026-01-03T00:00:00+00:00",
                 memory_bytes: Some(4096),
                 cpu_percent: Some(1.5),
+                cpu_cores: None,
                 admin_latency_ms: Some(7),
                 discovery_policy_version: Some(2),
                 work_state_changes: None,
@@ -2078,6 +2102,7 @@ mod tests {
                 last_seen_at: "2026-01-04T00:00:00+00:00",
                 memory_bytes: None,
                 cpu_percent: None,
+                cpu_cores: None,
                 admin_latency_ms: None,
                 discovery_policy_version: Some(0),
                 work_state_changes: None,

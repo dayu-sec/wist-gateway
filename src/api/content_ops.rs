@@ -12,8 +12,11 @@ use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 // 采集内容目录的只读视图
 //
 // 为什么要有它：内容目录（catalog / packs / templates）装载与校验在启动时做，
-// 但「网关到底装了什么、哪些面已经就绪（能真采到）」需要一个能看的地方 ——
+// 但「网关到底装了什么、哪些面已经能采、哪些还只能落原文」需要一个能看的地方 ——
 // 这也是「部分可用/渐进启用」的可见面（见 doc/design/center/agent-work-templates.md §6.1）。
+//
+// **两个轴分开报**：采集（能不能派下去把原文拿回来）与解析（拿回来的能不能归类、抽字段）。
+// 只报一个就会让人把「采到了但认不出是谁」当成已就绪，或反过来拿规则去卡采集。
 //
 // 该端点不在 jumo 静态模型 binding.mju 的声明里，与 host_metrics / pipeline / software
 // 同一模式（模型里没有这些内部视图路由）。重新生成控制面代码时需回补本模块与路由。
@@ -35,10 +38,15 @@ struct TemplateView {
 #[derive(Debug, Serialize)]
 struct FamilyReadinessView {
     family: String,
+    /// 采集就绪（`status = active`）的单元数。
     active_units: usize,
+    /// 采集就绪**且**解析就绪（`rule_ref` 非空）的单元数。
+    parse_ready_units: usize,
     total_units: usize,
-    /// `active_units > 0`：该面至少一个单元规则已就绪。
+    /// 采集就绪：这个面能被派下去采。
     ready: bool,
+    /// 解析就绪：采下来的记录能被归类、抽字段。**不参与授权闸门**。
+    parse_ready: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,9 +103,11 @@ pub async fn view_content(
                 .family_readiness(platform)
                 .into_iter()
                 .map(|entry| FamilyReadinessView {
-                    ready: entry.is_ready(),
+                    ready: entry.collect_ready(),
+                    parse_ready: entry.parse_ready(),
                     family: entry.family,
                     active_units: entry.active_units,
+                    parse_ready_units: entry.parse_ready_units,
                     total_units: entry.total_units,
                 })
                 .collect(),
