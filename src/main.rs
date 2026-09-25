@@ -37,6 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 两个监听共用一份状态：规则表、策略表、会话运行态与限流器都只能有一份。
     let state = wist_gateway::api::build_state(config, store);
 
+    // 一次性工作的到期判定：过了截止的标 expired、预算尽的标 timed_out。
+    // 与 agent 在不在线无关 —— 掉线的 agent 恰恰是活最容易卡住的时候。
+    wist_gateway::api::spawn_one_shot_expiry_tick(state.store.clone());
+
     if let Some(ingest_addr) = ingest_addr {
         // 数据面（warp-parse）订阅端的**内部**接入端点：明文 HTTP，默认只绑环回。
         // 为什么不能复用下面的 HTTPS 监听：数据面的 sink 连接器没有 TLS 参数（见 api/ingest.rs）。

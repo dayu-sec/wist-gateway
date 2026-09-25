@@ -16,7 +16,8 @@ use crate::infra::{
     AgentQuery, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
     DEFAULT_INSTALL_PACKAGE_SETTING_ID, StoredAgentClassification, StoredAgentFactSummary,
     StoredAgentInstallPackageAddress, StoredAgentUplinkAddress, StoredOneShotWork,
-    StoredPurposeSuggestion, StoredWorkAck, effective_standing, outstanding_one_shot,
+    StoredPurposeSuggestion, StoredWorkAck, StoredWorkResult, effective_standing,
+    outstanding_one_shot,
 };
 use wist_contracts::work::{OneShotWork, StandingWork, WorkKind, WorkReceipt};
 
@@ -1104,6 +1105,11 @@ struct OneShotWorkView {
     #[serde(flatten)]
     work: OneShotWork,
     ack: Option<StoredWorkAck>,
+    /// agentd 上报的执行结果（进度/终态）；从未上报过就是 `None`。
+    ///
+    /// 与 `ack` 并列而不合并：两个都是「最新一次」，但回答的是不同的问题 ——
+    /// 一个是「我收到了」，一个是「我做得怎么样了」。
+    result: Option<StoredWorkResult>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1117,7 +1123,11 @@ struct AgentWorkView {
     /// 已撤回/被取代的常驻工作（审计用，不下发）。
     retired_standing: Vec<StandingWork>,
     /// 已了结的一次性工作（审计用，不下发）。
-    settled_one_shot: Vec<OneShotWork>,
+    ///
+    /// 仍用 `OneShotWorkView`（而非裸 `OneShotWork`）是为了带上 `result`：
+    /// 「失败原因 / 回滚到哪一版」正是这活在**了结之后**才最需要看的东西，
+    /// 只留在未了结清单里等于做完就看不见了。
+    settled_one_shot: Vec<OneShotWorkView>,
     generated_at: String,
 }
 
@@ -1173,17 +1183,35 @@ pub async fn view_agent_work(
             Ok(ack) => ack,
             Err(response) => return *response,
         };
-        one_shot_views.push(OneShotWorkView { work, ack });
+        let result = match load_work_result(&state, &work.work_id).await {
+            Ok(result) => result,
+            Err(response) => return *response,
+        };
+        one_shot_views.push(OneShotWorkView { work, ack, result });
     }
     let retired_standing = standing
         .into_iter()
         .filter(|work| !matches!(work.status.as_str(), "active" | "paused"))
         .collect();
-    let settled_one_shot = one_shot
+    let mut settled_one_shot = Vec::new();
+    for work in one_shot
         .into_iter()
         .filter(|work| !work.work.is_outstanding())
-        .map(|work| work.work)
-        .collect();
+    {
+        let ack = match load_ack(&state, &work.work.work_id).await {
+            Ok(ack) => ack,
+            Err(response) => return *response,
+        };
+        let result = match load_work_result(&state, &work.work.work_id).await {
+            Ok(result) => result,
+            Err(response) => return *response,
+        };
+        settled_one_shot.push(OneShotWorkView {
+            work: work.work,
+            ack,
+            result,
+        });
+    }
     let sequence = match state.store.work_sequence(&agent_id).await {
         Ok(sequence) => sequence,
         Err(err) => {
@@ -1212,6 +1240,23 @@ async fn load_ack(state: &ApiState, work_id: &str) -> Result<Option<StoredWorkAc
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to load work ack: {err}"),
+            )
+                .into_response(),
+        )
+    })
+}
+
+/// 读某件一次性工作的执行结果；读不动就如实报错，**不降级成 `None`** ——
+/// `None` 的语义是「从没报过」，拿它冒充读失败会把「页面看不到结果」变成静默。
+async fn load_work_result(
+    state: &ApiState,
+    work_id: &str,
+) -> Result<Option<StoredWorkResult>, Box<Response>> {
+    state.store.get_work_result(work_id).await.map_err(|err| {
+        Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load work result: {err}"),
             )
                 .into_response(),
         )

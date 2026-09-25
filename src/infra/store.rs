@@ -341,6 +341,21 @@ pub struct StoredWorkAck {
     pub acknowledged_at: String,
 }
 
+/// 一次性工作的**执行结果**（agentd 上报的进度/终态）。一份工作一条，覆盖式。
+///
+/// 与 [`StoredWorkAck`] 分开两份记录：确认回答「我收到了」，结果回答「我做得怎么样了」。
+/// 混成一条会让「一次执行结果的上报」改写「确认」的含义，而两者的失效代价完全不同。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredWorkResult {
+    pub work_id: String,
+    pub agent_id: String,
+    /// 见 `wist_contracts::work::AGENT_REPORTABLE_WORK_STATUSES`。
+    pub status: String,
+    /// 人看的说明（失败原因原样带上）。
+    pub detail: String,
+    pub reported_at: String,
+}
+
 /// 一次性工作的落库形状：契约 [`OneShotWork`] + **网关侧**的状态机器字段。
 ///
 /// 为什么要包一层而不是把 `pre_pause_status` 加进契约：恢复要回到暂停前的状态，
@@ -814,11 +829,35 @@ pub trait Store: Send + Sync + fmt::Debug {
     /// 某 Agent 的**全部**一次性工作（含终态 —— 快照要筛，审计要全）。
     async fn list_one_shot_work(&self, agent_id: &str) -> StoreResult<Vec<StoredOneShotWork>>;
 
+    /// **所有**未了结的一次性工作（跨 Agent）：到期判定要一次扫全机队。
+    ///
+    /// 为什么不按 agent 逐个扫：到期是工作自己的属性，不是「agent 来问了」的属性 ——
+    /// agent 掉线时恰恰是这活最可能卡住的时候，那时没有 poll 可搭。
+    async fn list_outstanding_one_shot_work(&self) -> StoreResult<Vec<StoredOneShotWork>>;
+
+    /// 把一件**仍未了结**的一次性工作推入终态，返回是否真的推了。
+    ///
+    /// 为什么是条件更新（`WHERE status NOT IN 终态`）而不是「先读后写」：到期扫描与
+    /// agent 的结果上报是两条会交错的路径 —— 列表读出来到现在，agent 可能刚把 `succeeded`
+    /// 报进来。一条原子 UPDATE 就不会把 agent 报的终态覆盖成 `expired`：
+    /// 「它成了」比「它超时了」更可信，抹掉它只会让页面与结果记录互相打脸。
+    async fn terminate_outstanding_one_shot_work(
+        &self,
+        work_id: &str,
+        status: &str,
+    ) -> StoreResult<bool>;
+
     /// 写工作确认回执（一份工作一条，覆盖旧的）。
     async fn upsert_work_ack(&self, ack: &StoredWorkAck) -> StoreResult<()>;
 
     /// 读某份工作的确认回执；从未确认过返回 `None`（那就是漂移）。
     async fn get_work_ack(&self, work_id: &str) -> StoreResult<Option<StoredWorkAck>>;
+
+    /// 写一次性工作的执行结果（一份工作一条，覆盖旧的）。
+    async fn upsert_work_result(&self, result: &StoredWorkResult) -> StoreResult<()>;
+
+    /// 读某份工作的执行结果；从未上报过返回 `None`。
+    async fn get_work_result(&self, work_id: &str) -> StoreResult<Option<StoredWorkResult>>;
 
     /// 授权序号自增并返回新值（首次从 1 开始）。
     async fn next_work_sequence(&self, agent_id: &str, updated_at: &str) -> StoreResult<i64>;

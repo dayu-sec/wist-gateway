@@ -1546,6 +1546,36 @@ impl Store for SqliteStore {
         rows.iter().map(one_shot_work_from_row).collect()
     }
 
+    async fn list_outstanding_one_shot_work(&self) -> StoreResult<Vec<StoredOneShotWork>> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {ONE_SHOT_WORK_COLUMNS} FROM one_shot_work \
+             WHERE status NOT IN ({}) ORDER BY issued_at",
+            one_shot_terminal_status_sql()
+        )))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list outstanding one-shot work"))?;
+        rows.iter().map(one_shot_work_from_row).collect()
+    }
+
+    async fn terminate_outstanding_one_shot_work(
+        &self,
+        work_id: &str,
+        status: &str,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE one_shot_work SET status = ?2 WHERE work_id = ?1 \
+             AND status NOT IN ({})",
+            one_shot_terminal_status_sql()
+        )))
+        .bind(work_id)
+        .bind(status)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "terminate one-shot work"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn upsert_work_ack(&self, ack: &StoredWorkAck) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO work_ack (work_id, agent_id, work_kind, plan_version, acknowledged_at) \
@@ -1582,6 +1612,47 @@ impl Store for SqliteStore {
                     work_kind: column!(row, "work_kind"),
                     plan_version: column!(row, "plan_version"),
                     acknowledged_at: column!(row, "acknowledged_at"),
+                })
+            })
+            .transpose()
+    }
+
+    async fn upsert_work_result(&self, result: &StoredWorkResult) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO agent_work_result (work_id, agent_id, status, detail, reported_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (work_id) DO UPDATE SET agent_id = excluded.agent_id, \
+             status = excluded.status, detail = excluded.detail, \
+             reported_at = excluded.reported_at",
+        )
+        .bind(&result.work_id)
+        .bind(&result.agent_id)
+        .bind(&result.status)
+        .bind(&result.detail)
+        .bind(&result.reported_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert work result"))?;
+        Ok(())
+    }
+
+    async fn get_work_result(&self, work_id: &str) -> StoreResult<Option<StoredWorkResult>> {
+        let row = sqlx::query(
+            "SELECT work_id, agent_id, status, detail, reported_at \
+             FROM agent_work_result WHERE work_id = ?1",
+        )
+        .bind(work_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select work result"))?;
+        row.as_ref()
+            .map(|row| {
+                Ok(StoredWorkResult {
+                    work_id: column!(row, "work_id"),
+                    agent_id: column!(row, "agent_id"),
+                    status: column!(row, "status"),
+                    detail: column!(row, "detail"),
+                    reported_at: column!(row, "reported_at"),
                 })
             })
             .transpose()
@@ -1624,6 +1695,17 @@ const STANDING_WORK_COLUMNS: &str = "work_id, agent_id, family, spec, catalog_ve
 const ONE_SHOT_WORK_COLUMNS: &str = "work_id, agent_id, action, spec, scheduled_at, deadline_at, \
      timeout_seconds, interruptible, status, paused_at, pre_pause_status, paused_total_seconds, \
      current_step, completed_steps, attempt, issued_by, issued_at";
+
+/// 终态取值拼成 `'a', 'b'`，供 `NOT IN (...)` 用。
+///
+/// 从契约取（不写死字面量）：它一改，这里跟着改，不会各自漂移。
+fn one_shot_terminal_status_sql() -> String {
+    wist_contracts::work::ONE_SHOT_TERMINAL_STATUSES
+        .iter()
+        .map(|status| format!("'{status}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 fn standing_work_from_row(row: &SqliteRow) -> StoreResult<StandingWork> {
     Ok(StandingWork {
@@ -2653,6 +2735,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outstanding_one_shot_listing_covers_the_fleet_and_skips_terminal_work() {
+        let store = store().await;
+        store
+            .save_one_shot_work(&one_shot("work-run", "agent-a", "running"))
+            .await
+            .unwrap();
+        store
+            .save_one_shot_work(&one_shot("work-done", "agent-b", "succeeded"))
+            .await
+            .unwrap();
+
+        // 跨 agent 一次取齐（到期判定要扫全机队），但**只带未了结的**。
+        let outstanding = store.list_outstanding_one_shot_work().await.unwrap();
+        let ids: Vec<&str> = outstanding
+            .iter()
+            .map(|stored| stored.work.work_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["work-run"]);
+    }
+
+    #[tokio::test]
+    async fn terminating_one_shot_work_never_overwrites_a_settled_one() {
+        let store = store().await;
+        store
+            .save_one_shot_work(&one_shot("work-1", "agent-a", "running"))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .terminate_outstanding_one_shot_work("work-1", "expired")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_one_shot_work("work-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .work
+                .status,
+            "expired"
+        );
+        // 再推一次：已经终态了，不重复推（返回 false，状态不被改写）。
+        assert!(
+            !store
+                .terminate_outstanding_one_shot_work("work-1", "timed_out")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_one_shot_work("work-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .work
+                .status,
+            "expired"
+        );
+
+        // agent 报的终态不会被覆盖：这正是用条件更新而不是先读后写的理由。
+        store
+            .save_one_shot_work(&one_shot("work-2", "agent-a", "succeeded"))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .terminate_outstanding_one_shot_work("work-2", "expired")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_one_shot_work("work-2")
+                .await
+                .unwrap()
+                .unwrap()
+                .work
+                .status,
+            "succeeded"
+        );
+    }
+
+    #[tokio::test]
     async fn round_trips_one_shot_work_including_the_pause_state_machine() {
         let store = store().await;
         let original = one_shot("work-1", "agent-a", "paused");
@@ -2708,6 +2876,39 @@ mod tests {
             1
         );
         assert_eq!(store.work_sequence("agent-a").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn work_result_keeps_one_row_per_work() {
+        let store = store().await;
+        assert!(store.get_work_result("work-1").await.unwrap().is_none());
+
+        store
+            .upsert_work_result(&StoredWorkResult {
+                work_id: "work-1".to_string(),
+                agent_id: "agent-a".to_string(),
+                status: "running".to_string(),
+                detail: String::new(),
+                reported_at: "2026-09-23T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_work_result(&StoredWorkResult {
+                work_id: "work-1".to_string(),
+                agent_id: "agent-a".to_string(),
+                status: "failed".to_string(),
+                detail: "digest mismatch".to_string(),
+                reported_at: "2026-09-23T00:02:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // 一份工作一条：只留最新那次上报（运维问的是“现在怎么样了”）。
+        let result = store.get_work_result("work-1").await.unwrap().unwrap();
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.detail, "digest mismatch");
+        assert_eq!(result.reported_at, "2026-09-23T00:02:00Z");
     }
 
     #[tokio::test]

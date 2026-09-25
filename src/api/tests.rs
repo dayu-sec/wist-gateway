@@ -31,7 +31,7 @@ use wist_contracts::gateway::{
     POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies, ReportActionResult,
     ReportAgentFactSummary, ResultAttestation,
 };
-use wist_contracts::work::{ACK_WORK_KIND, POLL_WORK_KIND, WorkSpec};
+use wist_contracts::work::{ACK_WORK_KIND, POLL_WORK_KIND, REPORT_WORK_RESULT_KIND, WorkSpec};
 use wist_control::PollControlCommands;
 use wist_control::types::DateTime;
 
@@ -47,6 +47,7 @@ use super::{
     install_package::AgentPackageSource,
     overview::{RecentOnlineRegisteredAgentSource, agent_overview},
     router,
+    work_expiry::expire_overdue_one_shot_works,
 };
 
 const TEST_ADMIN_API_TOKEN: &str = "test-admin-token";
@@ -237,10 +238,10 @@ async fn install_script_handles_tarball_and_bare_package() {
     let env = TestEnv::new().await;
     let script = rendered_install_script(&env);
 
-    // 发布产物是 tarball（内含 wist-agentd + wist-exec，两者必须同级），
+    // 发布产物是 tarball（内含 wist-agentd + wist-exec + wist-upgrader，三者必须同级），
     // 网关内置包则是裸二进制；两种形态都要装到 $BIN_DIR。
     assert!(script.contains("if tar tzf \"$PACKAGE_FILE\""));
-    assert!(script.contains("for BIN_NAME in wist-agentd wist-exec"));
+    assert!(script.contains("for BIN_NAME in wist-agentd wist-exec wist-upgrader"));
     assert!(script.contains("install_bin \"$SRC\" \"$BIN_NAME\""));
     assert!(script.contains("install_bin \"$PACKAGE_FILE\" \"wist-agentd\""));
     // 必须先写新文件再 rename：直接 cp 到正在运行的二进制上会把该路径改坏
@@ -4978,6 +4979,342 @@ async fn acking_a_stale_plan_version_is_reported_in_band_and_not_recorded() {
     // 陈旧确认不写回执：否则「Agent 手上是哪一版」会被一个错的数盖掉。
     let view = get_agent_work(&env).await;
     assert!(view["standing"][0]["ack"].is_null());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 一次性工作的执行结果（Control.Agent.Work）：上报 → 推进 / 迟到 → 不覆盖
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 派一件一次性升级给已判定的 agent-node-a，返回 work_id。
+async fn grant_one_shot_upgrade(env: &TestEnv) -> String {
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            env,
+            serde_json::json!({
+                "work_kind": "OneShot", "action": "upgrade", "spec": "0.1.4",
+                "deadline_at": "2026-09-24T00:00:00Z", "timeout_seconds": 600
+            }),
+        )
+        .await,
+    )
+    .await;
+    receipt["work_id"].as_str().expect("work id").to_string()
+}
+
+/// 派一件带**指定**截止与预算的一次性升级（到期判定要看的是相对时间，不能写死）。
+async fn grant_one_shot_upgrade_until(
+    env: &TestEnv,
+    deadline_at: &str,
+    timeout_seconds: i64,
+) -> String {
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            env,
+            serde_json::json!({
+                "work_kind": "OneShot", "action": "upgrade", "spec": "0.1.4",
+                "deadline_at": deadline_at, "timeout_seconds": timeout_seconds
+            }),
+        )
+        .await,
+    )
+    .await;
+    receipt["work_id"].as_str().expect("work id").to_string()
+}
+
+async fn submit_work_result_as(
+    env: &TestEnv,
+    credential: Option<&str>,
+    agent_id: &str,
+    instance_id: &str,
+    work_id: &str,
+    status: &str,
+    detail: &str,
+) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/work:result",
+        credential,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": REPORT_WORK_RESULT_KIND,
+            "agent_id": agent_id,
+            "instance_id": instance_id,
+            "work_id": work_id,
+            "status": status,
+            "detail": detail,
+            "reported_at": "2026-09-23T00:05:00Z",
+        }),
+    )
+    .await
+}
+
+async fn submit_work_result(
+    env: &TestEnv,
+    credential: Option<&str>,
+    work_id: &str,
+    status: &str,
+    detail: &str,
+) -> Response {
+    submit_work_result_as(
+        env,
+        credential,
+        "agent-node-a",
+        "node-a",
+        work_id,
+        status,
+        detail,
+    )
+    .await
+}
+
+/// 结果上报回答「我做得怎么样了」：进度把工作从 dispatched 推到 running，页面上随工作一起可见。
+#[tokio::test]
+async fn an_agent_reports_the_result_of_a_one_shot_work() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    let accepted: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "running", "正在换件").await,
+    )
+    .await;
+    assert_eq!(accepted["status"], "accepted");
+
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["one_shot"][0]["status"], "running");
+    assert_eq!(view["one_shot"][0]["result"]["status"], "running");
+    assert_eq!(view["one_shot"][0]["result"]["detail"], "正在换件");
+}
+
+/// 终态让工作**了结**：离开「在办」清单，进历史留痕。
+#[tokio::test]
+async fn a_terminal_result_settles_the_work() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    let accepted: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "failed", "摘要不符").await,
+    )
+    .await;
+    assert_eq!(accepted["status"], "accepted");
+
+    let view = get_agent_work(&env).await;
+    assert!(view["one_shot"].as_array().expect("one_shot").is_empty());
+    assert_eq!(view["settled_one_shot"][0]["work_id"], work_id.as_str());
+    assert_eq!(view["settled_one_shot"][0]["status"], "failed");
+    // 了结之后**仍看得到原因**：失败说明正是这活做完才最需要看的东西。
+    assert_eq!(view["settled_one_shot"][0]["result"]["status"], "failed");
+    assert_eq!(view["settled_one_shot"][0]["result"]["detail"], "摘要不符");
+}
+
+/// 一件活只能有一个终态：迟到的结果回 `stale`、**不覆盖**状态，但结果记录照存
+/// —— 机器上确实发生过那次上报，抹掉它只会让事后无法解释。
+#[tokio::test]
+async fn a_late_result_is_stale_and_never_overwrites_the_terminal_state() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    let accepted: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "failed", "摘要不符").await,
+    )
+    .await;
+    assert_eq!(accepted["status"], "accepted");
+
+    let late: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "succeeded", "迟到的成功").await,
+    )
+    .await;
+    assert_eq!(late["status"], "stale");
+
+    let stored = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .expect("load work")
+        .expect("work exists");
+    assert_eq!(stored.work.status, "failed");
+
+    let result = env
+        .store_handle
+        .get_work_result(&work_id)
+        .await
+        .expect("load result")
+        .expect("result exists");
+    assert_eq!(result.status, "succeeded");
+    assert_eq!(result.detail, "迟到的成功");
+}
+
+/// agent 无权写回**控制面与期限**拥有的状态：那些要么是网关自己写的（dispatched），
+/// 要么归运维暂停/撤回或过了截止。
+#[tokio::test]
+async fn an_agent_cannot_report_a_status_the_control_plane_owns() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    for status in [
+        "dispatched",
+        "accepted",
+        "paused",
+        "canceled",
+        "expired",
+        "timed_out",
+        "rolled_back",
+    ] {
+        let response = submit_work_result(&env, Some(&credential), &work_id, status, "").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{status}");
+    }
+}
+
+/// 报一件**不属于自己**或**根本不存在**的活回 `unknown`：不报错，也不替它编一个状态。
+#[tokio::test]
+async fn a_result_for_an_unknown_or_someone_elses_work_is_unknown() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    // 不存在的活。
+    let unknown: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), "work-nope", "succeeded", "").await,
+    )
+    .await;
+    assert_eq!(unknown["status"], "unknown");
+
+    // 别人的活：换一台机器（agent-node-b）拿自己的凭据去报 agent-node-a 的活。
+    let other = enroll_agent_at_node(&env, "node-b").await;
+    let unknown: serde_json::Value = decode_json_response(
+        submit_work_result_as(
+            &env,
+            Some(&other),
+            "agent-node-b",
+            "node-b",
+            &work_id,
+            "succeeded",
+            "",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(unknown["status"], "unknown");
+
+    // 别人的上报没动这台机器的活：还是派下去那一刻的状态。
+    let stored = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .expect("load work")
+        .expect("work exists");
+    assert_eq!(stored.work.status, "dispatched");
+}
+
+#[tokio::test]
+async fn reporting_a_result_needs_an_agent_credential() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    assert_eq!(
+        submit_work_result(&env, None, &work_id, "running", "")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        submit_work_result(&env, Some("forged"), &work_id, "running", "")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // 凭据是真的、但报的是**别人**报的身份：同样拒绝（身份与凭据必须对得上）。
+    assert_eq!(
+        submit_work_result_as(
+            &env,
+            Some(&credential),
+            "agent-node-b",
+            "node-b",
+            &work_id,
+            "running",
+            "",
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 一次性工作的到期判定（后台 tick）：截止 → expired，预算尽 → timed_out
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 过了绝对截止的活由**网关**收敛掉，不等 agent 来报 —— 掉线的 agent 恰恰是这活最可能
+/// 卡住的时候，那时没有 poll 可搭。
+#[tokio::test]
+async fn the_gateway_expires_a_one_shot_work_that_passed_its_deadline() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    // 截止设在 1 小时后、预算给足 24 小时：两条约束里只会碰``截止``那一条。
+    let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+    let work_id = grant_one_shot_upgrade_until(&env, &deadline.to_rfc3339(), 86_400).await;
+
+    // 还没到期：一件都不动。（扫描用显式传入的“现在”，测试不靠抢时间。）
+    assert_eq!(
+        expire_overdue_one_shot_works(
+            env.store_handle.as_ref(),
+            chrono::Utc::now().timestamp_millis()
+        )
+        .await
+        .expect("sweep"),
+        0
+    );
+
+    // 越过截止：记 expired，并离开未了结清单与下发的快照。
+    let after = (deadline + chrono::Duration::minutes(1)).timestamp_millis();
+    assert_eq!(
+        expire_overdue_one_shot_works(env.store_handle.as_ref(), after)
+            .await
+            .expect("sweep"),
+        1
+    );
+    let view = get_agent_work(&env).await;
+    assert!(view["one_shot"].as_array().expect("one_shot").is_empty());
+    assert_eq!(view["settled_one_shot"][0]["work_id"], work_id.as_str());
+    assert_eq!(view["settled_one_shot"][0]["status"], "expired");
+
+    let grant: serde_json::Value =
+        decode_json_response(poll_work(&env, Some(&credential)).await).await;
+    assert!(grant["one_shot"].as_array().expect("one_shot").is_empty());
+
+    // 到期是终态：再扫一遍不会重复推进。
+    assert_eq!(
+        expire_overdue_one_shot_works(env.store_handle.as_ref(), after)
+            .await
+            .expect("sweep"),
+        0
+    );
+}
+
+/// 截止还没到但执行预算尽了 → `timed_out`（两条约束各自独立，不以截止为唯一时钟）。
+#[tokio::test]
+async fn the_gateway_times_out_a_one_shot_work_that_blew_its_budget() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    // 截止给足 10 天，预算只有 600s：只有预算这条会先到。
+    let deadline = chrono::Utc::now() + chrono::Duration::days(10);
+    let work_id = grant_one_shot_upgrade_until(&env, &deadline.to_rfc3339(), 600).await;
+
+    let after = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp_millis();
+    assert_eq!(
+        expire_overdue_one_shot_works(env.store_handle.as_ref(), after)
+            .await
+            .expect("sweep"),
+        1
+    );
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["settled_one_shot"][0]["work_id"], work_id.as_str());
+    assert_eq!(view["settled_one_shot"][0]["status"], "timed_out");
 }
 
 #[tokio::test]

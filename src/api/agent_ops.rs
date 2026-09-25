@@ -7,8 +7,8 @@ use axum::{
 
 use crate::infra::{
     AgentFactSummaryMarks, AgentStatusUpdate, RenewCredential, StoredAgentFactSummary,
-    StoredAgentRegistration, StoredCredentialStatus, StoredPurposeSuggestion, effective_standing,
-    new_secret_token, outstanding_one_shot, sha256_hex,
+    StoredAgentRegistration, StoredCredentialStatus, StoredPurposeSuggestion, StoredWorkResult,
+    effective_standing, new_secret_token, outstanding_one_shot, sha256_hex,
     victoria_metrics::{import_lines, metric_line},
 };
 use wist_contracts::API_VERSION_V1;
@@ -22,7 +22,8 @@ use wist_contracts::gateway::{
     REPORT_AGENT_FACT_SUMMARY_KIND, ReportActionResult, ReportAgentFactSummary,
 };
 use wist_contracts::work::{
-    ACK_WORK_KIND, AckWork, POLL_WORK_KIND, PollWork, WorkAccepted, WorkGrant,
+    ACK_WORK_KIND, AGENT_REPORTABLE_WORK_STATUSES, AckWork, POLL_WORK_KIND, PollWork,
+    REPORT_WORK_RESULT_KIND, ReportWorkResult, WorkAccepted, WorkGrant, WorkResultAccepted,
 };
 use wist_control::types::DateTime;
 use wist_control::{AgentControlCommandsReturned, PollControlCommands};
@@ -373,6 +374,101 @@ pub async fn ack_work(
     Json(WorkAccepted {
         work_id: input.work_id,
         status: status.to_string(),
+        accepted_at: now,
+    })
+    .into_response()
+}
+
+/// Agent 上报一次性工作的**执行结果**（进度/终态）。
+///
+/// 为什么与确认分开一条消息：确认丢了只是页面晚一拍，结果丢了则意味着「一件改变机器状态的活
+/// 已经做完/回滚，而控制面永远不知道」。两者失效的代价不同，就不该挤在一条路上。
+///
+/// 拒绝的边界（与 `ack_work` 同一取舍：只做**正确性**检查，不做认证以外的业务判断）：
+///   * `status` 必须在 `AGENT_REPORTABLE_WORK_STATUSES` 里 —— `dispatched` 是网关写的，
+///     `paused`/`canceled`/`expired` 归控制面与期限管，agent 无权写回去；
+///   * 工作不存在、不属于这台 agent、或不是一次性工作 → `unknown`（不报错，也不编一个状态）；
+///   * 已经到终态 → `stale`：**状态不覆盖**（一件活只能有一个终态），
+///     但结果记录照存 —— 机器上确实发生过那次执行，抹掉它只会让事后无法解释。
+pub async fn submit_work_result(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<ReportWorkResult>,
+) -> Response {
+    if input.api_version != API_VERSION_V1 || input.kind != REPORT_WORK_RESULT_KIND {
+        return (StatusCode::BAD_REQUEST, "invalid work result").into_response();
+    }
+    if let Err(response) =
+        authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await
+    {
+        return response;
+    }
+    if !AGENT_REPORTABLE_WORK_STATUSES.contains(&input.status.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "status {:?} is not agent-reportable (one of {:?})",
+                input.status, AGENT_REPORTABLE_WORK_STATUSES
+            ),
+        )
+            .into_response();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let stored = match state.store.get_one_shot_work(&input.work_id).await {
+        Ok(Some(stored)) if stored.work.agent_id == input.agent_id => stored,
+        Ok(_) => {
+            return Json(WorkResultAccepted {
+                work_id: input.work_id,
+                status: "unknown".to_string(),
+                accepted_at: now,
+            })
+            .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load one-shot work: {err}"),
+            )
+                .into_response();
+        }
+    };
+
+    let result_status = if stored.work.is_outstanding() {
+        let mut updated = stored;
+        updated.work.status = input.status.clone();
+        if let Err(err) = state.store.save_one_shot_work(&updated).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to store one-shot work: {err}"),
+            )
+                .into_response();
+        }
+        "accepted"
+    } else {
+        "stale"
+    };
+
+    if let Err(err) = state
+        .store
+        .upsert_work_result(&StoredWorkResult {
+            work_id: input.work_id.clone(),
+            agent_id: input.agent_id.clone(),
+            status: input.status.clone(),
+            detail: input.detail.clone(),
+            reported_at: input.reported_at.clone(),
+        })
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store work result: {err}"),
+        )
+            .into_response();
+    }
+
+    Json(WorkResultAccepted {
+        work_id: input.work_id,
+        status: result_status.to_string(),
         accepted_at: now,
     })
     .into_response()

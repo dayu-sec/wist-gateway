@@ -56,7 +56,7 @@ use admin_ops::{
 };
 use agent_ops::{
     ack_work, poll_control_commands, poll_discovery_policies, poll_work, renew_agent_credential,
-    report_action_result, submit_agent_status,
+    report_action_result, submit_agent_status, submit_work_result,
 };
 use content_ops::view_content;
 use enrollment::enroll_agent;
@@ -70,6 +70,11 @@ use logs::{MAX_LOG_INGEST_BODY_BYTES, ingest_agent_logs, view_agent_logs};
 use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
 use pipeline::get_pipeline_topology;
 use software_ops::{view_agent_software, view_software_holdings};
+
+pub mod work_expiry;
+pub use work_expiry::{
+    ONE_SHOT_EXPIRY_TICK, expire_overdue_one_shot_works, spawn_one_shot_expiry_tick,
+};
 
 #[derive(Debug, Clone)]
 pub struct ApiState {
@@ -237,6 +242,9 @@ pub fn router_with_state(state: ApiState) -> Router {
         // 与策略表同类：幂等内容、可重复拉取；断网重启后重新拉一次就回到期望状态。
         .route("/api/v1/agent/work:poll", post(poll_work))
         .route("/api/v1/agent/work:ack", post(ack_work))
+        // 一次性工作的执行结果（进度/终态）。与 ack 分开：确认回答「我收到了」，
+        // 结果回答「我做得怎么样了」——失效代价不同，不挤一条路。
+        .route("/api/v1/agent/work:result", post(submit_work_result))
         .route("/api/v1/admin/agents/overview", get(get_agent_overview))
         .route(
             "/api/v1/admin/agents/host-metrics",

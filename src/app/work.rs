@@ -300,6 +300,48 @@ pub fn check_resume_breakpoint(work: &OneShotWork) -> Result<(), WorkRejection> 
     Ok(())
 }
 
+/// 一次性工作的**到期判定**：到了该终结的时点就给出终态，否则 `None`。
+///
+/// 两条约束各自独立、任一先到即终结（照模型 `OneShotWork`）：
+///
+///   * `deadline_at` —— 绝对截止，**暂停也照走** → `expired`；
+///   * `timeout_seconds` —— 执行预算，**暂停期间不计** → `timed_out`。
+///
+/// 两条都到点时记 `expired`：业务截止比执行预算更硬。
+///
+/// 为什么要有这一步：网关是**唯一**同时知道「现在」与这两条业务约束的地方。没有它，
+/// 一件卡住的活（agent 掉线、升级器僵住）会在页面上永远显示「执行中」——
+/// 而「它没成」这个结论只存在于终态里。
+///
+/// 预算的**起算点**取 `scheduled_at`（计划开始时间；授权时缺省即当下），并减掉暂停时长
+/// （含仍在进行的那次）。这是现有字段里最接近「开始执行」的锚点 —— 要精确到「agent 真正
+/// 开跑」得让它报开始时间，而它现在只报结果。代价是 `dispatched` → `accepted` 那段往返
+/// 要吃掉预算；方向保守（宁可早判超时），且分钟级预算下可忽略。
+///
+/// 时间戳解析不了就不判（上游已校验格式，这里是防御）：截止与预算两条互不牵连。
+pub fn overdue_terminal_status(work: &OneShotWork, now_ms: i64) -> Option<&'static str> {
+    if !work.is_outstanding() {
+        return None;
+    }
+    if let Some(deadline_ms) = parse_epoch_millis(&work.deadline_at)
+        && now_ms >= deadline_ms
+    {
+        return Some("expired");
+    }
+    let start_ms = parse_epoch_millis(&work.scheduled_at)?;
+    let mut paused_seconds = work.paused_total_seconds;
+    if let Some(paused_at_ms) = work.paused_at.as_deref().and_then(parse_epoch_millis) {
+        // 正暂停着：这一段还没计进 paused_total_seconds，得一并减掉，
+        // 否则「暂停期间不消耗预算」在超时判定里就不成立。
+        paused_seconds += (now_ms - paused_at_ms).max(0) / 1000;
+    }
+    let consumed_seconds = (now_ms - start_ms).max(0) / 1000 - paused_seconds;
+    if consumed_seconds >= work.timeout_seconds {
+        return Some("timed_out");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +369,66 @@ mod tests {
             },
             pre_pause_status: None,
         }
+    }
+
+    #[test]
+    fn deadline_breach_expires_and_budget_breach_times_out() {
+        // 基准：scheduled 2026-09-23T00:00:00Z、deadline 次日 00:00、预算 600s。
+        let work = one_shot("running", false);
+        let scheduled = parse_epoch_millis("2026-09-23T00:00:00Z").unwrap();
+
+        // 刚派下去：两条都没到。
+        assert_eq!(overdue_terminal_status(&work.work, scheduled), None);
+        // 预算尽（600s），截止还没到 → timed_out。
+        assert_eq!(
+            overdue_terminal_status(&work.work, scheduled + 600_000),
+            Some("timed_out")
+        );
+        // 截止到点 → expired（即使预算也早尽了，业务截止优先）。
+        assert_eq!(
+            overdue_terminal_status(
+                &work.work,
+                parse_epoch_millis("2026-09-24T00:00:00Z").unwrap()
+            ),
+            Some("expired")
+        );
+    }
+
+    #[test]
+    fn pause_freezes_the_budget_but_not_the_deadline() {
+        let mut work = one_shot("paused", true);
+        let scheduled = parse_epoch_millis("2026-09-23T00:00:00Z").unwrap();
+        // 暂停了 1 小时且仍在暂停中：预算只该消耗 0，超时不该判。
+        work.work.paused_at = Some("2026-09-23T00:01:00Z".to_string());
+        assert_eq!(
+            overdue_terminal_status(&work.work, scheduled + 3_600_000),
+            None
+        );
+        // 但截止照走：同一件活到点仍取 expired。
+        assert_eq!(
+            overdue_terminal_status(
+                &work.work,
+                parse_epoch_millis("2026-09-24T00:00:00Z").unwrap()
+            ),
+            Some("expired")
+        );
+    }
+
+    #[test]
+    fn terminal_work_is_never_re_judged() {
+        let scheduled = parse_epoch_millis("2026-09-23T00:00:00Z").unwrap();
+        let far_future = parse_epoch_millis("2027-01-01T00:00:00Z").unwrap();
+        for status in ["succeeded", "failed", "timed_out", "canceled", "expired"] {
+            assert_eq!(
+                overdue_terminal_status(&one_shot(status, false).work, far_future),
+                None
+            );
+        }
+        // 未了结的才判。
+        assert_eq!(
+            overdue_terminal_status(&one_shot("dispatched", false).work, scheduled + 600_000),
+            Some("timed_out")
+        );
     }
 
     #[test]

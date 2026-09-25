@@ -181,8 +181,9 @@ else
   ACTUAL_SHA256="（网关未设置校验摘要）"
 fi
 
-# 两种包形态都支持：tarball 是发布产物（内含 artifacts/wist-agentd 与 artifacts/wist-exec，
-# 执行器必须与守护进程同级），裸二进制是网关自身分发的默认包（只有 wist-agentd）。
+# 两种包形态都支持：tarball 是发布产物（`sysrun/package-agentd.sh` 打的那份：一层
+# `wist-agentd-<版本>-<target>/` 里放 wist-agentd / wist-exec / wist-upgrader 三件），
+# 裸二进制是网关自身分发的默认包（只有 wist-agentd：执行器与升级器都不在，只能采集/上报）。
 if tar tzf "$PACKAGE_FILE" >/dev/null 2>&1; then
   PACKAGE_FORM="tarball"
 else
@@ -203,7 +204,8 @@ install_bin() {
 if [ "$PACKAGE_FORM" = "tarball" ]; then
   EXTRACT_DIR="$(mktemp -d)"
   tar xzf "$PACKAGE_FILE" -C "$EXTRACT_DIR"
-  for BIN_NAME in wist-agentd wist-exec; do
+  # 三个二进制必须一起换：升级器正好是去换 agentd 自己的那个进程，版本错配就没有「同版本」前提。
+  for BIN_NAME in wist-agentd wist-exec wist-upgrader; do
     SRC="$(find "$EXTRACT_DIR" -type f -name "$BIN_NAME" | head -n 1)"
     if [ -z "$SRC" ]; then
       bad "agent package is missing $BIN_NAME"
@@ -214,6 +216,7 @@ if [ "$PACKAGE_FORM" = "tarball" ]; then
   done
 else
   install_bin "$PACKAGE_FILE" "wist-agentd"
+  note "裸二进制包不含 wist-exec / wist-upgrader：执行类与升级类工作在这台机器上会失败"
 fi
 
 step "[3/4] 写入初始配置"
