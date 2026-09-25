@@ -27,3 +27,8 @@ pub mod content;
 // 面就绪度闸门、spec 由目录展开/逐条校验、暂停与恢复的边界。
 // 重新生成控制面代码时需回补本模块。
 pub mod work;
+
+// NOTE(hand-added): 灰度发布计划（模型 Control.Rollout）的校验与物化：
+// 推进闸门、target → OneShotWork 的物化、结果 → 条目的折算。与 Control.Agent.Work 分离，
+// 物化时才落到一次性工作。重新生成控制面代码时需回补本模块。
+pub mod rollout;

@@ -466,6 +466,26 @@ pub async fn submit_work_result(
             .into_response();
     }
 
+    // 若这份工作是某份灰度发布计划物化出来的，把结果回填到计划条目；终态结果还会触发
+    // 阶段内的 batch_size 节流补批、以及 advance_rule 的自动推进。
+    // 只在结果被「接受」（工作仍未了结、这次上报推进了它）时回填：stale（已了结）的结果
+    // 不覆盖条目 —— 与工作自身的终态语义一致（一件活只有一个终态）。
+    // 回填失败不阻塞结果上报（结果已落库，计划条目只是派生的观测）——只记一行日志。
+    if result_status == "accepted"
+        && let Err(err) = super::rollout_ops::reconcile_rollout_result(
+            &state,
+            &input.work_id,
+            &input.status,
+            &input.detail,
+        )
+        .await
+    {
+        eprintln!(
+            "event=RolloutEntryReconcileFailed work_id={} detail=\"{err}\"",
+            input.work_id
+        );
+    }
+
     Json(WorkResultAccepted {
         work_id: input.work_id,
         status: result_status.to_string(),

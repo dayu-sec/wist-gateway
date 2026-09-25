@@ -5467,3 +5467,428 @@ async fn work_routes_need_the_admin_token_and_the_right_agent() {
     .await;
     assert!(matches!(response.status(), StatusCode::NOT_FOUND));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 灰度发布计划（Control.Rollout）：创建 → 批准（物化第一阶段）→ 推进 → 完成 + 结果回填
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn create_rollout_plan(env: &TestEnv, phases: serde_json::Value) -> serde_json::Value {
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "action": "upgrade",
+            "spec": "{\"target_version\":\"0.1.4\",\"package_url\":\"/tmp/pkg\",\"package_sha256\":\"sha256:abc\"}",
+            "phases": phases,
+            "deadline_at": "2026-10-01T00:00:00Z",
+            "timeout_seconds": 600,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    decode_json_response(response).await
+}
+
+async fn approve_plan(env: &TestEnv, plan_id: &str) -> serde_json::Value {
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/approve",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "plan_id": plan_id }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+async fn advance_plan(env: &TestEnv, plan_id: &str) -> serde_json::Value {
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/advance",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "plan_id": plan_id }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+async fn view_plan(env: &TestEnv, plan_id: &str) -> serde_json::Value {
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/rollout-plans/{plan_id}"),
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+#[tokio::test]
+async fn rollout_plan_routes_require_admin_bearer() {
+    let env = TestEnv::new().await;
+    let body = serde_json::json!({
+        "action": "upgrade", "spec": "x",
+        "phases": [{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }],
+        "deadline_at": "2026-10-01T00:00:00Z", "timeout_seconds": 600,
+    });
+    assert_eq!(
+        post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/rollout-plans",
+            None,
+            &body,
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/rollout-plans",
+            None,
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn creating_a_plan_validates_phases_and_returns_draft() {
+    let env = TestEnv::new().await;
+    enroll_fleet(&env).await;
+    let plan = create_rollout_plan(
+        &env,
+        serde_json::json!([
+            { "target_ids": ["agent-node-a"], "advance_rule": "manual" },
+            { "target_ids": ["agent-node-b"], "advance_rule": "all_succeeded" },
+        ]),
+    )
+    .await;
+    assert_eq!(plan["status"], "draft");
+    assert_eq!(plan["current_phase"], 0);
+    assert_eq!(plan["action"], "upgrade");
+    assert_eq!(plan["phases"].as_array().expect("phases").len(), 2);
+    assert_eq!(plan["phases"][0]["phase_index"], 1);
+    assert_eq!(plan["phases"][0]["status"], "pending");
+    assert_eq!(plan["phases"][1]["phase_index"], 2);
+
+    // 阶段数/闸门/重复 target 都要响，不能当自由文本收下。
+    for (bad, reason) in [
+        (serde_json::json!([]), "at least one phase"),
+        (
+            serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "auto" }]),
+            "advance_rule",
+        ),
+        (
+            serde_json::json!([
+                { "target_ids": ["agent-node-a"], "advance_rule": "manual" },
+                { "target_ids": ["agent-node-a"], "advance_rule": "manual" },
+            ]),
+            "more than one phase",
+        ),
+    ] {
+        let response = post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/rollout-plans",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({
+                "action": "upgrade", "spec": "x", "phases": bad,
+                "deadline_at": "2026-10-01T00:00:00Z", "timeout_seconds": 600,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn creating_a_plan_rejects_unknown_targets() {
+    let env = TestEnv::new().await;
+    // 只注册 node-a：agent-node-a 存在，agent-ghost 不存在。
+    enroll_agent_at_node(&env, "node-a").await;
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "action": "upgrade",
+            "spec": "x",
+            "phases": [{
+                "target_ids": ["agent-node-a", "agent-ghost"],
+                "advance_rule": "manual"
+            }],
+            "deadline_at": "2026-10-01T00:00:00Z",
+            "timeout_seconds": 600,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_bytes(response).await;
+    let text = String::from_utf8(body.to_vec()).expect("utf8");
+    // 报错要能直接指出是哪个 target 不存在（否则运维只能翻代码猜）。
+    assert!(text.contains("agent-ghost"), "{text}");
+}
+
+#[tokio::test]
+async fn approving_a_plan_materializes_the_first_phase_and_advancing_completes_it() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let plan = create_rollout_plan(
+        &env,
+        serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }]),
+    )
+    .await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+
+    // 批准 → 进入第一阶段：物化出的 upgrade 工作应能被 agent 拉到。
+    let approved = approve_plan(&env, &plan_id).await;
+    assert_eq!(approved["status"], "rolling");
+    assert_eq!(approved["current_phase"], 1);
+    assert_eq!(approved["phases"][0]["status"], "rolling");
+    let grant: serde_json::Value =
+        decode_json_response(poll_work(&env, Some(&credential)).await).await;
+    let one_shot = grant["one_shot"].as_array().expect("one_shot");
+    assert_eq!(one_shot.len(), 1);
+    assert_eq!(one_shot[0]["action"], "upgrade");
+    assert_eq!(one_shot[0]["agent_id"], "agent-node-a");
+
+    // 推进（单阶段 = 最后阶段）→ 计划收敛为 completed。
+    let completed = advance_plan(&env, &plan_id).await;
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["phases"][0]["status"], "completed");
+}
+
+#[tokio::test]
+async fn advancing_materializes_the_next_phase() {
+    let env = TestEnv::new().await;
+    enroll_fleet(&env).await;
+    let plan = create_rollout_plan(
+        &env,
+        serde_json::json!([
+            { "target_ids": ["agent-node-a"], "advance_rule": "manual" },
+            { "target_ids": ["agent-node-b"], "advance_rule": "manual" },
+        ]),
+    )
+    .await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let advanced = advance_plan(&env, &plan_id).await;
+    assert_eq!(advanced["status"], "rolling");
+    assert_eq!(advanced["current_phase"], 2);
+    assert_eq!(advanced["phases"][0]["status"], "completed");
+    assert_eq!(advanced["phases"][1]["status"], "rolling");
+
+    // 第二阶段的 target 也被物化成了工作（与第一阶段同一计划）。
+    let work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-b");
+    let work = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .expect("load work")
+        .expect("work exists");
+    assert_eq!(work.work.agent_id, "agent-node-b");
+    assert_eq!(work.work.issued_by, format!("rollout:{plan_id}"));
+}
+
+#[tokio::test]
+async fn a_work_result_fills_the_rollout_entry() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let plan = create_rollout_plan(
+        &env,
+        serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }]),
+    )
+    .await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let detail = view_plan(&env, &plan_id).await;
+    let work_id = detail["entries"][0]["work_id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    assert_eq!(detail["entries"][0]["status"], "dispatched");
+
+    // 结果回填：成功 → 条目 succeeded。
+    let accepted: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await,
+    )
+    .await;
+    assert_eq!(accepted["status"], "accepted");
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["entries"][0]["status"], "succeeded");
+
+    // 迟到的失败是 stale：不覆盖已落成的终态（与工作自身的终态语义一致）。
+    let stale: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "failed", "迟到的失败").await,
+    )
+    .await;
+    assert_eq!(stale["status"], "stale");
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["entries"][0]["status"], "succeeded");
+}
+
+#[tokio::test]
+async fn a_failed_work_result_fills_the_entry_with_the_detail() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let plan = create_rollout_plan(
+        &env,
+        serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }]),
+    )
+    .await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+    let detail = view_plan(&env, &plan_id).await;
+    let work_id = detail["entries"][0]["work_id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+
+    submit_work_result(&env, Some(&credential), &work_id, "failed", "摘要不符").await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["entries"][0]["status"], "failed");
+    assert_eq!(detail["entries"][0]["detail"], "摘要不符");
+}
+
+fn entry_work_id(detail: &serde_json::Value, target: &str) -> String {
+    detail["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["target_id"] == target)
+        .and_then(|entry| entry["work_id"].as_str())
+        .expect("work id")
+        .to_string()
+}
+
+fn entry_status(detail: &serde_json::Value, target: &str) -> String {
+    detail["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["target_id"] == target)
+        .and_then(|entry| entry["status"].as_str())
+        .expect("entry status")
+        .to_string()
+}
+
+/// 注册 node-a（拿凭据）+ node-b + node-c，让计划里的 target 都真实存在。
+/// 返回 agent-node-a 的凭据（提交结果要用）。
+async fn enroll_fleet(env: &TestEnv) -> String {
+    let credential = enroll_agent_at_node(env, "node-a").await;
+    enroll_agent_at_node(env, "node-b").await;
+    enroll_agent_at_node(env, "node-c").await;
+    credential
+}
+
+#[tokio::test]
+async fn a_phase_with_all_succeeded_advances_automatically() {
+    let env = TestEnv::new().await;
+    let credential = enroll_fleet(&env).await;
+    let plan = create_rollout_plan(
+        &env,
+        serde_json::json!([
+            { "target_ids": ["agent-node-a"], "advance_rule": "all_succeeded" },
+            { "target_ids": ["agent-node-b"], "advance_rule": "manual" },
+        ]),
+    )
+    .await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let detail = view_plan(&env, &plan_id).await;
+    let work_id = entry_work_id(&detail, "agent-node-a");
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+
+    // 阶段 1 全部成功 → 自动推进到阶段 2。
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["status"], "rolling");
+    assert_eq!(detail["plan"]["current_phase"], 2);
+    assert_eq!(detail["plan"]["phases"][0]["status"], "completed");
+    assert_eq!(detail["plan"]["phases"][1]["status"], "rolling");
+    assert_eq!(entry_status(&detail, "agent-node-b"), "dispatched");
+}
+
+#[tokio::test]
+async fn a_manual_phase_never_auto_advances() {
+    let env = TestEnv::new().await;
+    let credential = enroll_fleet(&env).await;
+    let plan = create_rollout_plan(
+        &env,
+        serde_json::json!([
+            { "target_ids": ["agent-node-a"], "advance_rule": "manual" },
+            { "target_ids": ["agent-node-b"], "advance_rule": "manual" },
+        ]),
+    )
+    .await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let detail = view_plan(&env, &plan_id).await;
+    let work_id = entry_work_id(&detail, "agent-node-a");
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+
+    // manual：即便阶段 1 全部成功，也不自动推进，要人工 advance 确认。
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["current_phase"], 1);
+    assert_eq!(detail["plan"]["phases"][0]["status"], "rolling");
+
+    advance_plan(&env, &plan_id).await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["current_phase"], 2);
+}
+
+#[tokio::test]
+async fn batch_size_throttles_materialization_and_refills_on_terminal_results() {
+    let env = TestEnv::new().await;
+    let credential = enroll_fleet(&env).await;
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "action": "upgrade",
+            "spec": "{\"target_version\":\"0.1.4\"}",
+            "phases": [{
+                "target_ids": ["agent-node-a", "agent-node-b", "agent-node-c"],
+                "advance_rule": "manual"
+            }],
+            "deadline_at": "2026-10-01T00:00:00Z",
+            "timeout_seconds": 600,
+            "batch_size": 2,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // batch_size=2：只物化前 2 台，第 3 台 pending。
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(entry_status(&detail, "agent-node-a"), "dispatched");
+    assert_eq!(entry_status(&detail, "agent-node-b"), "dispatched");
+    assert_eq!(entry_status(&detail, "agent-node-c"), "pending");
+
+    // 一台成功（释放一个在飞槽位）→ 补物化第 3 台。
+    let work_id = entry_work_id(&detail, "agent-node-a");
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(entry_status(&detail, "agent-node-c"), "dispatched");
+    assert!(entry_work_id(&detail, "agent-node-c").starts_with("work-"));
+}

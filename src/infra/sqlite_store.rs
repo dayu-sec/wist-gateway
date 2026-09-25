@@ -1685,6 +1685,109 @@ impl Store for SqliteStore {
                 .map_err(|err| sql_error(err, "select work sequence"))?;
         Ok(sequence.unwrap_or(0))
     }
+
+    async fn save_rollout_plan(&self, plan: &StoredRolloutPlan) -> StoreResult<()> {
+        let phases_json = serialize_json_array(&plan.phases, "encode rollout plan phases")?;
+        sqlx::query(
+            "INSERT INTO rollout_plan (plan_id, action, spec, deadline_at, timeout_seconds, \
+             phases_json, batch_size, current_phase, status, created_by, created_at, \
+             approved_by, approved_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT (plan_id) DO UPDATE SET action = excluded.action, \
+             spec = excluded.spec, deadline_at = excluded.deadline_at, \
+             timeout_seconds = excluded.timeout_seconds, phases_json = excluded.phases_json, \
+             batch_size = excluded.batch_size, current_phase = excluded.current_phase, \
+             status = excluded.status, approved_by = excluded.approved_by, \
+             approved_at = excluded.approved_at",
+        )
+        .bind(&plan.plan_id)
+        .bind(&plan.action)
+        .bind(&plan.spec)
+        .bind(&plan.deadline_at)
+        .bind(plan.timeout_seconds)
+        .bind(&phases_json)
+        .bind(plan.batch_size)
+        .bind(plan.current_phase)
+        .bind(&plan.status)
+        .bind(&plan.created_by)
+        .bind(&plan.created_at)
+        .bind(&plan.approved_by)
+        .bind(&plan.approved_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert rollout plan"))?;
+        Ok(())
+    }
+
+    async fn get_rollout_plan(&self, plan_id: &str) -> StoreResult<Option<StoredRolloutPlan>> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {ROLLOUT_PLAN_COLUMNS} FROM rollout_plan WHERE plan_id = ?1"
+        )))
+        .bind(plan_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select rollout plan"))?;
+        row.as_ref().map(rollout_plan_from_row).transpose()
+    }
+
+    async fn list_rollout_plans(&self) -> StoreResult<Vec<StoredRolloutPlan>> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {ROLLOUT_PLAN_COLUMNS} FROM rollout_plan ORDER BY created_at DESC"
+        )))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list rollout plans"))?;
+        rows.iter().map(rollout_plan_from_row).collect()
+    }
+
+    async fn upsert_rollout_plan_entry(&self, entry: &StoredRolloutPlanEntry) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO rollout_plan_entry (plan_id, target_id, work_id, status, detail, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (plan_id, target_id) DO UPDATE SET work_id = excluded.work_id, \
+             status = excluded.status, detail = excluded.detail, updated_at = excluded.updated_at",
+        )
+        .bind(&entry.plan_id)
+        .bind(&entry.target_id)
+        .bind(&entry.work_id)
+        .bind(&entry.status)
+        .bind(&entry.detail)
+        .bind(&entry.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert rollout plan entry"))?;
+        Ok(())
+    }
+
+    async fn list_rollout_plan_entries(
+        &self,
+        plan_id: &str,
+    ) -> StoreResult<Vec<StoredRolloutPlanEntry>> {
+        let rows = sqlx::query(
+            "SELECT plan_id, target_id, work_id, status, detail, updated_at \
+             FROM rollout_plan_entry WHERE plan_id = ?1 ORDER BY target_id",
+        )
+        .bind(plan_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list rollout plan entries"))?;
+        rows.iter().map(rollout_plan_entry_from_row).collect()
+    }
+
+    async fn find_rollout_plan_entry_by_work(
+        &self,
+        work_id: &str,
+    ) -> StoreResult<Option<StoredRolloutPlanEntry>> {
+        let row = sqlx::query(
+            "SELECT plan_id, target_id, work_id, status, detail, updated_at \
+             FROM rollout_plan_entry WHERE work_id = ?1",
+        )
+        .bind(work_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "find rollout plan entry by work"))?;
+        row.as_ref().map(rollout_plan_entry_from_row).transpose()
+    }
 }
 
 /// 列清单单独提出来：读单行与读全表必须选同一组列，
@@ -1705,6 +1808,40 @@ fn one_shot_terminal_status_sql() -> String {
         .map(|status| format!("'{status}'"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// 灰度发布计划的列清单（读单行与读全表选同一组列）。
+const ROLLOUT_PLAN_COLUMNS: &str = "plan_id, action, spec, deadline_at, timeout_seconds, \
+     phases_json, batch_size, current_phase, status, created_by, created_at, approved_by, approved_at";
+
+fn rollout_plan_from_row(row: &SqliteRow) -> StoreResult<StoredRolloutPlan> {
+    let phases_json: String = column!(row, "phases_json");
+    Ok(StoredRolloutPlan {
+        plan_id: column!(row, "plan_id"),
+        action: column!(row, "action"),
+        spec: column!(row, "spec"),
+        deadline_at: column!(row, "deadline_at"),
+        timeout_seconds: column!(row, "timeout_seconds"),
+        phases: deserialize_json_array(&phases_json, "decode rollout plan phases")?,
+        batch_size: column!(row, "batch_size"),
+        current_phase: column!(row, "current_phase"),
+        status: column!(row, "status"),
+        created_by: column!(row, "created_by"),
+        created_at: column!(row, "created_at"),
+        approved_by: column!(row, "approved_by"),
+        approved_at: column!(row, "approved_at"),
+    })
+}
+
+fn rollout_plan_entry_from_row(row: &SqliteRow) -> StoreResult<StoredRolloutPlanEntry> {
+    Ok(StoredRolloutPlanEntry {
+        plan_id: column!(row, "plan_id"),
+        target_id: column!(row, "target_id"),
+        work_id: column!(row, "work_id"),
+        status: column!(row, "status"),
+        detail: column!(row, "detail"),
+        updated_at: column!(row, "updated_at"),
+    })
 }
 
 fn standing_work_from_row(row: &SqliteRow) -> StoreResult<StandingWork> {

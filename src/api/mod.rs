@@ -41,6 +41,10 @@ mod content_ops;
 // NOTE(hand-added): L1a 机械资产清单（从事实摘要派生）。不在 jumo 静态模型 binding.mju
 // 的声明里，与 host_metrics / pipeline 同一模式。重新生成控制面代码时需回补本模块与下方路由。
 mod software_ops;
+// NOTE(hand-added): 灰度发布计划（模型 Control.Rollout）：创建/列表/批准/推进/查看。
+// 计划是编排层，批准/推进时才物化成 OneShotWork；与 agent_ops 的 submit_work_result
+// 通过 reconcile_rollout_entry 回填条目。重新生成控制面代码时需回补本模块与下方路由。
+mod rollout_ops;
 
 pub mod wist_gateway_management_interface;
 pub mod wist_gateway_public_install_interface;
@@ -69,6 +73,10 @@ use install::{
 use logs::{MAX_LOG_INGEST_BODY_BYTES, ingest_agent_logs, view_agent_logs};
 use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
 use pipeline::get_pipeline_topology;
+use rollout_ops::{
+    advance_rollout_plan, approve_rollout_plan, create_rollout_plan, list_rollout_plans,
+    view_rollout_plan,
+};
 use software_ops::{view_agent_software, view_software_holdings};
 
 pub mod work_expiry;
@@ -336,6 +344,24 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agents/{agent_id}/credentials:revoke",
             post(revoke_agent_credential),
+        )
+        // NOTE(hand-added): 灰度发布计划（模型 Control.Rollout）：创建/列表/批准/推进/查看。
+        // 已在模型 WistGatewayManagementInterface 声明；重新生成控制面代码时需回补这些路由。
+        .route(
+            "/api/v1/admin/rollout-plans",
+            get(list_rollout_plans).post(create_rollout_plan),
+        )
+        .route(
+            "/api/v1/admin/rollout-plans/approve",
+            post(approve_rollout_plan),
+        )
+        .route(
+            "/api/v1/admin/rollout-plans/advance",
+            post(advance_rollout_plan),
+        )
+        .route(
+            "/api/v1/admin/rollout-plans/{plan_id}",
+            get(view_rollout_plan),
         )
         .with_state(state)
 }

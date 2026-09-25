@@ -368,6 +368,52 @@ pub struct StoredOneShotWork {
     pub pre_pause_status: Option<String>,
 }
 
+/// 灰度发布计划的一个阶段（对应模型 `RolloutPhase`）。
+///
+/// 目标范围与推进闸门创建后不变，只有 `status` 在走（`pending` → `rolling` → `completed`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredRolloutPhase {
+    pub phase_index: i64,
+    pub target_ids: Vec<String>,
+    /// `manual` | `all_succeeded` | `success_rate:<NN>`（自动推进见 `app/rollout.rs` 的缺口说明）。
+    pub advance_rule: String,
+    pub status: String,
+}
+
+/// 灰度发布计划（对应模型 `RolloutPlan`）。
+///
+/// 阶段以 JSON 数组随计划一行落库（见 `0012_rollout_plan.sql` 的注释）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredRolloutPlan {
+    pub plan_id: String,
+    pub action: String,
+    pub spec: String,
+    pub deadline_at: String,
+    pub timeout_seconds: i64,
+    pub phases: Vec<StoredRolloutPhase>,
+    /// 每个阶段内同时执行的目标数（节流；首版只存不控）。
+    pub batch_size: i64,
+    pub current_phase: i64,
+    pub status: String,
+    pub created_by: String,
+    pub created_at: String,
+    pub approved_by: Option<String>,
+    pub approved_at: Option<String>,
+}
+
+/// 灰度发布计划里某个目标的执行进度（对应模型 `RolloutPlanEntry`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredRolloutPlanEntry {
+    pub plan_id: String,
+    pub target_id: String,
+    /// 物化出的那件一次性工作的 `work_id`；尚未派发时为 `None`。
+    pub work_id: Option<String>,
+    /// `pending` | `dispatched` | `succeeded` | `failed`。
+    pub status: String,
+    pub detail: String,
+    pub updated_at: String,
+}
+
 pub use wist_contracts::work::{
     ONE_SHOT_TERMINAL_STATUSES, ONE_SHOT_WORK_STATUSES, STANDING_WORK_STATUSES, WorkKind,
     WorkReceipt,
@@ -864,6 +910,32 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 读授权序号；从未授权过任何工作时返回 0。
     async fn work_sequence(&self, agent_id: &str) -> StoreResult<i64>;
+
+    // ── 灰度发布计划 ──
+
+    /// 写入/覆盖一份灰度发布计划（`plan_id` 为主键）。
+    async fn save_rollout_plan(&self, plan: &StoredRolloutPlan) -> StoreResult<()>;
+
+    /// 按 `plan_id` 读一份灰度发布计划。
+    async fn get_rollout_plan(&self, plan_id: &str) -> StoreResult<Option<StoredRolloutPlan>>;
+
+    /// 全部灰度发布计划（按创建时间倒序，供管理面列表）。
+    async fn list_rollout_plans(&self) -> StoreResult<Vec<StoredRolloutPlan>>;
+
+    /// 写/覆盖一条计划条目（`plan_id` + `target_id` 为主键）。
+    async fn upsert_rollout_plan_entry(&self, entry: &StoredRolloutPlanEntry) -> StoreResult<()>;
+
+    /// 某计划的全部条目。
+    async fn list_rollout_plan_entries(
+        &self,
+        plan_id: &str,
+    ) -> StoreResult<Vec<StoredRolloutPlanEntry>>;
+
+    /// 按 `work_id` 找计划条目（结果上报回填用）；不是计划物化出来的工作返回 `None`。
+    async fn find_rollout_plan_entry_by_work(
+        &self,
+        work_id: &str,
+    ) -> StoreResult<Option<StoredRolloutPlanEntry>>;
 
     /// 满足同一过滤条件的 Agent 总数（分页用）。
     async fn count_agents(&self, query: &AgentQuery) -> StoreResult<u64>;
