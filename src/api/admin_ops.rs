@@ -112,7 +112,15 @@ pub struct AgentInstallPackageResponse {
 }
 
 /// 安装包录入历史里的一条（列表用）。
-#[derive(Debug, Serialize)]
+///
+/// 模型 `Control.Agent.Enrollment.AgentInstallPackageHistoryEntry`（升级计划从这里选包）。
+/// **不加 `serde(rename_all)`**：对外协议是 snake_case，前端按它解析。
+#[derive(Debug, Serialize, ::jumo_derive::Jumo)]
+#[jumo(
+    kind = "struct",
+    domain = "Control",
+    module = "Control.Agent.Enrollment"
+)]
 pub struct AgentInstallPackageHistoryEntry {
     pub package_id: String,
     pub source: String,
