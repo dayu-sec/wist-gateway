@@ -287,6 +287,8 @@ async fn authorize_package_download(
     }
     let Some(token) = bootstrap_bearer_token(headers) else {
         rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+        // 对外仍是一句不可区分的口径；具体原因只进服务端审计日志（**不记 token 本身**）。
+        eprintln!("audit package_download_rejected reason=missing_token");
         return Err(unauthorized_no_store(
             "agent package download requires a bootstrap or agent bearer token",
         ));
@@ -299,17 +301,21 @@ async fn authorize_package_download(
         rate_limit::clear_auth_failures(state, client_key, BOOTSTRAP_AUTH_SCOPE);
         return Ok(());
     }
-    if super::agent_ops::authenticate_agent_credential_token(state, token)
-        .await
-        .is_ok()
-    {
-        rate_limit::clear_auth_failures(state, client_key, BOOTSTRAP_AUTH_SCOPE);
-        return Ok(());
+    match super::agent_ops::authenticate_agent_credential_token(state, token).await {
+        Ok(()) => {
+            rate_limit::clear_auth_failures(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+            Ok(())
+        }
+        Err(reason) => {
+            rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+            // 分辨「没带 token」与「带了但不被接受」是排障关键：前者是升级器太旧 / 没注入凭据，
+            // 后者是凭据过期/被吊销/不在本网关。对外仍是同一句口径。
+            eprintln!("audit package_download_rejected reason=invalid_token detail={reason}");
+            Err(unauthorized_no_store(
+                "invalid bootstrap or agent bearer token",
+            ))
+        }
     }
-    rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
-    Err(unauthorized_no_store(
-        "invalid bootstrap or agent bearer token",
-    ))
 }
 
 fn unauthorized_no_store(message: impl Into<String>) -> Response {
