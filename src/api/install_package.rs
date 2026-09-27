@@ -54,9 +54,17 @@ pub struct AgentPackageSource {
 
 impl AgentPackageSource {
     /// 从某个本地制品文件构造来源（分发地址恒为网关端点）。
-    pub fn from_local_file(config: &AdminConfig, path: PathBuf) -> Result<Self, String> {
+    ///
+    /// `base` 是**生效的对外基址**（网关对外地址设置；未设置时由调用方传入
+    /// `server.public_base_url`）。分发地址必须与安装命令里给出的地址同源，
+    /// 否则目标主机拿到的是一个连不上的网关地址。
+    pub fn from_local_file(
+        config: &AdminConfig,
+        base: &str,
+        path: PathBuf,
+    ) -> Result<Self, String> {
         Ok(Self {
-            url: config.agent_package_url(),
+            url: config.agent_package_url_at(base),
             sha256: file_sha256_hex(&path)?,
         })
     }
@@ -79,12 +87,15 @@ pub async fn effective_package_path(config: &AdminConfig, store: &Arc<dyn Store>
 }
 
 /// 解析当前生效的安装包来源（分发地址 + 同源摘要）。
+///
+/// `base` 是生效的对外基址，见 [`AgentPackageSource::from_local_file`]。
 pub async fn resolve_agent_package(
     config: &AdminConfig,
     store: &Arc<dyn Store>,
+    base: &str,
 ) -> Result<AgentPackageSource, String> {
     let path = effective_package_path(config, store).await;
-    AgentPackageSource::from_local_file(config, path)
+    AgentPackageSource::from_local_file(config, base, path)
 }
 
 /// 把来源地址的制品拉取到网关本地缓存，返回其 sha256（裸 hex）。

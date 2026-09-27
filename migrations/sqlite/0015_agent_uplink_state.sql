@@ -1,0 +1,14 @@
+-- agentd 上报的**实际生效的采集输出状态**（`AgentUplinkState`）：只保留最近一份。
+--
+-- 与 `agent_uplink` 表（单例）是一对：那张表是控制面**下发**的期望（启用 + 目标），
+-- 这一列是 agent **自报**的生效结果。中间隔着若干只有 agent 才知道的环节 —— grant 可能
+-- 还没拉到、可能被本机总闸拦住、可能目标连不上。网关自己记账看不出这些，而运维要回答的
+-- 正是那句「这台为什么不上送」（待命？本机 file 出口？目标是谁？控制面下发的还是本机？
+-- 出口是不是正在失败？）。
+--
+-- 为什么放在 agent_instances：与同处的 `local_work` / `discovery_policy_version` 同理 ——
+-- 它是**最近一次上报的快照**，不是身份属性；行随 ON CONFLICT (instance_id) DO UPDATE 覆盖，
+-- 只需加列，无需回填历史。
+--
+-- 旧版本 agentd 不上报此字段，列为空（写库时保持上一次的值，不被清掉）。
+ALTER TABLE agent_instances ADD COLUMN uplink_state TEXT;

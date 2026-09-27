@@ -241,7 +241,10 @@ fn recent_online_registered_agent_at(
     }
 }
 
-fn agent_is_online(last_seen_at: &str, now: &DateTime) -> bool {
+/// 在线判据：`last_seen_at` 落在 `ONLINE_WINDOW_SECONDS` 内。
+///
+/// `pub(super)`：Agent 列表要用**同一份判据**标 `status`（不能一处算在线、一处写死 online）。
+pub(super) fn agent_is_online(last_seen_at: &str, now: &DateTime) -> bool {
     let Some(last_seen) = DateTime::from_rfc3339(last_seen_at) else {
         return false;
     };

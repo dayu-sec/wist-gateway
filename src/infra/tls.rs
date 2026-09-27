@@ -86,6 +86,51 @@ pub fn verify_certificate_as_rustls_client(
         .map_err(|err| err.to_string())
 }
 
+/// 用 rustls 的**客户端**校验器验证一条**服务端证书链**，信任锚**单独给**。
+///
+/// 与 [`verify_certificate_as_rustls_client`] 的区别是模拟的形态不同：
+///   · 那个：信任锚就是叶证书本身（dev 自签证书的形态）；
+///   · 这个：**真实部署**的形态 —— agent 的 `trust_bundle` 里是 **CA 根**，
+///     网关发出去的是 CA 签的叶证书（可带中间证书）。
+///
+/// 判据必须走这条路径：用「自签证书当锚」的校验器去验 CA 签的叶证书会得
+/// `UnknownIssuer`（叶的签发者不在信任锚里），而 OpenSSL / curl 未必这么判。
+pub fn verify_chain_as_rustls_client(
+    chain_pem: &str,
+    anchor_pem: &str,
+    server_name: &str,
+) -> Result<(), String> {
+    install_crypto_provider();
+    let chain = certificate_chain_from_pem(chain_pem)?;
+    let Some((leaf, intermediates)) = chain.split_first() else {
+        return Err("certificate chain is empty".to_string());
+    };
+
+    let mut roots = rustls::RootCertStore::empty();
+    for anchor in certificate_chain_from_pem(anchor_pem)? {
+        roots
+            .add(anchor)
+            .map_err(|err| format!("failed to add trust anchor: {err}"))?;
+    }
+    let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|err| format!("failed to build verifier: {err}"))?;
+
+    let name = rustls_pki_types::ServerName::try_from(server_name.to_string())
+        .map_err(|err| format!("invalid server name {server_name}: {err}"))?;
+
+    verifier
+        .verify_server_cert(
+            leaf,
+            intermediates,
+            &name,
+            &[],
+            rustls_pki_types::UnixTime::now(),
+        )
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
 fn certificate_chain_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>, String> {
     let certs: Vec<_> = pem_sections(pem, "CERTIFICATE")?
         .into_iter()
@@ -190,6 +235,9 @@ AQID
     /// 需要本机已生成的 dev 证书，不是 hermetic 测试，因此默认忽略。手工跑：
     ///   cargo test --offline --lib -- --ignored rustls_accepts_gateway_certificate --nocapture
     /// 可用 `WIST_GATEWAY_TLS_CERT` / `WIST_GATEWAY_TLS_SERVER_NAME` 覆盖。
+    ///
+    /// 注意：这条只模拟「信任锚就是叶证书本身」的形态（dev 自签证书）。
+    /// CA 签的叶证书要走 [`rustls_accepts_gateway_chain`]。
     #[test]
     #[ignore = "depends on a locally generated dev certificate"]
     fn rustls_accepts_gateway_certificate() {
@@ -203,6 +251,43 @@ AQID
         match verify_certificate_as_rustls_client(&pem, &server_name) {
             Ok(()) => println!("rustls ACCEPTS {path} for {server_name}"),
             Err(err) => panic!("rustls REJECTS {path} for {server_name}: {err}"),
+        }
+    }
+
+    /// 诊断用：模拟**真实部署**的判定 —— 信任锚是一个**单独的 CA 根**（agent 的 `trust_bundle`），
+    /// 被验证的是网关发出去的那条链（`dev/setup-domain.sh` 生成的形态）。
+    ///
+    ///   cargo test --offline --lib -- --ignored rustls_accepts_gateway_chain --nocapture
+    ///
+    /// 可用 `WIST_GATEWAY_TLS_CHAIN` / `WIST_GATEWAY_TLS_ANCHOR` / `WIST_GATEWAY_TLS_SERVER_NAME`
+    /// 覆盖；`WIST_GATEWAY_TLS_ANCHOR` 缺省优先取 `state/dev-ca.crt.pem`（在则用它），
+    /// 否则回落成链里的第一张（等价于自签形态）。
+    #[test]
+    #[ignore = "depends on a locally generated dev certificate"]
+    fn rustls_accepts_gateway_chain() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let chain_path = std::env::var("WIST_GATEWAY_TLS_CHAIN")
+            .unwrap_or_else(|_| format!("{home}/.wist-gateway/state/admin-tls.crt.pem"));
+        let anchor_path = std::env::var("WIST_GATEWAY_TLS_ANCHOR").unwrap_or_else(|_| {
+            let ca = format!("{home}/.wist-gateway/state/dev-ca.crt.pem");
+            if Path::new(&ca).exists() {
+                ca
+            } else {
+                chain_path.clone()
+            }
+        });
+        let server_name = std::env::var("WIST_GATEWAY_TLS_SERVER_NAME")
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
+        let chain = fs::read_to_string(&chain_path).expect("read gateway certificate chain");
+        let anchor = fs::read_to_string(&anchor_path).expect("read trust anchor");
+
+        match verify_chain_as_rustls_client(&chain, &anchor, &server_name) {
+            Ok(()) => println!(
+                "rustls ACCEPTS chain {chain_path} under anchor {anchor_path} for {server_name}"
+            ),
+            Err(err) => panic!(
+                "rustls REJECTS chain {chain_path} under anchor {anchor_path} for {server_name}: {err}"
+            ),
         }
     }
 }

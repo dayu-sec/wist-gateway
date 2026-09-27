@@ -417,19 +417,42 @@ impl AdminConfig {
         Ok(())
     }
 
+    /// 安装脚本分发地址（基址取配置里的 `server.public_base_url`）。
+    ///
+    /// **运行期分发不要用这个**：基址应取「网关对外地址」（管理面设置，未设置时回落
+    /// 配置值），见 [`Self::install_script_url_at`]。
     pub fn install_script_url(&self, arch: &str) -> String {
+        self.install_script_url_at(&self.public_base_url, arch)
+    }
+
+    /// 同 [`Self::install_script_url`]，但基址由调用方给出（网关对外地址）。
+    pub fn install_script_url_at(&self, base: &str, arch: &str) -> String {
         format!(
             "{}/api/v1/agent/install/{arch}/install.sh",
-            self.public_base_url
+            trim_base_url(base)
         )
     }
 
+    /// 安装包分发地址（基址取配置里的 `server.public_base_url`）；运行期见
+    /// [`Self::agent_package_url_at`]。
     pub fn agent_package_url(&self) -> String {
-        format!("{}/api/v1/agent/packages/current", self.public_base_url)
+        self.agent_package_url_at(&self.public_base_url)
     }
 
+    /// 同 [`Self::agent_package_url`]，但基址由调用方给出。
+    pub fn agent_package_url_at(&self, base: &str) -> String {
+        format!("{}/api/v1/agent/packages/current", trim_base_url(base))
+    }
+
+    /// Agent 初始配置地址（基址取配置里的 `server.public_base_url`）；运行期见
+    /// [`Self::agent_initial_config_url_at`]。
     pub fn agent_initial_config_url(&self) -> String {
-        format!("{}/api/v1/agent/initial-config", self.public_base_url)
+        self.agent_initial_config_url_at(&self.public_base_url)
+    }
+
+    /// 同 [`Self::agent_initial_config_url`]，但基址由调用方给出。
+    pub fn agent_initial_config_url_at(&self, base: &str) -> String {
+        format!("{}/api/v1/agent/initial-config", trim_base_url(base))
     }
 
     /// 管理面设置的安装包**本地缓存**路径（单例）。
@@ -542,6 +565,11 @@ fn trim_trailing_slash(value: String) -> String {
     value.trim_end_matches('/').to_string()
 }
 
+/// 拼路径前把基址的尾斜杠裁掉：管理面设置的对外地址允许带 `/` 收尾。
+fn trim_base_url(base: &str) -> &str {
+    base.trim_end_matches('/')
+}
+
 fn require_non_empty(field: &str, value: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() {
         return Err(config_validation(format!("{field} must not be empty")));
@@ -567,7 +595,10 @@ fn require_https_url(field: &str, value: &str) -> Result<(), ConfigError> {
 /// The value is embedded verbatim into install scripts that run under `sh` on
 /// target hosts (inside double-quoted URLs). Reject characters that would break
 /// out of that context or that are never valid in a control-plane base URL.
-fn contains_shell_metacharacters(value: &str) -> bool {
+///
+/// `pub(crate)`：管理面设置「网关对外地址」时要按同一口径校验（它同样会被拼进
+/// 安装命令），两处绝不能各写一份。
+pub(crate) fn contains_shell_metacharacters(value: &str) -> bool {
     value.chars().any(|ch| {
         matches!(
             ch,

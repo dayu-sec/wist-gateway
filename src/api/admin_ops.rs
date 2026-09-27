@@ -13,11 +13,11 @@ use crate::app::content::{MACHINE_CLASSES, platform_for_machine_class};
 use crate::app::work as work_rules;
 use crate::app::work::WorkRejection;
 use crate::infra::{
-    AgentQuery, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
-    DEFAULT_INSTALL_PACKAGE_SETTING_ID, StoredAgentClassification, StoredAgentFactSummary,
-    StoredAgentInstallPackageAddress, StoredAgentUplinkAddress, StoredOneShotWork,
-    StoredPurposeSuggestion, StoredWorkAck, StoredWorkResult, effective_standing,
-    outstanding_one_shot,
+    AgentQuery, DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID, DEFAULT_AGENT_UPLINK_PORT,
+    DEFAULT_AGENT_UPLINK_SETTING_ID, DEFAULT_INSTALL_PACKAGE_SETTING_ID, StoredAgentAdvertiseUrl,
+    StoredAgentClassification, StoredAgentFactSummary, StoredAgentInstallPackageAddress,
+    StoredAgentUplinkAddress, StoredOneShotWork, StoredPurposeSuggestion, StoredWorkAck,
+    StoredWorkResult, contains_shell_metacharacters, effective_standing, outstanding_one_shot,
 };
 use wist_contracts::work::{OneShotWork, StandingWork, WorkKind, WorkReceipt};
 
@@ -131,6 +131,31 @@ pub struct AgentUplinkResponse {
     pub updated_at: Option<DateTime>,
 }
 
+/// 设置网关对外地址的请求体。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetAgentAdvertiseUrlRequest {
+    /// 对外基址，形如 `https://gateway.example.com`；允许带尾斜杠，保存时裁掉。
+    pub url: String,
+    pub requested_by: Option<String>,
+}
+
+/// 网关对外地址响应。
+///
+/// `url` 为空 = 管理面没设置过，此时网关实际用的是配置文件里的
+/// `server.public_base_url`，也就是 `fallback_url`。管理面要能回答「不设置的话
+/// agent 会连到哪里」，所以两个都给，而不是只回一个空值。
+#[derive(Debug, Serialize)]
+pub struct AgentAdvertiseUrlResponse {
+    pub setting_id: String,
+    /// 管理面设置值；未设置时为空串。
+    pub url: String,
+    /// 未设置时网关实际使用的基址（配置文件值，无尾斜杠）。
+    pub fallback_url: String,
+    pub updated_by: String,
+    /// 未设置过时为 null。
+    pub updated_at: Option<DateTime>,
+}
+
 /// 当前生效的发现方向策略表视图（管理面）。
 ///
 /// `configured=false` 表示这台网关没配策略表（agent 回落内建默认值），与「配了一张空表」
@@ -213,6 +238,7 @@ pub async fn get_agent_runtime_status(
         agent.last_cpu_percent,
         agent.last_cpu_cores,
         agent.last_admin_latency_ms,
+        agent.uplink_state,
     ))
     .into_response()
 }
@@ -1128,6 +1154,12 @@ struct AgentWorkView {
     /// 「失败原因 / 回滚到哪一版」正是这活在**了结之后**才最需要看的东西，
     /// 只留在未了结清单里等于做完就看不见了。
     settled_one_shot: Vec<OneShotWorkView>,
+    /// agent 上报的**本机工作视图**（它实际在采哪些文件、一次性工作做到哪一步）。
+    /// `None` = 这台 agent 还没报过（旧版本 agentd 不发这个字段）。
+    ///
+    /// 与 `standing`（网关**授权**了什么）并列而不合并：一个是「我发了什么」，
+    /// 一个是「它真的在干什么」—— 本机手工加的输入、暂停、来源接不接得了，只有后者能回答。
+    local: Option<wist_contracts::local_work::AgentLocalWork>,
     generated_at: String,
 }
 
@@ -1222,6 +1254,18 @@ pub async fn view_agent_work(
                 .into_response();
         }
     };
+    // 本机工作视图：agent 上报的「我真的在干什么」。读不到就是没报过（`None`），
+    // 但**读失败必须报错** —— 拿它冒充「没报过」会让页面静默显示空。
+    let local = match state.store.get_agent(&agent_id).await {
+        Ok(agent) => agent.and_then(|agent| agent.local_work),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load agent store: {err}"),
+            )
+                .into_response();
+        }
+    };
     Json(AgentWorkView {
         agent_id,
         sequence,
@@ -1229,6 +1273,7 @@ pub async fn view_agent_work(
         one_shot: one_shot_views,
         retired_standing,
         settled_one_shot,
+        local,
         generated_at: chrono::Utc::now().to_rfc3339(),
     })
     .into_response()
@@ -1446,6 +1491,10 @@ pub async fn revoke_agent_credential(
 }
 
 fn agent_list_entry(agent: &crate::infra::StoredAgentRegistration) -> AgentListEntry {
+    // `status` 从 `last_seen_at` **现算**，不写死 "online"：机队索引页（升级计划）要据此把
+    // **离线**机器排除掉 —— 一台几天没上报的机器还报 "online"，页面就会把升级派给它，
+    // 然后那件工作一直挂着到过期。派生只这一处（与总览 `agent_is_online` 同一判据）。
+    let online = super::overview::agent_is_online(&agent.last_seen_at, &DateTime::now());
     AgentListEntry {
         agent_id: agent.agent_id.clone(),
         instance_id: agent.instance_id.clone(),
@@ -1454,7 +1503,7 @@ fn agent_list_entry(agent: &crate::infra::StoredAgentRegistration) -> AgentListE
         node_id: agent.node_id.clone(),
         hostname: agent.hostname.clone(),
         version: agent.version.clone(),
-        status: "online".to_string(),
+        status: if online { "online" } else { "offline" }.to_string(),
         health: "healthy".to_string(),
         credential_id: agent.credential_id.clone(),
         credential_status: agent.credential_status.as_str().to_string(),
@@ -1635,7 +1684,11 @@ pub async fn view_discovery_policies(
 /// 查看当前的 Agent 数据面上送地址。
 ///
 /// 未设置过时返回「未设置」标记（`host` 空、`updated_by` 空、`updated_at` 为 null）：
-/// 此时网关签发的 Agent 初始配置不带 tcp 上送段，Agent 只上报自身状态，不采集日志也不上送。
+/// 此时网关给 Agent 算出的上送授权只能是待命（没有目标），Agent 只上报自身状态，
+/// 不采集日志也不上送数据面。
+///
+/// 这个地址是**运行期**生效的：它是 `uplink:poll` 现算 `AgentUplinkGrant` 时的目标来源，
+/// 管理面改一次，已在网的 Agent 下一个 poll（30s 内）就换目标 —— 不需要重装。
 pub async fn view_agent_uplink(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1665,8 +1718,12 @@ pub async fn view_agent_uplink(
 
 /// 设置 Agent 数据面上送地址（管理面）。
 ///
-/// 变更只影响之后签发的安装代码所下载到的初始配置：已安装的 Agent 要重跑安装脚本才会生效
-/// （初始配置只在安装时拉一次）。
+/// 记录的是「数据面（warp-parse）在哪」这个控制面事实：它既是新签发初始配置里
+/// `[telemetry.logs.output.tcp]` 的取值，也是运行期 `uplink:poll` 现算上送授权时的
+/// 目标来源 —— 所以改这里对所有已签发的 Agent **立即**生效（下一个 poll 就拿到新目标），
+/// 不需要重跑安装脚本。
+///
+/// 但只有地址不等于启用：是否上送还要看该 Agent 有没有生效工作（派活即启用、撤回即待命）。
 pub async fn set_agent_uplink(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1735,6 +1792,118 @@ fn validate_uplink_address(host: &str, port: i64) -> Result<(&str, u16), String>
     }
     let port = u16::try_from(port).map_err(|_| "port must be between 1 and 65535".to_string())?;
     Ok((host, port))
+}
+
+/// 查看网关对外地址。
+///
+/// 未设置过时 `url` 为空、`updated_at` 为 null，但 `fallback_url` 仍给出网关当前
+/// **实际**使用的基址（配置文件里的 `server.public_base_url`）—— 管理面据此能回答
+/// 「不设置会怎样」，否则界面上只剩一个空值。
+pub async fn view_agent_advertise_url(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    match state.store.get_agent_advertise_url().await {
+        Ok(setting) => Json(advertise_url_response(
+            setting.as_ref(),
+            &state.config.public_base_url,
+        ))
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to load gateway advertise url: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 设置网关对外地址（管理面）。
+///
+/// 变更只影响**之后**签发的安装代码：安装命令 / install.sh / 安装包的分发地址、
+/// 以及新装 Agent 初始配置里的 `[control_plane] endpoint` 都由它派生。已安装的
+/// agent 要重跑安装脚本才会拿到新值（初始配置只在安装时拉一次）。
+pub async fn set_agent_advertise_url(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Json(input): Json<SetAgentAdvertiseUrlRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let url = match validate_advertise_url(&input.url) {
+        Ok(value) => value,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let setting = StoredAgentAdvertiseUrl {
+        setting_id: DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID.to_string(),
+        url: url.to_string(),
+        updated_by: input
+            .requested_by
+            .unwrap_or_else(|| "platform-maintenance-engineer".to_string()),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match state.store.upsert_agent_advertise_url(&setting).await {
+        Ok(()) => Json(advertise_url_response(
+            Some(&setting),
+            &state.config.public_base_url,
+        ))
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store gateway advertise url: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+fn advertise_url_response(
+    setting: Option<&StoredAgentAdvertiseUrl>,
+    fallback: &str,
+) -> AgentAdvertiseUrlResponse {
+    AgentAdvertiseUrlResponse {
+        setting_id: DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID.to_string(),
+        url: setting.map(|value| value.url.clone()).unwrap_or_default(),
+        fallback_url: fallback.trim_end_matches('/').to_string(),
+        updated_by: setting
+            .map(|value| value.updated_by.clone())
+            .unwrap_or_default(),
+        updated_at: setting.and_then(|value| DateTime::from_rfc3339(&value.updated_at)),
+    }
+}
+
+/// 校验网关对外地址。
+///
+/// 与 `server.public_base_url` 同口径：它会被拼进安装命令与 install.sh 里的 URL，
+/// 所以必须 https，且不含空白或 shell 元字符（复用配置层同一个判据，不另写一份 ——
+/// 两处各写一份迟早会漂移）。尾斜杠允许，保存时裁掉。
+fn validate_advertise_url(value: &str) -> Result<&str, String> {
+    let url = value.trim().trim_end_matches('/');
+    if url.is_empty() {
+        return Err("url must not be empty".to_string());
+    }
+    if url.len() > MAX_PACKAGE_URL_LEN {
+        return Err(format!("url must be at most {MAX_PACKAGE_URL_LEN} bytes"));
+    }
+    if url.chars().any(char::is_control) {
+        return Err("url must not contain control characters".to_string());
+    }
+    if !url.starts_with("https://") {
+        return Err("url must be an https:// URL".to_string());
+    }
+    if url.len() == "https://".len() {
+        return Err("url must include a host".to_string());
+    }
+    if contains_shell_metacharacters(url) {
+        return Err("url must not contain whitespace or shell metacharacters".to_string());
+    }
+    Ok(url)
 }
 
 /// 校验安装包地址与摘要。
@@ -1808,6 +1977,7 @@ fn runtime_status(
     cpu_percent: Option<f64>,
     cpu_cores: Option<u32>,
     admin_latency_ms: Option<u64>,
+    uplink_state: Option<wist_contracts::agent_uplink::AgentUplinkState>,
 ) -> AgentRuntimeStatusView {
     AgentRuntimeStatusView {
         agent_id: agent_id.to_string(),
@@ -1821,6 +1991,7 @@ fn runtime_status(
         cpu_percent_of_machine: cpu_percent_of_machine(cpu_percent, cpu_cores),
         admin_latency_ms: admin_latency_ms.map(|value| value as i64),
         last_seen_at: DateTime::from_rfc3339(last_seen_at).unwrap_or_else(DateTime::now),
+        uplink_state,
     }
 }
 
@@ -1859,4 +2030,11 @@ pub struct AgentRuntimeStatusView {
     /// 整机口径的 CPU 占比（0..100），由 `cpu_percent / cpu_cores` 派生；算不出时为 null。
     pub cpu_percent_of_machine: Option<f64>,
     pub admin_latency_ms: Option<i64>,
+    /// agent 上报的**实际生效**采集输出状态（它与网关下发的 `agent_uplink` 是一对：
+    /// 一个说「要它怎样」，一个说「它实际成了怎样」）。null = 这台 agent 还没报过
+    /// （旧版本 agentd 不发这个字段）。
+    ///
+    /// 为什么放在运行状态这里：运维问「这台为什么不上送」时查的就是这个响应，
+    /// 待命 / 本机 file 出口 / 目标是谁 / 控制面下发还是本机 / 出口是否在失败，一屏给全。
+    pub uplink_state: Option<wist_contracts::agent_uplink::AgentUplinkState>,
 }

@@ -54,13 +54,13 @@ pub use wist_agentd_online_registration_interface::WistAgentdOnlineRegistrationI
 
 use admin_ops::{
     classify_agent, get_agent_runtime_status, grant_work, list_agents, pause_work, resume_work,
-    revoke_agent_credential, revoke_work, set_agent_install_package, set_agent_uplink,
-    view_agent_install_package, view_agent_purpose, view_agent_uplink, view_agent_work,
-    view_discovery_policies, view_purpose_coverage,
+    revoke_agent_credential, revoke_work, set_agent_advertise_url, set_agent_install_package,
+    set_agent_uplink, view_agent_advertise_url, view_agent_install_package, view_agent_purpose,
+    view_agent_uplink, view_agent_work, view_discovery_policies, view_purpose_coverage,
 };
 use agent_ops::{
-    ack_work, poll_control_commands, poll_discovery_policies, poll_work, renew_agent_credential,
-    report_action_result, submit_agent_status, submit_work_result,
+    ack_work, poll_agent_uplink, poll_control_commands, poll_discovery_policies, poll_work,
+    renew_agent_credential, report_action_result, submit_agent_status, submit_work_result,
 };
 use content_ops::view_content;
 use enrollment::enroll_agent;
@@ -249,6 +249,13 @@ pub fn router_with_state(state: ApiState) -> Router {
         // WistAgentdOnlineRegistrationInterface 的 PollWork / AckWork）。
         // 与策略表同类：幂等内容、可重复拉取；断网重启后重新拉一次就回到期望状态。
         .route("/api/v1/agent/work:poll", post(poll_work))
+        // NOTE(hand-added): 数据面上送启用的拉取。模型侧已补齐
+        // `message` / `entry` / `flow` / `actor can` / 用例 / `bind`（见设计文档 §7）。
+        // 与 work:poll 同类：幂等内容、可重复拉取，但刻意走**独立端点**而不是给 WorkGrant 加字段 ——
+        // WorkGrant 两侧都 `deny_unknown_fields`，加字段会让「新网关 + 旧 agentd」解析失败（舰队级停摆）。
+        // 旧 agentd 不调它，新 agentd 遇旧网关得 404 后回落本机配置。
+        // 重新生成控制面代码时需回补本路由。
+        .route("/api/v1/agent/uplink:poll", post(poll_agent_uplink))
         .route("/api/v1/agent/work:ack", post(ack_work))
         // 一次性工作的执行结果（进度/终态）。与 ack 分开：确认回答「我收到了」，
         // 结果回答「我做得怎么样了」——失效代价不同，不挤一条路。
@@ -326,11 +333,19 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/admin/agent/install-package",
             get(view_agent_install_package).post(set_agent_install_package),
         )
-        // NOTE(hand-added): Agent 数据面上送地址的读取/设置。未设置时网关签发的初始配置
-        // 不带 tcp 上送段（Agent 只上报自身状态，不采集日志也不上送数据面）。
+        // NOTE(hand-added): Agent 数据面上送地址的读取/设置。它是 `uplink:poll` 现算上送
+        // 授权时的目标来源；未设置时授权只能是待命（没有目标，Agent 不采集日志也不上送数据面）。
         .route(
             "/api/v1/admin/agent/uplink",
             get(view_agent_uplink).post(set_agent_uplink),
+        )
+        // NOTE(hand-added): 网关对外地址的读取/设置。它是控制平台对 agent 宣告的地址：
+        // 新签发 Agent 初始配置里的 [control_plane] endpoint，以及安装命令 / install.sh /
+        // 安装包的分发基址都由它派生；未设置时回落配置文件里的 server.public_base_url。
+        // 重新生成控制面代码时这条路由与上面两条设置路由都要保住。
+        .route(
+            "/api/v1/admin/agent/advertise-url",
+            get(view_agent_advertise_url).post(set_agent_advertise_url),
         )
         // NOTE(hand-added): Agent 管理面列表与凭据吊销。已在 jumo 模型
         // WistGatewayManagementInterface（AdminListAgents / AdminRevokeAgentCredential）中声明，

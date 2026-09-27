@@ -342,6 +342,7 @@ async fn progress_phase_after_terminal_result(
     if idx == 0 || idx > plan.phases.len() {
         return Ok(());
     }
+    let is_last_phase = idx == plan.phases.len();
     let phase = plan.phases[idx - 1].clone();
     let entries = state
         .store
@@ -356,9 +357,6 @@ async fn progress_phase_after_terminal_result(
     }
 
     // 2) 自动推进（refill 后重读，因为 refill 可能刚把 pending 物化成 dispatched）。
-    if phase.advance_rule == rules::ADVANCE_RULE_MANUAL {
-        return Ok(());
-    }
     let entries = state
         .store
         .list_rollout_plan_entries(plan_id)
@@ -369,6 +367,22 @@ async fn progress_phase_after_terminal_result(
         .filter(|entry| phase.target_ids.contains(&entry.target_id))
         .cloned()
         .collect();
+
+    // 末阶段没有「下一段」：推进它不派任何新活，只是把计划收尾 —— 所以它**不需要人工闸门**。
+    // 全部了结（含失败）就直接收敛为 completed；否则一份单阶段/末阶段的计划会永远停在
+    // `rolling`，等人去点一下那个什么都不启动的「推进」。
+    if is_last_phase {
+        if rules::phase_settled(&phase_entries)
+            && let Err(response) = advance_plan(state, &mut plan).await
+        {
+            return Err(format!("auto-finish rollout plan: {}", response.status()));
+        }
+        return Ok(());
+    }
+
+    if phase.advance_rule == rules::ADVANCE_RULE_MANUAL {
+        return Ok(());
+    }
     if !rules::phase_should_advance(&phase.advance_rule, &phase_entries) {
         return Ok(());
     }
@@ -376,6 +390,47 @@ async fn progress_phase_after_terminal_result(
         return Err(format!("auto-advance rollout plan: {}", response.status()));
     }
     Ok(())
+}
+
+/// 读路径上的**自愈**：末阶段已全部了结、计划却还挂在 `rolling` → 收敛为 `completed`。
+///
+/// 终态结果回填是主要触发点，但网关当时不在、或结果由更早的版本处理时，计划会留在 `rolling`
+/// 等人点一下。而「末阶段不需要人工闸门」这条结论与触发点无关，顺手对一次账比留一个要人手点的
+/// 坑更省事。只在真满足条件时写，**幂等**。
+#[allow(clippy::result_large_err)]
+async fn converge_finished_plan(
+    state: &ApiState,
+    plan: StoredRolloutPlan,
+) -> Result<StoredRolloutPlan, Response> {
+    if plan.status != "rolling" || plan.current_phase == 0 {
+        return Ok(plan);
+    }
+    let idx = plan.current_phase as usize;
+    if idx != plan.phases.len() {
+        return Ok(plan);
+    }
+    let target_ids = plan.phases[idx - 1].target_ids.clone();
+    let entries = state
+        .store
+        .list_rollout_plan_entries(&plan.plan_id)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to list rollout plan entries: {err}"),
+            )
+                .into_response()
+        })?;
+    let phase_entries: Vec<StoredRolloutPlanEntry> = entries
+        .into_iter()
+        .filter(|entry| target_ids.contains(&entry.target_id))
+        .collect();
+    if !rules::phase_settled(&phase_entries) {
+        return Ok(plan);
+    }
+    let mut plan = plan;
+    advance_plan(state, &mut plan).await?;
+    Ok(plan)
 }
 
 pub async fn create_rollout_plan(
@@ -597,6 +652,11 @@ pub async fn view_rollout_plan(
             format!("unknown rollout plan {plan_id}"),
         )
             .into_response();
+    };
+    // 顺手对一次账：末阶段已了结但计划还挂着（见函数注释）→ 收敛为 completed，幂等。
+    let plan = match converge_finished_plan(&state, plan).await {
+        Ok(plan) => plan,
+        Err(response) => return response,
     };
     let entries = match state.store.list_rollout_plan_entries(&plan_id).await {
         Ok(value) => value,

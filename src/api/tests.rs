@@ -20,11 +20,12 @@ use wist_contracts::enrollment::{
 };
 
 use crate::infra::{
-    AdminConfig, DEFAULT_AGENT_UPLINK_SETTING_ID, SqliteStore, Store, StoredAgentUplinkAddress,
-    StoredCredentialStatus, StoredEnrollmentTokenStatus, bytes_sha256_hex,
-    load_install_script_public_key_pem, sha256_hex,
+    AdminConfig, AgentStatusUpdate, DEFAULT_AGENT_UPLINK_SETTING_ID, SqliteStore, Store,
+    StoredAgentUplinkAddress, StoredCredentialStatus, StoredEnrollmentTokenStatus,
+    bytes_sha256_hex, load_install_script_public_key_pem, sha256_hex,
 };
 use wist_contracts::action_result::{ActionResult, FinalStatus};
+use wist_contracts::agent_uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND};
 use wist_contracts::fact_summary::FactContent;
 use wist_contracts::gateway::{
     AgentStatusReport, AgentWorkState, AgentWorkStateChange, DiscoveryPoliciesReturned,
@@ -45,7 +46,7 @@ use super::{
         validate_bootstrap_token_for_config,
     },
     install_package::AgentPackageSource,
-    overview::{RecentOnlineRegisteredAgentSource, agent_overview},
+    overview::{RecentOnlineRegisteredAgentSource, agent_is_online, agent_overview},
     router,
     work_expiry::expire_overdue_one_shot_works,
 };
@@ -54,8 +55,12 @@ const TEST_ADMIN_API_TOKEN: &str = "test-admin-token";
 
 /// 测试用的内置安装包来源（未在管理面设置来源地址时的生效值）。
 fn builtin_package(env: &TestEnv) -> AgentPackageSource {
-    AgentPackageSource::from_local_file(&env.config, env.config.agent_package_file.clone())
-        .expect("builtin package source")
+    AgentPackageSource::from_local_file(
+        &env.config,
+        &env.config.public_base_url,
+        env.config.agent_package_file.clone(),
+    )
+    .expect("builtin package source")
 }
 
 /// 在 TestEnv 的临时目录里放一个安装包**来源**文件，返回其绝对路径。
@@ -89,8 +94,14 @@ const TEST_TLS_CERT_PIN: &str = "uq4O4EN3e09Xmlo5euGldyHw+y27baJ+Jm/OBnFHrZc=";
 /// 用内置安装包签发一份安装代码：下面几个测试关心的是安装命令/引导包的形态。
 async fn builtin_install_code(env: &TestEnv) -> wist_control::types::AgentInstallCode {
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(900);
-    agent_install_code(&env.config, "token-a", expires_at, &builtin_package(env))
-        .expect("install code")
+    agent_install_code(
+        &env.config,
+        "token-a",
+        expires_at,
+        &builtin_package(env),
+        &env.config.public_base_url,
+    )
+    .expect("install code")
 }
 
 #[tokio::test]
@@ -217,7 +228,12 @@ async fn issue_install_code_persists_one_time_token() {
 }
 
 fn rendered_install_script(env: &TestEnv) -> String {
-    super::install::install_script(&env.config, "x86", &builtin_package(env))
+    super::install::install_script(
+        &env.config,
+        "x86",
+        &builtin_package(env),
+        &env.config.public_base_url,
+    )
 }
 
 #[tokio::test]
@@ -387,8 +403,9 @@ async fn builtin_package_requires_readable_file() {
 
     // 解析内置来源需要读制品算摘要；制品不在就必须显式失败，
     // 而不是把空摘要发下去（那会让安装端跳过校验）。
-    let err = AgentPackageSource::from_local_file(&env.config, package_path)
-        .expect_err("unreadable package");
+    let err =
+        AgentPackageSource::from_local_file(&env.config, &env.config.public_base_url, package_path)
+            .expect_err("unreadable package");
 
     assert!(!err.is_empty());
 }
@@ -396,10 +413,19 @@ async fn builtin_package_requires_readable_file() {
 #[tokio::test]
 async fn install_script_signature_matches_script_body() {
     let env = TestEnv::new().await;
-    let script = super::install::install_script(&env.config, "x86", &builtin_package(&env));
-    let signature =
-        super::install::install_script_signature(&env.config, "x86", &builtin_package(&env))
-            .expect("sign script");
+    let script = super::install::install_script(
+        &env.config,
+        "x86",
+        &builtin_package(&env),
+        &env.config.public_base_url,
+    );
+    let signature = super::install::install_script_signature(
+        &env.config,
+        "x86",
+        &builtin_package(&env),
+        &env.config.public_base_url,
+    )
+    .expect("sign script");
 
     signature::UnparsedPublicKey::new(&signature::ED25519, &env.install_public_key_bytes)
         .verify(script.as_bytes(), &signature)
@@ -409,9 +435,13 @@ async fn install_script_signature_matches_script_body() {
 #[tokio::test]
 async fn install_script_signature_rejects_modified_body() {
     let env = TestEnv::new().await;
-    let signature =
-        super::install::install_script_signature(&env.config, "x86", &builtin_package(&env))
-            .expect("sign script");
+    let signature = super::install::install_script_signature(
+        &env.config,
+        "x86",
+        &builtin_package(&env),
+        &env.config.public_base_url,
+    )
+    .expect("sign script");
 
     let err = signature::UnparsedPublicKey::new(&signature::ED25519, &env.install_public_key_bytes)
         .verify(b"tampered install script", &signature)
@@ -423,7 +453,12 @@ async fn install_script_signature_rejects_modified_body() {
 #[tokio::test]
 async fn initial_config_matches_agent_config_contract() {
     let env = TestEnv::new().await;
-    let text = agent_initial_config_toml(&env.config, "install-token-a", None);
+    let text = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        None,
+        &env.config.public_base_url,
+    );
     let parsed: wist_contracts::agent_config::AgentConfig =
         toml::from_str(&text).expect("valid agent config toml");
 
@@ -460,14 +495,21 @@ async fn initial_config_matches_agent_config_contract() {
 #[tokio::test]
 async fn initial_config_without_uplink_keeps_local_only_output() {
     let env = TestEnv::new().await;
-    let text = agent_initial_config_toml(&env.config, "install-token-a", None);
+    let text = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        None,
+        &env.config.public_base_url,
+    );
 
-    // 待命语义：kind 恒为 file，不下发任何采集配置。
-    // file sink 没有 inputs 时什么都不写，而“静”本身就是要求。
+    // 待命：enabled = false（不是靠 kind）。没有上送地址就没有目标，用 kind = "file" 表示。
+    // `enabled = false` 下事实帧不会被上送，所以也不会再产生 fact summary uplink failed 噪声。
     assert!(text.contains("kind = \"file\""));
+    assert!(text.contains("enabled = false"));
     assert!(!text.contains("file_inputs_file"));
     let parsed: wist_contracts::agent_config::AgentConfig =
         toml::from_str(&text).expect("valid agent config toml");
+    assert!(!parsed.telemetry.logs.output.enabled);
     assert_eq!(parsed.telemetry.logs.output.kind, "file");
     assert!(parsed.telemetry.logs.file_inputs.is_empty());
     assert!(parsed.telemetry.logs.file_inputs_file.is_none());
@@ -483,17 +525,23 @@ async fn initial_config_records_uplink_target_stays_idle() {
         updated_by: "ops".to_string(),
         updated_at: "2026-09-21T00:00:00+00:00".to_string(),
     };
-    let text = agent_initial_config_toml(&env.config, "install-token-a", Some(&uplink));
+    let text = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        Some(&uplink),
+        &env.config.public_base_url,
+    );
 
     let parsed: wist_contracts::agent_config::AgentConfig =
         toml::from_str(&text).expect("valid agent config toml");
-    // 上送目标记录下来...
+    // 上送目标记录下来（kind = tcp）...
     assert_eq!(parsed.telemetry.logs.output.tcp.addr, "10.0.1.9");
     assert_eq!(parsed.telemetry.logs.output.tcp.port, 9100);
     assert_eq!(parsed.telemetry.logs.output.tcp.framing, "line");
-    // ...但 kind 仍是 file：设了地址也不等于开始干活（指标也不会被上送）。
-    // 靠 kind 而不是“没有任务”来保证静 —— 指标帧走的是同一个 sink。
-    assert_eq!(parsed.telemetry.logs.output.kind, "file");
+    assert_eq!(parsed.telemetry.logs.output.kind, "tcp");
+    // ...但 enabled = false：设了地址也不等于开始干活。
+    // 待命由 enabled 表达、与 kind 正交：目标记成 tcp，开关仍是关的。
+    assert!(!parsed.telemetry.logs.output.enabled);
     assert!(parsed.telemetry.logs.file_inputs.is_empty());
     assert!(parsed.telemetry.logs.file_inputs_file.is_none());
 }
@@ -501,8 +549,18 @@ async fn initial_config_records_uplink_target_stays_idle() {
 #[tokio::test]
 async fn initial_config_derives_instance_name_from_token() {
     let env = TestEnv::new().await;
-    let first = agent_initial_config_toml(&env.config, "install-token-a", None);
-    let second = agent_initial_config_toml(&env.config, "install-token-b", None);
+    let first = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        None,
+        &env.config.public_base_url,
+    );
+    let second = agent_initial_config_toml(
+        &env.config,
+        "install-token-b",
+        None,
+        &env.config.public_base_url,
+    );
 
     let extract = |text: &str| {
         text.lines()
@@ -524,7 +582,12 @@ async fn initial_config_preserves_multiline_trust_bundle() {
         "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n".to_string();
     env.config.trust_bundle = trust_bundle.clone();
 
-    let text = agent_initial_config_toml(&env.config, "install-token-a", None);
+    let text = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        None,
+        &env.config.public_base_url,
+    );
     let trust_bundle_line = text
         .lines()
         .find(|line| line.starts_with("trust_bundle = "))
@@ -841,6 +904,8 @@ async fn agent_status_route_requires_bearer_credential() {
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
         },
     )
     .await;
@@ -861,6 +926,8 @@ async fn agent_status_route_requires_bearer_credential() {
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
         },
     )
     .await;
@@ -900,6 +967,8 @@ async fn agent_status_route_persists_reported_metrics() {
             admin_latency_ms: Some(42),
             discovery_policy_version: None,
             work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
         },
     )
     .await;
@@ -939,6 +1008,8 @@ async fn post_agent_status_cpu(
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
         },
     )
     .await
@@ -2428,6 +2499,8 @@ async fn post_agent_status(
             admin_latency_ms: None,
             discovery_policy_version: Some(version),
             work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
         })
         .expect("serialize status"),
         None => serde_json::json!({
@@ -2935,6 +3008,8 @@ async fn agent_status_route_persists_work_state_changes() {
                 reason: "spool over limit".to_string(),
                 at: "now".to_string(),
             }]),
+            local_work: None,
+            uplink_state: None,
         },
     )
     .await;
@@ -2954,6 +3029,178 @@ async fn agent_status_route_persists_work_state_changes() {
     assert_eq!(changes[0].input_id, "app");
     assert_eq!(changes[0].state, AgentWorkState::Paused);
     assert_eq!(changes[0].reason, "spool over limit");
+}
+
+#[tokio::test]
+async fn the_work_view_exposes_the_agents_local_work_report() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let enrollment = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&token),
+    )
+    .await;
+    let returned = decode_enrollment_response(enrollment).await;
+    let credential = returned
+        .result
+        .credential_bundle
+        .expect("credential bundle")
+        .bearer_token
+        .expect("bearer token");
+
+    // 还没上报过：`local` 是 null（不是空对象）—— 与「上报了但没东西」区分开。
+    let before = get_agent_work(&env).await;
+    assert!(before["local"].is_null(), "{before}");
+
+    // 上报本机工作视图：一份常驻工作（盯一个文件）+ 一条手工输入。
+    let local_work = wist_contracts::local_work::AgentLocalWork {
+        recorded_at: "2026-09-26T08:00:00Z".to_string(),
+        gateway_sequence: 7,
+        standing: vec![wist_contracts::local_work::AgentLocalStandingWork {
+            work_id: "work-1".to_string(),
+            family: "SystemLogs".to_string(),
+            status: "active".to_string(),
+            plan_version: 3,
+            acknowledged_version: Some(3),
+            effective_from: "2026-09-25T00:00:00Z".to_string(),
+            tasks: vec![wist_contracts::local_work::AgentLocalTask {
+                input_id: "work-SystemLogs-syslog".to_string(),
+                path: "/var/log/system.log".to_string(),
+                startup_position: "tail".to_string(),
+            }],
+        }],
+        one_shot: Vec::new(),
+        local_inputs: vec![wist_contracts::local_work::AgentLocalTask {
+            input_id: "manual-app".to_string(),
+            path: "/var/log/app.log".to_string(),
+            startup_position: "tail".to_string(),
+        }],
+        metrics_interval_seconds: Some(15),
+    };
+    let status = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &AgentStatusReport {
+            agent_id: "agent-node-a".to_string(),
+            instance_id: "node-a".to_string(),
+            version: "v0.2.0".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: Some(local_work),
+            uplink_state: None,
+        },
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+
+    // 工作视图（管理面）把 agent 上报的本机事实一并带出来。
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["local"]["gateway_sequence"], 7);
+    assert_eq!(
+        view["local"]["standing"][0]["tasks"][0]["path"],
+        "/var/log/system.log"
+    );
+    assert_eq!(view["local"]["local_inputs"][0]["path"], "/var/log/app.log");
+    assert_eq!(view["local"]["metrics_interval_seconds"], 15);
+}
+
+/// 上报实际生效的上送状态后，运行状态响应能逐个字段读到它。
+///
+/// 运维问「这台为什么不上送」时查的就是运行状态响应：待命 / 本机 file 出口 / 目标是谁 /
+/// 控制面下发还是本机 / 出口是否在失败，都得能在这一个响应里看到。
+#[tokio::test]
+async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let enrollment = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&token),
+    )
+    .await;
+    let returned = decode_enrollment_response(enrollment).await;
+    let credential = returned
+        .result
+        .credential_bundle
+        .expect("credential bundle")
+        .bearer_token
+        .expect("bearer token");
+
+    // 还没上报过：`uplink_state` 是 null（不是全 false 的对象）。
+    let before = get_agent_runtime_status(&env).await;
+    assert!(before["uplink_state"].is_null(), "{before}");
+
+    // 上报实际生效的上送状态：控制面下发的 tcp 目标，且出口正在写失败。
+    let status = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &AgentStatusReport {
+            agent_id: "agent-node-a".to_string(),
+            instance_id: "node-a".to_string(),
+            version: "v0.2.0".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: Some(wist_contracts::agent_uplink::AgentUplinkState {
+                enabled: true,
+                kind: "tcp".to_string(),
+                target: Some("10.0.1.9:9000".to_string()),
+                source: "grant".to_string(),
+                output_write_failing: true,
+            }),
+        },
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+
+    let view = get_agent_runtime_status(&env).await;
+    assert_eq!(view["uplink_state"]["enabled"], true);
+    assert_eq!(view["uplink_state"]["kind"], "tcp");
+    assert_eq!(view["uplink_state"]["target"], "10.0.1.9:9000");
+    assert_eq!(view["uplink_state"]["source"], "grant");
+    assert_eq!(view["uplink_state"]["output_write_failing"], true);
+
+    // 关键语义：下一次心跳没带这个字段（旧版本 agentd）时保持上一次的值，不清空。
+    let status = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &AgentStatusReport {
+            agent_id: "agent-node-a".to_string(),
+            instance_id: "node-a".to_string(),
+            version: "v0.2.0".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+        },
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+
+    let view = get_agent_runtime_status(&env).await;
+    assert_eq!(view["uplink_state"]["kind"], "tcp");
+    assert_eq!(view["uplink_state"]["target"], "10.0.1.9:9000");
+    assert_eq!(view["uplink_state"]["source"], "grant");
+    assert_eq!(view["uplink_state"]["output_write_failing"], true);
 }
 
 #[tokio::test]
@@ -3003,6 +3250,8 @@ async fn agent_status_route_rejects_expired_bearer_credential() {
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
         },
     )
     .await;
@@ -3066,6 +3315,8 @@ async fn credential_renewal_replaces_previous_credential() {
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
         },
     )
     .await;
@@ -3086,6 +3337,8 @@ async fn credential_renewal_replaces_previous_credential() {
             admin_latency_ms: None,
             discovery_policy_version: None,
             work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
         },
     )
     .await;
@@ -3766,6 +4019,170 @@ async fn admin_agent_list_returns_enrolled_agents() {
     assert_eq!(body["agents"][0]["credential_status"], "active");
 }
 
+/// 列表的**形状**是前端机队索引页的契约。
+///
+/// 为什么单列一条：升级页 / 采集工作页靠 `list_agents` 拿机队（不是“有主机指标的 Agent”
+/// —— 那个口径会把待命 / 新装的机器漏掉）。前端只读 `agents[].{agent_id,instance_id,
+/// hostname,version,status,health}`，所以这些键必须**存在且是字符串**，否则一次后端改名
+/// 就会惄悄把页面变成空机队（比报错更难查）。
+///
+/// 同时钉住「注册表口径」：这台 Agent 只注册过、**没上报过任何状态或指标**，仍必须在列。
+#[tokio::test]
+async fn admin_agent_list_shape_is_the_registry_contract() {
+    let env = env_with_enrolled_agent().await;
+
+    let listed = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(listed).await;
+
+    // 外层分页字段。
+    assert!(body["total"].is_number(), "total must be a number: {body}");
+    assert!(body["limit"].is_number(), "limit must be a number: {body}");
+    assert!(
+        body["offset"].is_number(),
+        "offset must be a number: {body}"
+    );
+
+    // 注册表口径：刚注册、什么都没上报过的那台也要在。
+    let agents = body["agents"].as_array().expect("agents array");
+    assert_eq!(agents.len(), 1, "enrolled agent must be listed: {body}");
+    assert_eq!(agents[0]["agent_id"], "agent-node-a");
+
+    // 前端解析的字段：缺一个或类型不对，页面就读不出机队。
+    for key in [
+        "agent_id",
+        "instance_id",
+        "hostname",
+        "version",
+        "status",
+        "health",
+    ] {
+        assert!(
+            agents[0].get(key).is_some_and(serde_json::Value::is_string),
+            "{key} must be a string in {}",
+            agents[0]
+        );
+    }
+}
+
+/// 页大小越界必须**夹紧**，而不是回一个空页。
+///
+/// 前端取 `limit=500`（正好是 `MAX_AGENT_PAGE_LIMIT`）；若网关回一个空列表，页面会
+/// 把它读成“机队没了”—— 比回错页数难查得多。
+#[tokio::test]
+async fn admin_agent_list_clamps_the_page_size() {
+    let env = env_with_enrolled_agent().await;
+
+    for (query, expected) in [
+        ("/api/v1/admin/agents?limit=500", 500),  // 前端正在用的值
+        ("/api/v1/admin/agents?limit=9999", 500), // 越过上限 → 夹到上限
+        ("/api/v1/admin/agents?limit=0", 1),      // 非正 → 至少 1
+    ] {
+        let response = get_to_router(
+            &env.config,
+            &env.store_handle,
+            query,
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{query}");
+        let body: serde_json::Value = decode_json_response(response).await;
+        assert_eq!(body["limit"], expected, "{query}");
+        // 夹紧后仍能列出那台机器（不是空页）。
+        assert_eq!(body["agents"].as_array().map(Vec::len), Some(1), "{query}");
+    }
+}
+
+/// **离线的机器**在列表里必须被标成 `offline`，而不是一律 `online`。
+///
+/// 为什么：升级计划的目标列表要据此把离线机器排除掉 —— 一台几小时没上报的机器还报 "online"，
+/// 页面就会把升级派给它，然后那件工作一直挂到过期（或永远等不到）。判据与总览同一处
+/// （`agent_is_online`：`last_seen_at` 是否落在 300s 窗口内）。
+#[tokio::test]
+async fn admin_agent_list_marks_stale_agents_offline() {
+    let env = env_with_enrolled_agent().await;
+
+    // 直接写一次「很久以前」的状态上报：HTTP 路径总是把 `last_seen_at` 取当下，
+    // 造不出陈旧，所以这里走存储层把水位推老。
+    let stale = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    let recorded = env
+        .store_handle
+        .record_agent_status(&AgentStatusUpdate {
+            agent_id: "agent-node-a",
+            instance_id: "node-a",
+            boot_id: "",
+            version: "v0.2.0",
+            last_seen_at: &stale,
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+        })
+        .await
+        .expect("record stale status");
+    assert!(recorded, "the enrolled agent must exist");
+
+    let body = admin_agent_list(&env).await;
+    assert_eq!(body["agents"][0]["status"], "offline", "{body}");
+
+    // 再来一次「刚刚」的上报：同一台机器必须回到 online —— 判据是水位，不是一次性快照。
+    let fresh = chrono::Utc::now().to_rfc3339();
+    env.store_handle
+        .record_agent_status(&AgentStatusUpdate {
+            agent_id: "agent-node-a",
+            instance_id: "node-a",
+            boot_id: "",
+            version: "v0.2.0",
+            last_seen_at: &fresh,
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+        })
+        .await
+        .expect("record fresh status");
+
+    let body = admin_agent_list(&env).await;
+    assert_eq!(body["agents"][0]["status"], "online", "{body}");
+}
+
+/// 在线窗口的**边界**：`last_seen_at` 落在 `0..=300s` 内算在线。
+///
+/// 注意 `DateTime::seconds_until` 把负差**夹到 0**（`max(0)`）：所以「上报时间在未来」
+/// （机器时钟偏快 / 回拨）按 0 秒处理 = **在线**。这是刻意的 —— 一台刚上报、只是时钟
+/// 偏快的机器不该被当成离线排掉。
+#[test]
+fn agent_online_window_is_a_closed_three_hundred_second_boundary() {
+    let base = chrono::Utc::now();
+    let now = DateTime::from_rfc3339(&base.to_rfc3339()).expect("parse now");
+    // 同一时间源推差，避免 `Utc::now()` 与 `DateTime::now()` 的秒级偏差把边界测试弄成偶发。
+    let at = |secs_ago: i64| (base - chrono::Duration::seconds(secs_ago)).to_rfc3339();
+
+    assert!(agent_is_online(&at(0), &now), "刚上报：在线");
+    assert!(agent_is_online(&at(300), &now), "恰好在窗口上沿：仍算在线");
+    assert!(!agent_is_online(&at(301), &now), "越过窗口：离线");
+    assert!(
+        agent_is_online(&at(-30), &now),
+        "未来时间戳被夹到 0 秒 ⇒ 在线（时钟偏快的机器不该被当成离线）"
+    );
+    assert!(!agent_is_online("not-a-timestamp", &now), "坏时间戳：离线");
+}
+
 #[tokio::test]
 async fn admin_agent_list_filters_by_tenant() {
     let env = env_with_enrolled_agent().await;
@@ -3963,6 +4380,174 @@ async fn uplink_set_validates_and_round_trips() {
     assert_eq!(body["host"], "10.0.1.9");
     assert_eq!(body["port"], 9100);
     assert_eq!(body["updated_at"], stored["updated_at"]);
+}
+
+#[tokio::test]
+async fn advertise_url_view_reports_config_fallback() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/advertise-url";
+
+    let unauthorized = get_to_router(&env.config, &env.store_handle, uri, None).await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    // 未设置过：url 为空，但 fallback 要给出网关当前**实际**用的基址 ——
+    // 否则页面只能显示一个空值，答不出「不设置的话 agent 会连到哪里」。
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(view.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["url"], "");
+    assert_eq!(body["fallback_url"], env.config.public_base_url);
+    assert_eq!(body["updated_by"], "");
+    assert_eq!(body["updated_at"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn advertise_url_set_validates_and_round_trips() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/advertise-url";
+
+    // 只收 https 基址：它会被拼进安装命令与 install.sh 的 URL，还会写成 Agent 的控制面
+    // endpoint。http、裸主机、只有 scheme、带 shell 元字符的写法一律 400。
+    for bad in [
+        serde_json::json!({ "url": "" }),
+        serde_json::json!({ "url": "http://gw.example.com" }),
+        serde_json::json!({ "url": "gw.example.com" }),
+        serde_json::json!({ "url": "https://" }),
+        serde_json::json!({ "url": "https://gw.example.com; touch /tmp/pwned" }),
+        serde_json::json!({ "url": "https://gw.example.com/$(id)" }),
+        serde_json::json!({ "url": "https://gw.example.com/a b" }),
+    ] {
+        let response = post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            uri,
+            Some(TEST_ADMIN_API_TOKEN),
+            &bad,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "input {bad}");
+    }
+    // 被拒的输入不落库。
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["updated_at"], serde_json::Value::Null);
+
+    // 尾斜杠允许，保存时裁掉 —— 拼路径时不会再出现双斜杠。
+    let ok = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "url": "https://gw.example.com/", "requested_by": "ops" }),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let stored: serde_json::Value = decode_json_response(ok).await;
+    assert_eq!(stored["url"], "https://gw.example.com");
+    assert_eq!(stored["updated_by"], "ops");
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["url"], "https://gw.example.com");
+    assert_eq!(body["updated_at"], stored["updated_at"]);
+}
+
+#[tokio::test]
+async fn advertise_url_drives_install_code_and_initial_config() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/advertise-url";
+
+    // 未设置时，安装命令 / 分发地址 / Agent 控制面 endpoint 全部来自配置里的
+    // server.public_base_url —— 既有行为不变。
+    let before = issue_agent_install_code(&env.config, &env.store_handle)
+        .await
+        .unwrap();
+    assert_eq!(
+        before.bootstrap_bundle.control_endpoint,
+        env.config.public_base_url
+    );
+    assert!(
+        before
+            .bootstrap_bundle
+            .agent_package_url
+            .starts_with(&env.config.public_base_url)
+    );
+
+    let ok = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "url": "https://gw.example.com" }),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    // 设置之后，同一批产物全部改用设置值 —— 这就是这个设置项的全部意义：
+    // agent 拿到的必须是它对目标主机可见的地址。
+    let after = issue_agent_install_code(&env.config, &env.store_handle)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.bootstrap_bundle.control_endpoint,
+        "https://gw.example.com"
+    );
+    assert!(
+        after
+            .bootstrap_bundle
+            .install_script_url
+            .starts_with("https://gw.example.com/api/v1/agent/install/")
+    );
+    assert!(
+        after
+            .bootstrap_bundle
+            .agent_package_url
+            .starts_with("https://gw.example.com/api/v1/agent/packages/current")
+    );
+    assert!(
+        after
+            .x86_linux_install_code
+            .contains("https://gw.example.com/api/v1/agent/install/x86/install.sh")
+    );
+    assert!(
+        after
+            .macos_install_code
+            .contains("https://gw.example.com/api/v1/agent/install/")
+    );
+    assert!(
+        !after
+            .x86_linux_install_code
+            .contains(&env.config.public_base_url)
+    );
+
+    // 初始配置里的控制面 endpoint 与 tls_mode 同源派生自它。
+    let text = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        None,
+        "https://gw.example.com",
+    );
+    assert!(text.contains("endpoint = \"https://gw.example.com\""));
+    assert!(text.contains("tls_mode = \"https\""));
+    assert!(!text.contains(&env.config.public_base_url));
 }
 
 #[tokio::test]
@@ -4784,6 +5369,18 @@ async fn get_agent_work(env: &TestEnv) -> serde_json::Value {
     decode_json_response(response).await
 }
 
+async fn get_agent_runtime_status(env: &TestEnv) -> serde_json::Value {
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/runtime-status",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
 async fn poll_work(env: &TestEnv, credential: Option<&str>) -> Response {
     post_json_to_router(
         &env.config,
@@ -4801,6 +5398,95 @@ async fn poll_work(env: &TestEnv, credential: Option<&str>) -> Response {
         }),
     )
     .await
+}
+
+async fn poll_uplink(env: &TestEnv, credential: Option<&str>) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/uplink:poll",
+        credential,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": POLL_AGENT_UPLINK_KIND,
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "requested_at": "2026-09-26T00:00:00Z",
+        }),
+    )
+    .await
+}
+
+/// 带自定义 envelope 的 uplink poll（用于验 `api_version` / `kind` 被拒）。
+async fn poll_uplink_with(
+    env: &TestEnv,
+    credential: Option<&str>,
+    api_version: &str,
+    kind: &str,
+) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/uplink:poll",
+        credential,
+        &serde_json::json!({
+            "api_version": api_version,
+            "kind": kind,
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "requested_at": "2026-09-26T00:00:00Z",
+        }),
+    )
+    .await
+}
+
+/// envelope 字段与 `work:poll` 同一口径：`api_version` / `kind` 任一不对就是 400。
+#[tokio::test]
+async fn the_uplink_poll_rejects_a_wrong_envelope() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    for (api_version, kind) in [
+        ("v2", POLL_AGENT_UPLINK_KIND),
+        ("v1", "poll_something_else"),
+    ] {
+        let response = poll_uplink_with(&env, Some(&credential), api_version, kind).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "api_version={api_version} kind={kind}"
+        );
+    }
+}
+
+/// 「授权前不上送」的回归护栏：网关签发的初始配置**永远**是待命 ——
+/// 无论管理面有没有设上送地址。启用只能来自运行期的 `uplink:poll`（有生效工作 + 有地址）。
+/// 有人把模板改成 `enabled = true`，就会让新装 Agent 在授权前外发；这条测试要拦住它。
+#[tokio::test]
+async fn initial_config_never_enables_the_uplink() {
+    let env = TestEnv::new().await;
+    let uplink = StoredAgentUplinkAddress {
+        setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
+        host: "10.0.1.9".to_string(),
+        port: 9100,
+        updated_by: "ops".to_string(),
+        updated_at: "2026-09-21T00:00:00+00:00".to_string(),
+    };
+    for with_target in [false, true] {
+        let text = agent_initial_config_toml(
+            &env.config,
+            "install-token-a",
+            with_target.then_some(&uplink),
+            &env.config.public_base_url,
+        );
+        // 只信解析结果，不做文本匹配：模板里 `[control_plane] enabled = true` 也会命中
+        // 子串/行匹配（`enabled` 这个键名不止一处），而解析后看的是**输出那一段**的真值。
+        let parsed: wist_contracts::agent_config::AgentConfig =
+            toml::from_str(&text).expect("valid agent config toml");
+        assert!(
+            !parsed.telemetry.logs.output.enabled,
+            "网关签发的初始配置必须待命（with_target={with_target}）:\n{text}"
+        );
+    }
 }
 
 async fn ack_work(
@@ -5330,6 +6016,180 @@ async fn the_work_grant_needs_an_agent_credential() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 数据面上送启用（Control.Agent.Work）：现算 → 无工作 / 无地址即待命
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 直接经 store 设上送地址（比走管理面路由少一层，测试只关心授权计算结果）。
+async fn set_agent_uplink_address(env: &TestEnv, host: &str, port: u16) {
+    env.store
+        .upsert_agent_uplink(&StoredAgentUplinkAddress {
+            setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
+            host: host.to_string(),
+            port,
+            updated_by: "ops".to_string(),
+            updated_at: "2026-09-26T00:00:00+00:00".to_string(),
+        })
+        .await
+        .expect("store uplink address");
+}
+
+#[tokio::test]
+async fn the_uplink_grant_needs_an_agent_credential() {
+    let env = TestEnv::new().await;
+    assert_eq!(
+        poll_uplink(&env, None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        poll_uplink(&env, Some("forged")).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn the_uplink_poll_rejects_a_wrong_kind() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/uplink:poll",
+        Some(&credential),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "poll_something_else",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "requested_at": "2026-09-26T00:00:00Z",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(decode_text_response(response).await, "invalid uplink poll");
+}
+
+/// 没有生效工作就必须待命 —— 即使管理面已设了上送地址：
+/// 地址只回答「能连到哪」，不回答「该不该连」。
+#[tokio::test]
+async fn uplink_poll_is_standby_without_any_work() {
+    let env = TestEnv::new().await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9000).await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!grant.enabled);
+    assert_eq!(grant.target(), None);
+}
+
+/// 有工作但**未设**上送地址 → 没有目标可指 → 只能待命（不猜目标）。
+#[tokio::test]
+async fn uplink_poll_with_work_but_no_target_stays_standby() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!grant.enabled);
+    assert_eq!(grant.target(), None);
+}
+
+/// 授权层「暂停」≠ 撤回：暂停的工作仍在下发的快照里，所以上送授权**保持启用**。
+///
+/// 这是刻意的语义（暂停 = 暂不做这项采集，日志/指标停），不是 bug。钉住它，
+/// 免得有人顺手把 `effective_standing` 改成只认 `active` —— 那会把「暂停」变成「断连」。
+#[tokio::test]
+async fn a_paused_standing_work_still_authorizes_uplink() {
+    let env = TestEnv::new().await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9000).await;
+    let credential = a_classified_macos_agent(&env).await;
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            &env,
+            serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+        )
+        .await,
+    )
+    .await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    let enabled: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(enabled.enabled);
+
+    // 暂停之后仍启用。
+    let paused = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/pause"),
+    )
+    .await;
+    assert_eq!(paused.status(), StatusCode::OK);
+    let still_enabled: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(
+        still_enabled.enabled,
+        "暂停不是撤回：授权层暂停不该把上送也关掉"
+    );
+
+    // 撤回之后 → 回到待命。
+    let revoked = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/revoke"),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let standby: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!standby.enabled, "撤回后必须回到待命");
+}
+
+/// 派活即启用、撤回即待命：不需要管理面多一个动作，同一份拉取自动反映。
+#[tokio::test]
+async fn uplink_poll_enables_on_effective_work_and_target_then_returns_to_standby() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9100).await;
+
+    // 还没派活：待命。
+    let standby: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!standby.enabled);
+    assert_eq!(standby.target(), None);
+
+    // 派常驻工作：同一份拉取立刻变 enabled，且目标与设置一致。
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let enabled: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(enabled.enabled);
+    assert_eq!(enabled.target(), Some(("10.0.1.9", 9100)));
+
+    // 撤回：自动变回待命。
+    let view = get_agent_work(&env).await;
+    let work_id = view["standing"][0]["work_id"].as_str().expect("work id");
+    let revoked = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/revoke"),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let standby_again: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!standby_again.enabled);
+    assert_eq!(standby_again.target(), None);
+}
+
 #[tokio::test]
 async fn standing_work_pauses_resumes_and_leaves_the_grant_only_when_revoked() {
     let env = TestEnv::new().await;
@@ -5762,6 +6622,92 @@ async fn a_failed_work_result_fills_the_entry_with_the_detail() {
     let detail = view_plan(&env, &plan_id).await;
     assert_eq!(detail["entries"][0]["status"], "failed");
     assert_eq!(detail["entries"][0]["detail"], "摘要不符");
+}
+
+#[tokio::test]
+async fn a_settled_last_phase_finishes_the_plan_without_a_manual_advance() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    // 单阶段 + manual：末阶段不需要人工闸门 —— 全部了结就应收敛为 completed，
+    // 而不是让计划永远停在 rolling 等人去点那个什么都不启动的「推进」。
+    let plan = create_rollout_plan(
+        &env,
+        serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }]),
+    )
+    .await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["status"], "rolling");
+    let work_id = detail["entries"][0]["work_id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["status"], "completed", "{detail}");
+    assert_eq!(
+        detail["plan"]["phases"][0]["status"], "completed",
+        "{detail}"
+    );
+
+    // 已收敛之后再点推进会被拒（不是 rolling）—— 证明它是自己收尾的，不是靠人点。
+    let advance = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/advance",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "plan_id": plan_id }),
+    )
+    .await;
+    assert_ne!(advance.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_settled_last_phase_is_reconciled_when_the_plan_is_read() {
+    // 模拟「结果回填时网关没接上」留下的 rolling：条目已终态，但计划没收敛。
+    let env = TestEnv::new().await;
+    let _credential = a_classified_macos_agent(&env).await;
+    let plan = create_rollout_plan(
+        &env,
+        serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }]),
+    )
+    .await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // 直接把条目改成终态（绕过结果回填，模拟那条没触发收敛的路径）。
+    let mut entries = env
+        .store
+        .list_rollout_plan_entries(&plan_id)
+        .await
+        .expect("entries");
+    assert_eq!(entries.len(), 1);
+    entries[0].status = "succeeded".to_string();
+    entries[0].detail = String::new();
+    env.store
+        .upsert_rollout_plan_entry(&entries[0])
+        .await
+        .expect("upsert entry");
+
+    let stored = env
+        .store
+        .get_rollout_plan(&plan_id)
+        .await
+        .expect("load plan")
+        .expect("plan");
+    assert_eq!(stored.status, "rolling", "这一步计划确实还挂着");
+
+    // 读详情顺手对账 → 收敛为 completed（幂等）。
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["status"], "completed", "{detail}");
+    assert_eq!(
+        detail["plan"]["phases"][0]["status"], "completed",
+        "{detail}"
+    );
 }
 
 fn entry_work_id(detail: &serde_json::Value, target: &str) -> String {

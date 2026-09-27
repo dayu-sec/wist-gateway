@@ -60,7 +60,8 @@ pub async fn get_agent_install_script(
     let Ok(arch) = supported_agent_arch(&arch) else {
         return unknown_arch_response();
     };
-    match resolve_agent_package(&state.config, &state.store).await {
+    let base = effective_advertise_base(&state.config, &state.store).await;
+    match resolve_agent_package(&state.config, &state.store, &base).await {
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to resolve agent package: {err}"),
@@ -71,7 +72,7 @@ pub async fn get_agent_install_script(
                 (header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8"),
                 (header::CACHE_CONTROL, NO_STORE),
             ],
-            install_script(&state.config, arch, &package),
+            install_script(&state.config, arch, &package, &base),
         )
             .into_response(),
     }
@@ -84,7 +85,8 @@ pub async fn get_agent_install_script_signature(
     let Ok(arch) = supported_agent_arch(&arch) else {
         return unknown_arch_response();
     };
-    let package = match resolve_agent_package(&state.config, &state.store).await {
+    let base = effective_advertise_base(&state.config, &state.store).await;
+    let package = match resolve_agent_package(&state.config, &state.store, &base).await {
         Ok(package) => package,
         Err(err) => {
             return (
@@ -94,7 +96,7 @@ pub async fn get_agent_install_script_signature(
                 .into_response();
         }
     };
-    match install_script_signature(&state.config, arch, &package) {
+    match install_script_signature(&state.config, arch, &package, &base) {
         Ok(signature) => (
             [
                 (header::CONTENT_TYPE, "application/octet-stream"),
@@ -148,6 +150,9 @@ pub async fn get_agent_initial_config_with_token(
             rate_limit::clear_auth_failures(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
             // 管理面未设置数据面上送地址时不下发上送段；读设置失败不阻断安装，
             // 按「未设置」处理并留下告警。
+            // 控制面 endpoint 取「网关对外地址」（未设置回落配置值）：agent 拿到的
+            // 必须是它对目标主机可见的地址，否则装完连不上。
+            let base = effective_advertise_base(&state.config, &state.store).await;
             let uplink = match state.store.get_agent_uplink().await {
                 Ok(value) => value,
                 Err(err) => {
@@ -160,7 +165,7 @@ pub async fn get_agent_initial_config_with_token(
                     (header::CONTENT_TYPE, "application/toml; charset=utf-8"),
                     (header::CACHE_CONTROL, NO_STORE),
                 ],
-                agent_initial_config_toml(&state.config, token, uplink.as_ref()),
+                agent_initial_config_toml(&state.config, token, uplink.as_ref(), &base),
             )
                 .into_response()
         }
@@ -251,8 +256,26 @@ pub async fn issue_agent_install_code(
         .await
         .map_err(|err| err.to_string())?;
     // 分发地址恒为网关自身端点；管理面设置的是来源地址，制品已缓存到网关本地。
-    let package = resolve_agent_package(config, store).await?;
-    agent_install_code(config, &token, expires_at, &package)
+    // 基址取「网关对外地址」：安装命令、脚本与安装包的分发地址、以及 Agent 的控制面
+    // endpoint 全部由它派生，必须同源。
+    let base = effective_advertise_base(config, store).await;
+    let package = resolve_agent_package(config, store, &base).await?;
+    agent_install_code(config, &token, expires_at, &package, &base)
+}
+
+/// 生效的对外基址：管理面设置过就用它（去掉尾斜杠），否则回落 `server.public_base_url`。
+///
+/// 读设置失败不阻断安装链路，只回落并留下告警 —— 与 [`effective_package_path`] 同一个
+/// 取舍：安装端点不该因为管理面的一次读失败而整体不可用。
+pub async fn effective_advertise_base(config: &AdminConfig, store: &Arc<dyn Store>) -> String {
+    match store.get_agent_advertise_url().await {
+        Ok(Some(setting)) => setting.url.trim_end_matches('/').to_string(),
+        Ok(None) => config.public_base_url.clone(),
+        Err(err) => {
+            eprintln!("warning: failed to read gateway advertise url: {err}");
+            config.public_base_url.clone()
+        }
+    }
 }
 
 pub fn agent_install_code(
@@ -260,10 +283,11 @@ pub fn agent_install_code(
     token: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
     package: &AgentPackageSource,
+    base: &str,
 ) -> Result<AgentInstallCode, String> {
-    let x86_install_script_url = config.install_script_url("x86");
-    let arm_install_script_url = config.install_script_url("arm");
-    let macos_install_code = macos_install_command(config)?;
+    let x86_install_script_url = config.install_script_url_at(base, "x86");
+    let arm_install_script_url = config.install_script_url_at(base, "arm");
+    let macos_install_code = macos_install_command(config, base)?;
     Ok(AgentInstallCode {
         x86_linux_install_code: install_command(config, &x86_install_script_url),
         bootstrap_enrollment_token: token.to_string(),
@@ -274,7 +298,7 @@ pub fn agent_install_code(
             install_script_url: x86_install_script_url,
             agent_package_url: package.url.clone(),
             agent_package_sha256: package.sha256.clone(),
-            control_endpoint: config.public_base_url.clone(),
+            control_endpoint: base.to_string(),
             trust_bundle: config.trust_bundle.clone(),
             tenant_id: config.tenant_id.clone(),
             environment_id: config.environment_id.clone(),
@@ -288,13 +312,18 @@ pub fn agent_install_code(
 ///
 /// 调用方必须与 [`install_script_signature`] 传入同一个 [`AgentPackageSource`]，
 /// 否则客户端下载到的脚本与其签名会不一致。
-pub fn install_script(config: &AdminConfig, arch: &str, package: &AgentPackageSource) -> String {
+pub fn install_script(
+    config: &AdminConfig,
+    arch: &str,
+    package: &AgentPackageSource,
+    base: &str,
+) -> String {
     INSTALL_SCRIPT_TEMPLATE
         .replace("{{ARCH}}", arch)
         .replace("{{AGENT_PACKAGE_URL}}", &package.url)
         .replace(
             "{{AGENT_INITIAL_CONFIG_URL}}",
-            &config.agent_initial_config_url(),
+            &config.agent_initial_config_url_at(base),
         )
         .replace("{{AGENT_PACKAGE_SHA256}}", &package.sha256)
         .replace("{{TRUST_BUNDLE}}", &config.trust_bundle)
@@ -342,12 +371,9 @@ fn server_tls_spki_pin(config: &AdminConfig) -> Result<String, String> {
 /// pinning the gateway's serving certificate, so the target host needs no
 /// external OpenSSL 3 / Ed25519 CLI support. The host architecture is picked
 /// at runtime (arm64 -> arm, everything else -> x86).
-fn macos_install_command(config: &AdminConfig) -> Result<String, String> {
+fn macos_install_command(config: &AdminConfig, base: &str) -> Result<String, String> {
     let pin = server_tls_spki_pin(config)?;
-    let install_base = format!(
-        "{}/api/v1/agent/install",
-        config.public_base_url.trim_end_matches('/')
-    );
+    let install_base = format!("{}/api/v1/agent/install", base.trim_end_matches('/'));
     Ok(format!(
         r#"set -eu; D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT INT TERM
 if [ "$(uname -s)" != "Darwin" ]; then echo "this install command is for macOS only" >&2; exit 2; fi
@@ -367,8 +393,9 @@ pub(crate) fn install_script_signature(
     config: &AdminConfig,
     arch: &str,
     package: &AgentPackageSource,
+    base: &str,
 ) -> Result<Vec<u8>, String> {
-    let script = install_script(config, arch, package);
+    let script = install_script(config, arch, package, base);
     sign_install_script(
         &config.install_script_signing_private_key_file,
         script.as_bytes(),
@@ -379,26 +406,37 @@ pub fn agent_initial_config_toml(
     config: &AdminConfig,
     enrollment_token: &str,
     uplink: Option<&StoredAgentUplinkAddress>,
+    base: &str,
 ) -> String {
     // Give each install a unique instance_name derived from its bootstrap token so
     // cloned machines (shared machine-id) still derive distinct agent identities.
     let instance_name = format!("host-{}", short_token_id(enrollment_token));
-    // 默认**待命**：Agent 不做任何数据面工作 —— 不采集日志，也不上送（指标同样不上送）。
+    // 默认**待命**：Agent 不采集日志、也不上送（指标同样不上送）。
     //
-    // 靠 `kind = "file"` 实现：没有 inputs 时 file sink 什么都不会写，而 agentd 的指标帧
-    // 走的是同一个 sink（`write_metrics` 对 file 分支直接跳过）。所以“静”是靠 kind 保证的，
-    // 不是靠“没有任务”。上送目标只记录下来，等控制面派活时再改成 tcp。
+    // 待命由 `[telemetry.logs.output] enabled = false` 表达 —— 它与 `kind` **正交**：
+    // `kind` 回答「写到哪」（file / tcp），`enabled` 回答「要不要写」。待命是开关状态，
+    // 不该由「写到哪」来表达：
+    //   * 有上送地址 → 记下真实目标（`kind = "tcp"`），但 `enabled = false` 先关掉；
+    //   * 没有上送地址 → 没有目标可指，用 `kind = "file"` 表示，避免记一个会连错的
+    //     tcp 默认值（旧默认是 127.0.0.1:9000）。
+    //
+    // 控制面派活后会在 `uplink:poll` 上下发 `enabled = true` + 目标，Agent 自动开始上送，
+    // **无需人工改这份配置**、也无需重装。这也是相对旧实现（用 `kind = "file"` 表达待命）
+    // 的修复：旧写法让事实帧走 file 分支返回 Err，默认配置持续打印 `fact summary uplink failed`；
+    // `enabled = false` 时事实帧根本不会被上送，噪声自然消失。
     let telemetry = match uplink {
         Some(setting) => format!(
-            r#"# 待命：Agent 不采集日志、也不上送（指标同样不上送）。
-# 上送目标已由管理面的「数据面上送地址」设置好，此处只记录 ——
-# 真正开始上送要等控制面派活（下发任务清单）时把 kind 改成 "tcp"。
+            r#"# 待命：不采集日志、也不上送（指标同样不上送）。
+# 待命由 enabled = false 表达，与 kind 正交：目标记成 tcp，但开关先关掉。
+# 控制面派活后会在 uplink:poll 上下发 enabled = true + 目标，Agent 自动开始上送 ——
+# 不需要人工改这份配置。
 [telemetry.logs]
 in_memory_buffer_bytes = 1048576
 spool_dir = "state/spool/logs"
 
 [telemetry.logs.output]
-kind = "file"
+enabled = false
+kind = "tcp"
 
 [telemetry.logs.output.tcp]
 addr = "{addr}"
@@ -408,13 +446,16 @@ framing = "line"
             addr = toml_escape(&setting.host),
             port = setting.port,
         ),
-        None => r#"# 待命：Agent 不采集日志、也不上送（指标同样不上送）。
-# 管理面还没设置「数据面上送地址」，所以这里连上送目标都没有。
+        None => r#"# 待命：不采集日志、也不上送（指标同样不上送）。
+# 待命由 enabled = false 表达，与 kind 正交。
+# 管理面还没设置「数据面上送地址」，所以这里连上送目标都没有，用 kind = "file" 表示
+# 「没有目标」（不记一个会连错的 tcp 默认值）。派活后控制面会在 uplink:poll 上下发目标。
 [telemetry.logs]
 in_memory_buffer_bytes = 1048576
 spool_dir = "state/spool/logs"
 
 [telemetry.logs.output]
+enabled = false
 kind = "file"
 "#
         .to_string(),
@@ -449,9 +490,9 @@ container_enabled = false
 "#,
         environment_id = toml_escape(&config.environment_id),
         instance_name = toml_escape(&instance_name),
-        endpoint = toml_escape(&config.public_base_url),
+        endpoint = toml_escape(base),
         enrollment_token = toml_escape(enrollment_token),
-        tls_mode = toml_escape(tls_mode_for_endpoint(&config.public_base_url)),
+        tls_mode = toml_escape(tls_mode_for_endpoint(base)),
         trust_bundle = toml_escape(&config.trust_bundle),
         telemetry = telemetry,
     )

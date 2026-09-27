@@ -12,6 +12,11 @@ enroll with and report to. It exposes an admin/agent API over TLS and is the sin
 through which the control plane hands out install scripts and packages, accepts enrollment,
 collects status and host metrics, issues control commands, and aggregates execution results.
 
+## Docs
+
+- [docs/design/gateway-access-security.md](docs/design/gateway-access-security.md) — control-plane
+  access security: trust model, per-customer CA (KMS/HSM), DNS/naming, and disaster recovery.
+
 ## Features
 
 - **Agent install** — signed install script and package distribution, one-time enrollment tokens.

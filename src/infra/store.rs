@@ -164,6 +164,13 @@ pub struct StoredAgentRegistration {
     pub last_discovery_policy_version: Option<i64>,
     /// 最近一次状态上报携带的工作状态变化（paused/resumed），非告警/失败。
     pub work_state_changes: Option<Vec<AgentWorkStateChange>>,
+    /// 最近一次上报的**本机工作内容视图**（agentd 的 `state/work.json` 子集）。
+    /// `None` = 这台 agent 还没报过（旧版本 agentd 不发这个字段）。
+    pub local_work: Option<wist_contracts::local_work::AgentLocalWork>,
+    /// 最近一次上报的**实际生效**采集输出状态（它与网关的 `agent_uplink` 下发值是一对：
+    /// 一个说「要它怎样」，一个说「它实际成了怎样」）。
+    /// `None` = 这台 agent 还没报过（旧版本 agentd 不发这个字段）。
+    pub uplink_state: Option<wist_contracts::agent_uplink::AgentUplinkState>,
 }
 
 /// 历史实例记录（一个 Agent 可有多个）。
@@ -187,6 +194,9 @@ pub const DEFAULT_INSTALL_PACKAGE_SETTING_ID: &str = "default";
 /// 单例设置行 id：数据面上送地址只有一个生效值。
 pub const DEFAULT_AGENT_UPLINK_SETTING_ID: &str = "default";
 
+/// 单例设置行 id：网关对外地址只有一个生效值。
+pub const DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID: &str = "default";
+
 /// 数据面 TCP 入口的约定默认端口（与 wparse `topology/sources/tcp_1` 一致）。
 pub const DEFAULT_AGENT_UPLINK_PORT: u16 = 9000;
 
@@ -196,6 +206,22 @@ pub struct StoredAgentUplinkAddress {
     pub setting_id: String,
     pub host: String,
     pub port: u16,
+    pub updated_by: String,
+    pub updated_at: String,
+}
+
+/// 网关对外地址设置（管理面设置；未设置时回落到 `server.public_base_url`）。
+///
+/// 它是「控制平台对 agent 宣告的地址」的唯一来源：渲染 Agent 初始配置的
+/// `[control_plane] endpoint`，也是安装命令 / install.sh / 安装包分发 URL 的基址。
+/// 之所以要能从管理面改：`server.public_base_url` 是启动期配置，而对外入口
+/// （域名、端口、反代）常由部署侧决定并会随后调整，拿内部地址当 agent 的默认
+/// 控制面地址会让装出来的 agent 连不上。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoredAgentAdvertiseUrl {
+    pub setting_id: String,
+    /// 对外基址，形如 `https://gateway.example.com`（无尾斜杠）。
+    pub url: String,
     pub updated_by: String,
     pub updated_at: String,
 }
@@ -660,6 +686,13 @@ pub struct AgentStatusUpdate<'a> {
     /// 本机**实际生效**的发现方向策略版本；`None` = 还没拿到策略表（区别于「生效了第 0 版」）。
     pub discovery_policy_version: Option<i64>,
     pub work_state_changes: Option<Vec<AgentWorkStateChange>>,
+    /// 本机**工作内容视图**（agentd 的 `state/work.json` 子集）：我手里有哪些工作、各自在采哪些
+    /// 文件。`None` = 这次没带（旧版本 agentd）—— 落库后保持上一次的值。
+    pub local_work: Option<wist_contracts::local_work::AgentLocalWork>,
+    /// 本机**实际生效**的采集输出状态（控制面要它怎样 ≠ 它实际成了怎样）：`None` = 这次没带
+    /// （旧版本 agentd）—— 落库后**保持上一次的值**，不清空。运维问的是「这台为什么不上送」，
+    /// 一次没带就把最后一次可信的生效状态擦掉，反而会让原因从页面上消失。
+    pub uplink_state: Option<wist_contracts::agent_uplink::AgentUplinkState>,
 }
 
 /// 轮换 Agent 凭据（校验当前凭据后写入新凭据）。
@@ -748,6 +781,15 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 写入/覆盖 Agent 数据面上送地址设置。
     async fn upsert_agent_uplink(&self, setting: &StoredAgentUplinkAddress) -> StoreResult<()>;
+
+    /// 读取网关对外地址设置；未设置过返回 `None`（调用方回落 `server.public_base_url`）。
+    async fn get_agent_advertise_url(&self) -> StoreResult<Option<StoredAgentAdvertiseUrl>>;
+
+    /// 写入/覆盖网关对外地址设置。
+    async fn upsert_agent_advertise_url(
+        &self,
+        setting: &StoredAgentAdvertiseUrl,
+    ) -> StoreResult<()>;
 
     // ── Agent 事实摘要与用途推断 ──
 

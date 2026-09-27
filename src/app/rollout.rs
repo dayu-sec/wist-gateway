@@ -77,11 +77,14 @@ pub fn build_one_shot_work(plan: &StoredRolloutPlan, target_id: &str, now: &str)
     }
 }
 
-/// 阶段是否已**全部了结**（每个 target 都到了 `succeeded` / `failed` 终态）。
-fn phase_settled(entries: &[StoredRolloutPlanEntry]) -> bool {
-    entries
-        .iter()
-        .all(|entry| matches!(entry.status.as_str(), "succeeded" | "failed"))
+/// 阶段是否已**全部了结**：每个 target 都到了 `succeeded` / `failed` 终态。
+///
+/// 空阶段不算了结 —— `all` 在空集上恒真，那会把「一个目标都没有的阶段」当成可推进。
+pub fn phase_settled(entries: &[StoredRolloutPlanEntry]) -> bool {
+    !entries.is_empty()
+        && entries
+            .iter()
+            .all(|entry| matches!(entry.status.as_str(), "succeeded" | "failed"))
 }
 
 /// 阶段推进闸门是否放行（自动推进判定）。

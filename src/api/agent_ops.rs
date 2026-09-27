@@ -12,6 +12,7 @@ use crate::infra::{
     victoria_metrics::{import_lines, metric_line},
 };
 use wist_contracts::API_VERSION_V1;
+use wist_contracts::agent_uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND, PollAgentUplink};
 use wist_contracts::enrollment::{
     CredentialBundle, CredentialRenewal, CredentialRenewed, RENEW_AGENT_CREDENTIAL_KIND,
 };
@@ -59,6 +60,9 @@ pub async fn submit_agent_status(
                     admin_latency_ms,
                     discovery_policy_version,
                     work_state_changes: input.work_state_changes.clone(),
+                    local_work: input.local_work.clone(),
+                    // 与 local_work 同口径：`None`（旧版本 agentd 没带）落库时保持上一次的值。
+                    uplink_state: input.uplink_state.clone(),
                 })
                 .await;
             match status_result {
@@ -268,6 +272,44 @@ pub async fn poll_work(
     }
 }
 
+/// agentd → 网关：拉取「数据面上送是否启用、目标在哪」的当前期望（`PollAgentUplink`）。
+///
+/// 与 [`poll_work`] 同形：同一套 agent 凭据、同一份实例标识、同一类「拉期望状态」的动作，
+/// 只是期望状态的内容不同。计算规则见 [`build_agent_uplink_grant`]。
+///
+/// ## 为什么另开端点，不塞进 [`WorkGrant`] 的字段
+///
+/// `WorkGrant` 带 `#[serde(deny_unknown_fields)]`。往里加字段会让「新网关 + 旧 agentd」
+/// 直接解析失败：旧 agentd 连工作授权都收不到，会停在最后一次应用的工作上 —— 这是
+/// 舰队级的静默停摆。独立端点对两个方向都安全：旧 agentd 从不调它；新 agentd 遇到旧网关
+/// 得到 404，按「无下发」回落本机 `[telemetry.logs.output]`。契约见 `wist_contracts::agent_uplink`。
+///
+/// 出错口径与 [`poll_work`] 一致，回 500 而不是「按待命处理」：待命是「关掉上送」的**实质
+/// 决定**，会把一台本该上送的 Agent 悄悄停采；而一次失败的 poll 只是让 agentd 重试、
+/// 沿用上一次的期望。宁可让它重试，也不要在读库失败时替它做关机决定。
+pub async fn poll_agent_uplink(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<PollAgentUplink>,
+) -> Response {
+    if input.api_version != API_VERSION_V1 || input.kind != POLL_AGENT_UPLINK_KIND {
+        return (StatusCode::BAD_REQUEST, "invalid uplink poll").into_response();
+    }
+    if let Err(response) =
+        authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await
+    {
+        return response;
+    }
+    match build_agent_uplink_grant(&state, &input.agent_id).await {
+        Ok(grant) => Json(grant).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to build agent uplink grant: {err}"),
+        )
+            .into_response(),
+    }
+}
+
 /// 组装某 Agent 的授权快照（下发与查看共用同一份口径）。
 ///
 /// 只带**当前生效**的：常驻 `active`/`paused`、一次性未了结。被取代/已撤回/已了结的
@@ -286,6 +328,33 @@ pub async fn build_work_grant(
         sequence,
         granted_at: chrono::Utc::now().to_rfc3339(),
     })
+}
+
+/// 现算某 Agent 的数据面上送期望状态：`enabled = 有生效工作 且 已设上送地址`。
+///
+/// 没有新状态、没有推送通道 —— 每次被问到时从两个既有事实推出来：
+///   * 「有生效工作」复用工作授权同一口径（[`effective_standing`] / [`outstanding_one_shot`]，
+///     两者都空即没有工作），所以「派活即启用、撤回即待命」自动发生，无需管理面多一个动作；
+///   * 「上送地址」来自管理面已设的 `StoredAgentUplinkAddress`（`store.get_agent_uplink`）。
+///
+/// 缺任一条都只能待命：有工作但没地址 = 没目标可指（**不猜**目标）；有地址但没工作 =
+/// 地址只表示「能连到哪」，不表示「该不该连」。
+pub async fn build_agent_uplink_grant(
+    state: &ApiState,
+    agent_id: &str,
+) -> Result<AgentUplinkGrant, crate::infra::StoreError> {
+    let has_work = !effective_standing(&state.store.list_standing_work(agent_id).await?).is_empty()
+        || !outstanding_one_shot(&state.store.list_one_shot_work(agent_id).await?).is_empty();
+    let uplink = state.store.get_agent_uplink().await?;
+    let granted_at = chrono::Utc::now().to_rfc3339();
+    match (has_work, uplink) {
+        (true, Some(setting)) => Ok(AgentUplinkGrant::enabled_at(
+            setting.host,
+            setting.port,
+            granted_at,
+        )),
+        _ => Ok(AgentUplinkGrant::standby(granted_at)),
+    }
 }
 
 /// agentd → 网关：确认收到某份工作（`AckWork`）。

@@ -41,7 +41,7 @@ const AGENT_PROJECTION: &str = "SELECT a.agent_id, a.tenant_id, a.environment_id
      COALESCE(i.last_seen_at, '') AS last_seen_at, \
      COALESCE(i.started_at, '') AS started_at, \
      i.memory_bytes, i.cpu_percent, i.cpu_cores, i.admin_latency_ms, i.work_state_changes, \
-     i.discovery_policy_version, \
+     i.discovery_policy_version, i.local_work, i.uplink_state, \
      COALESCE(a.current_credential_id, '') AS credential_id, \
      COALESCE(c.token_hash, '') AS credential_token_hash, \
      COALESCE(c.issued_at, '') AS credential_issued_at, \
@@ -298,6 +298,52 @@ fn serialize_work_state_changes(
     }
 }
 
+/// 本机工作视图落一个 TEXT 列（只留最近一份）。
+fn serialize_local_work(
+    value: Option<wist_contracts::local_work::AgentLocalWork>,
+) -> StoreResult<Option<String>> {
+    match value {
+        Some(value) => serde_json::to_string(&value)
+            .map(Some)
+            .source_err(StoreReason::Json, "serialize local work view"),
+        None => Ok(None),
+    }
+}
+
+/// 实际生效的采集输出状态落一个 TEXT 列（只留最近一份），与 `serialize_local_work` 同形。
+fn serialize_uplink_state(
+    value: Option<wist_contracts::agent_uplink::AgentUplinkState>,
+) -> StoreResult<Option<String>> {
+    match value {
+        Some(value) => serde_json::to_string(&value)
+            .map(Some)
+            .source_err(StoreReason::Json, "serialize agent uplink state"),
+        None => Ok(None),
+    }
+}
+
+/// 与 `deserialize_work_state_changes` 同一条取舍：读到坏 JSON 就当「没报过」（`None`），
+/// 不让一列坏数据把「读取 agent」整条路打挂。
+fn deserialize_local_work(
+    raw: Option<String>,
+) -> Option<wist_contracts::local_work::AgentLocalWork> {
+    match raw.as_deref() {
+        Some(value) if !value.is_empty() => serde_json::from_str(value).ok(),
+        _ => None,
+    }
+}
+
+/// 与 `deserialize_local_work` 同一条取舍：读到坏 JSON 就当「没报过」（`None`），
+/// 不让一列坏数据把「读取 agent」整条路打挂。
+fn deserialize_uplink_state(
+    raw: Option<String>,
+) -> Option<wist_contracts::agent_uplink::AgentUplinkState> {
+    match raw.as_deref() {
+        Some(value) if !value.is_empty() => serde_json::from_str(value).ok(),
+        _ => None,
+    }
+}
+
 fn deserialize_work_state_changes(
     raw: Option<String>,
 ) -> Option<Vec<wist_contracts::gateway::AgentWorkStateChange>> {
@@ -388,6 +434,8 @@ fn software_entry_from_row(row: &SqliteRow) -> StoreResult<StoredSoftwareEntry> 
 fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
     let credential_status: String = column!(row, "credential_status");
     let work_state_changes: Option<String> = column!(row, "work_state_changes");
+    let local_work: Option<String> = column!(row, "local_work");
+    let uplink_state: Option<String> = column!(row, "uplink_state");
     Ok(StoredAgentRegistration {
         agent_id: column!(row, "agent_id"),
         instance_id: column!(row, "instance_id"),
@@ -411,6 +459,8 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
         last_admin_latency_ms: column!(row, "admin_latency_ms"),
         last_discovery_policy_version: column!(row, "discovery_policy_version"),
         work_state_changes: deserialize_work_state_changes(work_state_changes),
+        local_work: deserialize_local_work(local_work),
+        uplink_state: deserialize_uplink_state(uplink_state),
     })
 }
 
@@ -851,6 +901,46 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn get_agent_advertise_url(&self) -> StoreResult<Option<StoredAgentAdvertiseUrl>> {
+        let row = sqlx::query(
+            "SELECT setting_id, url, updated_by, updated_at \
+             FROM agent_advertise_url WHERE setting_id = ?1",
+        )
+        .bind(DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select agent advertise url"))?;
+        match row {
+            Some(row) => Ok(Some(StoredAgentAdvertiseUrl {
+                setting_id: column!(row, "setting_id"),
+                url: column!(row, "url"),
+                updated_by: column!(row, "updated_by"),
+                updated_at: column!(row, "updated_at"),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert_agent_advertise_url(
+        &self,
+        setting: &StoredAgentAdvertiseUrl,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO agent_advertise_url (setting_id, url, updated_by, updated_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (setting_id) DO UPDATE SET url = excluded.url, \
+             updated_by = excluded.updated_by, updated_at = excluded.updated_at",
+        )
+        .bind(DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID)
+        .bind(&setting.url)
+        .bind(&setting.updated_by)
+        .bind(&setting.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert agent advertise url"))?;
+        Ok(())
+    }
+
     async fn count_agents(&self, query: &AgentQuery) -> StoreResult<u64> {
         let mut builder = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM agents a");
         push_agent_filters(&mut builder, query);
@@ -927,12 +1017,14 @@ impl Store for SqliteStore {
         if !instance_id.is_empty() {
             let work_state_changes =
                 serialize_work_state_changes(update.work_state_changes.clone())?;
+            let local_work = serialize_local_work(update.local_work.clone())?;
+            let uplink_state = serialize_uplink_state(update.uplink_state.clone())?;
             // 实例行不存在则新建（Agentd 重启换 boot_id / instance_id 时保留历史）。
             sqlx::query(
                 "INSERT INTO agent_instances (instance_id, agent_id, boot_id, version, \
                  started_at, last_seen_at, memory_bytes, cpu_percent, cpu_cores, admin_latency_ms, \
-                 work_state_changes, discovery_policy_version) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 work_state_changes, discovery_policy_version, local_work, uplink_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
                  ON CONFLICT (instance_id) DO UPDATE SET version = excluded.version, \
                  boot_id = CASE WHEN excluded.boot_id = '' THEN agent_instances.boot_id \
                  ELSE excluded.boot_id END, \
@@ -941,7 +1033,11 @@ impl Store for SqliteStore {
                  cpu_cores = excluded.cpu_cores, \
                  admin_latency_ms = excluded.admin_latency_ms, \
                  work_state_changes = excluded.work_state_changes, \
-                 discovery_policy_version = excluded.discovery_policy_version",
+                 discovery_policy_version = excluded.discovery_policy_version, \
+                 local_work = CASE WHEN excluded.local_work IS NULL \
+                 THEN agent_instances.local_work ELSE excluded.local_work END, \
+                 uplink_state = CASE WHEN excluded.uplink_state IS NULL \
+                 THEN agent_instances.uplink_state ELSE excluded.uplink_state END",
             )
             .bind(&instance_id)
             .bind(update.agent_id)
@@ -954,6 +1050,8 @@ impl Store for SqliteStore {
             .bind(to_sql_int(update.admin_latency_ms))
             .bind(work_state_changes)
             .bind(update.discovery_policy_version)
+            .bind(local_work)
+            .bind(uplink_state)
             .execute(&mut *tx)
             .await
             .map_err(|err| sql_error(err, "upsert agent instance"))?;
@@ -2191,6 +2289,8 @@ mod tests {
                 admin_latency_ms: None,
                 discovery_policy_version: None,
                 work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
             })
             .await
             .unwrap();
@@ -2214,6 +2314,8 @@ mod tests {
                     admin_latency_ms: Some(7),
                     discovery_policy_version: None,
                     work_state_changes: None,
+                    local_work: None,
+                    uplink_state: None,
                 })
                 .await
                 .unwrap();
@@ -2265,6 +2367,234 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_adds_agent_local_work_column() {
+        // 迁移 0013 同样只是 ALTER TABLE ADD COLUMN（SQLite 不支持 ADD COLUMN IF NOT EXISTS），
+        // 直接查 pragma 确认列真存在，而不是只靠“插得进去”。
+        let store = store().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('agent_instances')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            columns.iter().any(|name| name == "local_work"),
+            "{columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_adds_agent_uplink_state_column() {
+        // 迁移 0015 同样只是 ALTER TABLE ADD COLUMN（SQLite 不支持 ADD COLUMN IF NOT EXISTS），
+        // 直接查 pragma 确认列真存在，而不是只靠“插得进去”。
+        let store = store().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('agent_instances')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            columns.iter().any(|name| name == "uplink_state"),
+            "{columns:?}"
+        );
+    }
+
+    fn local_work_view() -> wist_contracts::local_work::AgentLocalWork {
+        wist_contracts::local_work::AgentLocalWork {
+            recorded_at: "2026-01-05T00:00:00+00:00".to_string(),
+            gateway_sequence: 7,
+            standing: vec![wist_contracts::local_work::AgentLocalStandingWork {
+                work_id: "work-1".to_string(),
+                family: "SystemLogs".to_string(),
+                status: "active".to_string(),
+                plan_version: 3,
+                acknowledged_version: Some(3),
+                effective_from: "2026-01-04T00:00:00+00:00".to_string(),
+                tasks: vec![wist_contracts::local_work::AgentLocalTask {
+                    input_id: "work-SystemLogs-syslog".to_string(),
+                    path: "/var/log/system.log".to_string(),
+                    startup_position: "tail".to_string(),
+                }],
+            }],
+            one_shot: Vec::new(),
+            // 本机手工加的输入：不在 work.json 里，但也是「在采的文件」。
+            local_inputs: vec![wist_contracts::local_work::AgentLocalTask {
+                input_id: "manual-app".to_string(),
+                path: "/var/log/app.log".to_string(),
+                startup_position: "tail".to_string(),
+            }],
+            metrics_interval_seconds: Some(15),
+        }
+    }
+
+    #[tokio::test]
+    async fn stores_and_reads_back_the_local_work_view() {
+        let store = store().await;
+        register(&store, "hash-m", "agent-1", "inst-1").await;
+
+        // 旧 agent（没带这个字段）：写入不失败，读出为 None。
+        store
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-1",
+                instance_id: "inst-1",
+                boot_id: "boot-1",
+                version: "0.1.0",
+                last_seen_at: "2026-01-02T00:00:00+00:00",
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
+            })
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert!(agent.local_work.is_none());
+
+        // 上报本机工作视图：读写一致（standing.tasks 与手工输入都在）。
+        store
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-1",
+                instance_id: "inst-1",
+                boot_id: "boot-1",
+                version: "0.2.0",
+                last_seen_at: "2026-01-03T00:00:00+00:00",
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: Some(local_work_view()),
+                uplink_state: None,
+            })
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.local_work, Some(local_work_view()));
+
+        // 关键语义（与 `AgentStatusReport::local_work` 的文档口径一致）：本次没带（None）
+        // 保持上一次的值，不清成 NULL —— 否则一次不带该字段的旧版心跳就会把「在采哪些文件」
+        // 的最后一份可信快照擦掉。
+        store
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-1",
+                instance_id: "inst-1",
+                boot_id: "boot-1",
+                version: "0.2.0",
+                last_seen_at: "2026-01-04T00:00:00+00:00",
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
+            })
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.local_work, Some(local_work_view()));
+    }
+
+    fn uplink_state(
+        kind: &str,
+        target: Option<&str>,
+        source: &str,
+        output_write_failing: bool,
+    ) -> wist_contracts::agent_uplink::AgentUplinkState {
+        wist_contracts::agent_uplink::AgentUplinkState {
+            enabled: true,
+            kind: kind.to_string(),
+            target: target.map(str::to_string),
+            source: source.to_string(),
+            output_write_failing,
+        }
+    }
+
+    #[tokio::test]
+    async fn stores_uplink_state_and_keeps_it_when_the_next_report_omits_it() {
+        let store = store().await;
+        register(&store, "hash-u", "agent-1", "inst-1").await;
+
+        // 旧 agent（没带这个字段）：写入不失败，读出为 None。
+        store
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-1",
+                instance_id: "inst-1",
+                boot_id: "boot-1",
+                version: "0.1.0",
+                last_seen_at: "2026-01-02T00:00:00+00:00",
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
+            })
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert!(agent.uplink_state.is_none());
+
+        // 上报实际生效的上送状态：读写一致（target / source / 失败标志逐项对得上）。
+        store
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-1",
+                instance_id: "inst-1",
+                boot_id: "boot-1",
+                version: "0.2.0",
+                last_seen_at: "2026-01-03T00:00:00+00:00",
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: None,
+                uplink_state: Some(uplink_state("tcp", Some("10.0.1.9:9000"), "grant", true)),
+            })
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(
+            agent.uplink_state,
+            Some(uplink_state("tcp", Some("10.0.1.9:9000"), "grant", true))
+        );
+
+        // 关键语义（与 local_work 的文档口径一致）：本次没带（None）保持上一次的值，
+        // 不清成 NULL —— 否则「这台为什么不上送」的最后一份可信答案会被一次旧版心跳擦掉。
+        store
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-1",
+                instance_id: "inst-1",
+                boot_id: "boot-1",
+                version: "0.2.0",
+                last_seen_at: "2026-01-04T00:00:00+00:00",
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
+            })
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(
+            agent.uplink_state,
+            Some(uplink_state("tcp", Some("10.0.1.9:9000"), "grant", true))
+        );
+    }
+
+    #[tokio::test]
     async fn stores_agent_discovery_policy_version_and_distinguishes_none_from_zero() {
         let store = store().await;
         register(&store, "hash-l", "agent-1", "inst-1").await;
@@ -2283,6 +2613,8 @@ mod tests {
                 admin_latency_ms: None,
                 discovery_policy_version: None,
                 work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
             })
             .await
             .unwrap();
@@ -2304,6 +2636,8 @@ mod tests {
                 admin_latency_ms: Some(7),
                 discovery_policy_version: Some(2),
                 work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
             })
             .await
             .unwrap();
@@ -2325,6 +2659,8 @@ mod tests {
                 admin_latency_ms: None,
                 discovery_policy_version: Some(0),
                 work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
             })
             .await
             .unwrap();
