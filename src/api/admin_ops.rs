@@ -261,7 +261,8 @@ pub async fn get_agent_runtime_status(
         &agent.agent_id,
         &agent.instance_id,
         &agent.version,
-        "online",
+        // 与列表页共用同一在线口径：不写死 "online"，否则同一台机器两处答案会相反。
+        agent_status_label(&agent.last_seen_at),
         "healthy",
         &agent.last_seen_at,
         agent.last_memory_bytes,
@@ -271,6 +272,72 @@ pub async fn get_agent_runtime_status(
         agent.uplink_state,
     ))
     .into_response()
+}
+
+/// 删除一台**离线** Agent（连同它的实例、凭据与所有派生态数据）—— **不可恢复**。
+///
+/// 只允许离线：在线机器还在上报，删了它下一刻会用旧凭据重连、可能又注册回来，运维看到的
+/// 「删了又回来」比不删更困惑；而且它可能正写库。离线才删得干净。
+///
+/// 判据与列表 / 运行态**同一处**（`overview::agent_is_online`，300s 窗口）—— 不然会出现
+/// 「列表说离线、却删不掉」这种自相矛盾。
+///
+/// 前端要两次确认：删除不可恢复，一次点击不够。
+pub async fn delete_agent(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let agent = match state.store.get_agent(&agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load agent store: {err}"),
+            )
+                .into_response();
+        }
+    };
+    if super::overview::agent_is_online(&agent.last_seen_at, &DateTime::now()) {
+        return (
+            StatusCode::CONFLICT,
+            format!("agent {agent_id} is online; only offline agents can be deleted"),
+        )
+            .into_response();
+    }
+    match state.store.delete_agent(&agent_id).await {
+        Ok(true) => Json(AgentDeletionResult {
+            agent_id,
+            deleted_at: DateTime::now(),
+        })
+        .into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to delete agent: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 删除一台 Agent 的结果回执（模型 `Control.Agent.Identity.AgentDeletionResult`）。
+///
+/// 为什么回一个体而不回 204：模型里每个 bind entry 都要一个具名 `status` 类型，
+/// 没有“无体”这个概念；顺带前端也能拿 `agent_id` 做提示。
+/// **不加 `serde(rename_all)`**：对外协议是 snake_case，前端按它解析。
+#[derive(Debug, Serialize, ::jumo_derive::Jumo)]
+#[jumo(kind = "struct", domain = "Control", module = "Control.Agent.Identity")]
+pub struct AgentDeletionResult {
+    pub agent_id: String,
+    pub deleted_at: DateTime,
 }
 
 /// 查看某台 Agent 的用途（对应模型 `ViewAgentPurpose`）。
@@ -1520,11 +1587,23 @@ pub async fn revoke_agent_credential(
     }
 }
 
+/// 在线口径（**列表与单台运行态共用**）：从 `last_seen_at` 现算 `"online"` / `"offline"`。
+///
+/// 派生只此一处。曾经两处各写一遍就漂过：列表按 `last_seen_at` 现算、单台运行态接口把
+/// `"online"` 写死 —— 同一台几天没上报的机器，列表说离线、点进详情说在线，运维会误判
+/// （据此给一台已经死掉的机器派活，那件工作会一直挂到过期）。
+fn agent_status_label(last_seen_at: &str) -> &'static str {
+    if super::overview::agent_is_online(last_seen_at, &DateTime::now()) {
+        "online"
+    } else {
+        "offline"
+    }
+}
+
 fn agent_list_entry(agent: &crate::infra::StoredAgentRegistration) -> AgentListEntry {
-    // `status` 从 `last_seen_at` **现算**，不写死 "online"：机队索引页（升级计划）要据此把
+    // `status` 从 `last_seen_at` **现算**（不写死 "online"）：机队索引页（升级计划）要据此把
     // **离线**机器排除掉 —— 一台几天没上报的机器还报 "online"，页面就会把升级派给它，
-    // 然后那件工作一直挂着到过期。派生只这一处（与总览 `agent_is_online` 同一判据）。
-    let online = super::overview::agent_is_online(&agent.last_seen_at, &DateTime::now());
+    // 然后那件工作一直挂着到过期。与单台运行态共用同一判据（`agent_status_label`）。
     AgentListEntry {
         agent_id: agent.agent_id.clone(),
         instance_id: agent.instance_id.clone(),
@@ -1533,7 +1612,7 @@ fn agent_list_entry(agent: &crate::infra::StoredAgentRegistration) -> AgentListE
         node_id: agent.node_id.clone(),
         hostname: agent.hostname.clone(),
         version: agent.version.clone(),
-        status: if online { "online" } else { "offline" }.to_string(),
+        status: agent_status_label(&agent.last_seen_at).to_string(),
         health: "healthy".to_string(),
         credential_id: agent.credential_id.clone(),
         credential_status: agent.credential_status.as_str().to_string(),

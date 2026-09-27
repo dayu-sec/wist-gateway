@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 
 use crate::app::content::ContentSet;
@@ -53,11 +53,11 @@ pub mod wist_agentd_online_registration_interface;
 pub use wist_agentd_online_registration_interface::WistAgentdOnlineRegistrationInterface;
 
 use admin_ops::{
-    classify_agent, get_agent_runtime_status, grant_work, list_agent_install_packages, list_agents,
-    pause_work, resume_work, revoke_agent_credential, revoke_work, set_agent_advertise_url,
-    set_agent_install_package, set_agent_uplink, view_agent_advertise_url,
-    view_agent_install_package, view_agent_purpose, view_agent_uplink, view_agent_work,
-    view_discovery_policies, view_purpose_coverage,
+    classify_agent, delete_agent, get_agent_runtime_status, grant_work,
+    list_agent_install_packages, list_agents, pause_work, resume_work, revoke_agent_credential,
+    revoke_work, set_agent_advertise_url, set_agent_install_package, set_agent_uplink,
+    view_agent_advertise_url, view_agent_install_package, view_agent_purpose, view_agent_uplink,
+    view_agent_work, view_discovery_policies, view_purpose_coverage,
 };
 use agent_ops::{
     ack_work, poll_agent_uplink, poll_control_commands, poll_discovery_policies, poll_work,
@@ -277,6 +277,9 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/admin/agents/{agent_id}/runtime-status",
             get(get_agent_runtime_status),
         )
+        // NOTE(hand-added): 删除**离线** Agent（jumo 模型 WistGatewayManagementInterface
+        // 的 AdminDeleteAgent）。在线机器会被 409 拒（判据与列表/运行态同一处）。
+        .route("/api/v1/admin/agents/{agent_id}", delete(delete_agent))
         // NOTE(hand-added): Agent 用途视图（事实/推断/判定并列）。已在 jumo 模型
         // WistGatewayManagementInterface.AdminViewAgentPurpose 声明。
         .route(

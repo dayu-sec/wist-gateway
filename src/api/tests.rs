@@ -4200,6 +4200,204 @@ async fn admin_agent_list_marks_stale_agents_offline() {
     assert_eq!(body["agents"][0]["status"], "online", "{body}");
 }
 
+/// **单台运行态的 `status` 与列表口径一致**：同一台机器，列表说离线，详情也必须说离线。
+///
+/// 曾经单台接口把 `status` 写死 `"online"`，而列表是按 `last_seen_at` 现算 —— 一台几小时
+/// 没上报的机器点进详情反而显示在线，运维会把活派给一台已经死掉的机器。
+#[tokio::test]
+async fn admin_agent_runtime_status_shares_the_online_verdict_with_the_list() {
+    let env = env_with_enrolled_agent().await;
+
+    // 直接把水位推老（HTTP 上报路径总是取当下，造不出陈旧）。
+    let stale = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    assert!(
+        env.store_handle
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-node-a",
+                instance_id: "node-a",
+                boot_id: "",
+                version: "v0.2.0",
+                last_seen_at: &stale,
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
+            })
+            .await
+            .expect("record stale status")
+    );
+
+    let list = admin_agent_list(&env).await;
+    let detail = get_agent_runtime_status(&env).await;
+    assert_eq!(list["agents"][0]["status"], "offline", "{list}");
+    assert_eq!(detail["status"], "offline", "{detail}");
+
+    // 刚上报过：两处都要回到 online。
+    let fresh = chrono::Utc::now().to_rfc3339();
+    env.store_handle
+        .record_agent_status(&AgentStatusUpdate {
+            agent_id: "agent-node-a",
+            instance_id: "node-a",
+            boot_id: "",
+            version: "v0.2.0",
+            last_seen_at: &fresh,
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+        })
+        .await
+        .expect("record fresh status");
+
+    let list = admin_agent_list(&env).await;
+    let detail = get_agent_runtime_status(&env).await;
+    assert_eq!(list["agents"][0]["status"], "online", "{list}");
+    assert_eq!(detail["status"], "online", "{detail}");
+}
+
+/// 删除只允许**离线**机器：在线 → 409，且机器分毫未动。
+#[tokio::test]
+async fn delete_agent_refuses_an_online_agent() {
+    let env = env_with_enrolled_agent().await;
+    // 刚注册就是 `last_seen_at = 注册时刻`（在线）；再写一条新鲜上报把它明确钉在在线。
+    let fresh = chrono::Utc::now().to_rfc3339();
+    assert!(
+        env.store_handle
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-node-a",
+                instance_id: "node-a",
+                boot_id: "",
+                version: "v0.2.0",
+                last_seen_at: &fresh,
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
+            })
+            .await
+            .expect("record fresh status")
+    );
+
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        env.store_handle
+            .get_agent("agent-node-a")
+            .await
+            .expect("get")
+            .is_some(),
+        "被拒的删除不能动到机器"
+    );
+}
+
+/// 离线机器可以删：204，且注册与凭据都消失（旧 token 不能再被认出来）。
+#[tokio::test]
+async fn delete_agent_removes_an_offline_agent_and_its_credential() {
+    let env = env_with_enrolled_agent().await;
+    // 把水位推老 → 判离线（HTTP 上报路径总是取当下，造不出陈旧）。
+    let stale = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    assert!(
+        env.store_handle
+            .record_agent_status(&AgentStatusUpdate {
+                agent_id: "agent-node-a",
+                instance_id: "node-a",
+                boot_id: "",
+                version: "v0.2.0",
+                last_seen_at: &stale,
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
+            })
+            .await
+            .expect("record stale status")
+    );
+    let credential_hash = env
+        .store_handle
+        .get_agent("agent-node-a")
+        .await
+        .expect("get")
+        .expect("enrolled")
+        .credential_token_hash;
+
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["agent_id"], "agent-node-a", "{body}");
+    assert!(body["deleted_at"].is_string(), "{body}");
+
+    assert!(
+        env.store_handle
+            .get_agent("agent-node-a")
+            .await
+            .expect("get")
+            .is_none()
+    );
+    assert!(
+        env.store_handle
+            .find_agent_by_credential_token_hash(&credential_hash)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "凭据必须一并删掉，否则旧 token 还能用"
+    );
+}
+
+#[tokio::test]
+async fn delete_agent_is_not_found_for_an_unknown_agent() {
+    let env = env_with_enrolled_agent().await;
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-nope",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// 删除是管理动作（会连凭据一起拿走）：没有 admin token 一律 401。
+#[tokio::test]
+async fn delete_agent_requires_admin_bearer() {
+    let env = env_with_enrolled_agent().await;
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// 在线窗口的**边界**：`last_seen_at` 落在 `0..=300s` 内算在线。
 ///
 /// 注意 `DateTime::seconds_until` 把负差**夹到 0**（`max(0)`）：所以「上报时间在未来」
@@ -6362,6 +6560,22 @@ async fn get_to_router(
     admin_token: Option<&str>,
 ) -> axum::response::Response {
     let mut builder = Request::builder().method("GET").uri(uri);
+    if let Some(token) = admin_token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    router(config.clone(), Arc::clone(store))
+        .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("route response")
+}
+
+async fn delete_to_router(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    uri: &str,
+    admin_token: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method("DELETE").uri(uri);
     if let Some(token) = admin_token {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }

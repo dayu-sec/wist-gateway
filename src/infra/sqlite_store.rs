@@ -56,6 +56,33 @@ pub struct SqliteStore {
     pool: SqlitePool,
 }
 
+/// 删一台 Agent 时要清的 per-agent 表（**子表在前**），与 `delete_agent` 配套。
+///
+/// 只列**真正按 `agent_id` 分行**的表：`agent_uplink` / `agent_advertise_url` 是单例设置
+/// （`setting_id` 主键），`agent_discovery_policy_version` / `local_work` 是 `agent_instances`
+/// 的列 —— 都不在这里。`agents` 本身也不列：它是主表，由 `delete_agent` 最后删。
+///
+/// 第二个元素只是审计/报错用的说明，进 `sql_error` 的 `detail`。
+const DELETE_AGENT_TABLES: &[(&str, &str)] = &[
+    (
+        "agent_purpose_suggestion",
+        "delete agent purpose suggestion",
+    ),
+    ("agent_fact_summary", "delete agent fact summary"),
+    ("agent_classification", "delete agent classification"),
+    (
+        "agent_software_inventory",
+        "delete agent software inventory",
+    ),
+    ("agent_work_result", "delete agent work result"),
+    ("work_ack", "delete agent work ack"),
+    ("one_shot_work", "delete agent one-shot work"),
+    ("standing_work", "delete agent standing work"),
+    ("agent_work_sequence", "delete agent work sequence"),
+    ("agent_credentials", "delete agent credentials"),
+    ("agent_instances", "delete agent instances"),
+];
+
 fn sql_error(err: impl std::fmt::Display, detail: &str) -> StoreError {
     StoreReason::Sql
         .to_err()
@@ -1256,6 +1283,36 @@ impl Store for SqliteStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn delete_agent(&self, agent_id: &str) -> StoreResult<bool> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin delete agent"))?;
+        // 先删派生行、最后删 `agents`。`agent_purpose_suggestion` 挂在 `agent_fact_summary`
+        // 上（级联），所以它排在 fact_summary 之前；其余各表互不相干。
+        // 顺序写成「子 → 父」，即便哪天关了外键级联也照样干净。
+        // 表名是编译期常量，`format!` 只拼表名本身（无参数注入面）。
+        for (table, detail) in DELETE_AGENT_TABLES {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE agent_id = ?1"
+            )))
+            .bind(agent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| sql_error(err, detail))?;
+        }
+        let deleted = sqlx::query("DELETE FROM agents WHERE agent_id = ?1")
+            .bind(agent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| sql_error(err, "delete agent"))?;
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit delete agent"))?;
+        Ok(deleted.rows_affected() > 0)
+    }
+
     // ── Agent 事实摘要与用途推断 ──
 
     async fn get_agent_fact_summary(
@@ -2244,6 +2301,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay, Err(ReservationRejection::InvalidToken));
+    }
+
+    /// `delete_agent` 要把**没有外键**的派生态行也清干净 —— 不是只删 `agents`。
+    ///
+    /// 只有 `agent_instances` / `agent_credentials` 建了 `ON DELETE CASCADE`；其余 per-agent 表
+    /// 只删 `agents` 会留下无主的「幽灵」行，之后按 `agent_id` 查还会命中陈旧数据。
+    #[tokio::test]
+    async fn delete_agent_purges_rows_that_do_not_cascade() {
+        let store = store().await;
+        register(&store, "hash-del", "agent-del", "inst-del").await;
+        register(&store, "hash-keep", "agent-keep", "inst-keep").await;
+
+        // 两张**没有外键**的 per-agent 表：删 agents 不会连带它们（本测试要证明显式删除生效）。
+        sqlx::query(
+            "INSERT INTO agent_work_sequence (agent_id, sequence, updated_at) \
+             VALUES ('agent-del', 7, '2026-01-01T00:00:00Z'), \
+                    ('agent-keep', 1, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("seed work sequence");
+        sqlx::query(
+            "INSERT INTO agent_classification \
+             (agent_id, machine_class, suggestion_id, note, decided_by, decided_at) \
+             VALUES ('agent-del', 'LinuxCompute', NULL, NULL, 'admin', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("seed classification");
+
+        assert!(store.delete_agent("agent-del").await.expect("delete"));
+
+        for table in [
+            "agent_work_sequence",
+            "agent_classification",
+            "agent_instances",
+            "agent_credentials",
+        ] {
+            let left: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE agent_id = 'agent-del'"
+            )))
+            .fetch_one(&store.pool)
+            .await
+            .expect("count");
+            assert_eq!(left, 0, "{table} 仍留着 agent-del 的行");
+        }
+        assert!(store.get_agent("agent-del").await.expect("get").is_none());
+
+        // 不误伤别的 agent；重复删除返回 false。
+        let kept: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_work_sequence WHERE agent_id = 'agent-keep'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("count kept");
+        assert_eq!(kept, 1);
+        assert!(
+            !store
+                .delete_agent("agent-del")
+                .await
+                .expect("second delete")
+        );
     }
 
     #[tokio::test]

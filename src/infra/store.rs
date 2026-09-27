@@ -799,6 +799,15 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     async fn list_agents(&self, query: &AgentQuery) -> StoreResult<Vec<StoredAgentRegistration>>;
 
+    /// 删除一台 Agent：注册、实例、凭据，以及**所有**以它为主键的派生态行（一个事务）。
+    ///
+    /// 为什么要连派生表一起删：只有 `agent_instances` / `agent_credentials` 建了
+    /// `ON DELETE CASCADE`，其余 per-agent 表（事实摘要 / 用途 / 软件清单 / 分类 / 工作…）
+    /// 没有外键 —— 只删 `agents` 会留下一堆无主的「幽灵」行，之后按 `agent_id` 查还会命中陈旧数据。
+    ///
+    /// 返回是否确实删掉了一台（`false` = 本来就不存在）。
+    async fn delete_agent(&self, agent_id: &str) -> StoreResult<bool>;
+
     /// 读取 wist-agentd 安装包地址设置；未设置过返回 `None`（调用方回落到内置默认地址）。
     async fn get_agent_install_package(
         &self,
