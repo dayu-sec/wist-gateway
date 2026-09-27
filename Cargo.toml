@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.1.1" #@gxl:set(version)
+version = "0.1.2" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -20,10 +20,8 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rustls-pki-types = "1"
 rustls-webpki = "0.103"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-# NOTE(local-dev): 事实摘要上行要新契约类型，而发布版 wist-contracts 里还没有，
-# 所以临时切到本地 path 依赖（仓里原本就留了这个开关）。发布新版本后应切回 registry。
-wist-contracts = { version = "0.1.1", path = "../wist-contracts" }
-#wist-contracts = { version = "0.1"}
+wist-contracts = { version = "0.1" }
+#wist-contracts = { version = "0.1.1", path = "../wist-contracts" }
 wist-control = { version = "0.1" }
 wist-error = { version = "0.1" }
 
