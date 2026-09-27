@@ -238,6 +238,29 @@ pub struct StoredAgentInstallPackageAddress {
     pub updated_at: String,
 }
 
+/// 一条安装包**录入历史**（对应 `agent_install_package_history` 表，每个包一行）。
+///
+/// 与单例行 [`StoredAgentInstallPackageAddress`] 的区别：那张表只记「当前生效来源」，
+/// 这张表按内容寻址（`package_id`）保留每个录入过的包自带的那份副本，供升级按条目取包。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredAgentInstallPackage {
+    /// 内容寻址键：`pkg-<sha256 前 16 位>`；同一个包重复录入落在同一行（幂等）。
+    pub package_id: String,
+    /// 原始录入地址（`/abs/path` 或 `https://…`），只作留痕。
+    pub source: String,
+    /// 网关据自己缓存的字节算出的摘要，统一 `sha256:<64 hex>`。
+    pub package_sha256: String,
+    /// 包内目录名读到的版本；读不到为空串。
+    pub version: String,
+    /// 包内目录名读到的目标三元组；读不到为空串。
+    pub arch: String,
+    /// 网关自己存的那份副本路径。
+    pub cached_path: String,
+    pub created_by: String,
+    pub created_at: String,
+}
+
 /// 时序指标样本 DTO（历史在 VictoriaMetrics，库里只留最近值）。
 ///
 /// 带 `#[jumo]` 注解是因为它作为 `RecentOnlineRegisteredAgent.metrics_history` 的
@@ -581,7 +604,8 @@ impl EnrollmentTokenRejection {
 
 impl fmt::Display for EnrollmentTokenRejection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // 与安装路径（install.rs）既有对外文案逐字一致。
+        // 仅作**服务端审计/日志**用的具体原因：这些串不再作为 401 响应体返回
+        // （对外统一为不可区分口径，见 install.rs），以免泄露「存在但过期/已消费」。
         let message = match self {
             Self::Unknown => "unknown enrollment token",
             Self::EnvironmentMismatch => "enrollment token environment mismatch",
@@ -761,6 +785,16 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     async fn get_agent(&self, agent_id: &str) -> StoreResult<Option<StoredAgentRegistration>>;
 
+    /// 按凭据 token hash 查当前时点的 agent（注册在本机的凭据唯一命中一行）。
+    ///
+    /// 为什么要单独开一个：升级取包这类路径手上只有 `Authorization: Bearer <credential>`，
+    /// 没有 `agent_id` / `instance_id`，无法走 [`Store::get_agent`]。查的是
+    /// `agents.current_credential_id` 指向的那一份（轮换过的旧凭据不再当前，自然查不到）。
+    async fn find_agent_by_credential_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> StoreResult<Option<StoredAgentRegistration>>;
+
     async fn agent_exists(&self, agent_id: &str) -> StoreResult<bool>;
 
     async fn list_agents(&self, query: &AgentQuery) -> StoreResult<Vec<StoredAgentRegistration>>;
@@ -774,6 +808,21 @@ pub trait Store: Send + Sync + fmt::Debug {
     async fn upsert_agent_install_package(
         &self,
         setting: &StoredAgentInstallPackageAddress,
+    ) -> StoreResult<()>;
+
+    /// 列出安装包录入历史，按 `created_at` 倒序（最近录入的在前）。
+    async fn list_agent_install_packages(&self) -> StoreResult<Vec<StoredAgentInstallPackage>>;
+
+    /// 按内容寻址 id 读一条安装包录入历史；不存在返回 `None`。
+    async fn get_agent_install_package_by_id(
+        &self,
+        package_id: &str,
+    ) -> StoreResult<Option<StoredAgentInstallPackage>>;
+
+    /// 写入/覆盖一条安装包录入历史（按 `package_id` 幂等）。
+    async fn upsert_agent_install_package_by_id(
+        &self,
+        package: &StoredAgentInstallPackage,
     ) -> StoreResult<()>;
 
     /// 读取 Agent 数据面上送地址设置；未设置过返回 `None`（调用方不下发上送段）。

@@ -21,8 +21,8 @@ use wist_contracts::enrollment::{
 
 use crate::infra::{
     AdminConfig, AgentStatusUpdate, DEFAULT_AGENT_UPLINK_SETTING_ID, SqliteStore, Store,
-    StoredAgentUplinkAddress, StoredCredentialStatus, StoredEnrollmentTokenStatus,
-    bytes_sha256_hex, load_install_script_public_key_pem, sha256_hex,
+    StoredAgentInstallPackage, StoredAgentUplinkAddress, StoredCredentialStatus,
+    StoredEnrollmentTokenStatus, bytes_sha256_hex, load_install_script_public_key_pem, sha256_hex,
 };
 use wist_contracts::action_result::{ActionResult, FinalStatus};
 use wist_contracts::agent_uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND};
@@ -45,7 +45,7 @@ use super::{
         agent_initial_config_toml, agent_install_code, issue_agent_install_code, token_hash,
         validate_bootstrap_token_for_config,
     },
-    install_package::AgentPackageSource,
+    install_package::{AgentPackageSource, package_id_for_sha256, read_package_identity},
     overview::{RecentOnlineRegisteredAgentSource, agent_is_online, agent_overview},
     router,
     work_expiry::expire_overdue_one_shot_works,
@@ -3803,6 +3803,45 @@ async fn initial_config_route_requires_valid_token() {
 }
 
 #[tokio::test]
+async fn initial_config_route_401_is_uniform_across_token_failure_modes() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/agent/initial-config";
+    // 与安装包分发端点同一口径：未知 / 过期 / 已消费都不区分，不暴露「存在但过期」。
+    const GENERIC_BOOTSTRAP_BODY: &str = "invalid bootstrap bearer token";
+
+    let unknown = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some("wit_does_not_exist"),
+    )
+    .await;
+    assert_auth_rejected(unknown, GENERIC_BOOTSTRAP_BODY).await;
+
+    let expired = env.issue_token().await;
+    sqlx::query("UPDATE enrollment_tokens SET expires_at = ?1 WHERE token_hash = ?2")
+        .bind("2020-01-01T00:00:00+00:00")
+        .bind(token_hash(&expired))
+        .execute(env.store.pool())
+        .await
+        .expect("expire token");
+    let expired_response = get_to_router(&env.config, &env.store_handle, uri, Some(&expired)).await;
+    assert_auth_rejected(expired_response, GENERIC_BOOTSTRAP_BODY).await;
+
+    let consumed = env.issue_token().await;
+    let enrolled = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&consumed),
+    )
+    .await;
+    assert_eq!(enrolled.status(), StatusCode::CREATED);
+    let consumed_response =
+        get_to_router(&env.config, &env.store_handle, uri, Some(&consumed)).await;
+    assert_auth_rejected(consumed_response, GENERIC_BOOTSTRAP_BODY).await;
+}
+
+#[tokio::test]
 async fn bootstrap_routes_rate_limit_failed_bearer_attempts() {
     let env = TestEnv::new().await;
     let app = router(env.config.clone(), env.store_handle.clone());
@@ -4773,6 +4812,1135 @@ async fn package_download_serves_cached_artifact() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_bytes(response).await.to_vec(), bytes.to_vec());
+}
+
+/// 构造一个最小可解析的 tar.gz：单个条目 `path_in_archive` → `contents`。
+fn tar_gz_with_entry(path_in_archive: &str, contents: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path_in_archive, contents)
+            .expect("append tar entry");
+        builder.finish().expect("finish tar");
+    }
+    encoder.finish().expect("finish gzip")
+}
+
+#[test]
+fn read_package_identity_parses_version_and_triple() {
+    let bytes = tar_gz_with_entry(
+        "wist-agentd-1.2.3-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd-binary",
+    );
+    assert_eq!(
+        read_package_identity(&bytes),
+        ("1.2.3".to_string(), "x86_64-unknown-linux-gnu".to_string())
+    );
+}
+
+#[test]
+fn read_package_identity_tolerates_non_packages() {
+    // 裸二进制/非 gzip/空字节：读不出身份但不 panic，留空串（行照记）。
+    for bytes in [b"not-a-package".as_slice(), &[], b"\x1f\x8b\x00".as_slice()] {
+        assert_eq!(read_package_identity(bytes), (String::new(), String::new()));
+    }
+    // 是合法 tar.gz、但顶层目录不是 wist-agentd-<version>-<triple>：同样留空。
+    let odd = tar_gz_with_entry("some-other-dir/file", b"x");
+    assert_eq!(read_package_identity(&odd), (String::new(), String::new()));
+}
+
+#[tokio::test]
+async fn install_package_history_lists_recorded_packages() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/install-packages";
+
+    // 无凭据 → 401。
+    let unauthorized = get_to_router(&env.config, &env.store_handle, uri, None).await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"agentd-v0.1.9",
+    );
+    let (source, digest) = set_install_package_source(&env, "history", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+
+    // 网关为这个包单独存了一份副本（升级按条目取包要用）。
+    let cached = env.config.install_package_history_path(&package_id);
+    assert_eq!(
+        std::fs::read(&cached).expect("per-package copy"),
+        pkg,
+        "each recorded package gets its own cached copy"
+    );
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let packages = body["packages"].as_array().expect("packages array");
+    assert_eq!(packages.len(), 1);
+    let entry = &packages[0];
+    assert_eq!(entry["package_id"], package_id);
+    assert_eq!(entry["source"], source);
+    assert_eq!(entry["package_sha256"], format!("sha256:{digest}"));
+    assert_eq!(entry["version"], "0.1.9");
+    assert_eq!(entry["arch"], "aarch64-apple-darwin");
+    assert_eq!(entry["created_by"], "platform-maintenance-engineer");
+    assert!(entry["created_at"].is_string());
+}
+
+#[tokio::test]
+async fn install_package_history_entry_carries_derived_download_url() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/install-packages";
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.2.0-aarch64-apple-darwin/wist-agentd",
+        b"agentd-v0.2.0",
+    );
+    let (_, digest) = set_install_package_source(&env, "url-derive", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+
+    // 未设 advertise-url：基址取 server.public_base_url。
+    let body: serde_json::Value = decode_json_response(
+        get_to_router(
+            &env.config,
+            &env.store_handle,
+            uri,
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        body["packages"][0]["agent_package_url"],
+        format!(
+            "{}/api/v1/agent/packages/{package_id}",
+            env.config.public_base_url
+        )
+    );
+
+    // 设置网关对外地址后，该字段跟随生效基址（与安装命令同一口径）。
+    let ok = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/advertise-url",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "url": "https://gw.example.com" }),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    let body: serde_json::Value = decode_json_response(
+        get_to_router(
+            &env.config,
+            &env.store_handle,
+            uri,
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        body["packages"][0]["agent_package_url"],
+        format!("https://gw.example.com/api/v1/agent/packages/{package_id}")
+    );
+}
+
+#[tokio::test]
+async fn package_download_by_id_accepts_bootstrap_or_agent_credential() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd-upgrade-bytes",
+    );
+    let (_, digest) = set_install_package_source(&env, "byid", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+    let uri = format!("/api/v1/agent/packages/{package_id}");
+
+    // 无凭据 → 401。
+    let unauthorized = get_to_router(&env.config, &env.store_handle, &uri, None).await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    // bootstrap（注册）token → 200 + 字节。
+    let bootstrap = env.issue_token().await;
+    let response = get_to_router(&env.config, &env.store_handle, &uri, Some(&bootstrap)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.to_vec(), pkg);
+
+    // agent 凭据 → 200 + 字节（升级路径，没 enrollment token）。
+    let credential = enroll_agent_credential(&env).await;
+    let response = get_to_router(&env.config, &env.store_handle, &uri, Some(&credential)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.to_vec(), pkg);
+
+    // 未知 id → 404（凭据有效）。
+    let unknown = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/pkg-0000000000000000",
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn current_package_download_also_accepts_agent_credential() {
+    let env = TestEnv::new().await;
+    let bytes = b"cached-package-current";
+    set_install_package_source(&env, "current", bytes).await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.to_vec(), bytes.to_vec());
+}
+
+/// 安装包分发端点「没带凭据 / 凭据载体格式不对」的对外口径。
+/// 与下面的「带了 token 但无效」是**不同**的一句，但都不泄露任何 token 细节。
+const PACKAGE_NO_TOKEN_BODY: &str =
+    "agent package download requires a bootstrap or agent bearer token";
+/// 「带了 token 但不合法」的统一口径：未知 / 过期 / 已吊销 / 被轮换掉的旧凭据，
+/// 一律回这一句 —— 不区分「token 存在但过期」这类可被用来枚举的信息。
+const PACKAGE_INVALID_TOKEN_BODY: &str = "invalid bootstrap or agent bearer token";
+
+/// 用**原始** Authorization 头值发一次取包 GET（`get_to_router` 只能给合法 Bearer）。
+async fn get_package_with_raw_authorization(
+    env: &TestEnv,
+    uri: &str,
+    authorization: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method("GET").uri(uri);
+    if let Some(value) = authorization {
+        builder = builder.header("authorization", value);
+    }
+    router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("route response")
+}
+
+/// 断言一次取包鉴权失败：401 + `no-store` + 统一口径的响应体（不泄露细节）。
+async fn assert_auth_rejected(response: axum::response::Response, expected_body: &str) {
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_no_store(&response);
+    let body = String::from_utf8_lossy(&body_bytes(response).await).to_string();
+    assert_eq!(body, expected_body);
+}
+
+#[tokio::test]
+async fn package_download_rejects_missing_and_malformed_credentials_uniformly() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"credential-shape-bytes",
+    );
+    let (_, digest) = set_install_package_source(&env, "credential-shape", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+    let uri = format!("/api/v1/agent/packages/{package_id}");
+
+    // 根本没带 Authorization 头。
+    assert_auth_rejected(
+        get_package_with_raw_authorization(&env, &uri, None).await,
+        PACKAGE_NO_TOKEN_BODY,
+    )
+    .await;
+    // `Bearer ` 后面是空 token：被当成「没带 token」（trim + filter 空串）。
+    assert_auth_rejected(
+        get_package_with_raw_authorization(&env, &uri, Some("Bearer ")).await,
+        PACKAGE_NO_TOKEN_BODY,
+    )
+    .await;
+    // 非 Bearer 方案（Basic）：同样按「没带 token」处理，不解析。
+    assert_auth_rejected(
+        get_package_with_raw_authorization(&env, &uri, Some("Basic dXNlcjpwYXNz")).await,
+        PACKAGE_NO_TOKEN_BODY,
+    )
+    .await;
+    // 未知的 agent 凭据 token：统一口径（不暴露「不存在」）。
+    assert_auth_rejected(
+        get_package_with_raw_authorization(&env, &uri, Some("Bearer wic_does_not_exist")).await,
+        PACKAGE_INVALID_TOKEN_BODY,
+    )
+    .await;
+    // 未知的 bootstrap token：同样统一口径。
+    assert_auth_rejected(
+        get_package_with_raw_authorization(&env, &uri, Some("Bearer wit_does_not_exist")).await,
+        PACKAGE_INVALID_TOKEN_BODY,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn package_download_rejects_expired_agent_credential_on_both_routes() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "expired-cred", b"expired-cred-bytes").await;
+    let credential = enroll_agent_credential(&env).await;
+    let agent = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("load agent")
+        .expect("agent exists");
+    // Test-only seam: 存储层不暴露任意凭据改写，过期时间直接经 SQL 置到过去。
+    sqlx::query("UPDATE agent_credentials SET expires_at = ?1 WHERE credential_id = ?2")
+        .bind("2020-01-01T00:00:00+00:00")
+        .bind(&agent.credential_id)
+        .execute(env.store.pool())
+        .await
+        .expect("expire credential");
+
+    let by_id = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/pkg-0000000000000000",
+        Some(&credential),
+    )
+    .await;
+    assert_auth_rejected(by_id, PACKAGE_INVALID_TOKEN_BODY).await;
+
+    let current = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&credential),
+    )
+    .await;
+    assert_auth_rejected(current, PACKAGE_INVALID_TOKEN_BODY).await;
+}
+
+#[tokio::test]
+async fn package_download_rejects_revoked_agent_credential_immediately() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "revoked-cred", b"revoked-cred-bytes").await;
+    let credential = enroll_agent_credential(&env).await;
+    let agent = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("load agent")
+        .expect("agent exists");
+
+    // 吊销前：凭据可用。
+    let before = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(before.status(), StatusCode::OK);
+
+    let revoked = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/credentials:revoke",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "credential_id": agent.credential_id }),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+
+    // 吊销后**立即**失效：下一次请求就拒，不用等轮换，也没有内存缓存窗口。
+    let by_id = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/pkg-0000000000000000",
+        Some(&credential),
+    )
+    .await;
+    assert_auth_rejected(by_id, PACKAGE_INVALID_TOKEN_BODY).await;
+    let current = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&credential),
+    )
+    .await;
+    assert_auth_rejected(current, PACKAGE_INVALID_TOKEN_BODY).await;
+}
+
+#[tokio::test]
+async fn package_download_rejects_rotated_out_credential_but_accepts_the_new_one() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "rotated-cred", b"rotated-cred-bytes").await;
+    let old_bearer = enroll_agent_credential(&env).await;
+
+    let renewed = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/credentials:renew",
+        Some(&old_bearer),
+        &CredentialRenewal::new(
+            "agent-node-a".to_string(),
+            "node-a".to_string(),
+            "bearer".to_string(),
+            "2027-01-01T00:00:00Z".to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(renewed.status(), StatusCode::OK);
+    let renewed: CredentialRenewed = decode_json_response(renewed).await;
+    let new_bearer = renewed
+        .credential_bundle
+        .bearer_token
+        .expect("renewed bearer");
+    assert_ne!(new_bearer, old_bearer);
+
+    // 轮换掉的旧凭据：查的是「当前凭据」，旧 hash 已不再命中 → 统一口径拒绝。
+    let old_attempt = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&old_bearer),
+    )
+    .await;
+    assert_auth_rejected(old_attempt, PACKAGE_INVALID_TOKEN_BODY).await;
+
+    // 新凭据：放行。
+    let ok = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&new_bearer),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn any_registered_agent_credential_can_fetch_any_package_by_id() {
+    let env = TestEnv::new().await;
+    let pkg_one = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"package-one-bytes",
+    );
+    let (_, digest_one) = set_install_package_source(&env, "any-agent-one", &pkg_one).await;
+    let id_one = package_id_for_sha256(&digest_one);
+    let pkg_two = tar_gz_with_entry(
+        "wist-agentd-0.2.0-x86_64-unknown-linux-gnu/wist-agentd",
+        b"package-two-bytes",
+    );
+    let (_, digest_two) = set_install_package_source(&env, "any-agent-two", &pkg_two).await;
+    let id_two = package_id_for_sha256(&digest_two);
+
+    // 单个 agent 凭据能取**任意**已录入的包：两个包都不是它录入的，也没有归属表。
+    // 这是当前**设计**：网关按配置单租户，安装包本身不是秘密（install.sh 内嵌地址与摘要），
+    // 端点上刻意不做按 agent 的归属/租户校验。本测试钉住现状，改语义前必须先改这里。
+    let credential = enroll_agent_credential(&env).await;
+    for (package_id, bytes) in [(&id_one, &pkg_one), (&id_two, &pkg_two)] {
+        let response = get_to_router(
+            &env.config,
+            &env.store_handle,
+            &format!("/api/v1/agent/packages/{package_id}"),
+            Some(&credential),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await.to_vec(), bytes.to_vec());
+    }
+}
+
+#[tokio::test]
+async fn package_download_by_id_rejects_path_traversal_ids_without_reading_disk() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"traversal-guard-bytes",
+    );
+    let (_, digest) = set_install_package_source(&env, "traversal", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+    let credential = enroll_agent_credential(&env).await;
+
+    // 在 history 目录的**上一级**放一个哨兵文件：若 handler 拿 package_id 去 join 磁盘路径，
+    // `..%2Fwist-sentinel` 会顺着目录穿越读到它。这里断言永远读不到、也不吐任何缓存字节。
+    let history_dir = env.config.install_package_history_path("pkg-placeholder");
+    let history_dir = history_dir.parent().expect("history dir");
+    let sentinel = history_dir
+        .parent()
+        .expect("install-package dir")
+        .join("wist-sentinel");
+    std::fs::write(&sentinel, b"sentinel-must-not-be-served").expect("write sentinel");
+
+    let variants = [
+        "..%2F..%2Fetc%2Fpasswd",
+        "..%2Fwist-sentinel",
+        "..%2Fagent-package",
+        "%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+        "a%00b",
+    ];
+    for variant in variants {
+        let uri = format!("/api/v1/agent/packages/{variant}");
+        let response = get_to_router(&env.config, &env.store_handle, &uri, Some(&credential)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "traversal id {variant} must not resolve"
+        );
+        assert_no_store(&response);
+        let body = body_bytes(response).await.to_vec();
+        assert_ne!(
+            body, pkg,
+            "traversal id {variant} must not serve the cached package"
+        );
+        assert_ne!(
+            body,
+            b"sentinel-must-not-be-served".to_vec(),
+            "traversal id {variant} must not read the sentinel file"
+        );
+        assert_eq!(body, b"unknown agent package".to_vec());
+    }
+
+    // 超长 id（>1KB）：不 panic、不读盘，按「库里没有」处理。
+    let long_uri = format!("/api/v1/agent/packages/{}", "a".repeat(2_000));
+    let long = get_to_router(&env.config, &env.store_handle, &long_uri, Some(&credential)).await;
+    assert_eq!(long.status(), StatusCode::NOT_FOUND);
+
+    // 空 package_id（尾斜杠）：路由层没有可匹配的动态段，同样不是 200。
+    let empty = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/",
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::NOT_FOUND);
+
+    // 正常 id 仍能取到原字节（确认上面的 404 不是「整个端点坏了」）。
+    let ok = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/agent/packages/{package_id}"),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(body_bytes(ok).await.to_vec(), pkg);
+}
+
+/// 复用同一个 router 实例发一次取包 GET：限流状态挂在 state 上，必须共享才会累积。
+async fn package_get_with_bearer(app: &axum::Router, token: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/agent/packages/current")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+}
+
+#[tokio::test]
+async fn package_routes_rate_limit_repeated_failed_auth_attempts() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "rate-limit", b"rate-limit-bytes").await;
+    let app = router(env.config.clone(), env.store_handle.clone());
+
+    // 前 5 次失败都以 401 回应（沿用 BOOTSTRAP_AUTH_SCOPE 的失败计数）。
+    for _ in 0..5 {
+        let response = package_get_with_bearer(&app, "wit_not-a-real-token").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // 第 6 次在同一桶上被限流：不能靠反复试错绕过。
+    let blocked = package_get_with_bearer(&app, "wit_not-a-real-token").await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(blocked.headers().contains_key(header::RETRY_AFTER));
+    assert_no_store(&blocked);
+}
+
+#[tokio::test]
+async fn package_download_success_clears_the_failure_count() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "rate-limit-clear", b"rate-limit-clear-bytes").await;
+    let app = router(env.config.clone(), env.store_handle.clone());
+    let valid = env.issue_token().await;
+
+    for _ in 0..4 {
+        let response = package_get_with_bearer(&app, "wit_not-a-real-token").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // 一次成功必须清零失败计数：否则一次失败就会把客户端推向永久封禁。
+    let ok = package_get_with_bearer(&app, &valid).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    // 清零后重新计：再失败 5 次都还是 401（若没清零，这里第二次就该 429）。
+    for _ in 0..5 {
+        let response = package_get_with_bearer(&app, "wit_not-a-real-token").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let blocked = package_get_with_bearer(&app, "wit_not-a-real-token").await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn package_download_internal_errors_are_no_store() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    // `/current` 的本地制品读失败（未设置来源时走内置包，把内置包删掉）→ 500。
+    std::fs::remove_file(&env.config.agent_package_file).expect("remove builtin package");
+    let current = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(current.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_no_store(&current);
+
+    // by-id 的库读失败（直接撤掉历史表）→ 500，也必须 no-store。
+    sqlx::query("DROP TABLE agent_install_package_history")
+        .execute(env.store.pool())
+        .await
+        .expect("drop history table");
+    let by_id = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/pkg-0000000000000000",
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(by_id.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_no_store(&by_id);
+}
+
+#[tokio::test]
+async fn current_package_download_still_enforces_one_time_bootstrap_tokens() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "one-time", b"one-time-bytes").await;
+
+    // 放宽到「也接受 agent 凭据」没有放松 bootstrap token 的既有语义：
+    // 1) 首次可用。
+    let token = env.issue_token().await;
+    let first = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // 2) 被 enroll 消费后（一次性）不能再取包。
+    let enrolled = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&token),
+    )
+    .await;
+    assert_eq!(enrolled.status(), StatusCode::CREATED);
+    let replay = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&token),
+    )
+    .await;
+    assert_auth_rejected(replay, PACKAGE_INVALID_TOKEN_BODY).await;
+
+    // 3) 过期 token 同样被拒。
+    let expired = env.issue_token().await;
+    sqlx::query("UPDATE enrollment_tokens SET expires_at = ?1 WHERE token_hash = ?2")
+        .bind("2020-01-01T00:00:00+00:00")
+        .bind(token_hash(&expired))
+        .execute(env.store.pool())
+        .await
+        .expect("expire bootstrap token");
+    let after = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&expired),
+    )
+    .await;
+    assert_auth_rejected(after, PACKAGE_INVALID_TOKEN_BODY).await;
+}
+
+#[tokio::test]
+async fn install_package_history_url_is_admin_only_and_never_leaked_unauthenticated() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"url-secret-bytes",
+    );
+    let (_, digest) = set_install_package_source(&env, "url-secret", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+    let expected_url = format!(
+        "{}/api/v1/agent/packages/{package_id}",
+        env.config.public_base_url
+    );
+
+    // 管理面历史列表无凭据：401，且响应体里不得出现字段名或派生地址。
+    let unauthorized = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-packages",
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let body = String::from_utf8_lossy(&body_bytes(unauthorized).await).to_string();
+    assert!(!body.contains("agent_package_url"));
+    assert!(!body.contains(&expected_url));
+
+    // 安装包分发端点无凭据：同样 401，不泄露地址。
+    let pkg_unauth = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/agent/packages/{package_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(pkg_unauth.status(), StatusCode::UNAUTHORIZED);
+    let body = String::from_utf8_lossy(&body_bytes(pkg_unauth).await).to_string();
+    assert!(!body.contains("agent_package_url"));
+    assert!(!body.contains(&expected_url));
+
+    // 正例：带上 admin bearer 才出现该字段（防止上面的断言是假阴性）。
+    let authorized = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-packages",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(&body_bytes(authorized).await).to_string();
+    assert!(body.contains(&expected_url));
+}
+
+#[tokio::test]
+async fn install_package_history_absent_when_source_unreadable() {
+    let env = TestEnv::new().await;
+    let missing = write_source_package(&env, "gone-history", b"x");
+    std::fs::remove_file(&missing).expect("remove source");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "package_url": missing }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a failed set must not leave a history row"
+    );
+}
+
+#[tokio::test]
+async fn install_package_history_empty_lists_as_empty_array() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-packages",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    // 空历史是一个成功的空列表，不是 404 / null。
+    assert_eq!(body, serde_json::json!({ "packages": [] }));
+}
+
+#[tokio::test]
+async fn install_package_set_records_setting_and_history_together() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.3.1-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd-0.3.1",
+    );
+    let (source, digest) = set_install_package_source(&env, "together", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+
+    // 成功录入：单行设置（当前生效来源）与历史行**都在**，且摘要同源。
+    let setting = env
+        .store
+        .get_agent_install_package()
+        .await
+        .unwrap()
+        .expect("setting");
+    assert_eq!(setting.package_url, source);
+    assert_eq!(
+        setting.package_sha256.as_deref(),
+        Some(format!("sha256:{digest}").as_str())
+    );
+
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].package_id, package_id);
+    assert_eq!(history[0].source, source);
+    assert_eq!(history[0].package_sha256, format!("sha256:{digest}"));
+    assert_eq!(history[0].version, "0.3.1");
+    assert_eq!(history[0].arch, "x86_64-unknown-linux-gnu");
+}
+
+#[tokio::test]
+async fn install_package_history_is_idempotent_for_the_same_package() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.4.0-aarch64-apple-darwin/wist-agentd",
+        b"agentd-0.4.0",
+    );
+    let (first_source, digest) = set_install_package_source(&env, "idem-first", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+
+    // 同一份字节从**另一个来源路径**再录一次：内容寻址 id 不变。
+    let (second_source, second_digest) = set_install_package_source(&env, "idem-copy", &pkg).await;
+    assert_eq!(
+        second_digest, digest,
+        "identical bytes must yield the same digest"
+    );
+    assert_eq!(package_id_for_sha256(&second_digest), package_id);
+    assert_ne!(second_source, first_source);
+
+    // 历史只有一行；留痕来源被覆盖为最近一次录入的地址。
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1, "same package must stay one history row");
+    assert_eq!(history[0].source, second_source);
+
+    // 按条副本只有一份，内容正确。
+    let cached = env.config.install_package_history_path(&package_id);
+    assert!(cached.is_file(), "per-package copy must exist");
+    assert_eq!(std::fs::read(&cached).expect("copy"), pkg);
+}
+
+#[tokio::test]
+async fn install_package_failed_set_keeps_previous_setting_and_history() {
+    let env = TestEnv::new().await;
+    let good = tar_gz_with_entry(
+        "wist-agentd-0.5.0-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd-0.5.0",
+    );
+    let (good_source, good_digest) = set_install_package_source(&env, "good-set", &good).await;
+
+    // 期望摘要不符：整次操作失败，既不留历史行也不覆盖已有单行设置。
+    let bad_source = write_source_package(&env, "bad-digest", b"agentd-0.6.0");
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "package_url": bad_source,
+            "package_sha256": "c".repeat(64),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let setting = env
+        .store
+        .get_agent_install_package()
+        .await
+        .unwrap()
+        .expect("setting");
+    assert_eq!(
+        setting.package_url, good_source,
+        "failed set must not overwrite"
+    );
+    assert_eq!(
+        setting.package_sha256.as_deref(),
+        Some(format!("sha256:{good_digest}").as_str())
+    );
+
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1, "failed set must not append history");
+    assert_eq!(history[0].source, good_source);
+}
+
+#[tokio::test]
+async fn install_package_history_orders_newest_first() {
+    let env = TestEnv::new().await;
+    // 直接落库两条（带受控 created_at），验证列表按 created_at DESC 且派生地址逐条成立。
+    let older = StoredAgentInstallPackage {
+        package_id: "pkg-00000000000000aa".to_string(),
+        source: "/packages/older.tar.gz".to_string(),
+        package_sha256: "sha256:older".to_string(),
+        version: "0.1.0".to_string(),
+        arch: "aarch64-apple-darwin".to_string(),
+        cached_path: "/state/older".to_string(),
+        created_by: "eng".to_string(),
+        created_at: "2026-01-01T00:00:00+00:00".to_string(),
+    };
+    let newer = StoredAgentInstallPackage {
+        package_id: "pkg-00000000000000bb".to_string(),
+        created_at: "2026-02-01T00:00:00+00:00".to_string(),
+        ..older.clone()
+    };
+    env.store
+        .upsert_agent_install_package_by_id(&older)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&newer)
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = decode_json_response(
+        get_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agent/install-packages",
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    let packages = body["packages"].as_array().expect("packages array");
+    assert_eq!(packages.len(), 2);
+    assert_eq!(packages[0]["package_id"], "pkg-00000000000000bb");
+    assert_eq!(packages[1]["package_id"], "pkg-00000000000000aa");
+    for (entry, id) in packages
+        .iter()
+        .zip(["pkg-00000000000000bb", "pkg-00000000000000aa"])
+    {
+        assert_eq!(
+            entry["agent_package_url"],
+            format!("{}/api/v1/agent/packages/{id}", env.config.public_base_url)
+        );
+    }
+}
+
+#[tokio::test]
+async fn agent_package_url_by_id_trims_trailing_slash_base() {
+    let env = TestEnv::new().await;
+    // 基址带/不带尾斜杠都拼出同一条地址（不出现 `//api/...`）。
+    assert_eq!(
+        env.config
+            .agent_package_url_by_id_at("https://gw.example.com/", "pkg-abc"),
+        "https://gw.example.com/api/v1/agent/packages/pkg-abc"
+    );
+    assert_eq!(
+        env.config
+            .agent_package_url_by_id_at("https://gw.example.com", "pkg-abc"),
+        "https://gw.example.com/api/v1/agent/packages/pkg-abc"
+    );
+}
+
+#[tokio::test]
+async fn package_download_by_id_requires_a_valid_credential() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd",
+    );
+    let (_, digest) = set_install_package_source(&env, "auth-byid", &pkg).await;
+    let uri = format!("/api/v1/agent/packages/{}", package_id_for_sha256(&digest));
+
+    // 无凭据 → 401；有凭据但 token 无效 → 401。
+    assert_eq!(
+        get_to_router(&env.config, &env.store_handle, &uri, None)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get_to_router(
+            &env.config,
+            &env.store_handle,
+            &uri,
+            Some("not-a-real-token"),
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn package_download_by_id_returns_404_when_cached_copy_is_missing() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"upgrade-bytes",
+    );
+    let (_, digest) = set_install_package_source(&env, "missing-copy", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+    let uri = format!("/api/v1/agent/packages/{package_id}");
+    let credential = enroll_agent_credential(&env).await;
+
+    // 行在、副本在 → 200。
+    let ok = get_to_router(&env.config, &env.store_handle, &uri, Some(&credential)).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(body_bytes(ok).await.to_vec(), pkg);
+
+    // 磁盘上的副本被清掉（行还在）：当前实现按「这个包不在了」处理 —— 404、非空体，不 panic。
+    std::fs::remove_file(env.config.install_package_history_path(&package_id))
+        .expect("remove cached copy");
+    let response = get_to_router(&env.config, &env.store_handle, &uri, Some(&credential)).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = body_bytes(response).await;
+    assert!(
+        !body.is_empty(),
+        "must not return an empty body on a missing copy"
+    );
+}
+
+#[tokio::test]
+async fn package_download_by_id_rejects_path_traversal() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    // path 参数只用于**查库**（不是去拼文件路径）：穿越串查不到行 → 404，绝不读到任意文件。
+    for uri in [
+        "/api/v1/agent/packages/..%2F..%2Fetc%2Fpasswd",
+        "/api/v1/agent/packages/pkg-..%2F..%2Fetc%2Fpasswd",
+        "/api/v1/agent/packages/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+    ] {
+        let response = get_to_router(&env.config, &env.store_handle, uri, Some(&credential)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "uri {uri}");
+    }
+}
+
+/// 历史行写入失败时：单行设置已存（请求 500），随后重试同一来源可幂等补齐历史。
+///
+/// 用一条临时 SQLite 触发器把「历史表的 INSERT」打失败来制造这个中间态 ——
+/// 这正是 `set_agent_install_package` 里「先 upsert 单行、再 upsert 历史」的顺序所暴露的分界。
+#[tokio::test]
+async fn install_package_set_heals_history_after_a_history_write_failure() {
+    let env = TestEnv::new().await;
+    sqlx::query(
+        "CREATE TRIGGER fail_history_insert BEFORE INSERT ON agent_install_package_history \
+         BEGIN SELECT RAISE(ABORT, 'injected history failure'); END",
+    )
+    .execute(env.store.pool())
+    .await
+    .expect("install failing trigger");
+
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.7.0-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd-0.7.0",
+    );
+    let source = write_source_package(&env, "heal", &pkg);
+    let digest = bytes_sha256_hex(&pkg);
+
+    // 第一次：历史写失败 → 500，但单行设置已落库（与实现顺序一致）。
+    let failed = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "package_url": source }),
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let setting = env
+        .store
+        .get_agent_install_package()
+        .await
+        .unwrap()
+        .expect("setting stored despite failed history write");
+    assert_eq!(setting.package_url, source);
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "history write failed, so no history row yet"
+    );
+
+    // 去掉故障、重试同一来源：幂等补齐（设置不变，历史补上）。
+    sqlx::query("DROP TRIGGER fail_history_insert")
+        .execute(env.store.pool())
+        .await
+        .expect("drop trigger");
+    let retried = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "package_url": source }),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::OK);
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].package_id, package_id_for_sha256(&digest));
+    assert_eq!(history[0].source, source);
+}
+
+#[tokio::test]
+async fn install_package_set_rejects_unreachable_url() {
+    let env = TestEnv::new().await;
+    // https URL 分支的失败：URL 不可请求（无 host）→ 502，且不留历史。
+    // （本机路径分支的失败已由 `install_package_set_rejects_unfetchable_source` 覆盖。）
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "package_url": "https://" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "an unreachable URL must not leave a history row"
+    );
+}
+
+#[tokio::test]
+async fn install_package_history_records_non_tar_package_without_identity() {
+    let env = TestEnv::new().await;
+    // 裸二进制（非 gzip/tar）仍可录入与分发，只是历史里 version/arch 留空。
+    let raw = b"raw-binary-agentd-v0";
+    let (_, digest) = set_install_package_source(&env, "raw-package", raw).await;
+    let package_id = package_id_for_sha256(&digest);
+
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].package_id, package_id);
+    assert_eq!(history[0].version, "", "non-tar package has no identity");
+    assert_eq!(history[0].arch, "");
+
+    // 而且能按 id 取回原字节（不因“没身份”而阻断升级）。
+    let credential = enroll_agent_credential(&env).await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/agent/packages/{package_id}"),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.to_vec(), raw.to_vec());
 }
 
 fn enrollment_request(token: &str) -> EnrollmentRequest {

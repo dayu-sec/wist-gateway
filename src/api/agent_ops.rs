@@ -1083,6 +1083,37 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// 按明文凭据 token 校验 agent（无 `agent_id` / `instance_id` 的路径用）。
+///
+/// 与 [`authenticate_agent`] 同一套凭据口径（同一个 `sha256_hex` 哈希、同一种
+/// active + 未过期判定），只是少了「实例必须匹配」那一步 —— 升级取包时升级器手上
+/// 只有凭据 token，没有 agent_id/instance_id。查的是当前凭据（`agent_credentials.token_hash`）。
+pub(crate) async fn authenticate_agent_credential_token(
+    state: &ApiState,
+    token: &str,
+) -> Result<(), String> {
+    let token_hash = sha256_hex(token);
+    let agent = state
+        .store
+        .find_agent_by_credential_token_hash(&token_hash)
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "unknown agent credential".to_string())?;
+    if !constant_time_eq(
+        agent.credential_token_hash.as_bytes(),
+        token_hash.as_bytes(),
+    ) {
+        return Err("invalid agent credential".to_string());
+    }
+    if agent.credential_status != StoredCredentialStatus::Active {
+        return Err("agent credential is not active".to_string());
+    }
+    if credential_is_expired(&agent.credential_expires_at) {
+        return Err("agent credential is expired".to_string());
+    }
+    Ok(())
+}
+
 fn credential_is_expired(expires_at: &str) -> bool {
     let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expires_at) else {
         return true;

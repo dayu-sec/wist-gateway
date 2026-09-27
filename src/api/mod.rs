@@ -53,10 +53,11 @@ pub mod wist_agentd_online_registration_interface;
 pub use wist_agentd_online_registration_interface::WistAgentdOnlineRegistrationInterface;
 
 use admin_ops::{
-    classify_agent, get_agent_runtime_status, grant_work, list_agents, pause_work, resume_work,
-    revoke_agent_credential, revoke_work, set_agent_advertise_url, set_agent_install_package,
-    set_agent_uplink, view_agent_advertise_url, view_agent_install_package, view_agent_purpose,
-    view_agent_uplink, view_agent_work, view_discovery_policies, view_purpose_coverage,
+    classify_agent, get_agent_runtime_status, grant_work, list_agent_install_packages, list_agents,
+    pause_work, resume_work, revoke_agent_credential, revoke_work, set_agent_advertise_url,
+    set_agent_install_package, set_agent_uplink, view_agent_advertise_url,
+    view_agent_install_package, view_agent_purpose, view_agent_uplink, view_agent_work,
+    view_discovery_policies, view_purpose_coverage,
 };
 use agent_ops::{
     ack_work, poll_agent_uplink, poll_control_commands, poll_discovery_policies, poll_work,
@@ -67,8 +68,8 @@ use enrollment::enroll_agent;
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
 use ingest::{MAX_INGEST_BODY_BYTES, ingest_agent_facts};
 use install::{
-    download_agent_package, get_agent_initial_config_with_token, get_agent_install_code,
-    get_agent_install_script, get_agent_install_script_signature,
+    download_agent_package, download_agent_package_by_id, get_agent_initial_config_with_token,
+    get_agent_install_code, get_agent_install_script, get_agent_install_script_signature,
 };
 use logs::{MAX_LOG_INGEST_BODY_BYTES, ingest_agent_logs, view_agent_logs};
 use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
@@ -223,6 +224,13 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/agent/packages/current",
             get(download_agent_package),
         )
+        // NOTE(hand-added): 按内容寻址 id 取某个录入过的安装包（升级路径）。
+        // 与 `packages/current` 共存：matchit 静态段优先，`current` 仍走上面那条。
+        // 鉴权与 current 一致（bootstrap token 或 agent 凭据）。
+        .route(
+            "/api/v1/agent/packages/{package_id}",
+            get(download_agent_package_by_id),
+        )
         .route("/api/v1/agent/enroll", post(enroll_agent))
         .route("/api/v1/agent/status", post(submit_agent_status))
         // （agentd 上报事实**摘要**的原控制面路由 `POST /api/v1/agent/facts` 已删。）
@@ -332,6 +340,12 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agent/install-package",
             get(view_agent_install_package).post(set_agent_install_package),
+        )
+        // NOTE(hand-added): 安装包录入历史列表（管理面）。与安装包地址成对：
+        // 地址记当前生效来源，这条记历史录入过的包（每条带内容寻址 id）。
+        .route(
+            "/api/v1/admin/agent/install-packages",
+            get(list_agent_install_packages),
         )
         // NOTE(hand-added): Agent 数据面上送地址的读取/设置。它是 `uplink:poll` 现算上送
         // 授权时的目标来源；未设置时授权只能是待命（没有目标，Agent 不采集日志也不上送数据面）。

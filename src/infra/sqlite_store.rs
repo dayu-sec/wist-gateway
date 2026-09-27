@@ -464,6 +464,19 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
     })
 }
 
+fn agent_install_package_from_row(row: &SqliteRow) -> StoreResult<StoredAgentInstallPackage> {
+    Ok(StoredAgentInstallPackage {
+        package_id: column!(row, "package_id"),
+        source: column!(row, "source"),
+        package_sha256: column!(row, "package_sha256"),
+        version: column!(row, "version"),
+        arch: column!(row, "arch"),
+        cached_path: column!(row, "cached_path"),
+        created_by: column!(row, "created_by"),
+        created_at: column!(row, "created_at"),
+    })
+}
+
 async fn insert_token(tx: &mut SqliteConnection, token: &StoredEnrollmentToken) -> StoreResult<()> {
     sqlx::query(
         "INSERT OR REPLACE INTO enrollment_tokens (token_id, token_hash, tenant_id, \
@@ -788,6 +801,22 @@ impl Store for SqliteStore {
         row.as_ref().map(agent_from_row).transpose()
     }
 
+    async fn find_agent_by_credential_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> StoreResult<Option<StoredAgentRegistration>> {
+        // 只匹配「当前凭据」：投影的 `c` 是 agents.current_credential_id 指向的那一行，
+        // 所以轮换/吊销过的旧凭据不会命中（与 authenticate_agent 的口径一致）。
+        let mut builder = QueryBuilder::<Sqlite>::new(AGENT_PROJECTION);
+        builder.push(" WHERE c.token_hash = ").push_bind(token_hash);
+        let row = builder
+            .build()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "select agent by credential token hash"))?;
+        row.as_ref().map(agent_from_row).transpose()
+    }
+
     async fn agent_exists(&self, agent_id: &str) -> StoreResult<bool> {
         let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM agents WHERE agent_id = ?1")
             .bind(agent_id)
@@ -837,6 +866,61 @@ impl Store for SqliteStore {
             })),
             None => Ok(None),
         }
+    }
+
+    async fn list_agent_install_packages(&self) -> StoreResult<Vec<StoredAgentInstallPackage>> {
+        // 按录入时间倒序：最近录入的排前面（管理面列表与「刚录的那个」对齐）。
+        let rows = sqlx::query(
+            "SELECT package_id, source, package_sha256, version, arch, cached_path, \
+             created_by, created_at FROM agent_install_package_history \
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list agent install packages"))?;
+        rows.iter().map(agent_install_package_from_row).collect()
+    }
+
+    async fn get_agent_install_package_by_id(
+        &self,
+        package_id: &str,
+    ) -> StoreResult<Option<StoredAgentInstallPackage>> {
+        let row = sqlx::query(
+            "SELECT package_id, source, package_sha256, version, arch, cached_path, \
+             created_by, created_at FROM agent_install_package_history WHERE package_id = ?1",
+        )
+        .bind(package_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select agent install package by id"))?;
+        row.as_ref().map(agent_install_package_from_row).transpose()
+    }
+
+    async fn upsert_agent_install_package_by_id(
+        &self,
+        package: &StoredAgentInstallPackage,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO agent_install_package_history (package_id, source, package_sha256, \
+             version, arch, cached_path, created_by, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT (package_id) DO UPDATE SET source = excluded.source, \
+             package_sha256 = excluded.package_sha256, version = excluded.version, \
+             arch = excluded.arch, cached_path = excluded.cached_path, \
+             created_by = excluded.created_by, created_at = excluded.created_at",
+        )
+        .bind(&package.package_id)
+        .bind(&package.source)
+        .bind(&package.package_sha256)
+        .bind(&package.version)
+        .bind(&package.arch)
+        .bind(&package.cached_path)
+        .bind(&package.created_by)
+        .bind(&package.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert agent install package by id"))?;
+        Ok(())
     }
 
     async fn upsert_agent_install_package(
@@ -2398,6 +2482,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn migration_adds_agent_install_package_history_table() {
+        // 迁移 0016 新建一张表（CREATE TABLE IF NOT EXISTS），不会在已有库上重跑建表，
+        // 因此直接查 pragma 确认表/列真存在，而不是只靠“插得进去”。
+        let store = store().await;
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('agent_install_package_history')",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        for expected in [
+            "package_id",
+            "source",
+            "package_sha256",
+            "version",
+            "arch",
+            "cached_path",
+            "created_by",
+            "created_at",
+        ] {
+            assert!(
+                columns.iter().any(|name| name == expected),
+                "missing column {expected}: {columns:?}"
+            );
+        }
+    }
+
     fn local_work_view() -> wist_contracts::local_work::AgentLocalWork {
         wist_contracts::local_work::AgentLocalWork {
             recorded_at: "2026-01-05T00:00:00+00:00".to_string(),
@@ -2732,6 +2844,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finds_agent_by_current_credential_token_hash_only() {
+        let store = store().await;
+        register(&store, "hash-c", "agent-1", "inst-1").await;
+
+        // 当前凭据 hash 命中（升级取包只有 token，没有 agent_id/instance_id）。
+        let found = store
+            .find_agent_by_credential_token_hash("cred-hash-agent-1")
+            .await
+            .unwrap()
+            .expect("current credential must resolve to its agent");
+        assert_eq!(found.agent_id, "agent-1");
+
+        // 未知 hash → None（不能凭一个不存在的 token 拿到任何 agent）。
+        assert!(
+            store
+                .find_agent_by_credential_token_hash("no-such-hash")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // 轮换后旧 hash 不再是“当前凭据”，查不到；新 hash 查得到。
+        assert!(
+            store
+                .renew_agent_credential(&RenewCredential {
+                    agent_id: "agent-1",
+                    instance_id: "inst-1",
+                    current_token_hash: "cred-hash-agent-1",
+                    new_credential_id: "cred-next",
+                    new_token_hash: "cred-hash-next",
+                    issued_at: "2026-02-01T00:00:00+00:00",
+                    expires_at: "2027-01-01T00:00:00+00:00",
+                })
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .find_agent_by_credential_token_hash("cred-hash-agent-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "rotated-out credential must not resolve"
+        );
+        let renewed = store
+            .find_agent_by_credential_token_hash("cred-hash-next")
+            .await
+            .unwrap()
+            .expect("new credential resolves");
+        assert_eq!(renewed.agent_id, "agent-1");
+    }
+
+    #[tokio::test]
+    async fn credential_token_hash_lookup_returns_agent_for_revoked_or_expired_current_credential()
+    {
+        // 该查询只按「当前凭据」那一行匹配 `token_hash`，**不**在 SQL 里过滤状态/有效期：
+        // 吊销/过期的拒绝是 API 层 `authenticate_agent_credential_token` 的职责。
+        // 这里钉住分层契约，防止将来误以为查询本身已经做过状态过滤而省略 API 侧判定。
+        let store = store().await;
+        register(&store, "hash-k", "agent-1", "inst-1").await;
+
+        // 已吊销的当前凭据：行仍在（保留审计），hash 仍解析到 agent，但状态是 revoked。
+        assert!(
+            store
+                .revoke_agent_credential("agent-1", "cred-agent-1")
+                .await
+                .unwrap()
+        );
+        let revoked = store
+            .find_agent_by_credential_token_hash("cred-hash-agent-1")
+            .await
+            .unwrap()
+            .expect("revoked current credential still resolves so the API can reject it");
+        assert_eq!(revoked.agent_id, "agent-1");
+        assert_eq!(revoked.credential_status, StoredCredentialStatus::Revoked);
+
+        // 过期的当前凭据（状态仍 active）：同样解析得到，过期判定交给 API 层。
+        register(&store, "hash-l", "agent-2", "inst-2").await;
+        sqlx::query("UPDATE agent_credentials SET expires_at = ?1 WHERE credential_id = ?2")
+            .bind("2020-01-01T00:00:00+00:00")
+            .bind("cred-agent-2")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let expired = store
+            .find_agent_by_credential_token_hash("cred-hash-agent-2")
+            .await
+            .unwrap()
+            .expect("expired current credential still resolves so the API can reject it");
+        assert_eq!(expired.credential_status, StoredCredentialStatus::Active);
+        assert_eq!(expired.credential_expires_at, "2020-01-01T00:00:00+00:00");
+    }
+
+    #[tokio::test]
     async fn lists_and_filters_agents_with_pagination() {
         let store = store().await;
         register(&store, "hash-i", "agent-1", "inst-1").await;
@@ -2930,6 +3136,80 @@ mod tests {
             loaded.package_url,
             "https://other.example.com/agentd.tar.gz"
         );
+    }
+
+    #[tokio::test]
+    async fn stores_agent_install_package_history() {
+        let store = store().await;
+        // 未录入过时为空列表（而不是报错）。
+        assert!(
+            store
+                .list_agent_install_packages()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_agent_install_package_by_id("pkg-missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let first = StoredAgentInstallPackage {
+            package_id: "pkg-0000000000000001".to_string(),
+            source: "/tmp/agentd-0.1.9.tar.gz".to_string(),
+            package_sha256: "sha256:aaa".to_string(),
+            version: "0.1.9".to_string(),
+            arch: "aarch64-apple-darwin".to_string(),
+            cached_path: "/state/install-package/history/pkg-0000000000000001".to_string(),
+            created_by: "platform-eng".to_string(),
+            created_at: "2026-01-01T00:00:00+00:00".to_string(),
+        };
+        store
+            .upsert_agent_install_package_by_id(&first)
+            .await
+            .unwrap();
+        let loaded = store
+            .get_agent_install_package_by_id(&first.package_id)
+            .await
+            .unwrap()
+            .expect("history entry");
+        assert_eq!(loaded.source, first.source);
+        assert_eq!(loaded.package_sha256, first.package_sha256);
+        assert_eq!(loaded.version, "0.1.9");
+        assert_eq!(loaded.arch, "aarch64-apple-darwin");
+        assert_eq!(loaded.created_by, "platform-eng");
+
+        // 同 package_id 再写覆盖同一行（内容寻址幂等）。
+        let updated = StoredAgentInstallPackage {
+            source: "https://mirror.example.com/agentd-0.1.9.tar.gz".to_string(),
+            created_at: "2026-01-02T00:00:00+00:00".to_string(),
+            ..first.clone()
+        };
+        store
+            .upsert_agent_install_package_by_id(&updated)
+            .await
+            .unwrap();
+        let list = store.list_agent_install_packages().await.unwrap();
+        assert_eq!(list.len(), 1, "same package_id must stay one row");
+        assert_eq!(list[0].source, updated.source);
+
+        // 新包排前面（created_at DESC）。
+        let second = StoredAgentInstallPackage {
+            package_id: "pkg-0000000000000002".to_string(),
+            created_at: "2026-01-03T00:00:00+00:00".to_string(),
+            ..first.clone()
+        };
+        store
+            .upsert_agent_install_package_by_id(&second)
+            .await
+            .unwrap();
+        let list = store.list_agent_install_packages().await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].package_id, second.package_id);
+        assert_eq!(list[1].package_id, first.package_id);
     }
 
     #[tokio::test]

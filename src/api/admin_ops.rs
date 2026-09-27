@@ -15,13 +15,14 @@ use crate::app::work::WorkRejection;
 use crate::infra::{
     AgentQuery, DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID, DEFAULT_AGENT_UPLINK_PORT,
     DEFAULT_AGENT_UPLINK_SETTING_ID, DEFAULT_INSTALL_PACKAGE_SETTING_ID, StoredAgentAdvertiseUrl,
-    StoredAgentClassification, StoredAgentFactSummary, StoredAgentInstallPackageAddress,
-    StoredAgentUplinkAddress, StoredOneShotWork, StoredPurposeSuggestion, StoredWorkAck,
-    StoredWorkResult, contains_shell_metacharacters, effective_standing, outstanding_one_shot,
+    StoredAgentClassification, StoredAgentFactSummary, StoredAgentInstallPackage,
+    StoredAgentInstallPackageAddress, StoredAgentUplinkAddress, StoredOneShotWork,
+    StoredPurposeSuggestion, StoredWorkAck, StoredWorkResult, contains_shell_metacharacters,
+    effective_standing, outstanding_one_shot,
 };
 use wist_contracts::work::{OneShotWork, StandingWork, WorkKind, WorkReceipt};
 
-use super::install_package::{PackageFetchError, fetch_into_cache};
+use super::install_package::{PackageFetchError, fetch_into_package_cache};
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 
 /// 列表默认/最大分页大小（防止一次拉全表）。
@@ -108,6 +109,27 @@ pub struct AgentInstallPackageResponse {
     pub updated_by: String,
     /// 未设置过（当前用内置默认分发地址）时为 null。
     pub updated_at: Option<DateTime>,
+}
+
+/// 安装包录入历史里的一条（列表用）。
+#[derive(Debug, Serialize)]
+pub struct AgentInstallPackageHistoryEntry {
+    pub package_id: String,
+    pub source: String,
+    pub package_sha256: String,
+    pub version: String,
+    pub arch: String,
+    /// 由网关派生的下载地址（可直接给 agent 用）：
+    /// `<生效对外基址>/api/v1/agent/packages/<package_id>`。
+    pub agent_package_url: String,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+/// 安装包录入历史列表响应。
+#[derive(Debug, Serialize)]
+pub struct AgentInstallPackageHistoryResponse {
+    pub packages: Vec<AgentInstallPackageHistoryEntry>,
 }
 
 /// 设置 Agent 数据面上送地址的请求体。
@@ -1577,33 +1599,106 @@ pub async fn set_agent_install_package(
         };
     // 先把制品拉到网关本地：之后所有安装都从这份缓存分发，
     // 校验摘要因此与真正服务出去的内容天然同源。
-    let actual_sha256 =
-        match fetch_into_cache(&state.config, package_url, expected_sha256.as_deref()).await {
-            Ok(sha256) => sha256,
-            Err(err) => {
-                let status = match &err {
-                    PackageFetchError::DigestMismatch(_) => StatusCode::BAD_REQUEST,
-                    PackageFetchError::SourceUnavailable(_) => StatusCode::BAD_GATEWAY,
-                };
-                return (status, err.to_string()).into_response();
-            }
-        };
+    // 同时会把制品**另存一份按条副本**并解析包身份（升级按条目取包要用）。
+    let cached = match fetch_into_package_cache(
+        &state.config,
+        package_url,
+        expected_sha256.as_deref(),
+    )
+    .await
+    {
+        Ok(cached) => cached,
+        Err(err) => {
+            let status = match &err {
+                PackageFetchError::DigestMismatch(_) => StatusCode::BAD_REQUEST,
+                PackageFetchError::SourceUnavailable(_) => StatusCode::BAD_GATEWAY,
+            };
+            return (status, err.to_string()).into_response();
+        }
+    };
+    let requested_by = input
+        .requested_by
+        .unwrap_or_else(|| "platform-maintenance-engineer".to_string());
+    let recorded_at = chrono::Utc::now().to_rfc3339();
+    let package_sha256 = format!("sha256:{}", cached.sha256);
     let setting = StoredAgentInstallPackageAddress {
         address_id: DEFAULT_INSTALL_PACKAGE_SETTING_ID.to_string(),
         package_url: package_url.to_string(),
         // 摘要由网关拉取后计算/校验再落库：保证它与本地缓存内容永远一致
         // （手填摘要与本地的包对不上，正是安装端 sha256 mismatch 的成因）。
-        package_sha256: Some(format!("sha256:{actual_sha256}")),
-        updated_by: input
-            .requested_by
-            .unwrap_or_else(|| "platform-maintenance-engineer".to_string()),
-        updated_at: chrono::Utc::now().to_rfc3339(),
+        package_sha256: Some(package_sha256.clone()),
+        updated_by: requested_by.clone(),
+        updated_at: recorded_at.clone(),
     };
-    match state.store.upsert_agent_install_package(&setting).await {
+    if let Err(err) = state.store.upsert_agent_install_package(&setting).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store agent install package address: {err}"),
+        )
+            .into_response();
+    }
+    // 追加录入历史：内容寻址（package_id）幂等，同一个包重复录入覆盖同一行。
+    let history = StoredAgentInstallPackage {
+        package_id: cached.package_id.clone(),
+        source: package_url.to_string(),
+        package_sha256,
+        version: cached.version.clone(),
+        arch: cached.arch.clone(),
+        cached_path: cached.cached_path.to_string_lossy().to_string(),
+        created_by: requested_by,
+        created_at: recorded_at,
+    };
+    match state
+        .store
+        .upsert_agent_install_package_by_id(&history)
+        .await
+    {
         Ok(()) => Json(install_package_response(&setting)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store agent install package address: {err}"),
+            format!("failed to store agent install package history: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 列出 wist-agentd 安装包的**录入历史**（管理面）。
+///
+/// 按录入时间倒序返回；每条带内容寻址 id（可用于 `GET /api/v1/agent/packages/{package_id}`
+/// 按条目取包，备份升级用）。`source` 只是留痕，取包走网关自己的副本。
+pub async fn list_agent_install_packages(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    match state.store.list_agent_install_packages().await {
+        Ok(entries) => {
+            // 基址只取一次（`effective_advertise_base` 会读库设置），循环里复用。
+            let base = super::install::effective_advertise_base(&state.config, &state.store).await;
+            let packages = entries
+                .into_iter()
+                .map(|entry| AgentInstallPackageHistoryEntry {
+                    agent_package_url: state
+                        .config
+                        .agent_package_url_by_id_at(&base, &entry.package_id),
+                    package_id: entry.package_id,
+                    source: entry.source,
+                    package_sha256: entry.package_sha256,
+                    version: entry.version,
+                    arch: entry.arch,
+                    created_by: entry.created_by,
+                    created_at: entry.created_at,
+                })
+                .collect();
+            Json(AgentInstallPackageHistoryResponse { packages }).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to load agent install package history: {err}"),
         )
             .into_response(),
     }

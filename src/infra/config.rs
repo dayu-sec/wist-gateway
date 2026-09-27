@@ -444,6 +444,15 @@ impl AdminConfig {
         format!("{}/api/v1/agent/packages/current", trim_base_url(base))
     }
 
+    /// 某个内容寻址 id 的安装包下载地址（基址由调用方给出，通常取
+    /// `effective_advertise_base`）。
+    ///
+    /// 与 [`Self::agent_package_url_at`] 同一口径，只是路径尾部是 `package_id` 而非
+    /// `current`；由网关派生，避免前端自己拼。
+    pub fn agent_package_url_by_id_at(&self, base: &str, package_id: &str) -> String {
+        format!("{}/api/v1/agent/packages/{package_id}", trim_base_url(base))
+    }
+
     /// Agent 初始配置地址（基址取配置里的 `server.public_base_url`）；运行期见
     /// [`Self::agent_initial_config_url_at`]。
     pub fn agent_initial_config_url(&self) -> String {
@@ -462,6 +471,19 @@ impl AdminConfig {
     pub fn install_package_cache_path(&self) -> PathBuf {
         let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
         state_dir.join("install-package").join("agent-package")
+    }
+
+    /// 内容寻址的安装包**按条副本**路径：每个录入过的包单独存一份（升级要按条目取包）。
+    ///
+    /// 与单例 [`Self::install_package_cache_path`] 是两回事：那个 `agent-package` 是
+    /// 「当前生效来源」的单文件缓存（安装仍用它），这里 `history/<package_id>` 是历史里
+    /// 每个包各自的副本。调用方写入前会确保 parent 目录存在（见 `install_package::write_cache_to`）。
+    pub fn install_package_history_path(&self, package_id: &str) -> PathBuf {
+        let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
+        state_dir
+            .join("install-package")
+            .join("history")
+            .join(package_id)
     }
 
     /// 采集日志（数据面转发的 `LOGRAW:` 记录）的本地落盘文件。

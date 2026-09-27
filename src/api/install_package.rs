@@ -1,6 +1,6 @@
 //! wist-agentd 安装包的获取、本地缓存与生效来源解析。
 //!
-//! 管理面设置安装包**来源地址**时，网关先把制品拉到本地（[`fetch_into_cache`]），
+//! 管理面设置安装包**来源地址**时，网关先把制品拉到本地（[`fetch_into_package_cache`]），
 //! 之后所有安装都从网关自身的 `/api/v1/agent/packages/current` 取这份缓存
 //! （[`effective_package_path`]）。这样做有两个目的：
 //!
@@ -98,15 +98,57 @@ pub async fn resolve_agent_package(
     AgentPackageSource::from_local_file(config, base, path)
 }
 
-/// 把来源地址的制品拉取到网关本地缓存，返回其 sha256（裸 hex）。
+/// 一次录入的完整产物：单例缓存与按条副本都已落盘，并已解析出包身份。
+#[derive(Debug, Clone)]
+pub struct CachedInstallPackage {
+    /// 裸 hex sha256（不带 `sha256:` 前缀）。
+    pub sha256: String,
+    /// 内容寻址 id：`pkg-<sha256 前 16 位>`。
+    pub package_id: String,
+    /// 网关自己存的那份副本路径。
+    pub cached_path: PathBuf,
+    /// 包内目录名解析出的版本/架构（解析不出为空串）。
+    pub version: String,
+    pub arch: String,
+}
+
+/// 把来源制品拉到网关本地：**同时**写单例缓存（安装用）与按条副本（升级用）。
 ///
-/// `expected_sha256` 是管理面填写的期望摘要（可带 `sha256:` 前缀）：填写即表示
-/// 「我认可这个字节序列」，不匹配直接拒绝，既不改缓存也不落库。
-pub async fn fetch_into_cache(
+/// 来源只读一次：读到的字节同时用于写两份缓存与解析包身份，避免重复拉取几十 MB 的制品。
+pub async fn fetch_into_package_cache(
     config: &AdminConfig,
     source: &str,
     expected_sha256: Option<&str>,
-) -> Result<String, PackageFetchError> {
+) -> Result<CachedInstallPackage, PackageFetchError> {
+    let (bytes, sha256) = read_verified_source(source, expected_sha256).await?;
+    // 单例缓存照旧写：安装路径 /api/v1/agent/packages/current 仍从它分发。
+    write_cache_to(&config.install_package_cache_path(), &bytes)?;
+    let package_id = package_id_for_sha256(&sha256);
+    let cached_path = config.install_package_history_path(&package_id);
+    write_cache_to(&cached_path, &bytes)?;
+    let (version, arch) = read_package_identity(&bytes);
+    Ok(CachedInstallPackage {
+        sha256,
+        package_id,
+        cached_path,
+        version,
+        arch,
+    })
+}
+
+/// 内容寻址 id：`pkg-<sha256 前 16 位>`（裸 hex）。
+///
+/// 取前 16 位（64 bit）足够区分设备内录入的包，同时保持文件名短、可读。
+pub fn package_id_for_sha256(sha256_hex: &str) -> String {
+    let prefix: String = sha256_hex.chars().take(16).collect();
+    format!("pkg-{prefix}")
+}
+
+/// 读来源 → 校验期望摘要，返回（字节, 裸 hex sha256）。
+async fn read_verified_source(
+    source: &str,
+    expected_sha256: Option<&str>,
+) -> Result<(Vec<u8>, String), PackageFetchError> {
     let bytes = read_source(source).await?;
     let actual = bytes_sha256_hex(&bytes);
     if let Some(expected) = expected_sha256 {
@@ -120,12 +162,10 @@ pub async fn fetch_into_cache(
             )));
         }
     }
-    write_cache(config, &bytes)?;
-    Ok(actual)
+    Ok((bytes, actual))
 }
 
-fn write_cache(config: &AdminConfig, bytes: &[u8]) -> Result<(), PackageFetchError> {
-    let path = config.install_package_cache_path();
+fn write_cache_to(path: &Path, bytes: &[u8]) -> Result<(), PackageFetchError> {
     let dir = path.parent().ok_or_else(|| {
         PackageFetchError::SourceUnavailable(format!(
             "invalid package cache path {}",
@@ -146,7 +186,7 @@ fn write_cache(config: &AdminConfig, bytes: &[u8]) -> Result<(), PackageFetchErr
             partial.display()
         ))
     })?;
-    std::fs::rename(&partial, &path).map_err(|err| {
+    std::fs::rename(&partial, path).map_err(|err| {
         PackageFetchError::SourceUnavailable(format!(
             "failed to activate package cache {}: {err}",
             path.display()
@@ -240,6 +280,71 @@ struct PackageHashCacheEntry {
 
 static PACKAGE_HASH_CACHE: Mutex<Option<PackageHashCacheEntry>> = Mutex::new(None);
 
+/// 目标三元组的已知架构前缀（用于把 `wist-agentd-<version>-<triple>` 切两段）。
+const KNOWN_TRIPLE_ARCHES: &[&str] = &[
+    "aarch64",
+    "x86_64",
+    "i686",
+    "i586",
+    "armv7",
+    "armv6",
+    "arm",
+    "riscv64",
+    "powerpc64",
+    "powerpc64le",
+    "s390x",
+    "x86_64h",
+    "loongarch64",
+];
+
+/// 从安装包字节里读出版本与目标三元组，读不出返回 `("", "")`。
+///
+/// 包是 `wist-agentd-<version>-<target-triple>.tar.gz`，顶层一层同名目录，形如
+/// `wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd`。本函数解压 gzip 后取
+/// **第一个 tar 条目**的路径首段，再按前缀 `wist-agentd-` 切出 `<version>` 与 `<triple>`。
+///
+/// 不是标准包（裸二进制、非 gzip、损坏字节）一律返回空串而**不报错**：这些包仍能被
+/// 网关按内容寻址分发，只是历史行里 version/arch 留空；让录入整体失败反而会阻断升级。
+pub fn read_package_identity(bytes: &[u8]) -> (String, String) {
+    let Some(dir) = first_tar_entry_component(bytes) else {
+        return (String::new(), String::new());
+    };
+    parse_agent_package_dir_name(&dir)
+}
+
+/// gzip + tar 解出第一个条目路径的首段（如 `wist-agentd-0.1.9-aarch64-apple-darwin`）。
+/// 任何一步失败都返回 `None`，绝不 panic。
+fn first_tar_entry_component(bytes: &[u8]) -> Option<String> {
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder);
+    let mut entries = archive.entries().ok()?;
+    let entry = entries.next()?.ok()?;
+    let path = entry.path().ok()?;
+    // 跳过 `./` / `/` 之类非普通段，取第一个普通目录名。
+    path.components().find_map(|component| match component {
+        std::path::Component::Normal(name) => name.to_str().map(str::to_string),
+        _ => None,
+    })
+}
+
+/// 从顶层目录名 `wist-agentd-<version>-<triple>` 切出 `(version, triple)`。
+///
+/// 版本自身可能带 `-`（预发布，如 `0.2.0-beta.1`），因此不能简单按第一个 `-` 切：
+/// 以「剩余部分以已知架构名开头」的那个 `-` 作为分隔点。切不出时返回 `("", "")`。
+fn parse_agent_package_dir_name(dir: &str) -> (String, String) {
+    let Some(rest) = dir.strip_prefix("wist-agentd-") else {
+        return (String::new(), String::new());
+    };
+    for (index, _) in rest.match_indices('-') {
+        let candidate = &rest[index + 1..];
+        let arch_head = candidate.split('-').next().unwrap_or("");
+        if KNOWN_TRIPLE_ARCHES.contains(&arch_head) {
+            return (rest[..index].to_string(), candidate.to_string());
+        }
+    }
+    (String::new(), String::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +399,199 @@ mod tests {
         let hash_b = file_sha256_hex(&b).unwrap();
         assert_ne!(hash_a, hash_b, "cache must be keyed by path");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 把任意字节压成 gzip（构造「合法 gzip 但载荷不是 tar」的输入用）。
+    fn gzip_of(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).expect("gzip write");
+        encoder.finish().expect("gzip finish")
+    }
+
+    /// 构造一个 gzip 包住的 tar：按顺序写入 `(归档内路径, 内容)` 若干条目。
+    fn tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, *path, *contents)
+                .expect("append tar entry");
+        }
+        gzip_of(&builder.into_inner().expect("finish tar"))
+    }
+
+    #[test]
+    fn package_id_for_sha256_is_stable_prefixed_and_digest_sized() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let id = package_id_for_sha256(digest);
+        assert_eq!(id, "pkg-0123456789abcdef");
+        assert!(id.starts_with("pkg-"));
+        assert_eq!(id.len(), "pkg-".len() + 16);
+        // 同一 sha256 两次得到同一 id（幂等，内容寻址的前提）。
+        assert_eq!(package_id_for_sha256(digest), id);
+
+        // 不同 sha256 得到不同 id。
+        let other = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        assert_ne!(package_id_for_sha256(other), id);
+        assert_eq!(package_id_for_sha256(other), "pkg-fedcba9876543210");
+    }
+
+    #[test]
+    fn read_package_identity_returns_empty_for_non_tar_gzip() {
+        // 合法 gzip，但载荷不是 tar：读不出身份，不 panic、留空。
+        assert_eq!(
+            read_package_identity(&gzip_of(b"this is not a tar archive")),
+            (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn read_package_identity_returns_empty_for_plain_dot_entry() {
+        // 顶层条目就是 `./`：取不到普通段 → 留空（不 panic）。
+        let bytes = tar_gz(&[("./", b"")]);
+        assert_eq!(
+            read_package_identity(&bytes),
+            (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn read_package_identity_skips_leading_dot_slash() {
+        // `./wist-agentd-…/…`：跳过 CurDir 段，仍能取到目录名。
+        let bytes = tar_gz(&[(
+            "./wist-agentd-1.2.3-x86_64-unknown-linux-gnu/wist-agentd",
+            b"bin",
+        )]);
+        assert_eq!(
+            read_package_identity(&bytes),
+            ("1.2.3".to_string(), "x86_64-unknown-linux-gnu".to_string())
+        );
+    }
+
+    #[test]
+    fn read_package_identity_uses_only_the_first_entry() {
+        // 两个条目：只看第一个（顶层目录名是哪个就报哪个）。
+        let bytes = tar_gz(&[
+            (
+                "wist-agentd-1.2.3-x86_64-unknown-linux-gnu/wist-agentd",
+                b"first",
+            ),
+            (
+                "wist-agentd-9.9.9-aarch64-apple-darwin/wist-agentd",
+                b"second",
+            ),
+        ]);
+        assert_eq!(
+            read_package_identity(&bytes),
+            ("1.2.3".to_string(), "x86_64-unknown-linux-gnu".to_string())
+        );
+    }
+
+    #[test]
+    fn read_package_identity_reads_a_symlink_entry_name() {
+        // 首个条目是符号链接：取其自身路径名即可，不跟随、不 panic。
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_mtime(0);
+        builder
+            .append_link(
+                &mut header,
+                "wist-agentd-1.2.3-x86_64-unknown-linux-gnu/wist-agentd",
+                "..",
+            )
+            .expect("append symlink");
+        let bytes = gzip_of(&builder.into_inner().expect("finish tar"));
+        assert_eq!(
+            read_package_identity(&bytes),
+            ("1.2.3".to_string(), "x86_64-unknown-linux-gnu".to_string())
+        );
+    }
+
+    #[test]
+    fn read_package_identity_tolerates_absurd_declared_size() {
+        // 头部声明的条目大小离谱（约 4 EiB）：只读头部取名，不按声明大小分配/读取，不 panic。
+        let mut header = tar::Header::new_gnu();
+        header
+            .set_path("wist-agentd-1.2.3-x86_64-unknown-linux-gnu/")
+            .expect("path");
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(1 << 62);
+        header.set_mode(0o755);
+        header.set_mtime(0);
+        header.set_cksum();
+        let bytes = gzip_of(header.as_bytes());
+        assert_eq!(
+            read_package_identity(&bytes),
+            ("1.2.3".to_string(), "x86_64-unknown-linux-gnu".to_string())
+        );
+    }
+
+    #[test]
+    fn read_package_identity_handles_a_large_payload_package() {
+        // 包里带一大块内容：只读首个条目的头部，不受体积影响。
+        let big = vec![0u8; 4 * 1024 * 1024];
+        let bytes = tar_gz(&[
+            (
+                "wist-agentd-1.2.3-x86_64-unknown-linux-gnu/README",
+                b"readme",
+            ),
+            (
+                "wist-agentd-1.2.3-x86_64-unknown-linux-gnu/wist-agentd",
+                &big,
+            ),
+        ]);
+        assert_eq!(
+            read_package_identity(&bytes),
+            ("1.2.3".to_string(), "x86_64-unknown-linux-gnu".to_string())
+        );
+    }
+
+    #[test]
+    fn read_package_identity_parses_prerelease_and_four_segment_versions() {
+        assert_eq!(
+            read_package_identity(&tar_gz(&[(
+                "wist-agentd-0.2.0-beta.1-aarch64-apple-darwin/wist-agentd",
+                b"x",
+            )])),
+            (
+                "0.2.0-beta.1".to_string(),
+                "aarch64-apple-darwin".to_string()
+            )
+        );
+        assert_eq!(
+            read_package_identity(&tar_gz(&[(
+                "wist-agentd-1.2.3.4-x86_64-unknown-linux-gnu/wist-agentd",
+                b"x",
+            )])),
+            (
+                "1.2.3.4".to_string(),
+                "x86_64-unknown-linux-gnu".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn read_package_identity_returns_empty_for_unknown_triple() {
+        // 三元组不认识：整体留空，而不是把版本错切出来。
+        assert_eq!(
+            read_package_identity(&tar_gz(&[(
+                "wist-agentd-1.2.3-some-unknown-triple/wist-agentd",
+                b"x",
+            )])),
+            (String::new(), String::new())
+        );
+        // 连 `-<triple>` 都没有（整名就是一个未知词）：同样留空。
+        assert_eq!(
+            read_package_identity(&tar_gz(&[("wist-agentd-1.2.3/wist-agentd", b"x")])),
+            (String::new(), String::new())
+        );
     }
 }

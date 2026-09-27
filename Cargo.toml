@@ -33,6 +33,10 @@ orion-error = { version = "0.8", features = ["derive", "serde_json"] }
 ring = "0.17"
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# 读安装包（wist-agentd-<version>-<triple>.tar.gz）顶层目录名，取 version/arch 落历史。
+# flate2 默认走纯 Rust 后端（miniz_oxide），不引入 C 依赖。
+flate2 = "1"
+tar = "0.4"
 
 # 持久化：SQLite（默认，内嵌）+ 同一 Store trait 下可选的 Postgres 实现。
 # - sqlite-bundled：从源码编译 libsqlite3，构建期需要 C 编译器（release 流水线按架构原生构建，满足）。

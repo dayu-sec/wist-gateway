@@ -171,7 +171,11 @@ pub async fn get_agent_initial_config_with_token(
         }
         Err(reason) => {
             rate_limit::record_auth_failure(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
-            unauthorized_no_store(reason)
+            // 对外只回一句不可区分的口径：不暴露「token 存在但过期/已消费」这类可枚举细节
+            // （与安装包分发端点、enroll 路径的对外口径一致）。具体原因只进服务端审计日志，
+            // 保留运维可诊断性。
+            eprintln!("audit bootstrap_token_rejected endpoint=initial-config reason={reason}");
+            unauthorized_no_store("invalid bootstrap bearer token")
         }
     }
 }
@@ -182,21 +186,9 @@ pub async fn download_agent_package(
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
-    if let Some(response) = rate_limit::check_rate_limit(&state, &client_key, BOOTSTRAP_AUTH_SCOPE)
-    {
+    if let Err(response) = authorize_package_download(&state, &headers, &client_key).await {
         return response;
     }
-    let Some(token) = bootstrap_bearer_token(&headers) else {
-        rate_limit::record_auth_failure(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
-        return unauthorized_no_store("agent package download requires a bootstrap bearer token");
-    };
-    if let Err(reason) =
-        validate_bootstrap_token_for_config(&state.config, &state.store, token).await
-    {
-        rate_limit::record_auth_failure(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
-        return unauthorized_no_store(reason);
-    }
-    rate_limit::clear_auth_failures(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
     let package_path = effective_package_path(&state.config, &state.store).await;
     match std::fs::read(&package_path) {
         Ok(bytes) => (
@@ -213,10 +205,111 @@ pub async fn download_agent_package(
             .into_response(),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CACHE_CONTROL, NO_STORE)],
             "failed to read agent package",
         )
             .into_response(),
     }
+}
+
+/// 按内容寻址 id 取某个录入过的安装包（升级路径）。
+///
+/// 与 `/current` 不同：这里取的是历史里**这个包自己**的那份副本，而不是单例缓存。
+/// 鉴权与 `/current` 一致（bootstrap token 或 agent 凭据二者其一）。
+pub async fn download_agent_package_by_id(
+    State(state): State<ApiState>,
+    Path(package_id): Path<String>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = authorize_package_download(&state, &headers, &client_key).await {
+        return response;
+    }
+    let entry = match state
+        .store
+        .get_agent_install_package_by_id(&package_id)
+        .await
+    {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                [(header::CACHE_CONTROL, NO_STORE)],
+                "unknown agent package",
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CACHE_CONTROL, NO_STORE)],
+                format!("failed to load agent package history: {err}"),
+            )
+                .into_response();
+        }
+    };
+    match std::fs::read(&entry.cached_path) {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CACHE_CONTROL, NO_STORE),
+            ],
+            bytes,
+        )
+            .into_response(),
+        // 行在但副本丢了（磁盘被清/被移）：按不存在处理，别把 500 当作“网关挂了”。
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, NO_STORE)],
+            "agent package copy is missing",
+        )
+            .into_response(),
+    }
+}
+
+/// 安装包分发端点的鉴权：接受 **bootstrap（注册）token 或 agent 凭据** 二者其一。
+///
+/// 为什么要放两个：新装场景手上是注册 token；而升级场景的机器没有 enrollment
+/// token，只有自己的 agent 凭据，升级器发的是 `Bearer <agent credential>`。两者都是
+/// 「可信的舰队成员」，且包本身不是秘密（install.sh 会内嵌下载地址与摘要）。
+///
+/// 限流沿用现有 `BOOTSTRAP_AUTH_SCOPE`：这是同一个端点上的**一次**鉴权决策，
+/// 桶按客户端 IP 分；沿用旧 scope 能保持 `/current` 现有行为不变（不新立 scope）。
+#[allow(clippy::result_large_err)]
+async fn authorize_package_download(
+    state: &ApiState,
+    headers: &HeaderMap,
+    client_key: &str,
+) -> Result<(), Response> {
+    if let Some(response) = rate_limit::check_rate_limit(state, client_key, BOOTSTRAP_AUTH_SCOPE) {
+        return Err(response);
+    }
+    let Some(token) = bootstrap_bearer_token(headers) else {
+        rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+        return Err(unauthorized_no_store(
+            "agent package download requires a bootstrap or agent bearer token",
+        ));
+    };
+    // 先按引导 token 校验（现有安装路径），再按 agent 凭据（升级路径）。
+    if validate_bootstrap_token_for_config(&state.config, &state.store, token)
+        .await
+        .is_ok()
+    {
+        rate_limit::clear_auth_failures(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+        return Ok(());
+    }
+    if super::agent_ops::authenticate_agent_credential_token(state, token)
+        .await
+        .is_ok()
+    {
+        rate_limit::clear_auth_failures(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+        return Ok(());
+    }
+    rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+    Err(unauthorized_no_store(
+        "invalid bootstrap or agent bearer token",
+    ))
 }
 
 fn unauthorized_no_store(message: impl Into<String>) -> Response {
