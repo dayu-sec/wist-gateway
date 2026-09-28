@@ -1,14 +1,15 @@
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 
 use crate::infra::{
-    AgentFactSummaryMarks, AgentStatusUpdate, RenewCredential, StoredAgentFactSummary,
-    StoredAgentRegistration, StoredCredentialStatus, StoredPurposeSuggestion, StoredWorkResult,
-    effective_standing, new_secret_token, outstanding_one_shot, sha256_hex,
+    AgentFactSummaryMarks, AgentStatusUpdate, CertificateRegistration, RenewCredential,
+    StoredAgentFactSummary, StoredAgentRegistration, StoredCredentialStatus,
+    StoredPurposeSuggestion, StoredWorkResult, VerifiedAgentIdentity, effective_standing,
+    new_secret_token, outstanding_one_shot, sha256_hex,
     victoria_metrics::{import_lines, metric_line},
 };
 use wist_contracts::API_VERSION_V1;
@@ -34,9 +35,18 @@ use super::ApiState;
 pub async fn submit_agent_status(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<AgentStatusReport>,
 ) -> Response {
-    match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await {
+    match authenticate_agent(
+        &state,
+        &headers,
+        &input.agent_id,
+        &input.instance_id,
+        client_identity.as_ref().map(|identity| &identity.0),
+    )
+    .await
+    {
         Ok(agent) => {
             let now_utc = chrono::Utc::now();
             let last_seen_at = now_utc.to_rfc3339();
@@ -190,9 +200,18 @@ pub(super) fn agent_status_metric_lines(
 pub async fn poll_control_commands(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<PollControlCommands>,
 ) -> Response {
-    match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await {
+    match authenticate_agent(
+        &state,
+        &headers,
+        &input.agent_id,
+        &input.instance_id,
+        client_identity.as_ref().map(|identity| &identity.0),
+    )
+    .await
+    {
         Ok(_) => (
             StatusCode::OK,
             Json(AgentControlCommandsReturned {
@@ -218,13 +237,20 @@ pub async fn poll_control_commands(
 pub async fn poll_discovery_policies(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<PollDiscoveryPolicies>,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != POLL_DISCOVERY_POLICIES_KIND {
         return (StatusCode::BAD_REQUEST, "invalid discovery policies poll").into_response();
     }
-    if let Err(response) =
-        authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await
+    if let Err(response) = authenticate_agent(
+        &state,
+        &headers,
+        &input.agent_id,
+        &input.instance_id,
+        client_identity.as_ref().map(|identity| &identity.0),
+    )
+    .await
     {
         return response;
     }
@@ -252,13 +278,20 @@ pub async fn poll_discovery_policies(
 pub async fn poll_work(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<PollWork>,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != POLL_WORK_KIND {
         return (StatusCode::BAD_REQUEST, "invalid work poll").into_response();
     }
-    if let Err(response) =
-        authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await
+    if let Err(response) = authenticate_agent(
+        &state,
+        &headers,
+        &input.agent_id,
+        &input.instance_id,
+        client_identity.as_ref().map(|identity| &identity.0),
+    )
+    .await
     {
         return response;
     }
@@ -290,13 +323,20 @@ pub async fn poll_work(
 pub async fn poll_agent_uplink(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<PollAgentUplink>,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != POLL_AGENT_UPLINK_KIND {
         return (StatusCode::BAD_REQUEST, "invalid uplink poll").into_response();
     }
-    if let Err(response) =
-        authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await
+    if let Err(response) = authenticate_agent(
+        &state,
+        &headers,
+        &input.agent_id,
+        &input.instance_id,
+        client_identity.as_ref().map(|identity| &identity.0),
+    )
+    .await
     {
         return response;
     }
@@ -368,13 +408,20 @@ pub async fn build_agent_uplink_grant(
 pub async fn ack_work(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<AckWork>,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != ACK_WORK_KIND {
         return (StatusCode::BAD_REQUEST, "invalid work ack").into_response();
     }
-    if let Err(response) =
-        authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await
+    if let Err(response) = authenticate_agent(
+        &state,
+        &headers,
+        &input.agent_id,
+        &input.instance_id,
+        client_identity.as_ref().map(|identity| &identity.0),
+    )
+    .await
     {
         return response;
     }
@@ -462,13 +509,20 @@ pub async fn ack_work(
 pub async fn submit_work_result(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<ReportWorkResult>,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != REPORT_WORK_RESULT_KIND {
         return (StatusCode::BAD_REQUEST, "invalid work result").into_response();
     }
-    if let Err(response) =
-        authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await
+    if let Err(response) = authenticate_agent(
+        &state,
+        &headers,
+        &input.agent_id,
+        &input.instance_id,
+        client_identity.as_ref().map(|identity| &identity.0),
+    )
+    .await
     {
         return response;
     }
@@ -566,6 +620,7 @@ pub async fn submit_work_result(
 pub async fn renew_agent_credential(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<CredentialRenewal>,
 ) -> Response {
     if input.api_version != "v1" || input.kind != RENEW_AGENT_CREDENTIAL_KIND {
@@ -583,11 +638,18 @@ pub async fn renew_agent_credential(
     };
     let current_token_hash = sha256_hex(current_token);
 
-    let agent =
-        match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await {
-            Ok(agent) => agent,
-            Err(response) => return response,
-        };
+    let agent = match authenticate_agent(
+        &state,
+        &headers,
+        &input.agent_id,
+        &input.instance_id,
+        client_identity.as_ref().map(|identity| &identity.0),
+    )
+    .await
+    {
+        Ok(agent) => agent,
+        Err(response) => return response,
+    };
     let bearer_token = match new_secret_token("wic") {
         Ok(token) => token,
         Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
@@ -654,9 +716,18 @@ pub async fn renew_agent_credential(
 pub async fn report_action_result(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<ReportActionResult>,
 ) -> Response {
-    match authenticate_agent(&state, &headers, &input.agent_id, &input.instance_id).await {
+    match authenticate_agent(
+        &state,
+        &headers,
+        &input.agent_id,
+        &input.instance_id,
+        client_identity.as_ref().map(|identity| &identity.0),
+    )
+    .await
+    {
         Ok(_) => (
             StatusCode::ACCEPTED,
             Json(ActionResultAck {
@@ -1041,36 +1112,151 @@ async fn authenticate_agent(
     headers: &HeaderMap,
     agent_id: &str,
     instance_id: &str,
+    client_identity: Option<&VerifiedAgentIdentity>,
 ) -> Result<StoredAgentRegistration, Response> {
-    let Some(token) = bearer_token(headers) else {
-        return Err((StatusCode::UNAUTHORIZED, "missing bearer credential").into_response());
-    };
-    let token_hash = sha256_hex(token);
-    let agent = state.store.get_agent(agent_id).await.map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load agent credential store: {err}"),
-        )
-            .into_response()
-    })?;
-    let Some(agent) = agent else {
-        return Err((StatusCode::UNAUTHORIZED, "unknown agent credential").into_response());
-    };
-    if agent.instance_id != instance_id
-        || !constant_time_eq(
-            agent.credential_token_hash.as_bytes(),
-            token_hash.as_bytes(),
-        )
+    // ① bearer 双轨：迁移期的旧凭据照旧可用（docs/design/agent-identity-mtls.md §7）。
+    if let Some(token) = bearer_token(headers) {
+        let token_hash = sha256_hex(token);
+        let agent = state
+            .store
+            .get_agent(agent_id)
+            .await
+            .map_err(store_unavailable)?;
+        let Some(agent) = agent else {
+            // 库里没有这条记录：可能是库丢了。不在这里下结论 —— 交给证书路径重建（§5.3），
+            // 没有证书就还是普通的 401。
+            return match client_identity {
+                Some(identity) => {
+                    certificate_authenticate(state, identity, agent_id, instance_id).await
+                }
+                None => Err(unauthorized_code("unknown_credential")),
+            };
+        };
+        if agent.instance_id != instance_id
+            || !constant_time_eq(
+                agent.credential_token_hash.as_bytes(),
+                token_hash.as_bytes(),
+            )
+        {
+            return Err(unauthorized_code("credential_mismatch"));
+        }
+        if agent.credential_status != StoredCredentialStatus::Active {
+            return Err(unauthorized_code("credential_inactive"));
+        }
+        if credential_is_expired(&agent.credential_expires_at) {
+            return Err(unauthorized_code("credential_expired"));
+        }
+        return Ok(agent);
+    }
+
+    // ② mTLS：证书身份即权威身份（§5.2）。没配 agent CA 就是「没带凭据」。
+    match client_identity {
+        Some(identity) => certificate_authenticate(state, identity, agent_id, instance_id).await,
+        None => Err(unauthorized_code(
+            if state.config.agent_ca_files().is_some() {
+                "certificate_required"
+            } else {
+                "missing_credential"
+            },
+        )),
+    }
+}
+
+/// 证书路径：先把证书身份与请求体对齐，再查库；库里没有就**首触重建登记**（§5.3）。
+#[allow(clippy::result_large_err)]
+async fn certificate_authenticate(
+    state: &ApiState,
+    identity: &VerifiedAgentIdentity,
+    agent_id: &str,
+    _instance_id: &str,
+) -> Result<StoredAgentRegistration, Response> {
+    // 证书身份是权威：不接受「证书说是 A、请求体说是 B」；租户/环境也必须落在本网关上。
+    if identity.agent_id != agent_id
+        || identity.tenant_id != state.config.tenant_id
+        || identity.environment_id != state.config.environment_id
     {
-        return Err((StatusCode::UNAUTHORIZED, "invalid agent credential").into_response());
+        return Err(unauthorized_code("certificate_mismatch"));
     }
-    if agent.credential_status != StoredCredentialStatus::Active {
-        return Err((StatusCode::UNAUTHORIZED, "agent credential is not active").into_response());
+    if let Some(agent) = state
+        .store
+        .get_agent(agent_id)
+        .await
+        .map_err(store_unavailable)?
+    {
+        return Ok(agent);
     }
-    if credential_is_expired(&agent.credential_expires_at) {
-        return Err((StatusCode::UNAUTHORIZED, "agent credential is expired").into_response());
+    rebuild_agent_registration(state, identity).await?;
+    state
+        .store
+        .get_agent(agent_id)
+        .await
+        .map_err(store_unavailable)?
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "agent registration missing right after rebuild",
+            )
+                .into_response()
+        })
+}
+
+/// 凭证书**首触重建登记**：库丢失 / 换网关后，agent 仍持有效证书 → 零人工补一条记录。
+///
+/// 机器画像（node_id / hostname / machine_id / instance_id）在首触时未知，留空；
+/// 等 agent 后续的状态上报补齐。
+#[allow(clippy::result_large_err)]
+async fn rebuild_agent_registration(
+    state: &ApiState,
+    identity: &VerifiedAgentIdentity,
+) -> Result<(), Response> {
+    let now = chrono::Utc::now().to_rfc3339();
+    // 凭据 id 由指纹派生：同一张证书重复首触落在同一个 id（重建本身也是幂等的）。
+    let credential_id = format!(
+        "cert-{}",
+        identity
+            .fingerprint_sha256
+            .get(..16)
+            .unwrap_or(&identity.fingerprint_sha256)
+    );
+    let created = state
+        .store
+        .register_agent_from_certificate(&CertificateRegistration {
+            agent_id: &identity.agent_id,
+            tenant_id: &identity.tenant_id,
+            environment_id: &identity.environment_id,
+            credential_id: &credential_id,
+            credential_fingerprint: &identity.fingerprint_sha256,
+            credential_issued_at: &identity.not_before,
+            credential_expires_at: &identity.not_after,
+            registered_at: &now,
+            now: &now,
+        })
+        .await
+        .map_err(store_unavailable)?;
+    if created {
+        eprintln!(
+            "audit agent_rebuilt_from_certificate agent_id={} fingerprint={}",
+            identity.agent_id, identity.fingerprint_sha256
+        );
     }
-    Ok(agent)
+    Ok(())
+}
+
+/// 401 的正文里带一个稳定的 `code`，agentd 按它决定要不要自愈（§5.4）。
+fn unauthorized_code(code: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        format!("agent identity rejected: {code}"),
+    )
+        .into_response()
+}
+
+fn store_unavailable(err: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("failed to load agent credential store: {err}"),
+    )
+        .into_response()
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {

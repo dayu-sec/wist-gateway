@@ -778,6 +778,68 @@ impl Store for SqliteStore {
         Ok(Ok(()))
     }
 
+    async fn register_agent_from_certificate(
+        &self,
+        registration: &CertificateRegistration<'_>,
+    ) -> StoreResult<bool> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin register agent from certificate"))?;
+        // 幂等：已存在就一个字段都不碰（不刷新凭据/时间戳）。库丢/换网关后，多台 agent
+        // 会并发首触，谁先到谁建，后到的重入必须是无操作而不是覆盖。
+        if agent_exists_tx(&mut tx, registration.agent_id).await? {
+            return Ok(false);
+        }
+
+        // 只写已知的稳定身份；机器画像（node_id/hostname/machine_id）留给后续状态上报，
+        // 故置 ''。
+        //
+        // `current_instance_id` 故意留 NULL（而不是像注册路径那样填一个 instance_id）：
+        // 首触时实例本来就未知，且 `get_agent` 的投影对 `agent_instances` 用的是
+        // `LEFT JOIN`（见 AGENT_PROJECTION），NULL 不会把整行滤掉 —— 记录仍能读到，
+        // 投影里 `instance_id` 经 COALESCE 退化为 ''。再造一条 boot_id/version 都空的
+        // 「幽灵实例」反而会污染 `agent_instances`（那张表的语义是「每次真实 Agentd
+        // 启动一条」），等 agent 首次上包由 `record_agent_status` 正常写入当前实例。
+        sqlx::query(
+            "INSERT INTO agents (agent_id, tenant_id, environment_id, node_id, hostname, \
+             machine_id, status, current_instance_id, current_credential_id, registered_at, \
+             updated_at) VALUES (?1, ?2, ?3, '', '', '', 'active', NULL, ?4, ?5, ?6)",
+        )
+        .bind(registration.agent_id)
+        .bind(registration.tenant_id)
+        .bind(registration.environment_id)
+        .bind(registration.credential_id)
+        .bind(registration.registered_at)
+        .bind(registration.now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "insert agent from certificate"))?;
+
+        // 凭据：证书路径与注册路径的区别只在 `auth_scheme = 'certificate'`，指纹仍占
+        // `token_hash` 那列（该列有唯一索引，天然防止同一张证书重复落库）。instance_id
+        // 与 agents.current_instance_id 口径一致，留空。
+        sqlx::query(
+            "INSERT INTO agent_credentials (credential_id, agent_id, instance_id, auth_scheme, \
+             token_hash, status, issued_at, expires_at, revoked_at) \
+             VALUES (?1, ?2, '', 'certificate', ?3, 'active', ?4, ?5, NULL)",
+        )
+        .bind(registration.credential_id)
+        .bind(registration.agent_id)
+        .bind(registration.credential_fingerprint)
+        .bind(registration.credential_issued_at)
+        .bind(registration.credential_expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "insert certificate credential"))?;
+
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit register agent from certificate"))?;
+        Ok(true)
+    }
+
     async fn rollback_enrollment_token_reservation(&self, token_hash: &str) -> StoreResult<()> {
         // 只归还处于 reserved 的预留；其它状态为无操作（与既有实现一致）。
         sqlx::query(
@@ -2272,6 +2334,96 @@ mod tests {
             .await
             .unwrap()
             .expect("committed");
+    }
+
+    fn cert_registration<'a>(
+        agent_id: &'a str,
+        credential_id: &'a str,
+        fingerprint: &'a str,
+        registered_at: &'a str,
+        now: &'a str,
+    ) -> CertificateRegistration<'a> {
+        CertificateRegistration {
+            agent_id,
+            tenant_id: TENANT,
+            environment_id: ENVIRONMENT,
+            credential_id,
+            credential_fingerprint: fingerprint,
+            credential_issued_at: "2026-01-01T00:00:00+00:00",
+            credential_expires_at: "2026-12-31T00:00:00+00:00",
+            registered_at,
+            now,
+        }
+    }
+
+    /// 库丢/换网关后的首触：证书验链通过但库里没有登记 → 凭证书身份补一条，且必须能被
+    /// `get_agent` 读到（重建路径不能在投影上「建了却读不出」）。
+    #[tokio::test]
+    async fn register_agent_from_certificate_rebuilds_missing_agent() {
+        let store = store().await;
+        assert!(store.get_agent("agent-cert").await.unwrap().is_none());
+
+        let registration = cert_registration(
+            "agent-cert",
+            "cred-cert",
+            "fingerprint-cert",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:00+00:00",
+        );
+        assert!(
+            store
+                .register_agent_from_certificate(&registration)
+                .await
+                .unwrap(),
+            "首次接触应真正新建登记"
+        );
+
+        let agent = store.get_agent("agent-cert").await.unwrap().expect("agent");
+        assert_eq!(agent.agent_id, "agent-cert");
+        assert_eq!(agent.tenant_id, TENANT);
+        assert_eq!(agent.environment_id, ENVIRONMENT);
+        assert_eq!(agent.credential_id, "cred-cert");
+        assert_eq!(agent.credential_token_hash, "fingerprint-cert");
+        assert_eq!(agent.credential_status, StoredCredentialStatus::Active);
+        // 首触时画像未知：node_id/hostname/machine_id 留空是预期，不算异常。
+        assert_eq!(agent.node_id, "");
+    }
+
+    /// 幂等：同一张证书重入（并发首触 / 换网关后重复接触）不得改写已存在的登记。
+    #[tokio::test]
+    async fn register_agent_from_certificate_is_idempotent() {
+        let store = store().await;
+        let first = cert_registration(
+            "agent-cert-2",
+            "cred-cert-2",
+            "fingerprint-cert-2",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:00+00:00",
+        );
+        assert!(store.register_agent_from_certificate(&first).await.unwrap());
+
+        // 第二次带上不同的时间戳：若实现不是无操作，registered_at 会被改写。
+        let second = cert_registration(
+            "agent-cert-2",
+            "cred-cert-2",
+            "fingerprint-cert-2",
+            "2026-06-01T00:00:00+00:00",
+            "2026-06-01T00:00:00+00:00",
+        );
+        assert!(
+            !store
+                .register_agent_from_certificate(&second)
+                .await
+                .unwrap(),
+            "已存在时应返回 false 且不动任何字段"
+        );
+
+        let after = store
+            .get_agent("agent-cert-2")
+            .await
+            .unwrap()
+            .expect("agent");
+        assert_eq!(after.registered_at, "2026-01-01T00:00:00+00:00");
     }
 
     #[tokio::test]

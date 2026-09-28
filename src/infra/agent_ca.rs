@@ -239,6 +239,50 @@ pub fn agent_identity_from_certificate_der(
 ) -> Result<AgentCertificateIdentity, String> {
     let (_, certificate) = X509Certificate::from_der(certificate_der)
         .map_err(|err| format!("failed to parse client certificate: {err}"))?;
+    agent_identity_from_parsed(&certificate)
+}
+
+/// 由 mTLS 握手带进来、并**已由 agent CA 验链通过**的 agent 身份。
+///
+/// 与 [`AgentCertificateIdentity`] 的区别：还带证书指纹与有效期，供「首触重建登记」写凭据
+/// 记录、拒绝名单与审计使用。`agent_id` / `tenant_id` / `environment_id` 直接取自 URI SAN。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAgentIdentity {
+    pub agent_id: String,
+    pub tenant_id: String,
+    pub environment_id: String,
+    /// 证书 DER 的 SHA-256（小写 hex）。
+    pub fingerprint_sha256: String,
+    /// 证书生效时刻（RFC3339）。
+    pub not_before: String,
+    /// 证书到期时刻（RFC3339）。
+    pub not_after: String,
+}
+
+impl VerifiedAgentIdentity {
+    /// 从**已验证**的客户端叶证书 DER 解出身份与有效期。
+    ///
+    /// 证书来自 rustls 的 `WebPkiClientVerifier`：链路、有效期与 `EKU=clientAuth` 已经过关，
+    /// 这里只解主体（§5.2）。
+    pub fn from_certificate_der(certificate_der: &[u8]) -> Result<Self, String> {
+        let (_, certificate) = X509Certificate::from_der(certificate_der)
+            .map_err(|err| format!("failed to parse client certificate: {err}"))?;
+        let identity = agent_identity_from_parsed(&certificate)?;
+        let validity = certificate.validity();
+        Ok(Self {
+            agent_id: identity.agent_id,
+            tenant_id: identity.tenant_id,
+            environment_id: identity.environment_id,
+            fingerprint_sha256: hex_lower(digest(&SHA256, certificate_der).as_ref()),
+            not_before: rfc3339_from_unix(validity.not_before.timestamp()),
+            not_after: rfc3339_from_unix(validity.not_after.timestamp()),
+        })
+    }
+}
+
+fn agent_identity_from_parsed(
+    certificate: &X509Certificate<'_>,
+) -> Result<AgentCertificateIdentity, String> {
     let san = certificate
         .subject_alternative_name()
         .map_err(|err| format!("failed to read client certificate SAN: {err}"))?
@@ -284,6 +328,13 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+/// x509 的 `ASN1Time` 只给 unix 秒，这里统一走 chrono 输出 RFC3339。
+fn rfc3339_from_unix(seconds: i64) -> String {
+    chrono::DateTime::from_timestamp(seconds, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| seconds.to_string())
 }
 
 #[cfg(test)]
@@ -475,5 +526,24 @@ mod tests {
         let certificate = params.self_signed(&key).expect("self signed");
         let err = agent_identity_from_certificate_der(certificate.der()).expect_err("no agent uri");
         assert!(err.contains("no agent URI SAN"));
+    }
+
+    #[test]
+    fn verified_identity_carries_fingerprint_and_validity() {
+        install_provider();
+        let (ca, _) = test_ca();
+        let issued = ca
+            .issue_client_certificate(&dirty_csr(), &identity(), DEFAULT_CLIENT_CERT_TTL_SECONDS)
+            .expect("issue");
+
+        let verified = VerifiedAgentIdentity::from_certificate_der(&issued.certificate_der)
+            .expect("verified identity");
+        assert_eq!(verified.agent_id, "agent-abc");
+        assert_eq!(verified.tenant_id, "tenant-default");
+        assert_eq!(verified.environment_id, "env-default");
+        assert_eq!(verified.fingerprint_sha256, issued.fingerprint_sha256_hex);
+        // 证书里的起止时刻与签发时一致（都截断到秒）。
+        assert_eq!(verified.not_before, issued.not_before);
+        assert_eq!(verified.not_after, issued.not_after);
     }
 }

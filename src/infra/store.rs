@@ -672,6 +672,25 @@ pub struct CommitRegistration<'a> {
     pub now: &'a str,
 }
 
+/// 凭客户端证书重建一条 agent 登记所需的最小字段。
+///
+/// 机器画像（node_id / hostname / machine_id / instance_id）在**首触时未知**：证书只承载
+/// 稳定身份（agent_id / tenant / environment）与证书自身的指纹/有效期。这些画像字段留空，
+/// 等 agent 后续的状态上报补齐。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertificateRegistration<'a> {
+    pub agent_id: &'a str,
+    pub tenant_id: &'a str,
+    pub environment_id: &'a str,
+    pub credential_id: &'a str,
+    /// 证书指纹（sha256 lowercase hex）→ 落在 `agent_credentials.token_hash`，`auth_scheme = 'certificate'`。
+    pub credential_fingerprint: &'a str,
+    pub credential_issued_at: &'a str,
+    pub credential_expires_at: &'a str,
+    pub registered_at: &'a str,
+    pub now: &'a str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitRejection {
     InvalidToken,
@@ -768,6 +787,15 @@ pub trait Store: Send + Sync + fmt::Debug {
         &self,
         request: &CommitRegistration<'_>,
     ) -> StoreResult<Result<(), CommitRejection>>;
+
+    /// 首触重建登记：mTLS 证书验证通过、但库里没有这条记录时，凭证书身份补一条。
+    ///
+    /// 只在 mTLS 生效时调用（见 `docs/design/agent-identity-mtls.md` §5.3）。**幂等**：
+    /// 该 agent 已存在时不改动任何东西，返回 `Ok(false)`；真正新建返回 `Ok(true)`。
+    async fn register_agent_from_certificate(
+        &self,
+        registration: &CertificateRegistration<'_>,
+    ) -> StoreResult<bool>;
 
     /// 归还预留（凭据签发或落库失败时）。
     async fn rollback_enrollment_token_reservation(&self, token_hash: &str) -> StoreResult<()>;

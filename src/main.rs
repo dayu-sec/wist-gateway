@@ -21,6 +21,7 @@ use hyper_util::{
 };
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+use wist_gateway::infra::VerifiedAgentIdentity;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -33,7 +34,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = config.listen_addr.clone();
     let ingest_addr = config.ingest_listen_addr.clone();
     let store = build_store(&config).await?;
-    let tls_config = wist_gateway::infra::load_admin_tls_config(&config)?;
+    // 配了 agent CA = 启用 mTLS（客户端证书验证）。双轨期没配就保持原来的「只要服务端证书」。
+    let mtls_enabled = config.agent_ca_files().is_some();
+    let tls_config = if let Some((agent_ca_file, _)) = config.agent_ca_files() {
+        let agent_ca_pem = std::fs::read_to_string(agent_ca_file).map_err(|err| {
+            format!(
+                "failed to read agent CA certificate {}: {err}",
+                agent_ca_file.display()
+            )
+        })?;
+        wist_gateway::infra::load_agent_mtls_server_config(
+            &config.tls_cert_file,
+            &config.tls_key_file,
+            &agent_ca_pem,
+        )?
+    } else {
+        wist_gateway::infra::load_admin_tls_config(&config)?
+    };
     // 两个监听共用一份状态：规则表、策略表、会话运行态与限流器都只能有一份。
     let state = wist_gateway::api::build_state(config, store);
 
@@ -63,6 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         listener,
         wist_gateway::api::router_with_state(state),
         tls_config,
+        mtls_enabled,
     )
     .await?;
     Ok(())
@@ -132,6 +150,7 @@ async fn serve_tls(
     listener: TcpListener,
     app: Router,
     tls_config: rustls::ServerConfig,
+    mtls_enabled: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     loop {
@@ -146,10 +165,33 @@ async fn serve_tls(
                     return;
                 }
             };
+            // mTLS 开启时，从**已完成握手**的连接里取已验的客户端证书并解出 agent 身份。
+            // 链验过了但认不出身份（缺 URI SAN / 段非法）就不当作已认证 ——
+            // 交给应用层回 401，而不是静默落回未认证的 bearer 路径。
+            let client_identity = if mtls_enabled {
+                match wist_gateway::infra::peer_leaf_certificate_der(tls_stream.get_ref().1) {
+                    Some(der) => match VerifiedAgentIdentity::from_certificate_der(&der) {
+                        Ok(identity) => Some(identity),
+                        Err(err) => {
+                            eprintln!(
+                                "mTLS client certificate from {peer_addr} has no usable agent identity: {err}"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            } else {
+                None
+            };
             let io = TokioIo::new(tls_stream);
             // Inject the real peer address so rate limiting can bucket per client and
             // cannot be bypassed with spoofed x-real-ip / x-forwarded-for headers.
-            let service = service.layer(from_fn_with_state(peer_addr, inject_connect_info));
+            let context = ConnectionContext {
+                peer: peer_addr,
+                client_identity,
+            };
+            let service = service.layer(from_fn_with_state(context, inject_connection_context));
             let service = TowerToHyperService::new(service);
             let builder = Builder::new(TokioExecutor::new());
             if let Err(err) = builder.serve_connection(io, service).await {
@@ -159,13 +201,26 @@ async fn serve_tls(
     }
 }
 
-async fn inject_connect_info(
-    State(peer): State<SocketAddr>,
+/// 每条连接注入请求扩展的东西：对端地址（限流）与 mTLS 证书身份（鉴权）。
+///
+/// `client_identity` 只能由本进程在握手后写入 —— 它走 `request.extensions_mut()`，
+/// 客户端无法通过 HTTP 头伪造。
+#[derive(Clone)]
+struct ConnectionContext {
+    peer: SocketAddr,
+    client_identity: Option<VerifiedAgentIdentity>,
+}
+
+async fn inject_connection_context(
+    State(context): State<ConnectionContext>,
     mut request: Request,
     next: Next,
 ) -> Response {
     request
         .extensions_mut()
-        .insert(ConnectInfo::<SocketAddr>(peer));
+        .insert(ConnectInfo::<SocketAddr>(context.peer));
+    if let Some(identity) = context.client_identity {
+        request.extensions_mut().insert(identity);
+    }
     next.run(request).await
 }

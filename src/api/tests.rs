@@ -22,7 +22,8 @@ use wist_contracts::enrollment::{
 use crate::infra::{
     AdminConfig, AgentStatusUpdate, DEFAULT_AGENT_UPLINK_SETTING_ID, SqliteStore, Store,
     StoredAgentInstallPackage, StoredAgentUplinkAddress, StoredCredentialStatus,
-    StoredEnrollmentTokenStatus, bytes_sha256_hex, load_install_script_public_key_pem, sha256_hex,
+    StoredEnrollmentTokenStatus, VerifiedAgentIdentity, bytes_sha256_hex,
+    load_install_script_public_key_pem, sha256_hex,
 };
 use wist_contracts::action_result::{ActionResult, FinalStatus};
 use wist_contracts::agent_uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND};
@@ -8222,4 +8223,155 @@ async fn batch_size_throttles_materialization_and_refills_on_terminal_results() 
     let detail = view_plan(&env, &plan_id).await;
     assert_eq!(entry_status(&detail, "agent-node-c"), "dispatched");
     assert!(entry_work_id(&detail, "agent-node-c").starts_with("work-"));
+}
+
+// ── mTLS 客户端证书鉴权（docs/design/agent-identity-mtls.md §5.2 / §5.3 / §5.4）──
+
+/// 造一个「已由 agent CA 验链通过」的客户端身份，等价于 TLS 握手后注入的请求扩展。
+fn client_identity(agent_id: &str) -> VerifiedAgentIdentity {
+    VerifiedAgentIdentity {
+        agent_id: agent_id.to_string(),
+        tenant_id: "tenant-default".to_string(),
+        environment_id: "env-default".to_string(),
+        fingerprint_sha256: "ab".repeat(32),
+        not_before: "2026-09-01T00:00:00+00:00".to_string(),
+        not_after: "2026-10-08T00:00:00+00:00".to_string(),
+    }
+}
+
+/// 发一次 agent 请求，并可选地把证书身份塞进请求扩展（模拟握手注入）。
+async fn post_agent_with_client_identity(
+    env: &TestEnv,
+    uri: &str,
+    bearer_token: Option<&str>,
+    identity: Option<VerifiedAgentIdentity>,
+    body: &serde_json::Value,
+) -> Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = bearer_token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let mut request = builder
+        .body(Body::from(
+            serde_json::to_string(body).expect("serialize body"),
+        ))
+        .expect("request");
+    if let Some(identity) = identity {
+        request.extensions_mut().insert(identity);
+    }
+    super::router_with_state(super::build_state(
+        env.config.clone(),
+        Arc::clone(&env.store_handle),
+    ))
+    .oneshot(request)
+    .await
+    .expect("route response")
+}
+
+async fn response_text(response: Response) -> String {
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn status_body(agent_id: &str, instance_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "agent_id": agent_id,
+        "instance_id": instance_id,
+        "version": "v0.2.0",
+    })
+}
+
+/// 核心验收：库丢了（没有该 agent 记录），但 agent 持有效证书 → 首触重建登记，零人工。
+#[tokio::test]
+async fn mtls_certificate_rebuilds_unknown_agent_on_first_touch() {
+    let env = TestEnv::new().await;
+    assert!(
+        env.store
+            .get_agent("agent-rebuilt")
+            .await
+            .expect("read")
+            .is_none()
+    );
+
+    let response = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None, // 库丢了，旧 bearer 凭据也没了 —— 只有证书
+        Some(client_identity("agent-rebuilt")),
+        &status_body("agent-rebuilt", "rebuilt-host"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let rebuilt = env
+        .store
+        .get_agent("agent-rebuilt")
+        .await
+        .expect("read")
+        .expect("agent must be rebuilt from the certificate");
+    assert_eq!(rebuilt.tenant_id, "tenant-default");
+    assert_eq!(rebuilt.environment_id, "env-default");
+    assert_eq!(rebuilt.credential_status, StoredCredentialStatus::Active);
+}
+
+/// 证书身份与请求体不一致必须被拒：不能拿 A 的证书代表 B。
+#[tokio::test]
+async fn mtls_certificate_identity_mismatch_is_rejected() {
+    let env = TestEnv::new().await;
+    let response = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        Some(client_identity("agent-other")),
+        &status_body("agent-victim", "victim-host"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = response_text(response).await;
+    assert!(body.contains("certificate_mismatch"), "{body}");
+    assert!(
+        env.store
+            .get_agent("agent-victim")
+            .await
+            .expect("read")
+            .is_none()
+    );
+}
+
+/// 既没凭据也没证书：拒绝，并给出可辨识的 code。
+#[tokio::test]
+async fn agent_request_without_credential_or_certificate_is_rejected() {
+    let env = TestEnv::new().await;
+    let response = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        None,
+        &status_body("agent-nobody", "nobody-host"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = response_text(response).await;
+    assert!(body.contains("missing_credential"), "{body}");
+}
+
+/// 双轨：bearer 路径不受影响（带正确凭据仍可上报，不要求证书）。
+#[tokio::test]
+async fn bearer_credential_still_works_without_certificate() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    let response = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        Some(&credential),
+        None,
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
 }

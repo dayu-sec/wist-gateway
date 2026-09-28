@@ -338,6 +338,18 @@ impl AdminConfig {
         })
     }
 
+    /// agent CA 的（证书文件, 私钥文件）。两者都配了才返回 `Some` —— 也就是这台网关启用了
+    /// agent 客户端证书签发/验证（mTLS）。见 `docs/design/agent-identity-mtls.md` §4.1。
+    pub fn agent_ca_files(&self) -> Option<(&Path, &Path)> {
+        match (
+            self.agent_ca_cert_file.as_deref(),
+            self.agent_ca_key_file.as_deref(),
+        ) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            _ => None,
+        }
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         require_non_empty("server.listen_addr", &self.listen_addr)?;
         require_https_url("server.public_base_url", &self.public_base_url)?;
@@ -362,6 +374,11 @@ impl AdminConfig {
             self.agent_ca_cert_file.as_deref(),
             self.agent_ca_key_file.as_deref(),
         )?;
+        // 启动时就把 CA 读一遍：文件坏了/不是 PEM，现在就报出来，而不是等第一次签发或握手才炸。
+        if let Some((cert_file, key_file)) = self.agent_ca_files() {
+            crate::infra::agent_ca::AgentCa::load(cert_file, key_file)
+                .map_err(config_validation)?;
+        }
         require_non_empty("agent.trust_bundle", &self.trust_bundle)?;
         require_existing_file(
             "agent.install_script_signing_private_key_file",
@@ -1575,23 +1592,36 @@ environment_id = "env-default"
     /// 只给一半的 agent CA 是配置错误：宁可起不来，也不静默降级成「没有 mTLS」。
     #[test]
     fn agent_ca_requires_certificate_and_key_together() {
-        let ca_cert = write_temp_file("agent-ca-cert");
+        let (ca_cert_name, _) = write_agent_ca_files();
         let only_cert = write_temp_config(&agent_config_toml(&format!(
-            "agent_ca_cert_file = \"{}\"\n",
-            file_name(&ca_cert)
+            "agent_ca_cert_file = \"{ca_cert_name}\"\n"
         )));
         let err = AdminConfig::load_from_path(&only_cert).expect_err("cert without key");
         assert!(err.to_string().contains("agent_ca_key_file"), "{err}");
         let _ = fs::remove_file(only_cert);
 
-        let ca_key = write_temp_file("agent-ca-key");
+        let (_, ca_key_name) = write_agent_ca_files();
         let only_key = write_temp_config(&agent_config_toml(&format!(
-            "agent_ca_key_file = \"{}\"\n",
-            file_name(&ca_key)
+            "agent_ca_key_file = \"{ca_key_name}\"\n"
         )));
         let err = AdminConfig::load_from_path(&only_key).expect_err("key without cert");
         assert!(err.to_string().contains("agent_ca_cert_file"), "{err}");
         let _ = fs::remove_file(only_key);
+    }
+
+    /// 文件不是可解析的 CA 时，配置加载就应失败（fail fast），而不是等签发/握手才炸。
+    #[test]
+    fn agent_ca_with_unparsable_certificate_fails_at_load() {
+        let cert = write_temp_file("not a certificate");
+        let key = write_temp_file("not a key");
+        let path = write_temp_config(&agent_config_toml(&format!(
+            "agent_ca_cert_file = \"{}\"\nagent_ca_key_file = \"{}\"\n",
+            file_name(&cert),
+            file_name(&key),
+        )));
+        let err = AdminConfig::load_from_path(&path).expect_err("unparsable CA");
+        assert!(err.to_string().contains("agent CA certificate"), "{err}");
+        let _ = fs::remove_file(path);
     }
 
     /// 两个都不给 = 关闭 mTLS 签发（双轨期），且签发有效期缺省 37 天（= 保底 30 + 提前 7）。
@@ -1612,25 +1642,40 @@ environment_id = "env-default"
 
     #[test]
     fn agent_ca_paths_are_absolutized_and_ttl_override_is_honored() {
-        let ca_cert = write_temp_file("agent-ca-cert");
-        let ca_key = write_temp_file("agent-ca-key");
+        let (ca_cert_name, ca_key_name) = write_agent_ca_files();
         let path = write_temp_config(&agent_config_toml(&format!(
-            "agent_ca_cert_file = \"{}\"\nagent_ca_key_file = \"{}\"\nclient_cert_ttl_seconds = 1000\n",
-            file_name(&ca_cert),
-            file_name(&ca_key),
+            "agent_ca_cert_file = \"{ca_cert_name}\"\nagent_ca_key_file = \"{ca_key_name}\"\nclient_cert_ttl_seconds = 1000\n",
         )));
         let config = AdminConfig::load_from_path(&path).expect("config loads");
 
         assert_eq!(
             config.agent_ca_cert_file,
-            Some(env::temp_dir().join(file_name(&ca_cert)))
+            Some(env::temp_dir().join(&ca_cert_name))
         );
         assert_eq!(
             config.agent_ca_key_file,
-            Some(env::temp_dir().join(file_name(&ca_key)))
+            Some(env::temp_dir().join(&ca_key_name))
         );
         assert_eq!(config.client_cert_ttl_seconds, 1000);
+        assert!(config.agent_ca_files().is_some(), "both paths = mTLS on");
         let _ = fs::remove_file(path);
+    }
+
+    /// 一份可用的 agent CA（证书 + 私钥）PEM，落到临时目录，返回**文件名**（相对临时目录）。
+    fn write_agent_ca_files() -> (String, String) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+        };
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "Wist Test Agent CA");
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        let key = KeyPair::generate().expect("ca key");
+        let certificate = params.self_signed(&key).expect("ca cert");
+        let cert_path = write_temp_file(&certificate.pem());
+        let key_path = write_temp_file(&key.serialize_pem());
+        (file_name(&cert_path), file_name(&key_path))
     }
 
     fn file_name(path: &Path) -> String {
