@@ -53,11 +53,12 @@ pub mod wist_agentd_online_registration_interface;
 pub use wist_agentd_online_registration_interface::WistAgentdOnlineRegistrationInterface;
 
 use admin_ops::{
-    classify_agent, delete_agent, get_agent_runtime_status, grant_work,
-    list_agent_install_packages, list_agents, pause_work, resume_work, revoke_agent_credential,
-    revoke_work, set_agent_advertise_url, set_agent_install_package, set_agent_uplink,
-    view_agent_advertise_url, view_agent_install_package, view_agent_purpose, view_agent_uplink,
-    view_agent_work, view_discovery_policies, view_purpose_coverage,
+    classify_agent, delete_agent, get_agent_runtime_status, grant_work, lift_agent_revocation,
+    list_agent_install_packages, list_agent_revocations, list_agents, pause_work, resume_work,
+    revoke_agent, revoke_agent_credential, revoke_work, set_agent_advertise_url,
+    set_agent_install_package, set_agent_uplink, view_agent_advertise_url,
+    view_agent_install_package, view_agent_purpose, view_agent_uplink, view_agent_work,
+    view_discovery_policies, view_purpose_coverage,
 };
 use agent_ops::{
     ack_work, poll_agent_uplink, poll_control_commands, poll_discovery_policies, poll_work,
@@ -84,6 +85,11 @@ pub mod work_expiry;
 pub use work_expiry::{
     ONE_SHOT_EXPIRY_TICK, expire_overdue_one_shot_works, spawn_one_shot_expiry_tick,
 };
+
+// NOTE(hand-added): 拒绝名单的周期 GC（§5.6）。与 `work_expiry` 同一模式（自身 tick，
+// 不搭在任何请求路径上）。重新生成控制面代码时需回补本模块与 `main` 里那一行 spawn。
+pub mod revocation_gc;
+pub use revocation_gc::{REVOCATION_GC_TICK, spawn_revocation_gc_tick};
 
 #[derive(Debug, Clone)]
 pub struct ApiState {
@@ -400,6 +406,18 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agents/{agent_id}/credentials:revoke",
             post(revoke_agent_credential),
+        )
+        // NOTE(hand-added): 拒绝名单（吊销状态表，设计文档 agent-identity-mtls.md §5.6）。
+        // 与 `credentials:revoke` 不同：那个吊销一份凭据（可换凭据 / 证书自续绕开），
+        // 这个拒的是 agent_id 本身 —— 续签、重签同 id 仍被拒。
+        // 静态段（`agent-revocations`）与本段不冲突：前缀不同（`agents/` vs `agent-revocations`）。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/revocation",
+            post(revoke_agent).delete(lift_agent_revocation),
+        )
+        .route(
+            "/api/v1/admin/agent-revocations",
+            get(list_agent_revocations),
         )
         // NOTE(hand-added): 灰度发布计划（模型 Control.Rollout）：创建/列表/批准/推进/查看。
         // 已在模型 WistGatewayManagementInterface 声明；重新生成控制面代码时需回补这些路由。

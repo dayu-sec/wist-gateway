@@ -21,8 +21,8 @@ use wist_contracts::enrollment::{
 
 use crate::infra::{
     AdminConfig, AgentStatusUpdate, DEFAULT_AGENT_UPLINK_SETTING_ID, SqliteStore, Store,
-    StoredAgentInstallPackage, StoredAgentUplinkAddress, StoredCredentialStatus,
-    StoredEnrollmentTokenStatus, VerifiedAgentIdentity, bytes_sha256_hex,
+    StoredAgentInstallPackage, StoredAgentRevocation, StoredAgentUplinkAddress,
+    StoredCredentialStatus, StoredEnrollmentTokenStatus, VerifiedAgentIdentity, bytes_sha256_hex,
     load_install_script_public_key_pem, sha256_hex,
 };
 use wist_contracts::action_result::{ActionResult, FinalStatus};
@@ -917,6 +917,7 @@ async fn agent_status_route_requires_bearer_credential() {
             work_state_changes: None,
             local_work: None,
             uplink_state: None,
+            certificate_status: None,
         },
     )
     .await;
@@ -939,6 +940,7 @@ async fn agent_status_route_requires_bearer_credential() {
             work_state_changes: None,
             local_work: None,
             uplink_state: None,
+            certificate_status: None,
         },
     )
     .await;
@@ -980,6 +982,7 @@ async fn agent_status_route_persists_reported_metrics() {
             work_state_changes: None,
             local_work: None,
             uplink_state: None,
+            certificate_status: None,
         },
     )
     .await;
@@ -1021,6 +1024,7 @@ async fn post_agent_status_cpu(
             work_state_changes: None,
             local_work: None,
             uplink_state: None,
+            certificate_status: None,
         },
     )
     .await
@@ -2512,6 +2516,7 @@ async fn post_agent_status(
             work_state_changes: None,
             local_work: None,
             uplink_state: None,
+            certificate_status: None,
         })
         .expect("serialize status"),
         None => serde_json::json!({
@@ -3021,6 +3026,7 @@ async fn agent_status_route_persists_work_state_changes() {
             }]),
             local_work: None,
             uplink_state: None,
+            certificate_status: None,
         },
     )
     .await;
@@ -3106,6 +3112,7 @@ async fn the_work_view_exposes_the_agents_local_work_report() {
             work_state_changes: None,
             local_work: Some(local_work),
             uplink_state: None,
+            certificate_status: None,
         },
     )
     .await;
@@ -3172,6 +3179,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
                 source: "grant".to_string(),
                 output_write_failing: true,
             }),
+            certificate_status: None,
         },
     )
     .await;
@@ -3202,6 +3210,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
             work_state_changes: None,
             local_work: None,
             uplink_state: None,
+            certificate_status: None,
         },
     )
     .await;
@@ -3263,6 +3272,7 @@ async fn agent_status_route_rejects_expired_bearer_credential() {
             work_state_changes: None,
             local_work: None,
             uplink_state: None,
+            certificate_status: None,
         },
     )
     .await;
@@ -3329,6 +3339,7 @@ async fn credential_renewal_replaces_previous_credential() {
             work_state_changes: None,
             local_work: None,
             uplink_state: None,
+            certificate_status: None,
         },
     )
     .await;
@@ -3351,6 +3362,7 @@ async fn credential_renewal_replaces_previous_credential() {
             work_state_changes: None,
             local_work: None,
             uplink_state: None,
+            certificate_status: None,
         },
     )
     .await;
@@ -5386,6 +5398,39 @@ async fn package_download_rejects_revoked_agent_credential_immediately() {
     )
     .await;
     assert_auth_rejected(current, PACKAGE_INVALID_TOKEN_BODY).await;
+}
+
+/// 拒绝名单同样拦升级取包：被吊销的 agent 连包也不该能取（§5.6）。
+#[tokio::test]
+async fn package_download_rejects_a_revoked_agent() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "revoked-agent", b"revoked-agent-bytes").await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let before = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(before.status(), StatusCode::OK);
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "cut off")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let after = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&credential),
+    )
+    .await;
+    assert_auth_rejected(after, PACKAGE_INVALID_TOKEN_BODY).await;
 }
 
 #[tokio::test]
@@ -8541,4 +8586,486 @@ async fn credential_renewal_with_a_csr_issues_a_new_client_certificate() {
     let identity =
         crate::infra::agent_identity_from_certificate_der(&pem.contents).expect("identity");
     assert_eq!(identity.agent_id, "agent-node-a");
+}
+
+/// 客户端证书状态：agent 报上来 → 入库 → 管理面运行态里看得到（§5.5），连最近一次续签判定一起。
+#[tokio::test]
+async fn agent_certificate_status_is_stored_and_exposed_to_admins() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.2.0",
+            "certificate_status": {
+                "not_after": "2026-11-04T00:00:00+00:00",
+                "remaining_seconds": 1_234_567,
+                "state": "renew_due",
+                "last_renewal": {
+                    "outcome": "renewed",
+                    "checked_at": "2026-10-08T00:00:00+00:00",
+                    "detail": "credential renewed",
+                    "not_after": "2026-11-04T00:00:00+00:00",
+                },
+            },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let runtime = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/runtime-status",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(runtime.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(runtime).await;
+    assert_eq!(body["certificate_status"]["state"], "renew_due");
+    assert_eq!(body["certificate_status"]["remaining_seconds"], 1_234_567);
+    assert_eq!(
+        body["certificate_status"]["not_after"],
+        "2026-11-04T00:00:00+00:00"
+    );
+    // 续签上报（§5.5）：原样透出，网关不重算。
+    assert_eq!(
+        body["certificate_status"]["last_renewal"]["outcome"],
+        "renewed"
+    );
+    assert_eq!(
+        body["certificate_status"]["last_renewal"]["checked_at"],
+        "2026-10-08T00:00:00+00:00"
+    );
+
+    // 旧版本 agentd（不带 last_renewal）：字段仍存在，为 null。
+    let legacy = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.2.0",
+            "certificate_status": {
+                "not_after": "2026-11-04T00:00:00+00:00",
+                "remaining_seconds": 1_200_000,
+                "state": "valid",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(legacy.status(), StatusCode::ACCEPTED);
+    let runtime = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/runtime-status",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(runtime).await;
+    assert!(body["certificate_status"]["last_renewal"].is_null());
+}
+
+// ── 拒绝名单 / 吊销（docs/design/agent-identity-mtls.md §5.6）──
+
+async fn revoke_agent_via_admin(env: &TestEnv, agent_id: &str, reason: &str) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/agents/{agent_id}/revocation"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "reason_code": reason }),
+    )
+    .await
+}
+
+/// 吊销后 **bearer 路径**立即被拒，且 code 明确为 `certificate_revoked`（agentd 据此停重试）。
+#[tokio::test]
+async fn a_revoked_agent_is_rejected_on_the_bearer_path() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let ok = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::ACCEPTED);
+
+    let revoked = revoke_agent_via_admin(&env, "agent-node-a", "compromised").await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+
+    let blocked = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(blocked.status(), StatusCode::UNAUTHORIZED);
+    let body = response_text(blocked).await;
+    assert!(body.contains("certificate_revoked"), "{body}");
+}
+
+/// 吊销也拦 **证书路径**：同一张此前可用的证书，之后一律 401（续签也过不来）。
+#[tokio::test]
+async fn a_revoked_agent_is_rejected_on_the_certificate_path() {
+    let env = TestEnv::new().await;
+    let first = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        Some(client_identity("agent-revoked")),
+        &status_body("agent-revoked", "host"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-revoked", "stolen key")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let blocked = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        Some(client_identity("agent-revoked")),
+        &status_body("agent-revoked", "host"),
+    )
+    .await;
+    assert_eq!(blocked.status(), StatusCode::UNAUTHORIZED);
+    assert!(response_text(blocked).await.contains("certificate_revoked"));
+}
+
+/// 列表能看到「谁在名单里」；解除后恢复访问（且再解除返回 404）。
+#[tokio::test]
+async fn lifting_a_revocation_restores_access_and_the_list_shows_entries() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "bye")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let list = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent-revocations",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(list).await;
+    assert_eq!(body["revocations"][0]["agent_id"], "agent-node-a");
+    assert_eq!(body["revocations"][0]["reason_code"], "bye");
+
+    let lifted = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/revocation",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(lifted.status(), StatusCode::OK);
+
+    let ok = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::ACCEPTED);
+
+    // 已经不在名单里：再解除一次是 404，不把空操作当成功。
+    let again = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/revocation",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::NOT_FOUND);
+}
+
+/// 运行态里能看出「被吊销」——与「离线」区分开（离线会自己回来，被吊销不会）。
+#[tokio::test]
+async fn runtime_status_exposes_the_revocation_flag() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    let before = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/runtime-status",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(before).await;
+    assert_eq!(body["revoked"], false);
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "retired")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let after = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/runtime-status",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(after).await;
+    assert_eq!(body["revoked"], true);
+}
+
+/// 吊销一台不存在的 agent：404（不静默建一条无主条目）。
+#[tokio::test]
+async fn revoking_an_unknown_agent_is_rejected() {
+    let env = TestEnv::new().await;
+    let response = revoke_agent_via_admin(&env, "agent-ghost", "n/a").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// **续签也过不来**：这是「拒绝名单」相对「停止续签」的核心补口 —— 续签的凭据就是旧证书本身，
+/// 若不在这条路径上拦，持钥者能自己续命。走的就是 `authenticate_agent`，与上报同一条闸门。
+#[tokio::test]
+async fn a_revoked_agent_cannot_renew_its_credential() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "stolen key or retired")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let renew = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/credentials:renew",
+        Some(&credential),
+        &CredentialRenewal::new(
+            "agent-node-a".to_string(),
+            "node-a".to_string(),
+            "bearer".to_string(),
+            None,
+            "2026-07-29T00:00:00Z".to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(renew.status(), StatusCode::UNAUTHORIZED);
+    assert!(response_text(renew).await.contains("certificate_revoked"));
+}
+
+/// 过了 GC 水位就不再拦（即便行还没被清）：那时被吊销的证书早已过期，agent 只能带 token 重装。
+/// 用注入 `retain_until` 在过去的条目来验证，不必真的等 30 天。
+#[tokio::test]
+async fn a_revocation_past_its_retention_no_longer_blocks() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    env.store
+        .revoke_agent(&StoredAgentRevocation {
+            entry_id: "denylist-agent-node-a".to_string(),
+            agent_id: "agent-node-a".to_string(),
+            reason_code: "retired long ago".to_string(),
+            denied_by: "admin".to_string(),
+            denied_at: "2026-01-01T00:00:00+00:00".to_string(),
+            // 已过水位（“很久以前吊销的那张证书”早已过期）。
+            retain_until: "2026-02-01T00:00:00+00:00".to_string(),
+        })
+        .await
+        .expect("inject a stale revocation");
+
+    let ok = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::ACCEPTED);
+}
+
+/// 重复吊销同一台：列表里仍是一条（`agent_id` 一条），不是两条。
+#[tokio::test]
+async fn revoking_twice_keeps_one_entry() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    for reason in ["first", "again"] {
+        assert_eq!(
+            revoke_agent_via_admin(&env, "agent-node-a", reason)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    let list = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent-revocations",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(list).await;
+    let entries = body["revocations"].as_array().expect("array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["reason_code"], "again");
+}
+
+/// 拒绝名单视图是管理面接口：没有 admin 凭据一律 401。
+#[tokio::test]
+async fn listing_revocations_requires_admin_credentials() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent-revocations",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 不带**任何**凭据的请求不该探出「某 agent 已被吊销」：名单判定在凭据验明之后，
+/// 所以这里拿到的是与其它未鉴权请求同口径的 401，而不是 `certificate_revoked`。
+#[tokio::test]
+async fn an_unauthenticated_probe_cannot_reveal_revocation() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "x")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // 既没 bearer 也没证书。
+    let probe = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        None,
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(probe.status(), StatusCode::UNAUTHORIZED);
+    let body = response_text(probe).await;
+    assert!(
+        !body.contains("certificate_revoked"),
+        "must not leak revocation to an unauthenticated probe: {body}"
+    );
+
+    // 凭据没验明（错的 bearer）同样不泄露。
+    let wrong = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some("wic_not_the_real_token"),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    assert!(!response_text(wrong).await.contains("certificate_revoked"));
+}
+
+/// 被吊销 + 库丢了 + 手持有效证书：**不能**走首触重建把自己登记回来。
+///
+/// 这是「名单判定放在重建之前」的保护（见 `certificate_authenticate`）：若顺序反了，
+/// 被吊销的 agent 一接触网关就把自己重新登记回来，拒绝名单形同虚设。
+#[tokio::test]
+async fn a_revoked_agent_is_not_rebuilt_from_its_certificate() {
+    let env = TestEnv::new().await;
+    // 库里有吊销条目，但没有这台 agent 的注册记录（模拟「库丢了」）。
+    env.store
+        .revoke_agent(&StoredAgentRevocation {
+            entry_id: "denylist-agent-rebuilt".to_string(),
+            agent_id: "agent-rebuilt".to_string(),
+            reason_code: "compromised".to_string(),
+            denied_by: "admin".to_string(),
+            denied_at: "2026-09-01T00:00:00+00:00".to_string(),
+            retain_until: "2027-01-01T00:00:00+00:00".to_string(),
+        })
+        .await
+        .expect("inject revocation");
+
+    let response = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        Some(client_identity("agent-rebuilt")),
+        &status_body("agent-rebuilt", "rebuilt-host"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        response_text(response)
+            .await
+            .contains("certificate_revoked")
+    );
+    assert!(
+        env.store
+            .get_agent("agent-rebuilt")
+            .await
+            .expect("read")
+            .is_none(),
+        "a revoked agent must not be rebuilt from its certificate"
+    );
+}
+
+/// 被吊销的 agent 的数据面记录也不进库（§5.6）：控制面切断之外，数据面同样是「它还能联系网关」的途径。
+#[tokio::test]
+async fn ingest_endpoint_rejects_a_revoked_agent() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = data_plane_record("agent-node-a", &fact_report(&["/usr/bin/xcodebuild"]));
+
+    // 吊销前正常收下。
+    let ok = post_to_ingest_router(&env, &record).await;
+    assert_eq!(ok.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "cut off")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let rejected = post_to_ingest_router(&env, &record).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(rejected).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is revoked"),
+        "{body}"
+    );
 }

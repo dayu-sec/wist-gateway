@@ -7,9 +7,9 @@ use axum::{
 
 use crate::infra::{
     AgentFactSummaryMarks, AgentStatusUpdate, CertificateRegistration, RenewCredential,
-    StoredAgentFactSummary, StoredAgentRegistration, StoredCredentialStatus,
-    StoredPurposeSuggestion, StoredWorkResult, VerifiedAgentIdentity, effective_standing,
-    new_secret_token, outstanding_one_shot, sha256_hex,
+    StoredAgentCertificateStatus, StoredAgentFactSummary, StoredAgentRegistration,
+    StoredCredentialStatus, StoredPurposeSuggestion, StoredWorkResult, VerifiedAgentIdentity,
+    effective_standing, new_secret_token, outstanding_one_shot, sha256_hex,
     victoria_metrics::{import_lines, metric_line},
 };
 use wist_contracts::API_VERSION_V1;
@@ -93,6 +93,26 @@ pub async fn submit_agent_status(
                     )
                         .into_response();
                 }
+            }
+            // 客户端证书状态（mTLS）：agent 本地判定、网关只存最近一份供页面看。
+            // 存不动**不**断上报 —— 主状态已经落了，这只是可观测性。
+            if let Some(certificate) = input.certificate_status.as_ref()
+                && let Err(err) = state
+                    .store
+                    .upsert_agent_certificate_status(&StoredAgentCertificateStatus {
+                        agent_id: agent.agent_id.clone(),
+                        not_after: certificate.not_after.clone(),
+                        remaining_seconds: certificate.remaining_seconds,
+                        state: certificate.state.clone(),
+                        last_renewal: certificate.last_renewal.clone(),
+                        reported_at: last_seen_at.clone(),
+                    })
+                    .await
+            {
+                eprintln!(
+                    "event=AgentCertificateStatusStoreFailed agent_id={} detail=\"{err}\"",
+                    agent.agent_id
+                );
             }
             // 统一进 VM：agent 自身运行指标以时间序列写入，文件只保留最新值缓存。
             let lines = agent_status_metric_lines(
@@ -1154,6 +1174,9 @@ async fn authenticate_agent(
     instance_id: &str,
     client_identity: Option<&VerifiedAgentIdentity>,
 ) -> Result<StoredAgentRegistration, Response> {
+    // 拒绝名单（§5.6）的判定**放在凭据验明之后**（见下面两处），不放在最前面 ——
+    // 否则一个不带任何凭据的请求也能靠 `certificate_revoked` 探出「某个 agent_id 已被吊销」。
+    // 切断强度不受影响：被吊销的 agent 手上必有凭据，验明后同样立刻被拒（续签也走这里）。
     // ① bearer 双轨：迁移期的旧凭据照旧可用（docs/design/agent-identity-mtls.md §7）。
     if let Some(token) = bearer_token(headers) {
         let token_hash = sha256_hex(token);
@@ -1186,6 +1209,11 @@ async fn authenticate_agent(
         if credential_is_expired(&agent.credential_expires_at) {
             return Err(unauthorized_code("credential_expired"));
         }
+        // 凭据已验明身份：此时才判拒绝名单，命中即固定回 `certificate_revoked`
+        // （agentd 见到就明确报错退出，不静默重试，§5.4）。
+        if agent_is_revoked(state, agent_id).await? {
+            return Err(unauthorized_code("certificate_revoked"));
+        }
         return Ok(agent);
     }
 
@@ -1216,6 +1244,11 @@ async fn certificate_authenticate(
         || identity.environment_id != state.config.environment_id
     {
         return Err(unauthorized_code("certificate_mismatch"));
+    }
+    // 证书在握手期已验过、身份也已对齐：此时才判拒绝名单，且**在查库 / 首触重建之前** ——
+    // 被吊销的 agent 不能靠「库丢了 → 首触重建」把自己登记回来。
+    if agent_is_revoked(state, agent_id).await? {
+        return Err(unauthorized_code("certificate_revoked"));
     }
     if let Some(agent) = state
         .store
@@ -1299,6 +1332,18 @@ fn store_unavailable(err: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
+/// 命中拒绝名单就 `Err`（401 `certificate_revoked`），否则 `Ok(false)`；调用方当 `?` 用。
+///
+/// **只在凭据已验明后调用**：这样未持凭据的请求探测不到某 `agent_id` 是否被吊销（见 `authenticate_agent`）。
+#[allow(clippy::result_large_err)]
+async fn agent_is_revoked(state: &ApiState, agent_id: &str) -> Result<bool, Response> {
+    state
+        .store
+        .is_agent_revoked(agent_id)
+        .await
+        .map_err(store_unavailable)
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
@@ -1336,6 +1381,16 @@ pub(crate) async fn authenticate_agent_credential_token(
     }
     if credential_is_expired(&agent.credential_expires_at) {
         return Err("agent credential is expired".to_string());
+    }
+    // 拒绝名单（§5.6）：被吊销的 agent 连升级包也不该能取 —— 取证 / 升级取包同样是
+    // 「它还能联系网关」的途径，单单卡业务上报不叫切断。
+    if state
+        .store
+        .is_agent_revoked(&agent.agent_id)
+        .await
+        .map_err(|err| err.to_string())?
+    {
+        return Err("agent is revoked".to_string());
     }
     Ok(())
 }

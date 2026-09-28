@@ -58,6 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 与 agent 在不在线无关 —— 掉线的 agent 恰恰是活最容易卡住的时候。
     wist_gateway::api::spawn_one_shot_expiry_tick(state.store.clone());
 
+    // 拒绝名单的周期 GC：条目只活到被吊销证书自然过期（§5.6），到点清掉。
+    // 为什么不在启动扫一次就完：网关可能连续跑数周不重启，那只会在重启时扫。
+    wist_gateway::api::spawn_revocation_gc_tick(state.store.clone());
+
     if let Some(ingest_addr) = ingest_addr {
         // 数据面（warp-parse）订阅端的**内部**接入端点：明文 HTTP，默认只绑环回。
         // 为什么不能复用下面的 HTTPS 监听：数据面的 sink 连接器没有 TLS 参数（见 api/ingest.rs）。

@@ -210,6 +210,41 @@ pub struct StoredAgentUplinkAddress {
     pub updated_at: String,
 }
 
+/// agent 上报的**客户端证书状态**（最近一次）。
+///
+/// 为什么要存：证书与到期时间只有本机知道（服务端在握手期就验完了，而过期证书进不来），
+/// 而「哪些机器快到期 / 已过期需重装」要在页面上提前看到。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAgentCertificateStatus {
+    pub agent_id: String,
+    pub not_after: String,
+    pub remaining_seconds: i64,
+    /// `valid` / `renew_due` / `expired`（agent 本地判定，网关不重算）。
+    pub state: String,
+    /// agent 本机**最近一次续签判定**（§5.5）；`None` = 老版本 agentd 没报过。
+    pub last_renewal: Option<wist_contracts::gateway::AgentCredentialRenewal>,
+    pub reported_at: String,
+}
+
+/// 拒绝名单（吊销状态表）里的一条，按 `agent_id` 分行。
+///
+/// 对应模型 `Agent.Certificate.AgentCertificateDenylistEntry`（字段与模型一致）。
+/// 见 `docs/design/agent-identity-mtls.md` §5.6：这是「立即生效且跳续签持续」的拒绝点。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredAgentRevocation {
+    /// 代理主键（`denylist-<agent_id>`）；语义键是 `agent_id`，一台 agent 一条。
+    pub entry_id: String,
+    pub agent_id: String,
+    /// 吊销原因（人工填写，可空串）。
+    pub reason_code: String,
+    /// 谁吊销的（管理面录入，可空串）。
+    pub denied_by: String,
+    /// 加入名单的时刻（RFC3339）。
+    pub denied_at: String,
+    /// GC 水位（RFC3339）：条目保留到被吊销证书的自然过期时间为止。
+    pub retain_until: String,
+}
+
 /// 网关对外地址设置（管理面设置；未设置时回落到 `server.public_base_url`）。
 ///
 /// 它是「控制平台对 agent 宣告的地址」的唯一来源：渲染 Agent 初始配置的
@@ -867,6 +902,38 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 写入/覆盖 Agent 数据面上送地址设置。
     async fn upsert_agent_uplink(&self, setting: &StoredAgentUplinkAddress) -> StoreResult<()>;
+
+    /// 落 agent 上报的客户端证书状态（最近一次为准）。
+    async fn upsert_agent_certificate_status(
+        &self,
+        status: &StoredAgentCertificateStatus,
+    ) -> StoreResult<()>;
+
+    /// 读某台 agent 最近一次上报的证书状态；没报过返回 `None`。
+    async fn get_agent_certificate_status(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<StoredAgentCertificateStatus>>;
+
+    // ── 拒绝名单（吊销状态表，§5.6）──
+
+    /// 把一台 agent 加入拒绝名单（按 `agent_id` upsert：重复吊销只刷新原因与水位）。
+    async fn revoke_agent(&self, entry: &StoredAgentRevocation) -> StoreResult<()>;
+
+    /// 从拒绝名单移除；返回是否确实移除了（`false` = 本来就不在名单里）。
+    async fn lift_agent_revocation(&self, agent_id: &str) -> StoreResult<bool>;
+
+    /// 是否在拒绝名单内，且**尚未到 GC 水位**（`retain_until > 现在`）。
+    ///
+    /// 用「当前时刻」而非只看行是否存在：条目按证书生命周期保留，过了水位即使还没被
+    /// 物理删除，也不应再拦 —— 那时被吊销的那张证书早已过期，agent 只能带 token 重装。
+    async fn is_agent_revoked(&self, agent_id: &str) -> StoreResult<bool>;
+
+    /// 列出拒绝名单里**尚未到 GC 水位**的全部条目（按 `denied_at` 倒序，页面用）。
+    async fn list_agent_revocations(&self) -> StoreResult<Vec<StoredAgentRevocation>>;
+
+    /// 删除已到 GC 水位的条目，返回删除数（后台 tick 定期调用，防止列表无限增长）。
+    async fn purge_expired_agent_revocations(&self) -> StoreResult<u64>;
 
     /// 读取网关对外地址设置；未设置过返回 `None`（调用方回落 `server.public_base_url`）。
     async fn get_agent_advertise_url(&self) -> StoreResult<Option<StoredAgentAdvertiseUrl>>;

@@ -174,6 +174,11 @@ agent 走 **mTLS**（出示客户端证书）→ 网关 `WebPkiClientVerifier` �
 - **gateway**：续签记审计（`audit credential_renewed …`），并把**证书状态**（有效期、上次续签时间）
   入库，页面上每台 agent 可见（对齐「新装机没数据也能从页面看出原因」的诉求）。
 
+**携带位置**：上报走 `AgentStatusReport.certificate_status.last_renewal`（`AgentCredentialRenewal`）——
+与 `certificate_status` 同一次心跳带上。**边界**：它挂在「证书状态」下，所以只有**持有客户端证书**
+（即网关配了 agent CA）的 agent 会带；纯 bearer 双轨（未配 CA）不报（其凭据到期仍在 agent 列表里可见）。
+若将来要让 bearer 也报，需把它提到 `AgentStatusReport` 顶层（契约变更）。
+
 ### 5.6 吊销（为什么必需、怎么做）
 
 **存在，而且必要** —— 触发场景：
@@ -191,7 +196,14 @@ agent 走 **mTLS**（出示客户端证书）→ 网关 `WebPkiClientVerifier` �
 
 - 拒的是 **`agent_id`**（不是证书序列号）：攻击者续签 / 重签都还是同一个 `agent_id` → **仍被拒**；
   它若伪造机器标识换 `agent_id`，就变成**新身份**，得走首注册（需 token）→ 拿不到原 agent 的授权。
-- 生效点：`ClientCertVerifier` 验链后查名单，命中即拒。
+- 生效点：**HTTP 鉴权层**（`authenticate_agent`）查名单，命中即拒并回 401 `certificate_revoked`。
+  **为什么不放在 `ClientCertVerifier`（握手期）**：§5.4 要求网关对「能拿到请求」的拒绝给出**可辨识
+  错误码**，而握手期拒绝是 rustls 的 TLS alert，HTTP 层拿不到、agent 只看到不透明错误（也无法据此
+  决定「明确报错退出」）。所以信任判定仍留在握手期（信任库 / 链路），**名单判定放在拿到请求之后**。
+- 覆盖范围：**两条凭据路径同一条闸门**（bearer 与证书都拦，续签自然也拦）；升级取包
+  （`authenticate_agent_credential_token`）与**数据面 ingest** 走的是另外的路径，也各自查一次，
+  但按各自**统一的 401 正文**回（不额外区分「已吊销」）—— 否则会出现「业务被切断、却还能拉包 / 推数据」。
+  且**名单判定在凭据验明之后**：不带凭据的请求不会因某 `agent_id` 在名单里而拿到不同的错误码。
 - **列表 GC**：条目只需保留到**那张证书自然过期**为止（≤ 有效期），过期即清 —— 列表不会无限增长。
   这正是「短命证书 + 状态表」的组合意义：**不是二选一**（短命负责封顶时效，状态表负责立即切断）。
 
@@ -234,8 +246,12 @@ agent 走 **mTLS**（出示客户端证书）→ 网关 `WebPkiClientVerifier` �
 - **周期性续期 + 本地有效期自检**：今天续期只在 daemon **启动时**评估一次
   （`src/control/runtime_entry.rs:524`），需补定时任务（§4.2）；过期判定靠**本地读 `notAfter`**（§5.4）；
 - **续签留痕与上报**：续签结果 / 证书状态落 state 并上报（§5.5）；过期置「需重装」并上报；
-- 收到 `unknown_credential` 时**凭现有证书自动重建登记**；`revoked` 明确报错；
 - `enroll --force`（丢弃本地身份、凭 token 重新注册）——现已缺失，是「重装 ≠ 重注册」的补口。
+- 收到 `unknown_credential` → 网关侧首触重建（agent 无需动作）；收到 `certificate_revoked` → 进**终态**：
+  停止一切控制面请求（状态 / 工作 / 上送 / 续期）并把上送压成待命，落台账
+  （`identity/renewal.json` 记 `revoked`）并打一行可操作的 `event=AgentRevoked`。**进程不退出**
+  （launchd/systemd 的 KeepAlive 会把退出变成重启风暴）；恢复只有一条路——运维在网关**解除拒绝名单**后重启。
+  注：被吊销时 agent 也**无法**上报（网关会拒），所以「被吊销」在页面上以**网关侧**为准，不指望 agent 上报。
 
 **wist-gateway**
 
@@ -244,7 +260,9 @@ agent 走 **mTLS**（出示客户端证书）→ 网关 `WebPkiClientVerifier` �
 - **首触重建登记**（证书 URI SAN → `agent_id`）；
 - mTLS / 签发路径需引一个 x509 解析库（现有 `webpki::EndEntityCert` 取不到 Subject/SAN，见 §4.2）；
 - **续签审计 + 证书状态下库**（有效期 / 上次续签），供页面展示（§5.5）；
-- **按 `agent_id` 的拒绝名单**（§5.6）：`ClientCertVerifier` 验链后查名单，命中即拒；条目随证书过期 GC；
+- **按 `agent_id` 的拒绝名单**（§5.6）：鉴权层（`authenticate_agent` 的两条凭据路径）查名单，
+  命中即回 401 `certificate_revoked`；升级取包与数据面 ingest 各自也查一次（按各自的统一 401 正文）；
+  条目随证书过期 GC；
 - 签发接口（CSR → 客户端证书）；401 **错误码区分**。
 
 ---

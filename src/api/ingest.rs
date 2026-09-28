@@ -125,6 +125,17 @@ async fn ingest_one(state: &ApiState, raw: &Value) -> Result<(), String> {
         ));
     }
 
+    // 拒绝名单（§5.6）：被吊销的 agent 的数据面记录也不该进库 —— 控制面切断还不够，
+    // 「业务被切断、却还能推事实/日志」同样不叫切断。
+    if state
+        .store
+        .is_agent_revoked(&input.agent_id)
+        .await
+        .map_err(|err| format!("failed to check revocation for {}: {err}", input.agent_id))?
+    {
+        return Err(format!("agent {} is revoked", input.agent_id));
+    }
+
     // 校验/判重/入库/推断与「控制面直报」共用同一份实现，口径只有一份。
     let response = ingest_fact_summary(state, &agent, input).await;
     let status = response.status();

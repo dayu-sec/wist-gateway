@@ -105,6 +105,17 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
+/// 拒绝名单条目是否仍然「生效」：`retain_until` 可解析且晚于 `now`。
+///
+/// 解析失败按**仍生效**处理（与 `credential_is_expired` 解析失败即判过期同一口径：
+/// 安全侧 fail-closed）。要放行就走解除名单，不指望坏行自己过期。
+fn revocation_is_live(retain_until: &str, now: DateTime<Utc>) -> bool {
+    match parse_rfc3339(retain_until) {
+        Some(until) => until > now,
+        None => true,
+    }
+}
+
 /// 回收超时的预留（与既有 `recover_expired_reservation` 语义一致：`reserved_at`
 /// 缺失或不可解析视为立即可回收）。返回是否发生了回收。
 fn recover_stale_reservation(
@@ -152,6 +163,8 @@ impl SqliteStore {
             .run(&pool)
             .await
             .map_err(|err| sql_error(err, "run sqlite migrations"))?;
+        // 拒绝名单的 GC **不在这里**：它不是「打开库」的职责，而是运行期的周期清扫
+        // （见 `api::spawn_revocation_gc_tick`）。只放一处，免得两个触发点各自漂移。
         Ok(Self { pool })
     }
 
@@ -365,6 +378,28 @@ fn deserialize_local_work(
 fn deserialize_uplink_state(
     raw: Option<String>,
 ) -> Option<wist_contracts::agent_uplink::AgentUplinkState> {
+    match raw.as_deref() {
+        Some(value) if !value.is_empty() => serde_json::from_str(value).ok(),
+        _ => None,
+    }
+}
+
+/// 最近一次续签判定落一个 TEXT 列（只留最近一份），与 `serialize_uplink_state` 同形。
+fn serialize_renewal_report(
+    value: Option<wist_contracts::gateway::AgentCredentialRenewal>,
+) -> StoreResult<Option<String>> {
+    match value {
+        Some(value) => serde_json::to_string(&value)
+            .map(Some)
+            .source_err(StoreReason::Json, "serialize agent credential renewal"),
+        None => Ok(None),
+    }
+}
+
+/// 与 `deserialize_local_work` 同一条取舍：读到坏 JSON 就当「没报过」（`None`）。
+fn deserialize_renewal_report(
+    raw: Option<String>,
+) -> Option<wist_contracts::gateway::AgentCredentialRenewal> {
     match raw.as_deref() {
         Some(value) if !value.is_empty() => serde_json::from_str(value).ok(),
         _ => None,
@@ -1072,6 +1107,171 @@ impl Store for SqliteStore {
         .await
         .map_err(|err| sql_error(err, "upsert agent uplink"))?;
         Ok(())
+    }
+
+    async fn upsert_agent_certificate_status(
+        &self,
+        status: &StoredAgentCertificateStatus,
+    ) -> StoreResult<()> {
+        let last_renewal_json = serialize_renewal_report(status.last_renewal.clone())?;
+        sqlx::query(
+            "INSERT INTO agent_certificate_status (agent_id, not_after, remaining_seconds, state, \
+             last_renewal_json, reported_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (agent_id) DO UPDATE SET not_after = excluded.not_after, \
+             remaining_seconds = excluded.remaining_seconds, state = excluded.state, \
+             last_renewal_json = excluded.last_renewal_json, reported_at = excluded.reported_at",
+        )
+        .bind(&status.agent_id)
+        .bind(&status.not_after)
+        .bind(status.remaining_seconds)
+        .bind(&status.state)
+        .bind(&last_renewal_json)
+        .bind(&status.reported_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert agent certificate status"))?;
+        Ok(())
+    }
+
+    async fn get_agent_certificate_status(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<StoredAgentCertificateStatus>> {
+        let row = sqlx::query(
+            "SELECT agent_id, not_after, remaining_seconds, state, last_renewal_json, reported_at \
+             FROM agent_certificate_status WHERE agent_id = ?1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "load agent certificate status"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let last_renewal_json: Option<String> = row
+            .try_get("last_renewal_json")
+            .map_err(|err| sql_error(err, "last_renewal_json"))?;
+        Ok(Some(StoredAgentCertificateStatus {
+            agent_id: row
+                .try_get("agent_id")
+                .map_err(|err| sql_error(err, "agent_id"))?,
+            not_after: row
+                .try_get("not_after")
+                .map_err(|err| sql_error(err, "not_after"))?,
+            remaining_seconds: row
+                .try_get("remaining_seconds")
+                .map_err(|err| sql_error(err, "remaining_seconds"))?,
+            state: row
+                .try_get("state")
+                .map_err(|err| sql_error(err, "state"))?,
+            last_renewal: deserialize_renewal_report(last_renewal_json),
+            reported_at: row
+                .try_get("reported_at")
+                .map_err(|err| sql_error(err, "reported_at"))?,
+        }))
+    }
+
+    async fn revoke_agent(&self, entry: &StoredAgentRevocation) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO agent_certificate_denylist (entry_id, agent_id, reason_code, denied_by, \
+             denied_at, retain_until) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (agent_id) DO UPDATE SET reason_code = excluded.reason_code, \
+             denied_by = excluded.denied_by, denied_at = excluded.denied_at, \
+             retain_until = excluded.retain_until",
+        )
+        .bind(&entry.entry_id)
+        .bind(&entry.agent_id)
+        .bind(&entry.reason_code)
+        .bind(&entry.denied_by)
+        .bind(&entry.denied_at)
+        .bind(&entry.retain_until)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "revoke agent"))?;
+        Ok(())
+    }
+
+    async fn lift_agent_revocation(&self, agent_id: &str) -> StoreResult<bool> {
+        let result = sqlx::query("DELETE FROM agent_certificate_denylist WHERE agent_id = ?1")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "lift agent revocation"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn is_agent_revoked(&self, agent_id: &str) -> StoreResult<bool> {
+        let retain_until: Option<String> = sqlx::query_scalar(
+            "SELECT retain_until FROM agent_certificate_denylist WHERE agent_id = ?1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "check agent revocation"))?;
+        let Some(retain_until) = retain_until else {
+            return Ok(false);
+        };
+        Ok(revocation_is_live(&retain_until, Utc::now()))
+    }
+
+    async fn list_agent_revocations(&self) -> StoreResult<Vec<StoredAgentRevocation>> {
+        let rows = sqlx::query(
+            "SELECT entry_id, agent_id, reason_code, denied_by, denied_at, retain_until \
+             FROM agent_certificate_denylist",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list agent revocations"))?;
+        let now = Utc::now();
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let retain_until: String = column!(row, "retain_until");
+            if !revocation_is_live(&retain_until, now) {
+                continue;
+            }
+            entries.push(StoredAgentRevocation {
+                entry_id: column!(row, "entry_id"),
+                agent_id: column!(row, "agent_id"),
+                reason_code: column!(row, "reason_code"),
+                denied_by: column!(row, "denied_by"),
+                denied_at: column!(row, "denied_at"),
+                retain_until,
+            });
+        }
+        // 新的在前：页面默认看到最近吊销的。
+        entries.sort_by(|a, b| b.denied_at.cmp(&a.denied_at));
+        Ok(entries)
+    }
+
+    async fn purge_expired_agent_revocations(&self) -> StoreResult<u64> {
+        let rows = sqlx::query("SELECT agent_id, retain_until FROM agent_certificate_denylist")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "scan agent revocations"))?;
+        let now = Utc::now();
+        let mut removed = 0u64;
+        for row in &rows {
+            let retain_until: String = column!(row, "retain_until");
+            // 只清**可解析且已过水位**的；坏行留给人处理（见 `revocation_is_live`）。
+            if let Some(until) = parse_rfc3339(&retain_until)
+                && until <= now
+            {
+                let agent_id: String = column!(row, "agent_id");
+                // 条件删除（CAS）：只删快照里那条水位已过的记录。若扫描与删除之间管理面把同一
+                // agent 重新吊销（upsert 刷了新水位），这里的 `retain_until` 就对不上 → 不删，
+                // 避免把一条**仍在生效**的吊销静默丢掉。
+                let result = sqlx::query(
+                    "DELETE FROM agent_certificate_denylist WHERE agent_id = ?1 AND retain_until = ?2",
+                )
+                .bind(&agent_id)
+                .bind(&retain_until)
+                .execute(&self.pool)
+                .await
+                .map_err(|err| sql_error(err, "purge agent revocation"))?;
+                removed += result.rows_affected();
+            }
+        }
+        Ok(removed)
     }
 
     async fn get_agent_advertise_url(&self) -> StoreResult<Option<StoredAgentAdvertiseUrl>> {
@@ -3965,5 +4165,207 @@ mod tests {
         let ack = store.get_work_ack("work-1").await.unwrap().unwrap();
         assert_eq!(ack.plan_version, 2);
         assert_eq!(ack.acknowledged_at, "2026-09-23T00:01:00Z");
+    }
+
+    // ── 拒绝名单（吊销状态表，§5.6）──
+
+    fn revocation(agent_id: &str, reason: &str, retain_in_days: i64) -> StoredAgentRevocation {
+        StoredAgentRevocation {
+            entry_id: format!("denylist-{agent_id}"),
+            agent_id: agent_id.to_string(),
+            reason_code: reason.to_string(),
+            denied_by: "admin".to_string(),
+            denied_at: now_rfc3339(),
+            retain_until: (Utc::now() + chrono::Duration::days(retain_in_days)).to_rfc3339(),
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_blocks_only_the_listed_agent_and_lifts_cleanly() {
+        let store = store().await;
+        store
+            .revoke_agent(&revocation("agent-live", "compromised", 30))
+            .await
+            .unwrap();
+
+        assert!(store.is_agent_revoked("agent-live").await.unwrap());
+        assert!(!store.is_agent_revoked("agent-other").await.unwrap());
+
+        let entries = store.list_agent_revocations().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent_id, "agent-live");
+        assert_eq!(entries[0].reason_code, "compromised");
+        assert_eq!(entries[0].entry_id, "denylist-agent-live");
+
+        assert!(store.lift_agent_revocation("agent-live").await.unwrap());
+        assert!(!store.is_agent_revoked("agent-live").await.unwrap());
+        // 再解除一次：本来就不在，返回 false（不把空操作当命中）。
+        assert!(!store.lift_agent_revocation("agent-live").await.unwrap());
+    }
+
+    /// 过了 GC 水位的条目**不再拦**（即便行还在），且 `purge` 会把它真正删掉。
+    #[tokio::test]
+    async fn expired_revocations_stop_blocking_and_are_purged() {
+        let store = store().await;
+        store
+            .revoke_agent(&revocation("agent-retired", "retired", -1))
+            .await
+            .unwrap();
+
+        assert!(!store.is_agent_revoked("agent-retired").await.unwrap());
+        assert!(store.list_agent_revocations().await.unwrap().is_empty());
+
+        assert_eq!(store.purge_expired_agent_revocations().await.unwrap(), 1);
+        // 清过之后没有残留（未过水位的不会被误删）。
+        assert_eq!(store.purge_expired_agent_revocations().await.unwrap(), 0);
+    }
+
+    /// 重复吊销同一 agent：刷新原因与水位，不插重复行（一台 agent 一条）。
+    #[tokio::test]
+    async fn revoking_twice_refreshes_the_single_entry() {
+        let store = store().await;
+        store
+            .revoke_agent(&revocation("agent-x", "first", 10))
+            .await
+            .unwrap();
+        store
+            .revoke_agent(&revocation("agent-x", "again", 20))
+            .await
+            .unwrap();
+
+        let entries = store.list_agent_revocations().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].reason_code, "again");
+    }
+
+    /// 坏行（`retain_until` 不可解析）按**仍生效**处理：与 `credential_is_expired` 解析失败即判
+    /// 过期同一口径（安全侧 fail-closed）。这类行不会被 `purge` 自然清掉，要放行只能走解除名单。
+    #[tokio::test]
+    async fn an_unparseable_retention_stays_enforcing_and_is_not_purged() {
+        let store = store().await;
+        store
+            .revoke_agent(&StoredAgentRevocation {
+                entry_id: "denylist-agent-bad".to_string(),
+                agent_id: "agent-bad".to_string(),
+                reason_code: "tampered".to_string(),
+                denied_by: "admin".to_string(),
+                denied_at: now_rfc3339(),
+                retain_until: "not-a-timestamp".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(store.is_agent_revoked("agent-bad").await.unwrap());
+        assert!(
+            store
+                .list_agent_revocations()
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.agent_id == "agent-bad")
+        );
+        // `purge` 只清「可解析且已过水位」的，不动坏行。
+        assert_eq!(store.purge_expired_agent_revocations().await.unwrap(), 0);
+        assert!(store.is_agent_revoked("agent-bad").await.unwrap());
+    }
+
+    /// 列表按 `denied_at` 新的在前（页面默认看最近吊销的）。
+    #[tokio::test]
+    async fn revocation_list_is_newest_first() {
+        let store = store().await;
+        store
+            .revoke_agent(&StoredAgentRevocation {
+                entry_id: "denylist-old".to_string(),
+                agent_id: "agent-old".to_string(),
+                reason_code: "".to_string(),
+                denied_by: "".to_string(),
+                denied_at: "2026-01-01T00:00:00+00:00".to_string(),
+                retain_until: "2026-12-01T00:00:00+00:00".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .revoke_agent(&StoredAgentRevocation {
+                entry_id: "denylist-new".to_string(),
+                agent_id: "agent-new".to_string(),
+                reason_code: "".to_string(),
+                denied_by: "".to_string(),
+                denied_at: "2026-09-01T00:00:00+00:00".to_string(),
+                retain_until: "2026-12-01T00:00:00+00:00".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let entries = store.list_agent_revocations().await.unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-new", "agent-old"]
+        );
+    }
+
+    /// 证书状态里的「最近一次续签判定」能原样往返（JSON 列），且在下一份上报里被覆盖。
+    #[tokio::test]
+    async fn certificate_status_round_trips_the_last_renewal() {
+        let store = store().await;
+        // 先落一台 agent（证书状态表有外键指向 agents）。
+        store
+            .register_agent_from_certificate(&cert_registration(
+                "agent-c",
+                "cred-c",
+                "fp-c",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ))
+            .await
+            .unwrap();
+        let renewal = wist_contracts::gateway::AgentCredentialRenewal {
+            outcome: "renewed".to_string(),
+            checked_at: "2026-10-01T00:00:00+00:00".to_string(),
+            detail: "credential renewed".to_string(),
+            not_after: "2026-11-01T00:00:00+00:00".to_string(),
+        };
+        store
+            .upsert_agent_certificate_status(&StoredAgentCertificateStatus {
+                agent_id: "agent-c".to_string(),
+                not_after: "2026-11-01T00:00:00+00:00".to_string(),
+                remaining_seconds: 100,
+                state: "valid".to_string(),
+                last_renewal: Some(renewal.clone()),
+                reported_at: "2026-10-01T00:00:00+00:00".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let read = store
+            .get_agent_certificate_status("agent-c")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.last_renewal.as_ref(), Some(&renewal));
+
+        // 旧版本 agentd（不带 last_renewal）覆盖式写入：与其它子字段同口径，清成 None。
+        store
+            .upsert_agent_certificate_status(&StoredAgentCertificateStatus {
+                agent_id: "agent-c".to_string(),
+                not_after: "2026-11-01T00:00:00+00:00".to_string(),
+                remaining_seconds: 100,
+                state: "valid".to_string(),
+                last_renewal: None,
+                reported_at: "2026-10-01T01:00:00+00:00".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_agent_certificate_status("agent-c")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_renewal
+                .is_none()
+        );
     }
 }

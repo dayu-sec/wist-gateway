@@ -16,9 +16,9 @@ use crate::infra::{
     AgentQuery, DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID, DEFAULT_AGENT_UPLINK_PORT,
     DEFAULT_AGENT_UPLINK_SETTING_ID, DEFAULT_INSTALL_PACKAGE_SETTING_ID, StoredAgentAdvertiseUrl,
     StoredAgentClassification, StoredAgentFactSummary, StoredAgentInstallPackage,
-    StoredAgentInstallPackageAddress, StoredAgentUplinkAddress, StoredOneShotWork,
-    StoredPurposeSuggestion, StoredWorkAck, StoredWorkResult, contains_shell_metacharacters,
-    effective_standing, outstanding_one_shot,
+    StoredAgentInstallPackageAddress, StoredAgentRevocation, StoredAgentUplinkAddress,
+    StoredOneShotWork, StoredPurposeSuggestion, StoredWorkAck, StoredWorkResult,
+    contains_shell_metacharacters, effective_standing, outstanding_one_shot,
 };
 use wist_contracts::work::{OneShotWork, StandingWork, WorkKind, WorkReceipt};
 
@@ -90,6 +90,32 @@ pub struct AgentCredentialRevocationResponse {
     pub credential_id: String,
     pub status: String,
     pub revoked_at: DateTime,
+}
+
+/// 吊销一台 Agent 的请求体（按 `agent_id` 加入拒绝名单，见 §5.6）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RevokeAgentRequest {
+    /// 人工填写的吊销原因；不填就是空串。
+    #[serde(default)]
+    pub reason_code: String,
+    /// 谁吊销的（管理面录入）；不填就是空串。
+    #[serde(default)]
+    pub requested_by: String,
+}
+
+/// 拒绝名单视图（管理面列表）。
+#[derive(Debug, Serialize)]
+pub struct AgentRevocationsView {
+    /// 仍在生效（未到 GC 水位）的条目，新的在前。
+    pub revocations: Vec<StoredAgentRevocation>,
+    pub generated_at: DateTime,
+}
+
+/// 解除吊销的结果（管理面）。
+#[derive(Debug, Serialize)]
+pub struct AgentRevocationLiftedResponse {
+    pub agent_id: String,
+    pub status: String,
 }
 
 /// 设置安装包地址的请求体。
@@ -257,6 +283,32 @@ pub async fn get_agent_runtime_status(
                 .into_response();
         }
     };
+    let certificate_status = match state.store.get_agent_certificate_status(&agent_id).await {
+        Ok(status) => status.map(|status| wist_contracts::gateway::AgentCertificateStatus {
+            not_after: status.not_after,
+            remaining_seconds: status.remaining_seconds,
+            state: status.state,
+            last_renewal: status.last_renewal,
+        }),
+        Err(err) => {
+            // 这是 agent 自报的**可观测性**字段（§5.5），非安全关键：读不出来就降级成
+            // 「未上报」并记一行，不要把整个运行态接口（它还有 revoked 等关键信息）打成 500。
+            eprintln!(
+                "event=AgentCertificateStatusReadFailed agent_id={agent_id} detail=\"{err}\""
+            );
+            None
+        }
+    };
+    let revoked = match state.store.is_agent_revoked(&agent_id).await {
+        Ok(revoked) => revoked,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load agent revocation: {err}"),
+            )
+                .into_response();
+        }
+    };
     Json(runtime_status(
         &agent.agent_id,
         &agent.instance_id,
@@ -270,6 +322,8 @@ pub async fn get_agent_runtime_status(
         agent.last_cpu_cores,
         agent.last_admin_latency_ms,
         agent.uplink_state,
+        certificate_status,
+        revoked,
     ))
     .into_response()
 }
@@ -1587,6 +1641,150 @@ pub async fn revoke_agent_credential(
     }
 }
 
+/// 把一个 `agent_id` 加入**拒绝名单**（吊销，§5.6）。
+///
+/// 与 `revoke_agent_credential` 的区别：那个吊销的是**一份凭据**，agent 换个凭据 / 拿证书
+/// 自续就能回来；这个拒的是 **agent_id 本身** —— 攻击者续签、重签都还是同一个 `agent_id`，
+/// 所以是真正「立即生效且跳续签持续」的切断点。
+///
+/// 条目不是永久的：`retain_until` = 该 agent 当前证书的自然过期时间（拿不到时回落配置的
+/// 客户端证书有效期 `agent.client_cert_ttl_seconds`，即证书的上限寿命），到点由 GC 清掉 ——
+/// 那时它只能带 token 重装。要提前恢复就调解除接口。
+pub async fn revoke_agent(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Json(input): Json<RevokeAgentRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    // 一步拿 agent：既校验存在（否则 404），又要它的当前证书到期时间做 GC 水位。
+    let agent = match state.store.get_agent(&agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load agent store: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let now = chrono::Utc::now();
+    let entry = StoredAgentRevocation {
+        entry_id: format!("denylist-{agent_id}"),
+        agent_id: agent_id.clone(),
+        reason_code: input.reason_code.trim().to_string(),
+        denied_by: input.requested_by.trim().to_string(),
+        denied_at: now.to_rfc3339(),
+        retain_until: certificate_retention_until(
+            &agent.credential_expires_at,
+            state.config.credential_ttl_seconds,
+            state.config.client_cert_ttl_seconds,
+            now,
+        )
+        .to_rfc3339(),
+    };
+    if let Err(err) = state.store.revoke_agent(&entry).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to revoke agent: {err}"),
+        )
+            .into_response();
+    }
+    eprintln!(
+        "audit agent_revoked agent_id={} retain_until={} reason_code={}",
+        entry.agent_id, entry.retain_until, entry.reason_code
+    );
+    Json(entry).into_response()
+}
+
+/// 从拒绝名单移除一个 `agent_id`（解除吊销）；不在名单里返回 404。
+pub async fn lift_agent_revocation(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    match state.store.lift_agent_revocation(&agent_id).await {
+        Ok(true) => {
+            eprintln!("audit agent_revocation_lifted agent_id={agent_id}");
+            Json(AgentRevocationLiftedResponse {
+                agent_id,
+                status: "lifted".to_string(),
+            })
+            .into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            format!("agent {agent_id} is not in the revocation list"),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to lift agent revocation: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 列出拒绝名单（管理面）。条目很多时也只给「仍在生效」的那批（见 `list_agent_revocations`）。
+pub async fn list_agent_revocations(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    match state.store.list_agent_revocations().await {
+        Ok(revocations) => Json(AgentRevocationsView {
+            revocations,
+            generated_at: DateTime::now(),
+        })
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to list agent revocations: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 拒绝名单条目的 GC 水位：留到**被吊销的 agent 手上所有凭据都失效**之后（§5.6）。
+///
+/// 为什么不能只看一个时间源：agent 手上可能**同时**有 bearer 凭据（到期 = 库里的
+/// `credential_expires_at`，即 bearer TTL）与客户端证书（寿命上限 = `client_cert_ttl_seconds`，
+/// 两者可独立配置）。只按 bearer 的到期算，会在证书还没过期时就把条目清掉 —— 被吊销的
+/// agent 于是重新获得访问权，正是 §5.6 要防的。所以取两者**较晚者**：
+///   * 库里那条 bearer 凭据的实际到期（可解析且在将来时用实际值，否则用 TTL 兜底）；
+///   * 「现在 + 客户端证书有效期」—— 只要证书有效期没被**历史性下调**（当前配置小于当初
+///     签发时的值，极少见），任何在世证书的到期都不会晚于它。
+fn certificate_retention_until(
+    credential_expires_at: &str,
+    credential_ttl_seconds: i64,
+    client_cert_ttl_seconds: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let bearer_until = chrono::DateTime::parse_from_rfc3339(credential_expires_at)
+        .ok()
+        .map(|until| until.with_timezone(&chrono::Utc))
+        .filter(|until| *until > now)
+        .unwrap_or_else(|| now + chrono::Duration::seconds(credential_ttl_seconds));
+    let certificate_until = now + chrono::Duration::seconds(client_cert_ttl_seconds);
+    bearer_until.max(certificate_until)
+}
+
 /// 在线口径（**列表与单台运行态共用**）：从 `last_seen_at` 现算 `"online"` / `"offline"`。
 ///
 /// 派生只此一处。曾经两处各写一遍就漂过：列表按 `last_seen_at` 现算、单台运行态接口把
@@ -2160,6 +2358,8 @@ fn runtime_status(
     cpu_cores: Option<u32>,
     admin_latency_ms: Option<u64>,
     uplink_state: Option<wist_contracts::agent_uplink::AgentUplinkState>,
+    certificate_status: Option<wist_contracts::gateway::AgentCertificateStatus>,
+    revoked: bool,
 ) -> AgentRuntimeStatusView {
     AgentRuntimeStatusView {
         agent_id: agent_id.to_string(),
@@ -2174,6 +2374,8 @@ fn runtime_status(
         admin_latency_ms: admin_latency_ms.map(|value| value as i64),
         last_seen_at: DateTime::from_rfc3339(last_seen_at).unwrap_or_else(DateTime::now),
         uplink_state,
+        certificate_status,
+        revoked,
     }
 }
 
@@ -2219,4 +2421,63 @@ pub struct AgentRuntimeStatusView {
     /// 为什么放在运行状态这里：运维问「这台为什么不上送」时查的就是这个响应，
     /// 待命 / 本机 file 出口 / 目标是谁 / 控制面下发还是本机 / 出口是否在失败，一屏给全。
     pub uplink_state: Option<wist_contracts::agent_uplink::AgentUplinkState>,
+    /// agent 上报的**客户端证书状态**（mTLS）；null = 还没报过 / 没证书。
+    ///
+    /// 为什么要有它：证书快到期 / 已过期需重装这件事，只有本机能判（服务端在握手期就验完了，
+    /// 而过期证书根本进不来）。见 `docs/design/agent-identity-mtls.md` §5.5。
+    pub certificate_status: Option<wist_contracts::gateway::AgentCertificateStatus>,
+    /// 这台 agent 是否在**拒绝名单**内（被吊销，§5.6）。true 时它的任何凭据路径都会被 401
+    /// `certificate_revoked`，页面应据此把「被吊销」与「离线」区分开 —— 离线会自己回来，
+    /// 被吊销不会。原因 / GC 水位见拒绝名单列表接口。
+    pub revoked: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .expect("rfc3339")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// bearer 凭据的实际到期在将来、且**晚于**证书窗：取它（真正的失效点）。
+    #[test]
+    fn retention_uses_the_bearer_expiry_when_it_is_the_later_one() {
+        let now = at("2026-09-29T00:00:00Z");
+        // bearer 到期 60 天，证书窗 37 天 → 取 bearer。
+        let until =
+            certificate_retention_until("2026-11-28T00:00:00+00:00", 60 * 86_400, 37 * 86_400, now);
+        assert_eq!(until, at("2026-11-28T00:00:00Z"));
+    }
+
+    /// **关键**：bearer 到期早于证书窗时，必须取证书窗 —— 否则会在被吊销的证书还没过期时
+    /// 就把条目 GC 掉，被吊销的 agent 重新获得访问权（§5.6）。
+    #[test]
+    fn retention_never_ends_before_the_certificate_can_no_longer_exist() {
+        let now = at("2026-09-29T00:00:00Z");
+        // bearer 只剩 30 天，但证书能活到 37 天：取「now + 37 天」。
+        let until =
+            certificate_retention_until("2026-10-29T00:00:00+00:00", 30 * 86_400, 37 * 86_400, now);
+        assert_eq!(until, now + chrono::Duration::days(37));
+    }
+
+    /// 拿不到 / 不可解析 / 已过去：bearer 侧用 TTL 兜底；再与证书窗取较晚者。
+    #[test]
+    fn retention_falls_back_to_the_ttls_when_bearer_expiry_cannot_be_used() {
+        let now = at("2026-09-29T00:00:00Z");
+        for unusable in ["", "not-a-time", "2026-01-01T00:00:00+00:00"] {
+            assert_eq!(
+                certificate_retention_until(unusable, 30 * 86_400, 37 * 86_400, now),
+                now + chrono::Duration::days(37),
+                "unusable bearer expiry {unusable:?} must fall back to the ttl windows"
+            );
+            // bearer TTL 比证书窗长时，取 bearer。
+            assert_eq!(
+                certificate_retention_until(unusable, 60 * 86_400, 37 * 86_400, now),
+                now + chrono::Duration::days(60),
+            );
+        }
+    }
 }
