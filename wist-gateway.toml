@@ -16,57 +16,15 @@ install_script_signing_private_key_file = "state/install-script-signing-ed25519.
 tenant_id = "tenant-default"
 environment_id = "env-default"
 
-[store]
-# 持久化 DSN。留空 → 使用上面 agent.store_file 同目录下的 wist-gateway.db（SQLite）。
-# 可用环境变量 WIST_GATEWAY_DATABASE_URL 覆盖（显式置空 = 回到默认 SQLite 文件）。
-# 本版本只实现了 SQLite：其它 scheme 会在启动时被拒。
-database_url = ""
-
-[purpose]
-# 用途推断规则表（策展数据）。源头是 jumo 模型仓的
-#   jumo/model/content/purpose-rules.toml
-# 部署时拷过来并把路径写在这里（相对本配置文件）。
-# 留空 = 不推断：Agent 报上来的事实摘要照常入库；**已有的建议保持不动**
-# （页面仍能看到它的计算时刻），由人自行判断 —— 「不推断」不等于「清空」。
-#
-# 注意：**改了规则内容必须同时 bump rule_set_id**。网关靠 rule_set_id 判断建议是否
-# 过期并在读取时重算；只改内容不改版本号，旧建议会被当成仍然有效。
-rules_file = ""
-
-[discovery]
-# 发现方向策略表（策展数据）。源头是 jumo 模型仓的
-#   jumo/model/content/aspect-policies.toml
-# 部署时拷过来并把路径写在这里（相对本配置文件）。
-# 留空 = 不下发（`POST /api/v1/agent/discovery-policies:poll` 回 503）：Agent 继续用
-# 自己的内建默认值（与内容仓同值），行为与从前一致，不会因为「拿不到策略」而不采集。
-#
-# 注意：**改了策略内容必须同时 bump policy_version**。Agent 靠版本号判断手上那份
-# 是不是同一版；只改值不改版本号，已经拉过表的 Agent 不会重读。
-policies_file = ""
-
-[content]
-# 采集内容目录三件套（策展数据）。源头是 jumo 模型仓的
-#   jumo/model/content/catalog.toml / packs.toml / templates.toml
-# 部署时**拷到配置目录下**（如 content/）并把相对路径写在这里 —— 与 [purpose]/[discovery]
-# 同一约定：模型仓是**创作源**，不与网关运行目录绑定。
-#
-# 三者**要么都给、要么都不给**：内容集内部互相引用（模板 → 包 → 单元），缺一不可。
-# 留空 = 不装载内容：事实入库 / 用途推断 / 资产清单照常，但不提供模板展开
-# （`GET /api/v1/admin/content` 回 503）。
-#
-# 注意：**改内容要 bump 版本**（catalog_version / template_version）—— 已授权的工作锁在
-# 它展开时那一版目录上，换版不会追改在跑的工作（见 StandingWork.catalog_version）。
-catalog_file = ""
-packs_file = ""
-templates_file = ""
-
 [ingest]
-# 数据面（warp-parse）**订阅端**的内部接入端点。
-#
-# 为什么不复用 server.listen_addr：那张监听是 HTTPS（自签证书），而数据面的 sink
-# 连接器没有 TLS 参数，打不进来。按设计这就是「数据面 → 网关的**内部信任边界**」
-# （doc/design/center/agent-work-delivery-plan.md §4），所以是**明文 HTTP、只绑环回**。
-#
-# 缺省（无本段或本键）→ 默认 127.0.0.1:3001；置空（listen_addr = ""）→ 关闭订阅。
-# 只绑环回；改成其它地址等于把明文端点暴露到网卡上，先想清楚。
+# 数据面（wparse）内部接入端点：明文 HTTP，默认只绑环回；容器里要绑网卡（0.0.0.0）才连得上。
 listen_addr = "127.0.0.1:3001"
+
+# ── 可选段（默认都不装载；要启用就把文件放进配置目录并取消注释）──
+# 源头是 jumo 模型仓的 jumo/model/content/*.toml；改了内容要同步 bump 相应版本号。
+#
+# [purpose]   rules_file    = "content/purpose-rules.toml"    # 用途推断规则表
+# [discovery] policies_file = "content/aspect-policies.toml"  # 发现方向策略表
+# [content]   catalog_file / packs_file / templates_file      # 内容目录三件套（要么都给、要么都不给）
+#
+# [store]     database_url  = ""                              # 持久化 DSN；留空 = 用 store_file 同级的 SQLite
