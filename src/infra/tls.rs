@@ -26,9 +26,13 @@ pub fn load_rustls_server_config(
 
 /// 构建**开启 mTLS** 的服务端 TLS 配置：以 `agent_ca_pem` 为 client 验证信任锚。
 ///
-/// 校验发生在**握手期**（验链 + 有效期 + `EKU=clientAuth`）：证书过期时 rustls 直接回 TLS
-/// alert，HTTP 层根本收不到请求 —— 所以「过期」由 agent 本地自检，不靠服务端错误码
-/// （见 `docs/design/agent-identity-mtls.md` §5.4）。
+/// 客户端证书是**可选**的（`allow_unauthenticated`）：
+///
+/// - **首次注册**的 agent 还没有证书，强制要求会在握手就把它挡在外面；
+/// - 「无证书」不等于「未鉴权」——注册靠 bootstrap token，其余 agent 面路由由应用层
+///   `authenticate_agent` 按「bearer 或证书身份」判定（见 `docs/design/agent-identity-mtls.md` §5.4）。
+///
+/// 出示了证书就一定会被验证（链 + 有效期 + `EKU=clientAuth`）；有证书但验不过，握手仍会失败。
 pub fn load_agent_mtls_server_config(
     cert_path: &Path,
     key_path: &Path,
@@ -43,6 +47,7 @@ pub fn load_agent_mtls_server_config(
             .map_err(|err| format!("failed to add agent CA trust anchor: {err}"))?;
     }
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .allow_unauthenticated()
         .build()
         .map_err(|err| format!("failed to build agent client verifier: {err}"))?;
     ServerConfig::builder()
@@ -461,8 +466,10 @@ AQID
         );
     }
 
+    /// 没有客户端证书的连接**握手照样成**（首次注册的 agent 还没证书），
+    /// 服务端只是看不到证书 —— 由应用层回 401。
     #[tokio::test]
-    async fn mtls_server_rejects_client_without_certificate() {
+    async fn mtls_server_accepts_client_without_certificate_but_sees_none() {
         install_crypto_provider();
         let (ca_pem, _client_der, _client_key, _identity) = agent_ca_with_client_cert();
         let (server, addr, server_der) = spawn_mtls_server(&ca_pem).await;
@@ -478,9 +485,12 @@ AQID
             )
             .await;
 
-        assert!(
-            server.await.expect("join").is_err(),
-            "server must not accept a client without a certificate"
+        // 首次注册就是这条路径：还没证书。握手成、但服务端看不到客户端身份。
+        let outcome = server.await.expect("join");
+        assert_eq!(
+            outcome,
+            Err("server saw no client certificate".to_string()),
+            "unauthenticated connections stay unauthenticated"
         );
     }
 }
