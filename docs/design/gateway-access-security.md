@@ -229,6 +229,9 @@ WIST_GATEWAY_TLS_SERVER_NAME=c-001.gateway.dayu.com \
 
 ## 5. agent 的身份：现状与目标
 
+> 落地形态（mTLS 客户端证书、库丢失后的**自动重建登记**、代价边界、迁移与验收）：见
+> [`agent-identity-mtls.md`](./agent-identity-mtls.md)。
+
 | | 【现状】 | 【待做】目标 |
 | --- | --- | --- |
 | 载体 | 库里一条 **bearer token** | **你自己的 CA 签的 agent 证书（mTLS）** |
