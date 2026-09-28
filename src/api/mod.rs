@@ -11,7 +11,7 @@ use axum::{
 
 use crate::app::content::ContentSet;
 use crate::app::purpose::PurposeRuleTable;
-use crate::infra::{AdminConfig, Store};
+use crate::infra::{AdminConfig, AgentCa, Store};
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 
 mod admin_auth;
@@ -106,6 +106,11 @@ pub struct ApiState {
     /// 与规则表/策略表同理：启动时装载一次并缓存（改内容通过重启生效）。`None` 时
     /// 内容相关能力（模板展开）不可用，但不影响事实入库 / 用途推断 / 资产清单。
     pub content: Option<Arc<ContentSet>>,
+    /// agent 客户端证书的签发 CA。`None` = 未配置（不开 mTLS 签发，注册只发 bearer）。
+    ///
+    /// 启动时装载一次（配置错了 `AdminConfig::validate` 就已经拒绝启动）。它的根**只留服务端**
+    /// 当 client 验证信任锚，**不下发**给 agent（见 `docs/design/agent-identity-mtls.md` §4.1）。
+    pub agent_ca: Option<Arc<AgentCa>>,
 }
 
 /// 启动时装载规则表。
@@ -176,6 +181,7 @@ pub fn build_state(config: AdminConfig, store: Arc<dyn Store>) -> ApiState {
     let purpose_rules = load_purpose_rules(&config);
     let discovery_policies = load_discovery_policies(&config);
     let content = load_content(&config);
+    let agent_ca = load_agent_ca(&config);
     ApiState {
         config,
         store,
@@ -184,6 +190,24 @@ pub fn build_state(config: AdminConfig, store: Arc<dyn Store>) -> ApiState {
         purpose_rules,
         discovery_policies,
         content,
+        agent_ca,
+    }
+}
+
+/// 装载 agent 客户端证书的签发 CA（未配置 = 不开 mTLS 签发）。
+///
+/// `AdminConfig::validate` 已经解析过一次（配置错就起不来）；走到这里再失败只可能是启动后
+/// 文件被改坏 —— 记一条警告并当作「未配置」，注册回落成只发 bearer，而不是把网关整个拒了。
+fn load_agent_ca(config: &AdminConfig) -> Option<Arc<AgentCa>> {
+    let (cert_file, key_file) = config.agent_ca_files()?;
+    match AgentCa::load(cert_file, key_file) {
+        Ok(ca) => Some(Arc::new(ca)),
+        Err(err) => {
+            eprintln!(
+                "warning: agent CA is configured but unusable; mTLS issuance disabled: {err}"
+            );
+            None
+        }
     }
 }
 

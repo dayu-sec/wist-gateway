@@ -12,7 +12,8 @@ use wist_contracts::enrollment::{
 };
 
 use crate::infra::{
-    AdminConfig, CommitRegistration, ReserveEnrollmentToken, Store, new_secret_token, sha256_hex,
+    AdminConfig, AgentCa, AgentCertificateIdentity, CommitRegistration, ReserveEnrollmentToken,
+    Store, new_secret_token, sha256_hex,
 };
 
 use super::{
@@ -37,7 +38,14 @@ pub async fn enroll_agent(
     }
     let requested_at = input.requested_at.clone();
     let version = agent_version_from_capability_summary(&input.capability_summary);
-    let result = agent_enrollment_result(&state.config, &state.store, input, &version).await;
+    let result = agent_enrollment_result(
+        &state.config,
+        &state.store,
+        state.agent_ca.as_deref(),
+        input,
+        &version,
+    )
+    .await;
     if result.status == EnrollmentStatus::Accepted {
         rate_limit::clear_auth_failures(&state, &client_key, ENROLLMENT_AUTH_SCOPE);
         if let (Some(agent_id), Some(instance_id)) =
@@ -82,15 +90,25 @@ pub async fn enroll_agent(
 pub async fn agent_enrollment_result(
     config: &AdminConfig,
     store: &Arc<dyn Store>,
+    agent_ca: Option<&AgentCa>,
     input: EnrollmentRequest,
     version: &str,
 ) -> EnrollmentOutcome {
-    agent_enrollment_result_with_token_issuer(config, store, input, version, new_secret_token).await
+    agent_enrollment_result_with_token_issuer(
+        config,
+        store,
+        agent_ca,
+        input,
+        version,
+        new_secret_token,
+    )
+    .await
 }
 
 pub(super) async fn agent_enrollment_result_with_token_issuer(
     config: &AdminConfig,
     store: &Arc<dyn Store>,
+    agent_ca: Option<&AgentCa>,
     input: EnrollmentRequest,
     version: &str,
     issue_secret_token: impl FnOnce(&str) -> Result<String, String>,
@@ -120,8 +138,31 @@ pub(super) async fn agent_enrollment_result_with_token_issuer(
     };
     let issued_at_time = chrono::Utc::now();
     let issued_at = issued_at_time.to_rfc3339();
-    let not_after =
+    let bearer_not_after =
         (issued_at_time + chrono::Duration::seconds(config.credential_ttl_seconds)).to_rfc3339();
+
+    // 拿 CSR 换客户端证书（mTLS）。网关没配 agent CA 时忽略 CSR，回落 bearer 双轨（§7）。
+    // agent 既然开口要证书，就**不能静默降级**：签不出来就拒，并给出可诊断的原因。
+    let issued_certificate = match (agent_ca, input.certificate_signing_request.as_deref()) {
+        (Some(ca), Some(csr)) => {
+            let identity = AgentCertificateIdentity::new(
+                config.tenant_id.clone(),
+                config.environment_id.clone(),
+                agent_id.clone(),
+            );
+            match ca.issue_client_certificate(csr, &identity, config.client_cert_ttl_seconds) {
+                Ok(issued) => Some(issued),
+                Err(reason) => {
+                    let _ = rollback_enrollment_token_reservation(store, &reservation).await;
+                    return rejected_result(format!(
+                        "invalid_certificate_signing_request: {reason}"
+                    ));
+                }
+            }
+        }
+        _ => None,
+    };
+
     let credential_id = format!("cred-{}", stable_identifier(&agent_id));
     let identity = AgentIdentity {
         agent_id: agent_id.clone(),
@@ -133,17 +174,30 @@ pub(super) async fn agent_enrollment_result_with_token_issuer(
         expires_at: None,
         status: AgentIdentityStatus::Active,
     };
+    // 有效期以**证书**为准（agentd 的续期窗就落在这个到期时间上，§4.2）：
+    // bearer 仍然一起发（双轨），但它的 30 天口子不写在回包里。
+    let (auth_scheme, not_before, not_after) = match issued_certificate.as_ref() {
+        Some(issued) => (
+            "certificate",
+            issued.not_before.clone(),
+            issued.not_after.clone(),
+        ),
+        None => ("bearer", issued_at.clone(), bearer_not_after.clone()),
+    };
     let credential_bundle = CredentialBundle {
         credential_id: credential_id.clone(),
         agent_id: agent_id.clone(),
         instance_id: instance_id.clone(),
-        auth_scheme: Some("bearer".to_string()),
+        auth_scheme: Some(auth_scheme.to_string()),
         bearer_token: Some(bearer_token.clone()),
-        certificate: None,
+        certificate: issued_certificate
+            .as_ref()
+            .map(|issued| issued.certificate_pem.clone()),
+        // 私钥永不上送（本地生成）；服务端信任锚已经走 trust_bundle，不重复放进凭据包。
         private_key_ref: None,
         ca_bundle: None,
         issued_at: issued_at.clone(),
-        not_before: Some(issued_at.clone()),
+        not_before: Some(not_before),
         not_after: Some(not_after),
     };
 
@@ -157,8 +211,16 @@ pub(super) async fn agent_enrollment_result_with_token_issuer(
         initial_config: None,
         policy_binding: None,
     };
-    if let Err(reason) =
-        commit_reserved_registration(config, store, &input, &result, version, &bearer_token).await
+    if let Err(reason) = commit_reserved_registration(
+        config,
+        store,
+        &input,
+        &result,
+        version,
+        &bearer_token,
+        &bearer_not_after,
+    )
+    .await
     {
         let _ = rollback_enrollment_token_reservation(store, &reservation).await;
         return rejected_result(reason);
@@ -211,6 +273,7 @@ async fn commit_reserved_registration(
     result: &EnrollmentOutcome,
     version: &str,
     bearer_token: &str,
+    bearer_not_after: &str,
 ) -> Result<(), String> {
     let token_hash = token_hash(&input.token);
     let agent_id = result
@@ -230,7 +293,9 @@ async fn commit_reserved_registration(
         .map(|value| value.with_timezone(&chrono::Utc).to_rfc3339())
         .unwrap_or_else(|_| now.clone());
     let credential_token_hash = sha256_hex(bearer_token);
-    let credential_expires_at = credential.not_after.clone().unwrap_or_default();
+    // 库里记的仍是 bearer 凭据的到期时间（bearer 鉴权路径按它判过期）；
+    // 证书的到期时间在回包的 credential_bundle 里，agent 侧据此算续期窗。
+    let credential_expires_at = bearer_not_after.to_string();
 
     // token 状态收尾（used/reserved_at）与 agents 落库现在都在 store 单事务内完成。
     let rejection = store

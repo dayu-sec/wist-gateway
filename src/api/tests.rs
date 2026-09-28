@@ -607,6 +607,7 @@ async fn enrollment_accepts_valid_token_and_issues_identity() {
     let result = agent_enrollment_result(
         &env.config,
         &env.store_handle,
+        None,
         enrollment_request(&token),
         "v0.1.0",
     )
@@ -637,6 +638,7 @@ async fn enrollment_rejects_invalid_token_without_identity() {
     let result = agent_enrollment_result(
         &env.config,
         &env.store_handle,
+        None,
         enrollment_request("bad-token"),
         "v0.1.0",
     )
@@ -657,6 +659,7 @@ async fn enrollment_rejects_invalid_token_before_generating_credential() {
     let result = agent_enrollment_result_with_token_issuer(
         &env.config,
         &env.store_handle,
+        None,
         enrollment_request("bad-token"),
         "v0.1.0",
         |_| panic!("credential generation must not run for an invalid token"),
@@ -678,6 +681,7 @@ async fn enrollment_rolls_back_reservation_on_credential_failure() {
     let result = agent_enrollment_result_with_token_issuer(
         &env.config,
         &env.store_handle,
+        None,
         enrollment_request(&token),
         "v0.1.0",
         |_| Err("injected_random_failure".to_string()),
@@ -742,6 +746,7 @@ async fn enrollment_consumes_token_and_rejects_replay() {
     let first = agent_enrollment_result(
         &env.config,
         &env.store_handle,
+        None,
         enrollment_request(&token),
         "v0.1.0",
     )
@@ -749,6 +754,7 @@ async fn enrollment_consumes_token_and_rejects_replay() {
     let second = agent_enrollment_result(
         &env.config,
         &env.store_handle,
+        None,
         enrollment_request(&token),
         "v0.1.0",
     )
@@ -770,6 +776,7 @@ async fn enrollment_rejects_duplicate_agent_without_consuming_token() {
     let first = agent_enrollment_result(
         &env.config,
         &env.store_handle,
+        None,
         enrollment_request(&first_token),
         "v0.1.0",
     )
@@ -777,6 +784,7 @@ async fn enrollment_rejects_duplicate_agent_without_consuming_token() {
     let duplicate = agent_enrollment_result(
         &env.config,
         &env.store_handle,
+        None,
         enrollment_request(&second_token),
         "v0.1.0",
     )
@@ -801,7 +809,8 @@ async fn enrollment_ignores_unknown_node_id() {
     request.host_profile.node_id = "unknown".to_string();
     request.host_profile.hostname = "host-a".to_string();
 
-    let result = agent_enrollment_result(&env.config, &env.store_handle, request, "v0.1.0").await;
+    let result =
+        agent_enrollment_result(&env.config, &env.store_handle, None, request, "v0.1.0").await;
 
     assert_eq!(result.agent_id.as_deref(), Some("agent-host-a"));
     assert_eq!(result.instance_id.as_deref(), Some("host-a"));
@@ -815,6 +824,7 @@ async fn enrollment_response_uses_contract_wire_status() {
         result: agent_enrollment_result(
             &env.config,
             &env.store_handle,
+            None,
             enrollment_request(&token),
             "v0.1.0",
         )
@@ -6365,6 +6375,7 @@ async fn test_state() -> ApiState {
         purpose_rules: super::load_purpose_rules(&env.config),
         discovery_policies: super::load_discovery_policies(&env.config),
         content: super::load_content(&env.config),
+        agent_ca: super::load_agent_ca(&env.config),
         config: env.config.clone(),
         store: Arc::clone(&env.store_handle),
         runtime: Arc::new(Mutex::new(AdminRuntimeState::default())),
@@ -8375,4 +8386,95 @@ async fn bearer_credential_still_works_without_certificate() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+// ── 注册时拿 CSR 换客户端证书（docs/design/agent-identity-mtls.md §5.1）──
+
+fn test_agent_ca() -> crate::infra::AgentCa {
+    use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "Wist Test Agent CA");
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    let key = KeyPair::generate().expect("ca key");
+    let certificate = params.self_signed(&key).expect("ca cert");
+    crate::infra::AgentCa::from_pem(&certificate.pem(), &key.serialize_pem()).expect("load ca")
+}
+
+fn certificate_signing_request() -> String {
+    let key = rcgen::KeyPair::generate().expect("client key");
+    rcgen::CertificateParams::default()
+        .serialize_request(&key)
+        .expect("csr")
+        .pem()
+        .expect("csr pem")
+}
+
+/// 核心：带了 CSR + 配了 agent CA → 回包里带客户端证书，且证书身份就是刚注册的 agent。
+#[tokio::test]
+async fn enrollment_with_a_csr_issues_a_client_certificate() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let ca = test_agent_ca();
+    let mut request = enrollment_request(&token);
+    request.certificate_signing_request = Some(certificate_signing_request());
+
+    let result =
+        agent_enrollment_result(&env.config, &env.store_handle, Some(&ca), request, "v0.1.0").await;
+    assert_eq!(result.status, EnrollmentStatus::Accepted);
+
+    let bundle = result.credential_bundle.clone().expect("credential bundle");
+    assert_eq!(bundle.auth_scheme.as_deref(), Some("certificate"));
+    let certificate_pem = bundle.certificate.expect("client certificate");
+
+    // 证书里的身份 = 刚注册的 agent，且能被 agent CA 验链接受。
+    let (_, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes()).expect("pem");
+    let identity =
+        crate::infra::agent_identity_from_certificate_der(&pem.contents).expect("identity");
+    assert_eq!(
+        identity.agent_id,
+        result.agent_id.clone().expect("agent id")
+    );
+    assert_eq!(identity.environment_id, "env-default");
+}
+
+/// 开了 agent CA 但 CSR 是坏的：**拒绝**，不静默降级成 bearer。
+#[tokio::test]
+async fn enrollment_with_a_broken_csr_is_rejected_not_downgraded() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let ca = test_agent_ca();
+    let mut request = enrollment_request(&token);
+    request.certificate_signing_request = Some("not a csr".to_string());
+
+    let result =
+        agent_enrollment_result(&env.config, &env.store_handle, Some(&ca), request, "v0.1.0").await;
+    assert_eq!(result.status, EnrollmentStatus::Rejected);
+    assert!(
+        result
+            .reason_code
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invalid_certificate_signing_request"),
+        "{:?}",
+        result.reason_code
+    );
+}
+
+/// 没配 agent CA（双轨默认）：CSR 被忽略，回到只发 bearer。
+#[tokio::test]
+async fn enrollment_ignores_a_csr_when_no_agent_ca_is_configured() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let mut request = enrollment_request(&token);
+    request.certificate_signing_request = Some(certificate_signing_request());
+
+    let result =
+        agent_enrollment_result(&env.config, &env.store_handle, None, request, "v0.1.0").await;
+    assert_eq!(result.status, EnrollmentStatus::Accepted);
+    let bundle = result.credential_bundle.expect("credential bundle");
+    assert_eq!(bundle.auth_scheme.as_deref(), Some("bearer"));
+    assert!(bundle.certificate.is_none());
+    assert!(bundle.bearer_token.is_some());
 }
