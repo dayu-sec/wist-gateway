@@ -8644,7 +8644,7 @@ async fn agent_certificate_status_is_stored_and_exposed_to_admins() {
         "2026-10-08T00:00:00+00:00"
     );
 
-    // 旧版本 agentd（不带 last_renewal）：字段仍存在，为 null。
+    // 旧版本 agentd（不带 last_renewal）：**保留**上一次的续签记录，必填子字段照常覆盖。
     let legacy = post_json_to_router(
         &env.config,
         &env.store_handle,
@@ -8671,7 +8671,11 @@ async fn agent_certificate_status_is_stored_and_exposed_to_admins() {
     )
     .await;
     let body: serde_json::Value = decode_json_response(runtime).await;
-    assert!(body["certificate_status"]["last_renewal"].is_null());
+    assert_eq!(body["certificate_status"]["state"], "valid");
+    assert_eq!(
+        body["certificate_status"]["last_renewal"]["outcome"],
+        "renewed"
+    );
 }
 
 // ── 拒绝名单 / 吊销（docs/design/agent-identity-mtls.md §5.6）──

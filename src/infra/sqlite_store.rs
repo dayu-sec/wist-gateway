@@ -1119,7 +1119,9 @@ impl Store for SqliteStore {
              last_renewal_json, reported_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT (agent_id) DO UPDATE SET not_after = excluded.not_after, \
              remaining_seconds = excluded.remaining_seconds, state = excluded.state, \
-             last_renewal_json = excluded.last_renewal_json, reported_at = excluded.reported_at",
+             last_renewal_json = CASE WHEN excluded.last_renewal_json IS NULL \
+             THEN agent_certificate_status.last_renewal_json ELSE excluded.last_renewal_json END, \
+             reported_at = excluded.reported_at",
         )
         .bind(&status.agent_id)
         .bind(&status.not_after)
@@ -2954,6 +2956,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_adds_agent_certificate_status_table() {
+        // 迁移 0017 新建一张表（CREATE TABLE IF NOT EXISTS），在已有库上不会重跑建表，
+        // 因此直接查 pragma 确认列真存在，而不是只靠“插得进去”。
+        let store = store().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('agent_certificate_status')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        for expected in [
+            "agent_id",
+            "not_after",
+            "remaining_seconds",
+            "state",
+            "reported_at",
+        ] {
+            assert!(columns.iter().any(|name| name == expected), "{columns:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_adds_agent_certificate_renewal_column() {
+        // 迁移 0019 只是 ALTER TABLE ADD COLUMN（SQLite 不支持 ADD COLUMN IF NOT EXISTS），
+        // 直接查 pragma 确认列真存在。
+        let store = store().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('agent_certificate_status')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            columns.iter().any(|name| name == "last_renewal_json"),
+            "{columns:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn migration_adds_agent_install_package_history_table() {
         // 迁移 0016 新建一张表（CREATE TABLE IF NOT EXISTS），不会在已有库上重跑建表，
         // 因此直接查 pragma 确认表/列真存在，而不是只靠“插得进去”。
@@ -4346,7 +4385,8 @@ mod tests {
             .unwrap();
         assert_eq!(read.last_renewal.as_ref(), Some(&renewal));
 
-        // 旧版本 agentd（不带 last_renewal）覆盖式写入：与其它子字段同口径，清成 None。
+        // 旧版本 agentd（不带 last_renewal）：**保留上一次**的值（与 local_work / uplink_state 同口径）——
+        // 降级或本机台账一时读不到时，不该把已经看到的续签记录丢掉。
         store
             .upsert_agent_certificate_status(&StoredAgentCertificateStatus {
                 agent_id: "agent-c".to_string(),
@@ -4358,14 +4398,13 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(
-            store
-                .get_agent_certificate_status("agent-c")
-                .await
-                .unwrap()
-                .unwrap()
-                .last_renewal
-                .is_none()
-        );
+        let kept = store
+            .get_agent_certificate_status("agent-c")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.last_renewal.as_ref(), Some(&renewal));
+        // 必填子字段照常覆盖（只有可选的那份保留）。
+        assert_eq!(kept.state, "valid");
     }
 }

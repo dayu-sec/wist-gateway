@@ -221,7 +221,7 @@ pub struct StoredAgentCertificateStatus {
     pub remaining_seconds: i64,
     /// `valid` / `renew_due` / `expired`（agent 本地判定，网关不重算）。
     pub state: String,
-    /// agent 本机**最近一次续签判定**（§5.5）；`None` = 老版本 agentd 没报过。
+    /// agent 本机**最近一次续签判定**（§5.5）；`None` = 老版本 agentd 没报过（落库时保留上一次）。
     pub last_renewal: Option<wist_contracts::gateway::AgentCredentialRenewal>,
     pub reported_at: String,
 }
