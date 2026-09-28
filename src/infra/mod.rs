@@ -1,6 +1,8 @@
 // @jumo generated
 // @jumo hash=cbf29ce484222325
 
+pub mod agent_ca;
+pub use agent_ca::*;
 pub mod agent_logs;
 pub use agent_logs::*;
 pub mod config;

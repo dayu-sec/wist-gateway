@@ -16,6 +16,13 @@ install_script_signing_private_key_file = "state/install-script-signing-ed25519.
 tenant_id = "tenant-default"
 environment_id = "env-default"
 
+# agent 客户端证书（mTLS）签发 CA：与「服务端叶证书的 CA」**分开**的一把 CA
+# （见 docs/design/agent-identity-mtls.md §4.1）。两者同给同缺；都给才开 mTLS 签发。
+# agent_ca_cert_file = "state/agent-ca.crt.pem"
+# agent_ca_key_file = "state/agent-ca.key.pem"
+# 签发的客户端证书有效期（秒）；缺省 37 天 = 保底 30 天 + 提前 7 天续期（§4.2）。
+# client_cert_ttl_seconds = 3196800
+
 [ingest]
 # 数据面（wparse）内部接入端点：明文 HTTP，默认只绑环回；容器里要绑网卡（0.0.0.0）才连得上。
 listen_addr = "127.0.0.1:3001"

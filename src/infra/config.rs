@@ -47,6 +47,13 @@ pub struct AdminConfig {
     /// 默认 SQLite 数据库文件（DSN 未配置时使用）。
     pub sqlite_path: PathBuf,
     pub trust_bundle: String,
+    /// agent 客户端证书签发 CA（证书 + 私钥，PEM）。这是与「服务端叶证书的 CA」**分开**的
+    /// 一把 CA（见 `docs/design/agent-identity-mtls.md` §4.1）。两者**要么都给、要么都不给**：
+    /// 都缺 = 关闭 mTLS 签发（双轨期，bearer 路径照常）。
+    pub agent_ca_cert_file: Option<PathBuf>,
+    pub agent_ca_key_file: Option<PathBuf>,
+    /// 签发的 agent 客户端证书有效期（秒）。缺省 37 天 = 保底 30 天 + 提前 7 天续期（§4.2）。
+    pub client_cert_ttl_seconds: i64,
     pub install_script_signing_private_key_file: PathBuf,
     pub install_script_signing_public_key_pem: String,
     pub tenant_id: String,
@@ -175,6 +182,13 @@ struct RawAgentConfig {
     /// 外部信任锚文件（相对 config 目录的 PEM）。信任锚**只走文件**：证书不内联进本配置，
     /// 便于轮换（换证书只换文件），也免去把多行 PEM 塞进 TOML。
     trust_bundle_file: String,
+    /// agent 客户端证书签发 CA（相对 config 目录的 PEM）。两者同给同缺，见 [`AdminConfig`]。
+    #[serde(default)]
+    agent_ca_cert_file: Option<String>,
+    #[serde(default)]
+    agent_ca_key_file: Option<String>,
+    #[serde(default = "default_client_cert_ttl_seconds")]
+    client_cert_ttl_seconds: i64,
     install_script_signing_private_key_file: String,
     tenant_id: String,
     environment_id: String,
@@ -256,6 +270,15 @@ impl AdminConfig {
             database_url: resolved_database_url(&raw.store)?,
             sqlite_path: default_sqlite_path(config_dir, &raw.agent.store_file)?,
             trust_bundle,
+            agent_ca_cert_file: resolve_optional_agent_ca_path(
+                config_dir,
+                raw.agent.agent_ca_cert_file.as_deref(),
+            )?,
+            agent_ca_key_file: resolve_optional_agent_ca_path(
+                config_dir,
+                raw.agent.agent_ca_key_file.as_deref(),
+            )?,
+            client_cert_ttl_seconds: raw.agent.client_cert_ttl_seconds,
             install_script_signing_private_key_file: install_script_signing_private_key_file
                 .clone(),
             install_script_signing_public_key_pem: load_install_script_public_key_pem(
@@ -331,6 +354,14 @@ impl AdminConfig {
             MAX_BOOTSTRAP_TOKEN_TTL_SECONDS,
         )?;
         require_positive_seconds("agent.credential_ttl_seconds", self.credential_ttl_seconds)?;
+        require_positive_seconds(
+            "agent.client_cert_ttl_seconds",
+            self.client_cert_ttl_seconds,
+        )?;
+        require_agent_ca_together(
+            self.agent_ca_cert_file.as_deref(),
+            self.agent_ca_key_file.as_deref(),
+        )?;
         require_non_empty("agent.trust_bundle", &self.trust_bundle)?;
         require_existing_file(
             "agent.install_script_signing_private_key_file",
@@ -508,6 +539,10 @@ fn default_credential_ttl_seconds() -> i64 {
     30 * 24 * 60 * 60
 }
 
+fn default_client_cert_ttl_seconds() -> i64 {
+    crate::infra::agent_ca::DEFAULT_CLIENT_CERT_TTL_SECONDS
+}
+
 fn default_victoria_metrics_url() -> String {
     "http://127.0.0.1:18429".to_string()
 }
@@ -604,6 +639,38 @@ fn read_trust_bundle_file(config_dir: &Path, file: &str) -> Result<String, Confi
 /// 拼路径前把基址的尾斜杠裁掉：管理面设置的对外地址允许带 `/` 收尾。
 fn trim_base_url(base: &str) -> &str {
     base.trim_end_matches('/')
+}
+
+/// 解析可选的 agent CA 路径（相对 config 目录）。
+fn resolve_optional_agent_ca_path(
+    config_dir: &Path,
+    value: Option<&str>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let value = match value {
+        Some(value) => normalize_optional(Some(expand_env(value)?)),
+        None => None,
+    };
+    Ok(value.map(|value| absolutize_path(config_dir, Path::new(&value))))
+}
+
+/// agent CA 的证书与私钥必须**同给同缺**：只有一半是配置错误，宁可起不来也不静默降级。
+fn require_agent_ca_together(
+    cert_file: Option<&Path>,
+    key_file: Option<&Path>,
+) -> Result<(), ConfigError> {
+    match (cert_file, key_file) {
+        (None, None) => Ok(()),
+        (Some(cert), Some(key)) => {
+            require_existing_file("agent.agent_ca_cert_file", cert)?;
+            require_existing_file("agent.agent_ca_key_file", key)
+        }
+        (Some(_), None) => Err(config_validation(
+            "agent.agent_ca_cert_file is set but agent.agent_ca_key_file is missing",
+        )),
+        (None, Some(_)) => Err(config_validation(
+            "agent.agent_ca_key_file is set but agent.agent_ca_cert_file is missing",
+        )),
+    }
 }
 
 fn require_non_empty(field: &str, value: &str) -> Result<(), ConfigError> {
@@ -1503,5 +1570,82 @@ environment_id = "env-default"
         }
         output.push_str("-----END PRIVATE KEY-----\n");
         output
+    }
+
+    /// 只给一半的 agent CA 是配置错误：宁可起不来，也不静默降级成「没有 mTLS」。
+    #[test]
+    fn agent_ca_requires_certificate_and_key_together() {
+        let ca_cert = write_temp_file("agent-ca-cert");
+        let only_cert = write_temp_config(&agent_config_toml(&format!(
+            "agent_ca_cert_file = \"{}\"\n",
+            file_name(&ca_cert)
+        )));
+        let err = AdminConfig::load_from_path(&only_cert).expect_err("cert without key");
+        assert!(err.to_string().contains("agent_ca_key_file"), "{err}");
+        let _ = fs::remove_file(only_cert);
+
+        let ca_key = write_temp_file("agent-ca-key");
+        let only_key = write_temp_config(&agent_config_toml(&format!(
+            "agent_ca_key_file = \"{}\"\n",
+            file_name(&ca_key)
+        )));
+        let err = AdminConfig::load_from_path(&only_key).expect_err("key without cert");
+        assert!(err.to_string().contains("agent_ca_cert_file"), "{err}");
+        let _ = fs::remove_file(only_key);
+    }
+
+    /// 两个都不给 = 关闭 mTLS 签发（双轨期），且签发有效期缺省 37 天（= 保底 30 + 提前 7）。
+    #[test]
+    fn agent_ca_absent_disables_mtls_and_defaults_ttl_to_37_days() {
+        let path = write_temp_config(&agent_config_toml(""));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+
+        assert!(config.agent_ca_cert_file.is_none());
+        assert!(config.agent_ca_key_file.is_none());
+        assert_eq!(
+            config.client_cert_ttl_seconds,
+            crate::infra::agent_ca::DEFAULT_CLIENT_CERT_TTL_SECONDS
+        );
+        assert_eq!(config.client_cert_ttl_seconds, 37 * 24 * 60 * 60);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn agent_ca_paths_are_absolutized_and_ttl_override_is_honored() {
+        let ca_cert = write_temp_file("agent-ca-cert");
+        let ca_key = write_temp_file("agent-ca-key");
+        let path = write_temp_config(&agent_config_toml(&format!(
+            "agent_ca_cert_file = \"{}\"\nagent_ca_key_file = \"{}\"\nclient_cert_ttl_seconds = 1000\n",
+            file_name(&ca_cert),
+            file_name(&ca_key),
+        )));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+
+        assert_eq!(
+            config.agent_ca_cert_file,
+            Some(env::temp_dir().join(file_name(&ca_cert)))
+        );
+        assert_eq!(
+            config.agent_ca_key_file,
+            Some(env::temp_dir().join(file_name(&ca_key)))
+        );
+        assert_eq!(config.client_cert_ttl_seconds, 1000);
+        let _ = fs::remove_file(path);
+    }
+
+    fn file_name(path: &Path) -> String {
+        path.file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// 最小的可加载配置：`[server]` + `[agent]`，其余交给 `write_temp_config` 注入。
+    fn agent_config_toml(extra_agent_lines: &str) -> String {
+        let package = write_temp_file("wist-agentd");
+        format!(
+            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n{extra_agent_lines}",
+            package.display()
+        )
     }
 }
