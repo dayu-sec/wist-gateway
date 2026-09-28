@@ -6148,6 +6148,7 @@ fn enrollment_request(token: &str) -> EnrollmentRequest {
         kind: "submit_enrollment_request".to_string(),
         token: token.to_string(),
         credential_request: "none".to_string(),
+        certificate_signing_request: None,
         host_profile: wist_contracts::enrollment::HostProfile {
             node_id: "node-a".to_string(),
             hostname: "host-a".to_string(),
