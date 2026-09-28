@@ -172,7 +172,9 @@ struct RawAgentConfig {
     credential_ttl_seconds: i64,
     #[serde(default = "default_store_file")]
     store_file: String,
-    trust_bundle: String,
+    /// 外部信任锚文件（相对 config 目录的 PEM）。信任锚**只走文件**：证书不内联进本配置，
+    /// 便于轮换（换证书只换文件），也免去把多行 PEM 塞进 TOML。
+    trust_bundle_file: String,
     install_script_signing_private_key_file: String,
     tenant_id: String,
     environment_id: String,
@@ -240,6 +242,7 @@ impl AdminConfig {
             MIN_ADMIN_API_TOKEN_BYTES,
         )?;
         require_non_weak_admin_token(&admin_api_token)?;
+        let trust_bundle = read_trust_bundle_file(config_dir, &raw.agent.trust_bundle_file)?;
         Ok(Self {
             listen_addr: expand_env(&raw.server.listen_addr)?,
             public_base_url: trim_trailing_slash(expand_env(&raw.server.public_base_url)?),
@@ -252,7 +255,7 @@ impl AdminConfig {
             store_file: absolutize_path(config_dir, Path::new(&expand_env(&raw.agent.store_file)?)),
             database_url: resolved_database_url(&raw.store)?,
             sqlite_path: default_sqlite_path(config_dir, &raw.agent.store_file)?,
-            trust_bundle: expand_env(&raw.agent.trust_bundle)?,
+            trust_bundle,
             install_script_signing_private_key_file: install_script_signing_private_key_file
                 .clone(),
             install_script_signing_public_key_pem: load_install_script_public_key_pem(
@@ -587,6 +590,17 @@ fn trim_trailing_slash(value: String) -> String {
     value.trim_end_matches('/').to_string()
 }
 
+/// 读 agent 的信任锚文件（相对 config 目录的 PEM）。
+fn read_trust_bundle_file(config_dir: &Path, file: &str) -> Result<String, ConfigError> {
+    let resolved = absolutize_path(config_dir, Path::new(&expand_env(file)?));
+    fs::read_to_string(&resolved).map_err(|err| {
+        config_io(format!(
+            "failed to read agent.trust_bundle_file {}: {err}",
+            resolved.display()
+        ))
+    })
+}
+
 /// 拼路径前把基址的尾斜杠裁掉：管理面设置的对外地址允许带 `/` 收尾。
 fn trim_base_url(base: &str) -> &str {
     base.trim_end_matches('/')
@@ -849,7 +863,7 @@ admin_api_token = "test-admin-token"
 [agent]
 package_file = "wist-agent.tar.gz"
 enrollment_token = "test-token"
-trust_bundle = "internal-ca-stub"
+trust_bundle_file = "trust-bundle.pem"
 install_script_signing_private_key_file = "install-signing-ed25519.pkcs8.pem"
 tenant_id = "tenant-default"
 environment_id = "env-default"
@@ -858,6 +872,7 @@ environment_id = "env-default"
         .expect("write config");
         fs::write(dir.join("admin-tls.crt.pem"), "cert").expect("write cert");
         fs::write(dir.join("admin-tls.key.pem"), "key").expect("write key");
+        fs::write(dir.join("trust-bundle.pem"), "bundle").expect("write trust bundle");
 
         let config = AdminConfig::load_from_path(&config_path).expect("config loads");
 
@@ -1223,8 +1238,14 @@ environment_id = "env-default"
     }
 
     #[test]
-    fn loads_multiline_trust_bundle() {
+    fn loads_trust_bundle_from_file() {
         let package_file = write_temp_file("wist-agentd");
+        let bundle_path = env::temp_dir().join(format!("trust-bundle-{}.pem", unique_suffix()));
+        fs::write(
+            &bundle_path,
+            "-----BEGIN CERTIFICATE-----\nMIIBfromfile\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write trust bundle");
         let path = write_temp_config(&format!(
             r#"
 [server]
@@ -1234,22 +1255,47 @@ admin_api_token = "test-admin-token"
 
 [agent]
 package_file = "{}"
-trust_bundle = '''-----BEGIN CERTIFICATE-----
-MIIBtest
------END CERTIFICATE-----
-'''
+trust_bundle_file = "{}"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
-            package_file.display()
+            package_file.display(),
+            bundle_path.display()
         ));
 
         let config = AdminConfig::load_from_path(&path).expect("config loads");
 
         assert_eq!(
             config.trust_bundle,
-            "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n"
+            "-----BEGIN CERTIFICATE-----\nMIIBfromfile\n-----END CERTIFICATE-----\n"
         );
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(package_file);
+        let _ = fs::remove_file(bundle_path);
+    }
+
+    #[test]
+    fn missing_trust_bundle_file_is_an_error() {
+        let package_file = write_temp_file("wist-agentd");
+        let missing = env::temp_dir().join(format!("does-not-exist-{}.pem", unique_suffix()));
+        let path = write_temp_config(&format!(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://localhost:3000/"
+admin_api_token = "test-admin-token"
+
+[agent]
+package_file = "{}"
+trust_bundle_file = "{}"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+            package_file.display(),
+            missing.display()
+        ));
+
+        assert!(AdminConfig::load_from_path(&path).is_err());
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(package_file);
     }
@@ -1325,11 +1371,37 @@ environment_id = "env-default"
         let key_path = path.with_extension("ed25519.pkcs8.pem");
         let tls_cert_path = path.with_extension("tls.crt.pem");
         let tls_key_path = path.with_extension("tls.key.pem");
+        let bundle_path = path.with_extension("trust-bundle.pem");
         write_install_signing_key(&key_path);
         fs::write(&tls_cert_path, "cert").expect("write TLS cert");
         fs::write(&tls_key_path, "key").expect("write TLS key");
+        fs::write(
+            &bundle_path,
+            "-----BEGIN CERTIFICATE-----\ntest-bundle\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write trust bundle");
+        // 信任锚只走文件：把内联 `trust_bundle = ...` 改写成 `trust_bundle_file = "<...>"`；
+        // 原配置若没有锚字段，再注入一行（见下方 inject_agent_field）。
+        let mut has_bundle = false;
+        let content = content
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("trust_bundle =") {
+                    has_bundle = true;
+                    let indent = &line[..line.len() - trimmed.len()];
+                    format!("{indent}trust_bundle_file = \"{}\"", bundle_path.display())
+                } else {
+                    if trimmed.starts_with("trust_bundle_file =") {
+                        has_bundle = true;
+                    }
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let content = if content.contains("install_script_signing_private_key_file") {
-            content.to_string()
+            content
         } else {
             format!(
                 "{content}\ninstall_script_signing_private_key_file = \"{}\"\n",
@@ -1354,6 +1426,15 @@ environment_id = "env-default"
                 &tls_key_path.display().to_string(),
             )
         };
+        let content = if has_bundle {
+            content
+        } else {
+            inject_agent_field(
+                &content,
+                "trust_bundle_file",
+                &bundle_path.display().to_string(),
+            )
+        };
         fs::write(&path, content).expect("write config");
         path
     }
@@ -1369,6 +1450,20 @@ environment_id = "env-default"
             }
         }
         assert!(inserted, "test config must include [server]");
+        format!("{}\n", output.join("\n"))
+    }
+
+    fn inject_agent_field(content: &str, key: &str, value: &str) -> String {
+        let mut output = Vec::new();
+        let mut inserted = false;
+        for line in content.lines() {
+            output.push(line.to_string());
+            if !inserted && line.trim() == "[agent]" {
+                output.push(format!("{key} = \"{value}\""));
+                inserted = true;
+            }
+        }
+        assert!(inserted, "test config must include [agent]");
         format!("{}\n", output.join("\n"))
     }
 
