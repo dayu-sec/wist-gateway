@@ -630,7 +630,7 @@ pub async fn renew_agent_credential(
         )
             .into_response();
     }
-    if input.credential_request != "bearer" {
+    if !matches!(input.credential_request.as_str(), "bearer" | "csr") {
         return (StatusCode::BAD_REQUEST, "unsupported credential request").into_response();
     }
     let Some(current_token) = bearer_token(&headers) else {
@@ -663,18 +663,58 @@ pub async fn renew_agent_credential(
         Ok(id) => id,
         Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
     };
+
+    // 续期也能**换发客户端证书**：agent 重新交 CSR，网关用 agent CA 签一张新的（§4.2）。
+    // 开了 CA 但 CSR 坏了就拒，不静默降级 —— 与注册同一口径。
+    let issued_certificate = match (
+        input.credential_request.as_str(),
+        state.agent_ca.as_deref(),
+        input.certificate_signing_request.as_deref(),
+    ) {
+        ("csr", Some(ca), Some(csr)) => {
+            let identity = crate::infra::AgentCertificateIdentity::new(
+                state.config.tenant_id.clone(),
+                state.config.environment_id.clone(),
+                agent.agent_id.clone(),
+            );
+            match ca.issue_client_certificate(csr, &identity, state.config.client_cert_ttl_seconds)
+            {
+                Ok(issued) => Some(issued),
+                Err(reason) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid_certificate_signing_request: {reason}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // 有效期以**证书**为准（agentd 的续期窗就落在这个时间上），bearer 仍然一起换发（双轨）。
+    let (auth_scheme, bundle_not_before, bundle_not_after) = match issued_certificate.as_ref() {
+        Some(issued) => (
+            "certificate",
+            issued.not_before.clone(),
+            issued.not_after.clone(),
+        ),
+        None => ("bearer", issued_at.clone(), not_after.clone()),
+    };
     let bundle = CredentialBundle {
         credential_id: credential_id.clone(),
         agent_id: agent.agent_id.clone(),
         instance_id: agent.instance_id.clone(),
-        auth_scheme: Some("bearer".to_string()),
+        auth_scheme: Some(auth_scheme.to_string()),
         bearer_token: Some(bearer_token.clone()),
-        certificate: None,
+        certificate: issued_certificate
+            .as_ref()
+            .map(|issued| issued.certificate_pem.clone()),
         private_key_ref: None,
         ca_bundle: None,
         issued_at: issued_at.clone(),
-        not_before: Some(issued_at.clone()),
-        not_after: Some(not_after.clone()),
+        not_before: Some(bundle_not_before),
+        not_after: Some(bundle_not_after),
     };
 
     let new_token_hash = sha256_hex(&bearer_token);

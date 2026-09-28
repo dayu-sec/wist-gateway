@@ -3297,6 +3297,7 @@ async fn credential_renewal_replaces_previous_credential() {
             "agent-node-a".to_string(),
             "node-a".to_string(),
             "bearer".to_string(),
+            None,
             "2026-07-29T00:00:00Z".to_string(),
         ),
     )
@@ -3377,6 +3378,7 @@ async fn agent_credential_renewal_requires_current_bearer() {
             "agent-node-a".to_string(),
             "node-a".to_string(),
             "bearer".to_string(),
+            None,
             "2026-07-29T00:00:00Z".to_string(),
         ),
     )
@@ -5401,6 +5403,7 @@ async fn package_download_rejects_rotated_out_credential_but_accepts_the_new_one
             "agent-node-a".to_string(),
             "node-a".to_string(),
             "bearer".to_string(),
+            None,
             "2027-01-01T00:00:00Z".to_string(),
         ),
     )
@@ -8390,7 +8393,14 @@ async fn bearer_credential_still_works_without_certificate() {
 
 // ── 注册时拿 CSR 换客户端证书（docs/design/agent-identity-mtls.md §5.1）──
 
-fn test_agent_ca() -> crate::infra::AgentCa {
+/// 临时 agent CA：返回 `(CA, 证书文件, 私钥文件)`。
+///
+/// 文件用于给 `AdminConfig` 指路 —— `build_state` 是从配置**装载** CA 的，不是从内存对象。
+fn test_agent_ca() -> (
+    crate::infra::AgentCa,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();
@@ -8399,7 +8409,22 @@ fn test_agent_ca() -> crate::infra::AgentCa {
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     let key = KeyPair::generate().expect("ca key");
     let certificate = params.self_signed(&key).expect("ca cert");
-    crate::infra::AgentCa::from_pem(&certificate.pem(), &key.serialize_pem()).expect("load ca")
+    let cert_path = write_temp_pem("agent-ca.crt.pem", &certificate.pem());
+    let key_path = write_temp_pem("agent-ca.key.pem", &key.serialize_pem());
+    let ca =
+        crate::infra::AgentCa::from_pem(&certificate.pem(), &key.serialize_pem()).expect("load ca");
+    (ca, cert_path, key_path)
+}
+
+fn write_temp_pem(suffix: &str, body: &str) -> std::path::PathBuf {
+    static NEXT_SUFFIX: AtomicU64 = AtomicU64::new(1);
+    let path = std::env::temp_dir().join(format!(
+        "wist-gateway-test-{}-{}-{suffix}",
+        std::process::id(),
+        NEXT_SUFFIX.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, body).expect("write temp pem");
+    path
 }
 
 fn certificate_signing_request() -> String {
@@ -8416,7 +8441,7 @@ fn certificate_signing_request() -> String {
 async fn enrollment_with_a_csr_issues_a_client_certificate() {
     let env = TestEnv::new().await;
     let token = env.issue_token().await;
-    let ca = test_agent_ca();
+    let (ca, _, _) = test_agent_ca();
     let mut request = enrollment_request(&token);
     request.certificate_signing_request = Some(certificate_signing_request());
 
@@ -8444,7 +8469,7 @@ async fn enrollment_with_a_csr_issues_a_client_certificate() {
 async fn enrollment_with_a_broken_csr_is_rejected_not_downgraded() {
     let env = TestEnv::new().await;
     let token = env.issue_token().await;
-    let ca = test_agent_ca();
+    let (ca, _, _) = test_agent_ca();
     let mut request = enrollment_request(&token);
     request.certificate_signing_request = Some("not a csr".to_string());
 
@@ -8477,4 +8502,43 @@ async fn enrollment_ignores_a_csr_when_no_agent_ca_is_configured() {
     assert_eq!(bundle.auth_scheme.as_deref(), Some("bearer"));
     assert!(bundle.certificate.is_none());
     assert!(bundle.bearer_token.is_some());
+}
+
+/// 续期也能换发新证书：agent 重新交 CSR，网关用 agent CA 签一张新的（§4.2）。
+#[tokio::test]
+async fn credential_renewal_with_a_csr_issues_a_new_client_certificate() {
+    let mut env = TestEnv::new().await;
+    let (_ca, ca_cert_path, ca_key_path) = test_agent_ca();
+    env.config.agent_ca_cert_file = Some(ca_cert_path);
+    env.config.agent_ca_key_file = Some(ca_key_path);
+
+    let credential = enroll_agent_credential(&env).await;
+    let body = serde_json::json!({
+        "api_version": "v1",
+        "kind": "renew_agent_credential",
+        "agent_id": "agent-node-a",
+        "instance_id": "node-a",
+        "credential_request": "csr",
+        "certificate_signing_request": certificate_signing_request(),
+        "requested_at": "2026-09-28T00:00:00Z",
+    });
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/credentials:renew",
+        Some(&credential),
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let renewed: CredentialRenewed = decode_json_response(response).await;
+    let bundle = renewed.credential_bundle;
+    assert_eq!(bundle.auth_scheme.as_deref(), Some("certificate"));
+    let certificate_pem = bundle.certificate.expect("renewed client certificate");
+    let (_, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes()).expect("pem");
+    let identity =
+        crate::infra::agent_identity_from_certificate_der(&pem.contents).expect("identity");
+    assert_eq!(identity.agent_id, "agent-node-a");
 }
