@@ -581,9 +581,9 @@ dependencies = [
 
 [[package]]
 name = "jumo-derive"
-version = "0.1.3"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d13031db93a0130ba158ff7f58fce8e21e80f5e2f149546ac081efb8dd44354"
+checksum = "7c26f71c98babc48a349915af0aeeb5c4ac0747aebde4ee600fa9754b01a5ec1"
 dependencies = [
  "jumo-derive-macros",
 ]
