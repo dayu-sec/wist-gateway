@@ -17,6 +17,54 @@ pub fn load_rustls_server_config(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<ServerConfig, String> {
+    let (certs, key) = load_server_cert_and_key(cert_path, key_path)?;
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| format!("invalid TLS certificate or private key: {err}"))
+}
+
+/// 构建**开启 mTLS** 的服务端 TLS 配置：以 `agent_ca_pem` 为 client 验证信任锚。
+///
+/// 校验发生在**握手期**（验链 + 有效期 + `EKU=clientAuth`）：证书过期时 rustls 直接回 TLS
+/// alert，HTTP 层根本收不到请求 —— 所以「过期」由 agent 本地自检，不靠服务端错误码
+/// （见 `docs/design/agent-identity-mtls.md` §5.4）。
+pub fn load_agent_mtls_server_config(
+    cert_path: &Path,
+    key_path: &Path,
+    agent_ca_pem: &str,
+) -> Result<ServerConfig, String> {
+    install_crypto_provider();
+    let (certs, key) = load_server_cert_and_key(cert_path, key_path)?;
+    let mut roots = rustls::RootCertStore::empty();
+    for anchor in certificate_chain_from_pem(agent_ca_pem)? {
+        roots
+            .add(anchor)
+            .map_err(|err| format!("failed to add agent CA trust anchor: {err}"))?;
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|err| format!("failed to build agent client verifier: {err}"))?;
+    ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|err| format!("invalid TLS certificate or private key: {err}"))
+}
+
+/// 从**已完成握手**的服务端连接里取出已验证的客户端叶证书 DER。
+///
+/// `None` = 该连接没出示客户端证书（没开 mTLS 的监听上恒为 `None`）。
+/// 这是「库丢失后首触重建登记」的入口：拿到证书就能从 URI SAN 认出 `agent_id`。
+pub fn peer_leaf_certificate_der(conn: &rustls::server::ServerConnection) -> Option<Vec<u8>> {
+    conn.peer_certificates()
+        .and_then(|chain| chain.first())
+        .map(|leaf| leaf.as_ref().to_vec())
+}
+
+fn load_server_cert_and_key(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
     install_crypto_provider();
     let cert_pem = fs::read_to_string(cert_path).map_err(|err| {
         format!(
@@ -32,11 +80,7 @@ pub fn load_rustls_server_config(
     })?;
     let certs = certificate_chain_from_pem(&cert_pem)?;
     let key = private_key_from_pem(&key_pem)?;
-
-    ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|err| format!("invalid TLS certificate or private key: {err}"))
+    Ok((certs, key))
 }
 
 fn install_crypto_provider() {
@@ -289,5 +333,154 @@ AQID
                 "rustls REJECTS chain {chain_path} under anchor {anchor_path} for {server_name}: {err}"
             ),
         }
+    }
+
+    // ── mTLS 链路 spike（M3 的唯一未知点：服务端能否从连接里拿到已验客户端证书）──
+
+    use crate::infra::agent_ca::{
+        AgentCa, AgentCertificateIdentity, DEFAULT_CLIENT_CERT_TTL_SECONDS,
+        agent_identity_from_certificate_der,
+    };
+    use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    fn write_temp_pem(prefix: &str, content: &str) -> std::path::PathBuf {
+        static NEXT_SUFFIX: AtomicU64 = AtomicU64::new(1);
+        let path = std::env::temp_dir().join(format!(
+            "wist-gateway-tls-{}-{}-{prefix}.pem",
+            std::process::id(),
+            NEXT_SUFFIX.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, content).expect("write temp pem");
+        path
+    }
+
+    /// 独立 agent CA + 一张用它签出的客户端证书（附客户端私钥 DER）。
+    fn agent_ca_with_client_cert() -> (
+        String,
+        Vec<u8>,
+        PrivateKeyDer<'static>,
+        AgentCertificateIdentity,
+    ) {
+        let mut ca_params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "Wist Test Agent CA");
+        ca_params.distinguished_name = dn;
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        let ca_key = KeyPair::generate().expect("ca key");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+        let ca_pem = ca_cert.pem();
+        let ca = AgentCa::from_pem(&ca_pem, &ca_key.serialize_pem()).expect("load ca");
+
+        let client_key = KeyPair::generate().expect("client key");
+        let csr_pem = CertificateParams::default()
+            .serialize_request(&client_key)
+            .expect("csr")
+            .pem()
+            .expect("csr pem");
+        let identity = AgentCertificateIdentity::new("tenant-default", "env-default", "agent-mtls");
+        let issued = ca
+            .issue_client_certificate(&csr_pem, &identity, DEFAULT_CLIENT_CERT_TTL_SECONDS)
+            .expect("issue");
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der()));
+        (ca_pem, issued.certificate_der, key_der, identity)
+    }
+
+    /// 服务端叶证书（自签，SAN=localhost）+ 一个已完成握手的监听。
+    async fn spawn_mtls_server(
+        ca_pem: &str,
+    ) -> (
+        tokio::task::JoinHandle<Result<Vec<u8>, String>>,
+        std::net::SocketAddr,
+        Vec<u8>,
+    ) {
+        let rcgen::CertifiedKey {
+            cert: server_cert,
+            key_pair: server_key,
+        } = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("server cert");
+        let cert_path = write_temp_pem("server-cert", &server_cert.pem());
+        let key_path = write_temp_pem("server-key", &server_key.serialize_pem());
+        let server_config =
+            load_agent_mtls_server_config(&cert_path, &key_path, ca_pem).expect("server config");
+        let _ = fs::remove_file(&cert_path);
+        let _ = fs::remove_file(&key_path);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let acceptor = TlsAcceptor::from(Arc::new(server_config));
+            let (stream, _) = listener.accept().await.map_err(|err| err.to_string())?;
+            let tls = acceptor
+                .accept(stream)
+                .await
+                .map_err(|err| format!("handshake: {err}"))?;
+            peer_leaf_certificate_der(tls.get_ref().1)
+                .ok_or_else(|| "server saw no client certificate".to_string())
+        });
+        (handle, addr, server_cert.der().to_vec())
+    }
+
+    fn client_roots(server_der: Vec<u8>) -> rustls::RootCertStore {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(server_der))
+            .expect("server anchor");
+        roots
+    }
+
+    #[tokio::test]
+    async fn mtls_server_reports_verified_client_certificate_identity() {
+        install_crypto_provider();
+        let (ca_pem, client_der, client_key, identity) = agent_ca_with_client_cert();
+        let (server, addr, server_der) = spawn_mtls_server(&ca_pem).await;
+
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(client_roots(server_der))
+            .with_client_auth_cert(vec![CertificateDer::from(client_der)], client_key)
+            .expect("client config");
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let _tls = TlsConnector::from(Arc::new(client_config))
+            .connect(
+                rustls_pki_types::ServerName::try_from("localhost").expect("server name"),
+                stream,
+            )
+            .await
+            .expect("client handshake");
+
+        let leaf = server
+            .await
+            .expect("join")
+            .expect("server must see the client certificate");
+        // 服务端从连接里读回的证书，能还原出 agent 身份 —— M3 的入口成立。
+        assert_eq!(
+            agent_identity_from_certificate_der(&leaf).expect("identity"),
+            identity
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_server_rejects_client_without_certificate() {
+        install_crypto_provider();
+        let (ca_pem, _client_der, _client_key, _identity) = agent_ca_with_client_cert();
+        let (server, addr, server_der) = spawn_mtls_server(&ca_pem).await;
+
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(client_roots(server_der))
+            .with_no_client_auth();
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let _ = TlsConnector::from(Arc::new(client_config))
+            .connect(
+                rustls_pki_types::ServerName::try_from("localhost").expect("server name"),
+                stream,
+            )
+            .await;
+
+        assert!(
+            server.await.expect("join").is_err(),
+            "server must not accept a client without a certificate"
+        );
     }
 }
