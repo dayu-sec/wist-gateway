@@ -59,7 +59,10 @@ fn builtin_package(env: &TestEnv) -> AgentPackageSource {
     AgentPackageSource::from_local_file(
         &env.config,
         &env.config.public_base_url,
-        env.config.agent_package_file.clone(),
+        env.config
+            .agent_package_file
+            .clone()
+            .expect("builtin package configured"),
     )
     .expect("builtin package source")
 }
@@ -399,7 +402,11 @@ async fn install_script_braces_variables_before_cjk() {
 #[tokio::test]
 async fn builtin_package_requires_readable_file() {
     let env = TestEnv::new().await;
-    let package_path = env.config.agent_package_file.clone();
+    let package_path = env
+        .config
+        .agent_package_file
+        .clone()
+        .expect("builtin package configured");
     std::fs::remove_file(&package_path).expect("remove package");
 
     // 解析内置来源需要读制品算摘要；制品不在就必须显式失败，
@@ -5657,7 +5664,13 @@ async fn package_download_internal_errors_are_no_store() {
     let credential = enroll_agent_credential(&env).await;
 
     // `/current` 的本地制品读失败（未设置来源时走内置包，把内置包删掉）→ 500。
-    std::fs::remove_file(&env.config.agent_package_file).expect("remove builtin package");
+    std::fs::remove_file(
+        env.config
+            .agent_package_file
+            .as_deref()
+            .expect("builtin package configured"),
+    )
+    .expect("remove builtin package");
     let current = get_to_router(
         &env.config,
         &env.store_handle,
@@ -6363,7 +6376,7 @@ impl TestEnv {
             tls_cert_file,
             tls_key_file: root.join("admin-tls.key.pem"),
             admin_api_token_hash: sha256_hex(TEST_ADMIN_API_TOKEN),
-            agent_package_file: package_file,
+            agent_package_file: Some(package_file),
             bootstrap_token_ttl_seconds: 900,
             credential_ttl_seconds: 30 * 24 * 60 * 60,
             store_file,

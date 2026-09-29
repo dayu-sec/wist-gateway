@@ -189,7 +189,14 @@ pub async fn download_agent_package(
     if let Err(response) = authorize_package_download(&state, &headers, &client_key).await {
         return response;
     }
-    let package_path = effective_package_path(&state.config, &state.store).await;
+    let Some(package_path) = effective_package_path(&state.config, &state.store).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CACHE_CONTROL, NO_STORE)],
+            "agent package is not configured on this gateway",
+        )
+            .into_response();
+    };
     match std::fs::read(&package_path) {
         Ok(bytes) => (
             [

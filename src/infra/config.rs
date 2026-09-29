@@ -37,7 +37,9 @@ pub struct AdminConfig {
     pub tls_cert_file: PathBuf,
     pub tls_key_file: PathBuf,
     pub admin_api_token_hash: String,
-    pub agent_package_file: PathBuf,
+    /// 内置 agent 安装包（**可空**）。为空、或文件不在，都**不阻断启动** —— 只让「安装包分发」
+    /// 不可用；真正需要它的端点（安装脚本 / 包下载）会明确报错。
+    pub agent_package_file: Option<PathBuf>,
     pub bootstrap_token_ttl_seconds: i64,
     pub credential_ttl_seconds: i64,
     /// 旧版单文件 JSON 存储路径：现在只作为「首次启动一次性导入」的来源。
@@ -263,7 +265,11 @@ impl AdminConfig {
             tls_cert_file: absolutize_path(config_dir, Path::new(&tls_cert_file)),
             tls_key_file: absolutize_path(config_dir, Path::new(&tls_key_file)),
             admin_api_token_hash: sha256_hex(&admin_api_token),
-            agent_package_file: absolutize_path(config_dir, Path::new(&package_file)),
+            agent_package_file: if package_file.trim().is_empty() {
+                None
+            } else {
+                Some(absolutize_path(config_dir, Path::new(&package_file)))
+            },
             bootstrap_token_ttl_seconds: raw.agent.bootstrap_token_ttl_seconds,
             credential_ttl_seconds: raw.agent.credential_ttl_seconds,
             store_file: absolutize_path(config_dir, Path::new(&expand_env(&raw.agent.store_file)?)),
@@ -355,7 +361,16 @@ impl AdminConfig {
         require_https_url("server.public_base_url", &self.public_base_url)?;
         require_existing_file("server.tls_cert_file", &self.tls_cert_file)?;
         require_existing_file("server.tls_key_file", &self.tls_key_file)?;
-        require_existing_file("agent.package_file", &self.agent_package_file)?;
+        // 内置安装包是**可选**的：为空、或文件不在，都不阻断启动 —— 一个安装包缺失不该把整个
+        // 控制面拖下水；真正需要它的端点（安装脚本 / 包下载）再明确报错。
+        if let Some(package_file) = &self.agent_package_file
+            && !package_file.is_file()
+        {
+            eprintln!(
+                "warning: agent.package_file 不是可读文件：{}（安装包分发将不可用；可在管理面录入来源包，或补上该文件）",
+                package_file.display()
+            );
+        }
         require_positive_seconds(
             "agent.bootstrap_token_ttl_seconds",
             self.bootstrap_token_ttl_seconds,
@@ -896,7 +911,10 @@ environment_id = "env-default"
 
         let config = AdminConfig::load_from_path(&path).expect("config loads");
 
-        assert_eq!(config.agent_package_file, package_file);
+        assert_eq!(
+            config.agent_package_file.as_deref(),
+            Some(package_file.as_path())
+        );
         assert_eq!(config.admin_api_token_hash, sha256_hex("test-admin-token"));
         assert_eq!(config.public_base_url, "https://127.0.0.1:3000");
         assert_eq!(
@@ -960,7 +978,10 @@ environment_id = "env-default"
 
         let config = AdminConfig::load_from_path(&config_path).expect("config loads");
 
-        assert_eq!(config.agent_package_file, dir.join("wist-agent.tar.gz"));
+        assert_eq!(
+            config.agent_package_file,
+            Some(dir.join("wist-agent.tar.gz"))
+        );
         assert_eq!(config.tls_cert_file, dir.join("admin-tls.crt.pem"));
         assert_eq!(config.tls_key_file, dir.join("admin-tls.key.pem"));
         assert_eq!(
@@ -1158,7 +1179,8 @@ environment_id = "env-default"
     }
 
     #[test]
-    fn rejects_missing_agent_package_file() {
+    fn accepts_missing_agent_package_file() {
+        // 内置安装包缺失**不该**让网关起不来（只让安装包分发不可用）—— 见 `validate` 里的取舍。
         let path = write_temp_config(
             r#"
 [server]
@@ -1175,9 +1197,40 @@ environment_id = "env-default"
 "#,
         );
 
-        let err = AdminConfig::load_from_path(&path).expect_err("invalid URL rejected");
+        let config = AdminConfig::load_from_path(&path)
+            .expect("missing package file must not block startup");
 
-        assert!(err.to_string().contains("agent.package_file"));
+        assert_eq!(
+            config.agent_package_file.as_deref(),
+            Some(std::path::Path::new(
+                "/tmp/warp-insight-missing-agent-package.tar.gz"
+            ))
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_agent_package_file_becomes_none() {
+        // `package_file = ""` = 显式关闭内置安装包，同样不阻断启动。
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[agent]
+package_file = ""
+enrollment_token = "test-token"
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+
+        let config = AdminConfig::load_from_path(&path).expect("empty package file loads");
+
+        assert_eq!(config.agent_package_file, None);
         let _ = fs::remove_file(path);
     }
 
