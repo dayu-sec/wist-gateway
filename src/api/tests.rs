@@ -20,8 +20,9 @@ use wist_contracts::enrollment::{
 };
 
 use crate::infra::{
-    AdminConfig, AgentStatusUpdate, DEFAULT_AGENT_UPLINK_SETTING_ID, SqliteStore, Store,
-    StoredAgentInstallPackage, StoredAgentRevocation, StoredAgentUplinkAddress,
+    AdminConfig, AgentStatusUpdate, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
+    DEFAULT_INSTALL_PACKAGE_SETTING_ID, SqliteStore, Store, StoredAgentInstallPackage,
+    StoredAgentInstallPackageAddress, StoredAgentRevocation, StoredAgentUplinkAddress,
     StoredCredentialStatus, StoredEnrollmentTokenStatus, VerifiedAgentIdentity, bytes_sha256_hex,
     load_install_script_public_key_pem, sha256_hex,
 };
@@ -54,17 +55,14 @@ use super::{
 
 const TEST_ADMIN_API_TOKEN: &str = "test-admin-token";
 
-/// 测试用的内置安装包来源（未在管理面设置来源地址时的生效值）。
-fn builtin_package(env: &TestEnv) -> AgentPackageSource {
+/// 测试用的本地制品来源（直接从文件构造 `AgentPackageSource`，不经过库）。
+fn local_package(env: &TestEnv) -> AgentPackageSource {
     AgentPackageSource::from_local_file(
         &env.config,
         &env.config.public_base_url,
-        env.config
-            .agent_package_file
-            .clone()
-            .expect("builtin package configured"),
+        env.package_file.clone(),
     )
-    .expect("builtin package source")
+    .expect("local package source")
 }
 
 /// 在 TestEnv 的临时目录里放一个安装包**来源**文件，返回其绝对路径。
@@ -95,14 +93,14 @@ const TEST_TLS_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDCTCCAfGgAwIBAg
 /// Expected `sha256//` pin (base64 of the sha256 of the SPKI) of the cert above.
 const TEST_TLS_CERT_PIN: &str = "uq4O4EN3e09Xmlo5euGldyHw+y27baJ+Jm/OBnFHrZc=";
 
-/// 用内置安装包签发一份安装代码：下面几个测试关心的是安装命令/引导包的形态。
-async fn builtin_install_code(env: &TestEnv) -> wist_control::types::AgentInstallCode {
+/// 用手边的本地制品签发一份安装代码：下面几个测试关心的是安装命令/引导包的形态。
+async fn local_package_install_code(env: &TestEnv) -> wist_control::types::AgentInstallCode {
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(900);
     agent_install_code(
         &env.config,
         "token-a",
         expires_at,
-        &builtin_package(env),
+        &local_package(env),
         &env.config.public_base_url,
     )
     .expect("install code")
@@ -111,7 +109,7 @@ async fn builtin_install_code(env: &TestEnv) -> wist_control::types::AgentInstal
 #[tokio::test]
 async fn install_code_bundle_targets_gateway_package() {
     let env = TestEnv::new().await;
-    let install_code = builtin_install_code(&env).await;
+    let install_code = local_package_install_code(&env).await;
 
     assert_eq!(
         install_code.bootstrap_bundle.agent_package_url,
@@ -128,7 +126,7 @@ async fn install_code_bundle_targets_gateway_package() {
 #[tokio::test]
 async fn linux_install_code_verifies_signed_script() {
     let env = TestEnv::new().await;
-    let install_code = builtin_install_code(&env).await;
+    let install_code = local_package_install_code(&env).await;
     let command = &install_code.x86_linux_install_code;
 
     assert!(install_code.arm_linux_install_code.contains(
@@ -157,7 +155,7 @@ async fn linux_install_code_verifies_signed_script() {
 #[tokio::test]
 async fn macos_install_code_pins_gateway_certificate() {
     let env = TestEnv::new().await;
-    let install_code = builtin_install_code(&env).await;
+    let install_code = local_package_install_code(&env).await;
     let macos = &install_code.macos_install_code;
 
     assert!(macos.contains("\"$(uname -s)\" != \"Darwin\""));
@@ -175,7 +173,7 @@ async fn macos_install_code_pins_gateway_certificate() {
 #[tokio::test]
 async fn install_code_leaks_no_enrollment_token() {
     let env = TestEnv::new().await;
-    let install_code = builtin_install_code(&env).await;
+    let install_code = local_package_install_code(&env).await;
 
     // 令牌只能经 Authorization 头或交互输入进入脚本，不能落在命令、URL 或环境变量里。
     assert_eq!(install_code.bootstrap_enrollment_token, "token-a");
@@ -235,7 +233,7 @@ fn rendered_install_script(env: &TestEnv) -> String {
     super::install::install_script(
         &env.config,
         "x86",
-        &builtin_package(env),
+        &local_package(env),
         &env.config.public_base_url,
     )
 }
@@ -244,7 +242,7 @@ fn rendered_install_script(env: &TestEnv) -> String {
 async fn install_script_verifies_package_digest() {
     let env = TestEnv::new().await;
     let script = rendered_install_script(&env);
-    let sha256 = builtin_package(&env).sha256;
+    let sha256 = local_package(&env).sha256;
 
     assert!(script.contains("ARCH=\"x86\""));
     assert!(script.contains("AGENT_PACKAGE_SHA256=\""));
@@ -259,7 +257,7 @@ async fn install_script_handles_tarball_and_bare_package() {
     let script = rendered_install_script(&env);
 
     // 发布产物是 tarball（内含 wist-agentd + wist-exec + wist-upgrader，三者必须同级），
-    // 网关内置包则是裸二进制；两种形态都要装到 $BIN_DIR。
+    // 开发/调试时录的可能是一个裸二进制；两种形态都要装到 $BIN_DIR。
     assert!(script.contains("if tar tzf \"$PACKAGE_FILE\""));
     assert!(script.contains("for BIN_NAME in wist-agentd wist-exec wist-upgrader"));
     assert!(script.contains("install_bin \"$SRC\" \"$BIN_NAME\""));
@@ -400,16 +398,12 @@ async fn install_script_braces_variables_before_cjk() {
 }
 
 #[tokio::test]
-async fn builtin_package_requires_readable_file() {
+async fn local_package_requires_readable_file() {
     let env = TestEnv::new().await;
-    let package_path = env
-        .config
-        .agent_package_file
-        .clone()
-        .expect("builtin package configured");
+    let package_path = env.package_file.clone();
     std::fs::remove_file(&package_path).expect("remove package");
 
-    // 解析内置来源需要读制品算摘要；制品不在就必须显式失败，
+    // 从本地文件构造来源需要读制品算摘要；制品不在就必须显式失败，
     // 而不是把空摘要发下去（那会让安装端跳过校验）。
     let err =
         AgentPackageSource::from_local_file(&env.config, &env.config.public_base_url, package_path)
@@ -424,13 +418,13 @@ async fn install_script_signature_matches_script_body() {
     let script = super::install::install_script(
         &env.config,
         "x86",
-        &builtin_package(&env),
+        &local_package(&env),
         &env.config.public_base_url,
     );
     let signature = super::install::install_script_signature(
         &env.config,
         "x86",
-        &builtin_package(&env),
+        &local_package(&env),
         &env.config.public_base_url,
     )
     .expect("sign script");
@@ -446,7 +440,7 @@ async fn install_script_signature_rejects_modified_body() {
     let signature = super::install::install_script_signature(
         &env.config,
         "x86",
-        &builtin_package(&env),
+        &local_package(&env),
         &env.config.public_base_url,
     )
     .expect("sign script");
@@ -498,6 +492,37 @@ async fn initial_config_matches_agent_config_contract() {
     assert!(!has_section("[telemetry.logs.output.file]"));
     // 用户级布局不受影响：契约默认值仍是相对配置目录。
     assert_eq!(parsed.paths.root_dir, ".");
+}
+
+/// 新装 Agent 拿到初始配置时就有上送目标（同一域名 + 数据面端口），**不必先有人录入地址**；
+/// 但默认仍待命（`enabled = false`）——派活后控制面才在 `uplink:poll` 上下发启用。
+#[tokio::test]
+async fn initial_config_route_records_the_derived_uplink_target() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let response = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/agent/initial-config")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = decode_text_response(response).await;
+    let parsed: wist_contracts::agent_config::AgentConfig =
+        toml::from_str(&text).expect("valid agent config toml");
+    assert_eq!(parsed.telemetry.logs.output.kind, "tcp");
+    assert_eq!(parsed.telemetry.logs.output.tcp.addr, "127.0.0.1");
+    assert_eq!(
+        parsed.telemetry.logs.output.tcp.port,
+        DEFAULT_AGENT_UPLINK_PORT
+    );
+    assert!(!parsed.telemetry.logs.output.enabled);
 }
 
 #[tokio::test]
@@ -4565,15 +4590,16 @@ async fn admin_revoke_agent_credential_locks_agent_out() {
 }
 
 #[tokio::test]
-async fn uplink_view_starts_unset() {
+async fn uplink_view_reports_the_target_derived_from_the_deployment_config() {
     let env = TestEnv::new().await;
     let uri = "/api/v1/admin/agent/uplink";
 
     let unauthorized = get_to_router(&env.config, &env.store_handle, uri, None).await;
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
-    // 未设置过：host 空、updated_at 为 null。端口回约定默认值，但那只是给页面预填的提示，
-    // 不落库 —— `updated_at == null` 才是「未设置」的判据。
+    // 管理面没设过：生效值是**部署配置派生**的 —— 与 Agent 拿到的控制面地址同域 + 数据面端口
+    // （「一台机器、一个域名」的部署不必再录一遍）。`updated_at == null` 即「不是管理面录入的值」，
+    // 页面据此显示「来自部署配置」。
     let view = get_to_router(
         &env.config,
         &env.store_handle,
@@ -4583,10 +4609,140 @@ async fn uplink_view_starts_unset() {
     .await;
     assert_eq!(view.status(), StatusCode::OK);
     let body: serde_json::Value = decode_json_response(view).await;
-    assert_eq!(body["host"], "");
+    assert_eq!(body["host"], "127.0.0.1"); // 取 public_base_url 的主机名
     assert_eq!(body["port"], 9000);
     assert_eq!(body["updated_by"], "");
     assert_eq!(body["updated_at"], serde_json::Value::Null);
+}
+
+/// 连派生都派不出（对外基址里取不出主机名）才是真的「未设置」：页面据此提示「没有上送目标」。
+#[tokio::test]
+async fn uplink_view_is_unset_when_the_base_url_yields_no_host() {
+    let mut env = TestEnv::new().await;
+    // 真实部署里配置校验挡得住这种基址，这里只钉住「派生不出就返回未设置」的兜底分支。
+    env.config.public_base_url = "https://".to_string();
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/uplink",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(view.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["host"], "");
+    assert_eq!(body["port"], 9000);
+    assert_eq!(body["updated_at"], serde_json::Value::Null);
+}
+
+/// 生效上送目标的两级来源：管理面设置优先，没设过用部署配置派生的。
+#[tokio::test]
+async fn effective_uplink_prefers_the_admin_setting_over_the_derived_target() {
+    let env = TestEnv::new().await;
+
+    let derived = super::install::effective_agent_uplink(&env.config, &env.store_handle)
+        .await
+        .expect("resolve")
+        .expect("derived target");
+    assert_eq!(derived.host, "127.0.0.1");
+    assert_eq!(derived.port, DEFAULT_AGENT_UPLINK_PORT);
+    // 派生值的 `updated_at` 为空 —— 它是「不是管理面录入的」的判据。
+    assert_eq!(derived.updated_at, "");
+
+    set_agent_uplink_address(&env, "10.0.1.9", 9100).await;
+    let chosen = super::install::effective_agent_uplink(&env.config, &env.store_handle)
+        .await
+        .expect("resolve")
+        .expect("admin setting");
+    assert_eq!(chosen.host, "10.0.1.9");
+    assert_eq!(chosen.port, 9100);
+    assert_eq!(chosen.updated_by, "ops");
+}
+
+/// 派生只取主机名：丢 scheme、丢端口、丢路径；IPv6 字面量拼不出 `host:port`，判为派生不出。
+#[tokio::test]
+async fn derived_uplink_target_takes_only_the_host_name() {
+    let mut env = TestEnv::new().await;
+    for (base, expected) in [
+        ("https://gw.example.com", Some("gw.example.com")),
+        ("https://gw.example.com/", Some("gw.example.com")),
+        ("https://gw.example.com:8443/admin", Some("gw.example.com")),
+        (
+            "https://gw.example.com:8443/a/b?x=1#f",
+            Some("gw.example.com"),
+        ),
+        ("  https://gw.example.com  ", Some("gw.example.com")),
+        ("https://10.0.0.1", Some("10.0.0.1")),
+        ("https://gw-ex_1.example.com", Some("gw-ex_1.example.com")),
+        // 取不出**干净**的主机名就不猜（比派生错一个地址好）：
+        ("https://[::1]:8443", None),
+        ("https://::1", None),
+        ("https://user@gw.example.com", None),
+        ("https://gw example.com", None),
+        ("https://", None),
+        ("", None),
+    ] {
+        env.config.public_base_url = base.to_string();
+        let derived = super::install::derived_agent_uplink(&env.config, &env.store_handle).await;
+        match expected {
+            Some(host) => {
+                let setting = derived.expect("derived target");
+                assert_eq!(setting.host, host, "base {base}");
+                assert_eq!(setting.port, DEFAULT_AGENT_UPLINK_PORT, "base {base}");
+                // 派生值的判据：不是管理面录入的。
+                assert_eq!(setting.updated_at, "", "base {base}");
+                assert_eq!(setting.updated_by, "", "base {base}");
+            }
+            None => assert!(derived.is_none(), "base {base}"),
+        }
+    }
+}
+
+/// 读上送设置失败时的口径（三条路径各不相同，都是刻意的）：
+///   * 管理面看得到 —— 查看端点 500，不把「读不到」伪装成「未设置」；
+///   * 授权端点 500 让 agentd 重试 —— 待命是**实质决定**，不在读库失败时替它做；
+///   * 安装链路不因此中断 —— 按「没设过」用派生目标，只留告警。
+#[tokio::test]
+async fn uplink_store_failure_is_reported_but_does_not_break_install() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let credential = enroll_agent_credential(&env).await;
+    // 直接撤掉这张表：等价于读设置时出错。
+    sqlx::query("DROP TABLE agent_uplink")
+        .execute(env.store.pool())
+        .await
+        .expect("drop uplink table");
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/uplink",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(view.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let poll = poll_uplink(&env, Some(&credential)).await;
+    assert_eq!(poll.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let response = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/agent/initial-config")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = decode_text_response(response).await;
+    let parsed: wist_contracts::agent_config::AgentConfig =
+        toml::from_str(&text).expect("valid agent config toml");
+    assert_eq!(parsed.telemetry.logs.output.tcp.addr, "127.0.0.1");
+    assert!(!parsed.telemetry.logs.output.enabled);
 }
 
 #[tokio::test]
@@ -4821,7 +4977,7 @@ async fn advertise_url_drives_install_code_and_initial_config() {
 
 #[tokio::test]
 async fn install_package_view_starts_unset() {
-    let env = TestEnv::new().await;
+    let env = TestEnv::new_without_package().await;
     let uri = "/api/v1/admin/agent/install-package";
 
     let unauthorized = get_to_router(&env.config, &env.store_handle, uri, None).await;
@@ -4876,7 +5032,7 @@ async fn install_package_set_rejects_bad_input() {
 
 #[tokio::test]
 async fn install_package_set_rejects_unfetchable_source() {
-    let env = TestEnv::new().await;
+    let env = TestEnv::new_without_package().await;
     let missing = write_source_package(&env, "gone", b"x");
     std::fs::remove_file(&missing).expect("remove source");
 
@@ -4902,7 +5058,7 @@ async fn install_package_set_rejects_unfetchable_source() {
 
 #[tokio::test]
 async fn install_package_set_rejects_mismatched_digest() {
-    let env = TestEnv::new().await;
+    let env = TestEnv::new_without_package().await;
     let source = write_source_package(&env, "source", b"cached-package-bytes-v1");
 
     let response = post_json_to_router(
@@ -5634,6 +5790,36 @@ async fn package_routes_rate_limit_repeated_failed_auth_attempts() {
 }
 
 #[tokio::test]
+async fn recorded_package_with_a_missing_copy_is_unavailable() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    // 录入过，但网关那份副本丢了：没有可用包（不会回落到别的来源）。
+    std::fs::remove_file(env.config.install_package_cache_path()).expect("remove cached copy");
+
+    let current = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current",
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(current.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_no_store(&current);
+
+    // 安装脚本要嵌摘要，没有包就必须明确失败（而不是发一份空摘要的脚本下去）。
+    let script = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/install/x86/install.sh",
+        None,
+    )
+    .await;
+    assert_eq!(script.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = decode_text_response(script).await;
+    assert!(body.contains("没有可用的 agent 安装包"), "{body}");
+}
+
+#[tokio::test]
 async fn package_download_success_clears_the_failure_count() {
     let env = TestEnv::new().await;
     set_install_package_source(&env, "rate-limit-clear", b"rate-limit-clear-bytes").await;
@@ -5659,18 +5845,16 @@ async fn package_download_success_clears_the_failure_count() {
 }
 
 #[tokio::test]
-async fn package_download_internal_errors_are_no_store() {
+async fn package_download_without_a_recorded_package_is_no_store() {
     let env = TestEnv::new().await;
     let credential = enroll_agent_credential(&env).await;
 
-    // `/current` 的本地制品读失败（未设置来源时走内置包，把内置包删掉）→ 500。
-    std::fs::remove_file(
-        env.config
-            .agent_package_file
-            .as_deref()
-            .expect("builtin package configured"),
-    )
-    .expect("remove builtin package");
+    // 抹掉「已录入的安装包」这一行：缓存副本还在，但没有来源就是**没有可用包**
+    // （已删的 `agent.package_file` 不再是退路）→ 503，而且必须 no-store。
+    sqlx::query("DELETE FROM agent_install_package")
+        .execute(env.store.pool())
+        .await
+        .expect("clear recorded package");
     let current = get_to_router(
         &env.config,
         &env.store_handle,
@@ -5678,8 +5862,10 @@ async fn package_download_internal_errors_are_no_store() {
         Some(&credential),
     )
     .await;
-    assert_eq!(current.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(current.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_no_store(&current);
+    let body = decode_text_response(current).await;
+    assert!(body.contains("not configured"), "{body}");
 
     // by-id 的库读失败（直接撤掉历史表）→ 500，也必须 no-store。
     sqlx::query("DROP TABLE agent_install_package_history")
@@ -6314,6 +6500,9 @@ struct TestEnv {
     store: SqliteStore,
     store_handle: Arc<dyn Store>,
     install_public_key_bytes: Vec<u8>,
+    /// 就绪的本地安装包**制品**（测试夹具）。它不再是配置项 —— 运行时网关只认
+    /// 管理面录入的那份；这里只给「从本地文件构造来源」这类单测提供一个可读文件。
+    package_file: std::path::PathBuf,
     _root: std::path::PathBuf,
 }
 
@@ -6325,6 +6514,12 @@ impl TestEnv {
     /// 不装载内容目录的用例用这个（`/api/v1/admin/content` 回 503）。
     async fn new_without_content() -> Self {
         Self::new_with_policy_files(None, None, false).await
+    }
+
+    /// **未录入任何安装包**的环境：用于「来源为空 / 没有可用包 → 503」这类用例
+    /// （默认的 `new()` 已录入一份本地制品，让安装链路开箱可用）。
+    async fn new_without_package() -> Self {
+        Self::new_with_policy_files_and_package(None, None, true, false).await
     }
 
     /// 需要用途推断的用例用这个：把规则表写进 temp 目录并挂到配置上。
@@ -6343,6 +6538,21 @@ impl TestEnv {
         purpose_rules_toml: Option<&str>,
         discovery_policies_toml: Option<&str>,
         content: bool,
+    ) -> Self {
+        Self::new_with_policy_files_and_package(
+            purpose_rules_toml,
+            discovery_policies_toml,
+            content,
+            true,
+        )
+        .await
+    }
+
+    async fn new_with_policy_files_and_package(
+        purpose_rules_toml: Option<&str>,
+        discovery_policies_toml: Option<&str>,
+        content: bool,
+        record_package: bool,
     ) -> Self {
         let root = std::env::temp_dir().join(format!("wist-gateway-test-{}", unique_suffix()));
         std::fs::create_dir_all(&root).expect("create root");
@@ -6376,7 +6586,6 @@ impl TestEnv {
             tls_cert_file,
             tls_key_file: root.join("admin-tls.key.pem"),
             admin_api_token_hash: sha256_hex(TEST_ADMIN_API_TOKEN),
-            agent_package_file: Some(package_file),
             bootstrap_token_ttl_seconds: 900,
             credential_ttl_seconds: 30 * 24 * 60 * 60,
             store_file,
@@ -6413,11 +6622,29 @@ impl TestEnv {
             .await
             .expect("open store");
         let store_handle: Arc<dyn Store> = Arc::new(store.clone());
+        // 安装包只有「管理面录入」一个来源（`agent.package_file` 已删）：默认给测试环境录一份本地
+        // 制品，等价于真实部署里先在「安装包」页录入 —— 否则签发安装代码/分发端点会直接 503。
+        if record_package {
+            let cached = config.install_package_cache_path();
+            std::fs::create_dir_all(cached.parent().expect("cache dir")).expect("create cache dir");
+            std::fs::copy(&package_file, &cached).expect("seed package cache");
+            store_handle
+                .upsert_agent_install_package(&StoredAgentInstallPackageAddress {
+                    address_id: DEFAULT_INSTALL_PACKAGE_SETTING_ID.to_string(),
+                    package_url: package_file.to_string_lossy().to_string(),
+                    package_sha256: None,
+                    updated_by: "test-ops".to_string(),
+                    updated_at: "2026-09-01T00:00:00+00:00".to_string(),
+                })
+                .await
+                .expect("record install package");
+        }
         Self {
             config,
             store,
             store_handle,
             install_public_key_bytes,
+            package_file,
             _root: root,
         }
     }
@@ -7542,10 +7769,33 @@ async fn uplink_poll_is_standby_without_any_work() {
     assert_eq!(grant.target(), None);
 }
 
-/// 有工作但**未设**上送地址 → 没有目标可指 → 只能待命（不猜目标）。
+/// 派活即启用 —— **不必先有人在管理面录入上送地址**：没设过时目标派生自部署配置
+/// （同一个域名 + 数据面端口），于是「装完 + 派活」就能开始上送。
+#[tokio::test]
+async fn uplink_poll_derives_the_target_from_the_deployment_config() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(grant.enabled);
+    assert_eq!(
+        grant.target(),
+        Some(("127.0.0.1", DEFAULT_AGENT_UPLINK_PORT))
+    );
+}
+
+/// 派生不出目标（对外基址里取不出主机名）时**仍然不猜**：有工作也只能待命。
 #[tokio::test]
 async fn uplink_poll_with_work_but_no_target_stays_standby() {
-    let env = TestEnv::new().await;
+    let mut env = TestEnv::new().await;
+    env.config.public_base_url = "https://".to_string();
     let credential = a_classified_macos_agent(&env).await;
     let response = grant_work(
         &env,

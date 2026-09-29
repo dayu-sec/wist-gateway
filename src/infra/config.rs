@@ -37,9 +37,6 @@ pub struct AdminConfig {
     pub tls_cert_file: PathBuf,
     pub tls_key_file: PathBuf,
     pub admin_api_token_hash: String,
-    /// 内置 agent 安装包（**可空**）。为空、或文件不在，都**不阻断启动** —— 只让「安装包分发」
-    /// 不可用；真正需要它的端点（安装脚本 / 包下载）会明确报错。
-    pub agent_package_file: Option<PathBuf>,
     pub bootstrap_token_ttl_seconds: i64,
     pub credential_ttl_seconds: i64,
     /// 旧版单文件 JSON 存储路径：现在只作为「首次启动一次性导入」的来源。
@@ -174,7 +171,6 @@ struct RawServerConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawAgentConfig {
-    package_file: String,
     #[serde(default = "default_bootstrap_token_ttl_seconds")]
     bootstrap_token_ttl_seconds: i64,
     #[serde(default = "default_credential_ttl_seconds")]
@@ -241,7 +237,6 @@ impl AdminConfig {
     }
 
     fn from_raw(raw: RawAdminConfig, config_dir: &Path) -> Result<Self, ConfigError> {
-        let package_file = expand_env(&raw.agent.package_file)?;
         let tls_cert_file = expand_env(&raw.server.tls_cert_file)?;
         let tls_key_file = expand_env(&raw.server.tls_key_file)?;
         let admin_api_token = expand_env(&raw.server.admin_api_token)?;
@@ -265,11 +260,6 @@ impl AdminConfig {
             tls_cert_file: absolutize_path(config_dir, Path::new(&tls_cert_file)),
             tls_key_file: absolutize_path(config_dir, Path::new(&tls_key_file)),
             admin_api_token_hash: sha256_hex(&admin_api_token),
-            agent_package_file: if package_file.trim().is_empty() {
-                None
-            } else {
-                Some(absolutize_path(config_dir, Path::new(&package_file)))
-            },
             bootstrap_token_ttl_seconds: raw.agent.bootstrap_token_ttl_seconds,
             credential_ttl_seconds: raw.agent.credential_ttl_seconds,
             store_file: absolutize_path(config_dir, Path::new(&expand_env(&raw.agent.store_file)?)),
@@ -361,16 +351,6 @@ impl AdminConfig {
         require_https_url("server.public_base_url", &self.public_base_url)?;
         require_existing_file("server.tls_cert_file", &self.tls_cert_file)?;
         require_existing_file("server.tls_key_file", &self.tls_key_file)?;
-        // 内置安装包是**可选**的：为空、或文件不在，都不阻断启动 —— 一个安装包缺失不该把整个
-        // 控制面拖下水；真正需要它的端点（安装脚本 / 包下载）再明确报错。
-        if let Some(package_file) = &self.agent_package_file
-            && !package_file.is_file()
-        {
-            eprintln!(
-                "warning: agent.package_file 不是可读文件：{}（安装包分发将不可用；可在管理面录入来源包，或补上该文件）",
-                package_file.display()
-            );
-        }
         require_positive_seconds(
             "agent.bootstrap_token_ttl_seconds",
             self.bootstrap_token_ttl_seconds,
@@ -888,9 +868,7 @@ mod tests {
 
     #[test]
     fn loads_config_with_environment_expansion() {
-        let package_file = write_temp_file("wist-agentd");
         unsafe {
-            env::set_var("WARP_INSIGHT_TEST_AGENT_PACKAGE_FILE", &package_file);
             env::set_var("WARP_INSIGHT_TEST_ADMIN_API_TOKEN", "test-admin-token");
         }
         let path = write_temp_config(
@@ -901,7 +879,6 @@ public_base_url = "https://127.0.0.1:3000/"
 admin_api_token = "${WARP_INSIGHT_TEST_ADMIN_API_TOKEN}"
 
 [agent]
-package_file = "${WARP_INSIGHT_TEST_AGENT_PACKAGE_FILE}"
 enrollment_token = "test-token"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
@@ -911,10 +888,6 @@ environment_id = "env-default"
 
         let config = AdminConfig::load_from_path(&path).expect("config loads");
 
-        assert_eq!(
-            config.agent_package_file.as_deref(),
-            Some(package_file.as_path())
-        );
         assert_eq!(config.admin_api_token_hash, sha256_hex("test-admin-token"));
         assert_eq!(config.public_base_url, "https://127.0.0.1:3000");
         assert_eq!(
@@ -933,7 +906,6 @@ environment_id = "env-default"
         );
 
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
     }
 
     #[test]
@@ -946,10 +918,9 @@ environment_id = "env-default"
     }
 
     #[test]
-    fn relative_package_file_is_absolutized_against_config_dir() {
+    fn relative_paths_are_absolutized_against_config_dir() {
         let dir = env::temp_dir().join(format!("wist-gateway-dir-{}", unique_suffix()));
         fs::create_dir_all(&dir).expect("create dir");
-        fs::write(dir.join("wist-agent.tar.gz"), "package").expect("write package");
         write_install_signing_key(&dir.join("install-signing-ed25519.pkcs8.pem"));
         let config_path = dir.join("admin.toml");
         fs::write(
@@ -963,7 +934,6 @@ tls_key_file = "admin-tls.key.pem"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "wist-agent.tar.gz"
 enrollment_token = "test-token"
 trust_bundle_file = "trust-bundle.pem"
 install_script_signing_private_key_file = "install-signing-ed25519.pkcs8.pem"
@@ -978,10 +948,6 @@ environment_id = "env-default"
 
         let config = AdminConfig::load_from_path(&config_path).expect("config loads");
 
-        assert_eq!(
-            config.agent_package_file,
-            Some(dir.join("wist-agent.tar.gz"))
-        );
         assert_eq!(config.tls_cert_file, dir.join("admin-tls.crt.pem"));
         assert_eq!(config.tls_key_file, dir.join("admin-tls.key.pem"));
         assert_eq!(
@@ -1018,19 +984,15 @@ policies = [
     /// `[purpose]` 放在最前面：`write_temp_config` 会在文末补签名私钥行，
     /// 那行应落在 `[agent]` 里而不是 `[purpose]` 里。
     fn config_with_purpose(purpose_body: &str) -> String {
-        let package_file = write_temp_file("wist-agentd");
         format!(
-            "[purpose]\n{purpose_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
-            package_file.display()
+            "[purpose]\n{purpose_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
         )
     }
 
     /// 同 `config_with_purpose`，但给出的是 `[discovery]` 表体。
     fn config_with_discovery(discovery_body: &str) -> String {
-        let package_file = write_temp_file("wist-agentd");
         format!(
-            "[discovery]\n{discovery_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
-            package_file.display()
+            "[discovery]\n{discovery_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
         )
     }
 
@@ -1144,7 +1106,6 @@ policies = [
 
     #[test]
     fn rejects_missing_tls_certificate_file() {
-        let package_file = write_temp_file("wist-agentd");
         let key_file = write_temp_file("key");
         let missing_cert = env::temp_dir().join(format!(
             "warp-insight-missing-admin-tls-{}.crt.pem",
@@ -1160,84 +1121,24 @@ tls_key_file = "{}"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "{}"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
             missing_cert.display(),
             key_file.display(),
-            package_file.display()
         ));
 
         let err = AdminConfig::load_from_path(&path).expect_err("missing TLS cert rejected");
 
         assert!(err.to_string().contains("server.tls_cert_file"));
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
         let _ = fs::remove_file(key_file);
     }
 
     #[test]
-    fn accepts_missing_agent_package_file() {
-        // 内置安装包缺失**不该**让网关起不来（只让安装包分发不可用）—— 见 `validate` 里的取舍。
-        let path = write_temp_config(
-            r#"
-[server]
-listen_addr = "127.0.0.1:3000"
-public_base_url = "https://127.0.0.1:3000"
-admin_api_token = "test-admin-token"
-
-[agent]
-package_file = "/tmp/warp-insight-missing-agent-package.tar.gz"
-enrollment_token = "test-token"
-trust_bundle = "internal-ca-stub"
-tenant_id = "tenant-default"
-environment_id = "env-default"
-"#,
-        );
-
-        let config = AdminConfig::load_from_path(&path)
-            .expect("missing package file must not block startup");
-
-        assert_eq!(
-            config.agent_package_file.as_deref(),
-            Some(std::path::Path::new(
-                "/tmp/warp-insight-missing-agent-package.tar.gz"
-            ))
-        );
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn empty_agent_package_file_becomes_none() {
-        // `package_file = ""` = 显式关闭内置安装包，同样不阻断启动。
-        let path = write_temp_config(
-            r#"
-[server]
-listen_addr = "127.0.0.1:3000"
-public_base_url = "https://127.0.0.1:3000"
-admin_api_token = "test-admin-token"
-
-[agent]
-package_file = ""
-enrollment_token = "test-token"
-trust_bundle = "internal-ca-stub"
-tenant_id = "tenant-default"
-environment_id = "env-default"
-"#,
-        );
-
-        let config = AdminConfig::load_from_path(&path).expect("empty package file loads");
-
-        assert_eq!(config.agent_package_file, None);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
     fn rejects_short_admin_api_token() {
-        let package_file = write_temp_file("wist-agentd");
-        let path = write_temp_config(&format!(
+        let path = write_temp_config(
             r#"
 [server]
 listen_addr = "127.0.0.1:3000"
@@ -1245,26 +1146,40 @@ public_base_url = "https://127.0.0.1:3000"
 admin_api_token = "short"
 
 [agent]
-package_file = "{}"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
-            package_file.display()
-        ));
+        );
 
         let err = AdminConfig::load_from_path(&path).expect_err("short token rejected");
 
         assert!(err.to_string().contains("server.admin_api_token"));
         assert!(err.to_string().contains("at least 8 bytes"));
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
     }
 
+    /// `init-config` 直接把仓库里的 `wist-gateway.toml` 模板写出去（`default_config_text`），
+    /// 所以模板里的键名必须仍是当前配置结构认的 —— 否则现场 `wist-gateway init-config`
+    /// 生成的配置一启动就报 missing field。改模板/改结构时这条会当场报。
     #[test]
-    fn rejects_long_bootstrap_token_ttl() {
-        let package_file = write_temp_file("wist-agentd");
-        let path = write_temp_config(&format!(
+    fn generated_config_template_parses() {
+        let text = default_config_text("test-admin-token");
+        let parsed: RawAdminConfig = toml::from_str(&text).expect("config template parses");
+
+        assert_eq!(parsed.server.listen_addr, "127.0.0.1:3000");
+        assert_eq!(parsed.server.public_base_url, "https://127.0.0.1:3000");
+        assert_eq!(parsed.agent.tenant_id, "tenant-default");
+        assert_eq!(parsed.agent.environment_id, "env-default");
+        // 安装包不是配置项（`agent.package_file` 已删）：模板里不该再有这个键。
+        assert!(!text.contains("package_file"));
+    }
+
+    /// 0.1.8 起 `agent.package_file` 已删。既有部署渲染出的配置里还留着这一行，
+    /// 把镜像升上去后必须照常启动 —— 所以 `RawAgentConfig` **有意不**给 deny_unknown_fields。
+    #[test]
+    fn legacy_agent_package_file_key_does_not_block_startup() {
+        let path = write_temp_config(
             r#"
 [server]
 listen_addr = "127.0.0.1:3000"
@@ -1272,14 +1187,35 @@ public_base_url = "https://127.0.0.1:3000"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "{}"
+package_file = "/config/wist-agentd.tar.gz"
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+
+        let config = AdminConfig::load_from_path(&path).expect("legacy key must not block startup");
+
+        assert_eq!(config.public_base_url, "https://127.0.0.1:3000");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_long_bootstrap_token_ttl() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[agent]
 bootstrap_token_ttl_seconds = 7200
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
-            package_file.display()
-        ));
+        );
 
         let err = AdminConfig::load_from_path(&path).expect_err("long ttl rejected");
 
@@ -1289,13 +1225,11 @@ environment_id = "env-default"
         );
         assert!(err.to_string().contains("less than or equal to 3600"));
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
     }
 
     #[test]
     fn rejects_http_public_base_url() {
-        let package_file = write_temp_file("wist-agentd");
-        let path = write_temp_config(&format!(
+        let path = write_temp_config(
             r#"
 [server]
 listen_addr = "0.0.0.0:3000"
@@ -1303,26 +1237,22 @@ public_base_url = "http://127.0.0.1:3000"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "{}"
 enrollment_token = "test-token"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
-            package_file.display()
-        ));
+        );
 
         let err = AdminConfig::load_from_path(&path).expect_err("insecure URL rejected");
 
         assert!(err.to_string().contains("must start with https://"));
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
     }
 
     #[test]
     fn accepts_https_public_base_url() {
-        let package_file = write_temp_file("wist-agentd");
-        let path = write_temp_config(&format!(
+        let path = write_temp_config(
             r#"
 [server]
 listen_addr = "127.0.0.1:3000"
@@ -1330,25 +1260,21 @@ public_base_url = "https://localhost:3000/"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "{}"
 enrollment_token = "test-token"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
-            package_file.display()
-        ));
+        );
 
         let config = AdminConfig::load_from_path(&path).expect("https config loads");
 
         assert_eq!(config.public_base_url, "https://localhost:3000");
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
     }
 
     #[test]
     fn rejects_public_base_url_with_shell_metacharacters() {
-        let package_file = write_temp_file("wist-agentd");
         let text = r#"
 [server]
 listen_addr = "127.0.0.1:3000"
@@ -1356,13 +1282,11 @@ public_base_url = "https://127.0.0.1:3000\"; touch /tmp/pwned"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "__PACKAGE__"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
-"#
-        .replace("__PACKAGE__", &package_file.display().to_string());
-        let path = write_temp_config(&text);
+"#;
+        let path = write_temp_config(text);
 
         let err = AdminConfig::load_from_path(&path).expect_err("injected URL rejected");
 
@@ -1371,12 +1295,10 @@ environment_id = "env-default"
                 .contains("unsafe in generated install scripts")
         );
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
     }
 
     #[test]
     fn loads_trust_bundle_from_file() {
-        let package_file = write_temp_file("wist-agentd");
         let bundle_path = env::temp_dir().join(format!("trust-bundle-{}.pem", unique_suffix()));
         fs::write(
             &bundle_path,
@@ -1391,12 +1313,10 @@ public_base_url = "https://localhost:3000/"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "{}"
 trust_bundle_file = "{}"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
-            package_file.display(),
             bundle_path.display()
         ));
 
@@ -1407,13 +1327,11 @@ environment_id = "env-default"
             "-----BEGIN CERTIFICATE-----\nMIIBfromfile\n-----END CERTIFICATE-----\n"
         );
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
         let _ = fs::remove_file(bundle_path);
     }
 
     #[test]
     fn missing_trust_bundle_file_is_an_error() {
-        let package_file = write_temp_file("wist-agentd");
         let missing = env::temp_dir().join(format!("does-not-exist-{}.pem", unique_suffix()));
         let path = write_temp_config(&format!(
             r#"
@@ -1423,25 +1341,21 @@ public_base_url = "https://localhost:3000/"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "{}"
 trust_bundle_file = "{}"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
-            package_file.display(),
             missing.display()
         ));
 
         assert!(AdminConfig::load_from_path(&path).is_err());
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
     }
 
     // ── `[content]` 三件套 ────────────────────────────────────────────
 
     /// 把三份内容写进 temp 目录（与 `write_temp_config` 同目录），再用相对路径引用。
     fn config_with_content(catalog: &str, packs: &str, templates: &str) -> String {
-        let package_file = write_temp_file("wist-agentd");
         let catalog_file = write_temp_file(catalog);
         let packs_file = write_temp_file(packs);
         let templates_file = write_temp_file(templates);
@@ -1452,11 +1366,10 @@ environment_id = "env-default"
                 .to_string()
         };
         format!(
-            "[content]\ncatalog_file = \"{}\"\npacks_file = \"{}\"\ntemplates_file = \"{}\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+            "[content]\ncatalog_file = \"{}\"\npacks_file = \"{}\"\ntemplates_file = \"{}\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
             rel(&catalog_file),
             rel(&packs_file),
             rel(&templates_file),
-            package_file.display()
         )
     }
 
@@ -1468,13 +1381,9 @@ environment_id = "env-default"
         assert_eq!(config.content_packs_file, None);
         assert_eq!(config.content_templates_file, None);
 
-        let blank = {
-            let package_file = write_temp_file("wist-agentd");
-            write_temp_config(&format!(
-                "[content]\ncatalog_file = \"\"\npacks_file = \"\"\ntemplates_file = \"\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
-                package_file.display()
-            ))
-        };
+        let blank = write_temp_config(
+            "[content]\ncatalog_file = \"\"\npacks_file = \"\"\ntemplates_file = \"\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        );
         let config = AdminConfig::load_from_path(&blank).expect("blank content loads as unset");
         assert_eq!(config.content_catalog_file, None);
     }
@@ -1483,11 +1392,9 @@ environment_id = "env-default"
     fn content_files_must_all_be_provided() {
         // 只给一份：内容集内部互相引用（模板 → 包 → 单元），缺一不可。
         let catalog_file = write_temp_file("catalog_version = 1\nunits = []\n");
-        let package_file = write_temp_file("wist-agentd");
         let body = format!(
-            "[content]\ncatalog_file = \"{}\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+            "[content]\ncatalog_file = \"{}\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
             catalog_file.file_name().expect("name").to_string_lossy(),
-            package_file.display()
         );
         let path = write_temp_config(&body);
         let err = AdminConfig::load_from_path(&path).expect_err("partial content must be rejected");
@@ -1740,10 +1647,8 @@ environment_id = "env-default"
 
     /// 最小的可加载配置：`[server]` + `[agent]`，其余交给 `write_temp_config` 注入。
     fn agent_config_toml(extra_agent_lines: &str) -> String {
-        let package = write_temp_file("wist-agentd");
         format!(
-            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\npackage_file = \"{}\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n{extra_agent_lines}",
-            package.display()
+            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n{extra_agent_lines}",
         )
     }
 }

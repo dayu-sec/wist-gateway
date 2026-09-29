@@ -1843,7 +1843,7 @@ pub async fn view_agent_install_package(
     }
     match state.store.get_agent_install_package().await {
         Ok(Some(setting)) => Json(install_package_response(&setting)).into_response(),
-        // 未设置来源地址：分发走网关内置包，因此没有「来源地址」可报。
+        // 未录入过来源：没有「来源地址」可报（安装包也没有其它来路 —— 已删的内置包不是回落）。
         // 这里回空串而不回填分发端点 —— 回填会让操作者以为可以把这个地址当来源保存，
         // 而那样网关会去请求自己（且没有 bootstrap token）。
         Ok(None) => Json(AgentInstallPackageResponse {
@@ -2061,11 +2061,14 @@ pub async fn view_discovery_policies(
     }
 }
 
-/// 查看当前的 Agent 数据面上送地址。
+/// 查看当前生效的 Agent 数据面上送地址。
 ///
-/// 未设置过时返回「未设置」标记（`host` 空、`updated_by` 空、`updated_at` 为 null）：
-/// 此时网关给 Agent 算出的上送授权只能是待命（没有目标），Agent 只上报自身状态，
-/// 不采集日志也不上送数据面。
+/// 生效值取「管理面设置 → 部署配置派生 → 都没有」（见
+/// [`super::install::effective_agent_uplink`]）：没在管理面设过时，它就是**同一个域名 + 数据面端口**
+/// （即「这台网关的数据面在哪」），`updated_at` 为 null，管理面据此显示「来自部署配置」。
+///
+/// 都没有（连对外基址都取不出主机名）才真是「未设置」：`host` 空、`updated_by` 空、`updated_at` 为 null，
+/// 此时网关给 Agent 算出的上送授权只能是待命（没有目标），Agent 只上报自身状态，不采集日志也不上送数据面。
 ///
 /// 这个地址是**运行期**生效的：它是 `uplink:poll` 现算 `AgentUplinkGrant` 时的目标来源，
 /// 管理面改一次，已在网的 Agent 下一个 poll（30s 内）就换目标 —— 不需要重装。
@@ -2078,7 +2081,7 @@ pub async fn view_agent_uplink(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    match state.store.get_agent_uplink().await {
+    match super::install::effective_agent_uplink(&state.config, &state.store).await {
         Ok(Some(setting)) => Json(uplink_response(&setting)).into_response(),
         Ok(None) => Json(AgentUplinkResponse {
             setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
@@ -2102,6 +2105,9 @@ pub async fn view_agent_uplink(
 /// `[telemetry.logs.output.tcp]` 的取值，也是运行期 `uplink:poll` 现算上送授权时的
 /// 目标来源 —— 所以改这里对所有已签发的 Agent **立即**生效（下一个 poll 就拿到新目标），
 /// 不需要重跑安装脚本。
+///
+/// 只在「要指到别处」时才需要用它：没设过时生效的是**部署配置派生**的目标（同一域名 + 数据面端口，
+/// 见 [`super::install::effective_agent_uplink`]），所以「一台机器、一个域名」的部署不必录入。
 ///
 /// 但只有地址不等于启用：是否上送还要看该 Agent 有没有生效工作（派活即启用、撤回即待命）。
 pub async fn set_agent_uplink(

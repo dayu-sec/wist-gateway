@@ -90,4 +90,4 @@ echo "  state  : ${STATE_DIR}"
 if [[ -n "${admin_token}" ]]; then
   echo "  admin token: ${admin_token}"
 fi
-echo "  注意：容器运行时把 listen_addr 改为 0.0.0.0:3000，并配置 public_base_url / victoria_metrics_url / package_file"
+echo "  注意：容器运行时把 listen_addr 改为 0.0.0.0:3000，并配置 public_base_url / victoria_metrics_url；agent 安装包由管理面「安装包」页录入"

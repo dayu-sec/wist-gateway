@@ -390,22 +390,23 @@ pub async fn build_work_grant(
     })
 }
 
-/// 现算某 Agent 的数据面上送期望状态：`enabled = 有生效工作 且 已设上送地址`。
+/// 现算某 Agent 的数据面上送期望状态：`enabled = 有生效工作 且 有上送目标`。
 ///
 /// 没有新状态、没有推送通道 —— 每次被问到时从两个既有事实推出来：
 ///   * 「有生效工作」复用工作授权同一口径（[`effective_standing`] / [`outstanding_one_shot`]，
 ///     两者都空即没有工作），所以「派活即启用、撤回即待命」自动发生，无需管理面多一个动作；
-///   * 「上送地址」来自管理面已设的 `StoredAgentUplinkAddress`（`store.get_agent_uplink`）。
+///   * 「上送目标」取生效值：管理面设置 → 部署配置派生（同一个域名 + 数据面端口，
+///     见 [`super::install::effective_agent_uplink`]）。
 ///
-/// 缺任一条都只能待命：有工作但没地址 = 没目标可指（**不猜**目标）；有地址但没工作 =
-/// 地址只表示「能连到哪」，不表示「该不该连」。
+/// 缺任一条都只能待命：有工作但连目标都派生不出 = 没目标可指（**不猜**目标）；有目标但没工作 =
+/// 目标只表示「能连到哪」，不表示「该不该连」。
 pub async fn build_agent_uplink_grant(
     state: &ApiState,
     agent_id: &str,
 ) -> Result<AgentUplinkGrant, crate::infra::StoreError> {
     let has_work = !effective_standing(&state.store.list_standing_work(agent_id).await?).is_empty()
         || !outstanding_one_shot(&state.store.list_one_shot_work(agent_id).await?).is_empty();
-    let uplink = state.store.get_agent_uplink().await?;
+    let uplink = super::install::effective_agent_uplink(&state.config, &state.store).await?;
     let granted_at = chrono::Utc::now().to_rfc3339();
     match (has_work, uplink) {
         (true, Some(setting)) => Ok(AgentUplinkGrant::enabled_at(

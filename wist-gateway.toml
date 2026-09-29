@@ -1,5 +1,8 @@
 [server]
 listen_addr = "127.0.0.1:3000"
+# 对外基址：新装 Agent 的控制面 endpoint（安装命令 / 安装包也从它派生）。
+# 同时是**数据面上送目标的域名来源**：管理面没设过「数据面上送地址」时，目标 =
+# 本基址的主机名 + 数据面端口 9000（见 docs/design 里的上送授权设计）。
 public_base_url = "https://127.0.0.1:3000"
 tls_cert_file = "state/admin-tls.crt.pem"
 tls_key_file = "state/admin-tls.key.pem"
@@ -7,7 +10,6 @@ admin_api_token = "${WARP_INSIGHT_ADMIN_TOKEN}"
 victoria_metrics_url = "http://127.0.0.1:18429"
 
 [agent]
-package_file = "../../../wist-agentd/target/debug/wist-agentd"
 bootstrap_token_ttl_seconds = 900
 credential_ttl_seconds = 2592000
 store_file = "state/wist-gateway-store.json"

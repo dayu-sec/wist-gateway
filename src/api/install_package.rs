@@ -70,13 +70,16 @@ impl AgentPackageSource {
     }
 }
 
-/// 生效的本地制品路径：管理面设置过**且**缓存存在时用缓存，否则回落到内置包。
+/// 生效的本地制品路径：**只有**管理面录入过、且缓存的副本还在时才有值。
 ///
-/// 返回 `None` = 没有可用的安装包（`agent.package_file` 为空、或文件不在）—— 不报错，
+/// 返回 `None` = 没有可用的安装包（从未录入、或录过的副本已不在）—— 不报错，
 /// 由调用方决定怎么提示（安装/分发端点会明确拒绝）。
 ///
-/// 读设置失败或缓存文件丢失都不阻断安装分发，只回落并留下告警 ——
-/// 与「安装端点不该因为管理面的一次读失败而整体不可用」的取舍一致。
+/// 为什么不再有「配置里的内置包」这个回落：安装包只能有一个来源（管理面录入那份），
+/// 否则又会回到「分发地址认管理面、校验摘要认配置文件」那种矛盾。
+///
+/// 读设置失败同样只回落为「没有包」并留下告警 —— 与「安装端点不该因为管理面的一次读失败
+/// 而整体不可用」的取舍一致。
 pub async fn effective_package_path(
     config: &AdminConfig,
     store: &Arc<dyn Store>,
@@ -84,10 +87,10 @@ pub async fn effective_package_path(
     let cached = config.install_package_cache_path();
     match store.get_agent_install_package().await {
         Ok(Some(_)) if cached.is_file() => Some(cached),
-        Ok(_) => config.agent_package_file.clone(),
+        Ok(_) => None,
         Err(err) => {
             eprintln!("warning: failed to read agent install package address: {err}");
-            config.agent_package_file.clone()
+            None
         }
     }
 }
@@ -102,7 +105,7 @@ pub async fn resolve_agent_package(
 ) -> Result<AgentPackageSource, String> {
     let Some(path) = effective_package_path(config, store).await else {
         return Err(
-            "未配置 agent 安装包：agent.package_file 为空或文件不在；请在管理面录入来源包，或补上该文件"
+            "没有可用的 agent 安装包：管理面未录入来源，或录入的副本已不在 —— 到「安装包」页看一眼（重新录入会重新拉取）"
                 .to_string(),
         );
     };
@@ -256,7 +259,7 @@ async fn read_source(source: &str) -> Result<Vec<u8>, PackageFetchError> {
 /// 文件 sha256（裸 hex）。
 ///
 /// 按 (路径, mtime, 大小) 缓存：分发端点与签发安装代码都会用到摘要，而制品可能几十 MB，
-/// 不能每次请求都整读一遍。缓存键含路径，因为现在有内置包与管理面缓存两个候选制品。
+/// 不能每次请求都整读一遍。
 pub fn file_sha256_hex(path: &Path) -> Result<String, String> {
     let metadata = std::fs::metadata(path).map_err(|err| err.to_string())?;
     let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);

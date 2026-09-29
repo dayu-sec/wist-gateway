@@ -8,7 +8,8 @@ use axum::{
 };
 
 use crate::infra::{
-    AdminConfig, BootstrapTokenCheck, Store, StoredAgentUplinkAddress, StoredEnrollmentToken,
+    AdminConfig, BootstrapTokenCheck, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
+    Store, StoreResult, StoredAgentUplinkAddress, StoredEnrollmentToken,
     StoredEnrollmentTokenStatus, new_secret_token, sha256_hex, sign_install_script,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -148,16 +149,16 @@ pub async fn get_agent_initial_config_with_token(
     match validate_bootstrap_token_for_config(&state.config, &state.store, token).await {
         Ok(()) => {
             rate_limit::clear_auth_failures(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
-            // 管理面未设置数据面上送地址时不下发上送段；读设置失败不阻断安装，
-            // 按「未设置」处理并留下告警。
             // 控制面 endpoint 取「网关对外地址」（未设置回落配置值）：agent 拿到的
             // 必须是它对目标主机可见的地址，否则装完连不上。
             let base = effective_advertise_base(&state.config, &state.store).await;
-            let uplink = match state.store.get_agent_uplink().await {
+            // 上送目标：管理面设置 → 部署配置派生（与上面同一个域名 + 数据面端口）。
+            // 读设置失败不阻断安装：按「没设过」处理，用派生值兜底并留下告警。
+            let uplink = match effective_agent_uplink(&state.config, &state.store).await {
                 Ok(value) => value,
                 Err(err) => {
                     eprintln!("warning: failed to read agent uplink address: {err}");
-                    None
+                    derived_agent_uplink(&state.config, &state.store).await
                 }
             };
             (
@@ -382,6 +383,65 @@ pub async fn effective_advertise_base(config: &AdminConfig, store: &Arc<dyn Stor
             config.public_base_url.clone()
         }
     }
+}
+
+/// 生效的数据面上送目标：**管理面设置 → 部署配置派生 → 都没有**。
+///
+/// 「一台机器、一个域名」的部署不该再录一遍地址：录进来的域名（[`effective_advertise_base`]）
+/// 就是唯一来源 —— 派生规则是「与 Agent 拿到的控制面地址**同域**，端口取数据面约定的入口端口
+/// [`DEFAULT_AGENT_UPLINK_PORT`]」。要指到别处（另一台机器的数据面、非约定端口）才需要管理面录入。
+///
+/// 派生的那条 `updated_at` 留空，管理面据此把「来自部署配置」与「管理面设置过」区分开
+/// （见 `admin_ops::uplink_response`）。
+pub async fn effective_agent_uplink(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+) -> StoreResult<Option<StoredAgentUplinkAddress>> {
+    Ok(match store.get_agent_uplink().await? {
+        Some(setting) => Some(setting),
+        None => derived_agent_uplink(config, store).await,
+    })
+}
+
+/// 部署配置派生的上送目标（管理面没设过时的回落）。
+///
+/// `None` = 连基址里都取不出主机名 —— 这时才是真的「没有上送目标」，调用方按未设置处理。
+pub async fn derived_agent_uplink(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+) -> Option<StoredAgentUplinkAddress> {
+    let base = effective_advertise_base(config, store).await;
+    uplink_host_from_base_url(&base).map(|host| StoredAgentUplinkAddress {
+        setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
+        host,
+        port: DEFAULT_AGENT_UPLINK_PORT,
+        updated_by: String::new(),
+        updated_at: String::new(),
+    })
+}
+
+/// 从基址取「裸主机名」：`https://gw.example.com:8443/x` → `gw.example.com`。
+///
+/// 端口一律丢掉：上送端口是**数据面**端口，与基址里那个（网关自己的监听端口）无关。
+///
+/// **只接受裸主机名 / IPv4 字面量**（白名单），其余一律判为派生不出：
+///   * IPv6 字面量（`[::1]`）拼不出 agentd 要的 `host:port`；
+///   * 带 userinfo（`https://user@gw`）、带空白或其它符号的写法：宁可判「无目标」也不猜 ——
+///     派生错了会让整队 agent 去连一个不存在的地址（**比没有目标更糟**）。
+fn uplink_host_from_base_url(base: &str) -> Option<String> {
+    // scheme 按大小写不敏感地切（固定小写是在上游校验里保证的，这里不靠它做正确性）。
+    let after_scheme = base.find("://").map_or(base, |index| &base[index + 3..]);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let host = authority.split(':').next().unwrap_or_default();
+    let is_bare_host = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    is_bare_host.then(|| host.to_string())
 }
 
 pub fn agent_install_code(
