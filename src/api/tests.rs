@@ -477,7 +477,7 @@ async fn initial_config_matches_agent_config_contract() {
     );
     assert_eq!(
         parsed.control_plane.credential_request.as_deref(),
-        Some("bearer")
+        Some("csr")
     );
     assert_eq!(
         parsed.control_plane.trust_bundle.as_deref(),

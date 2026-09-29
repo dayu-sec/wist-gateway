@@ -3,6 +3,15 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.9-alpha] - 2026-09-29
+
+### 变更
+
+- **新装 Agent 默认申请客户端证书（mTLS）**：生成的注册材料由 `credential_request = "bearer"` 改为
+  `"csr"`。配合网关侧配置的 agent CA（`agent.agent_ca_cert_file` / `agent_ca_key_file`），agent 注册时就会
+  用本地 CSR 换到一张客户端证书 —— 这也是**换库/丢库后 agent 能自动重建身份**（网关按证书重建登记）的前提。
+  未配 agent CA 时行为不变（证书申请被忽略，回落 bearer）。
+
 ## [0.1.8-alpha] - 2026-09-29
 
 ### 变更
