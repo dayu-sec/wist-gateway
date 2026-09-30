@@ -19,7 +19,7 @@ use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 
 use crate::app::content::ContentSet;
 use crate::app::purpose::PurposeRuleTable;
-use crate::infra::{AdminConfig, Store};
+use crate::infra::{AdminConfig, Store, StoredKnowledgePackage};
 
 /// 包内五份数据的文件名（与 `wist-knowledge` 制品一致）。
 ///
@@ -216,6 +216,441 @@ impl fmt::Display for KnowledgeLoadError {
 
 impl std::error::Error for KnowledgeLoadError {}
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 录入（设计 §5.4 的校验链）与激活前装载
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 制品名：包内 `manifest.json` 必须自报这个名，否则说明"传错了包"。
+pub const PACKAGE_NAME: &str = "wist-knowledge";
+
+/// 内容寻址 id：`kbp-<sha256 前 16 位>`（裸 hex）。
+///
+/// 与安装包的 `pkg-<…>` 同口径：前 16 位（64 bit）足够区分一台网关里录入过的包，
+/// 同时保持目录名短、可读。
+///
+/// 摘要算的是**来源制品（tarball）的字节**，不是解开后的目录 —— 这样它与发布侧
+/// `wist-knowledge-<版本>.tar.gz.sha256` 是同一个数，运维拿它核对不会两边对不上；
+/// 代价是同一份内容重打包会得到不同的 id（压缩不可复现），但那本就不是"同一个制品"。
+pub fn package_id_for_sha256(sha256_hex: &str) -> String {
+    let prefix: String = sha256_hex.chars().take(16).collect();
+    format!("kbp-{prefix}")
+}
+
+/// 录入失败的原因。分类是为了让管理面能给出**可操作**的错误码（设计 §7）。
+#[derive(Debug)]
+pub enum KnowledgeRecordError {
+    /// 来源写法不合法（不是 https URL、也不是绝对路径）。
+    SourceInvalid(String),
+    /// 来源拿不到（文件不存在 / HTTP 失败 / 超限）。
+    SourceUnavailable(String),
+    /// 期望摘要与实际不符。
+    DigestMismatch(String),
+    /// 包自报的 `manifest.json` 与包内实际内容对不上。
+    ManifestInconsistent(String),
+    /// 内容不合法（真实装载器校验不过）。
+    ContentInvalid(String),
+    /// 落库失败。
+    Store(String),
+}
+
+impl KnowledgeRecordError {
+    /// 管理面错误码（设计 §7 的 `code`）。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::SourceInvalid(_) => "package_source_invalid",
+            Self::SourceUnavailable(_) => "package_source_unavailable",
+            Self::DigestMismatch(_) => "package_sha256_mismatch",
+            Self::ManifestInconsistent(_) => "package_manifest_inconsistent",
+            Self::ContentInvalid(_) => "package_content_invalid",
+            Self::Store(_) => "package_store_failed",
+        }
+    }
+}
+
+impl fmt::Display for KnowledgeRecordError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceInvalid(message)
+            | Self::SourceUnavailable(message)
+            | Self::DigestMismatch(message)
+            | Self::ManifestInconsistent(message)
+            | Self::ContentInvalid(message)
+            | Self::Store(message) => f.write_str(message),
+        }
+    }
+}
+
+/// 一次成功录入的产物。
+#[derive(Debug)]
+pub struct RecordedKnowledge {
+    pub package_id: String,
+    /// 来源制品字节的摘要（裸 hex），与发布侧 `.sha256` 同一个数。
+    pub sha256: String,
+    /// 网关自己存的那份**目录**。
+    pub cached_path: std::path::PathBuf,
+    /// 已校验通过的那一份（激活时直接换它，不必重装）。
+    pub loaded: LoadedKnowledge,
+}
+
+/// 包内 `manifest.json`（打包侧 `scripts/package.sh` 产出）。
+///
+/// 只取这里用得上的字段：`files` 用来**逐条核对**（不信任何单一摘要），
+/// `content_versions` 用来与装载结果**交叉核对**（手改 TOML 忘了 bump 版本会在这里露出来）。
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct PackageManifest {
+    name: String,
+    version: String,
+    content_versions: serde_json::Map<String, serde_json::Value>,
+    files: std::collections::BTreeMap<String, String>,
+}
+
+/// 校验链（设计 §5.4）：拉字节 → 摘要 → 解到**临时目录** → 逐条核对 → manifest 自洽
+/// → 真实装载器校验 → 原子换入。
+///
+/// M1 不做签名与 `parser_abi` 强制（设计 §9/§10 排在 M2）。
+pub async fn record_package(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    source: &str,
+    expected_sha256: Option<&str>,
+    created_by: &str,
+    created_at: &str,
+) -> Result<RecordedKnowledge, KnowledgeRecordError> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(KnowledgeRecordError::SourceInvalid(
+            "来源不能为空：给 https:// 链接或容器内绝对路径".to_string(),
+        ));
+    }
+    if !source.starts_with("https://") && !source.starts_with('/') {
+        return Err(KnowledgeRecordError::SourceInvalid(format!(
+            "来源必须是 https:// 链接或**容器内**绝对路径（当前：{source}）\
+             —— 网关跑在容器里，读不到宿主路径"
+        )));
+    }
+    let bytes = read_source(source).await?;
+    let sha256 = crate::infra::bytes_sha256_hex(&bytes);
+    if let Some(expected) = expected_sha256.map(str::trim).filter(|v| !v.is_empty()) {
+        let expected_hex = expected
+            .strip_prefix("sha256:")
+            .unwrap_or(expected)
+            .to_ascii_lowercase();
+        if expected_hex != sha256 {
+            return Err(KnowledgeRecordError::DigestMismatch(format!(
+                "知识库包 sha256 不一致：期望 {expected_hex}，实际 {sha256}"
+            )));
+        }
+    }
+    let package_id = package_id_for_sha256(&sha256);
+
+    // 解到临时目录：校验没过之前，半成品不进 `<state>/knowledge/`。
+    let staging = config
+        .knowledge_dir()
+        .join(format!(".staging-{package_id}"));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|err| {
+        KnowledgeRecordError::SourceUnavailable(format!(
+            "创建临时目录失败 {}：{err}",
+            staging.display()
+        ))
+    })?;
+    let unpacked = unpack_into(&bytes, &staging);
+    let result = match unpacked {
+        Ok(()) => validate_package(&staging, &package_id),
+        Err(err) => Err(err),
+    };
+    let validated = match result {
+        Ok(validated) => validated,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err);
+        }
+    };
+
+    // 原子换入 `<state>/knowledge/<package_id>/`。
+    // 目标已存在就**换掉**（可能是上次录入留下的、也可能被人改过）—— 重复录入因此也是修复。
+    let cached_path = config.knowledge_package_dir(&package_id);
+    if cached_path.exists() {
+        std::fs::remove_dir_all(&cached_path).map_err(|err| {
+            KnowledgeRecordError::SourceUnavailable(format!(
+                "替换旧副本失败 {}：{err}",
+                cached_path.display()
+            ))
+        })?;
+    }
+    if let Some(parent) = cached_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            KnowledgeRecordError::SourceUnavailable(format!(
+                "创建知识库目录失败 {}：{err}",
+                parent.display()
+            ))
+        })?;
+    }
+    std::fs::rename(&validated.package_root, &cached_path).map_err(|err| {
+        KnowledgeRecordError::SourceUnavailable(format!(
+            "落盘失败 {} → {}：{err}",
+            validated.package_root.display(),
+            cached_path.display()
+        ))
+    })?;
+    let _ = std::fs::remove_dir_all(&staging);
+
+    let row = StoredKnowledgePackage {
+        package_id: package_id.clone(),
+        source: source.to_string(),
+        package_sha256: format!("sha256:{sha256}"),
+        version: validated.manifest.version.clone(),
+        catalog_version: validated.catalog_version,
+        template_version: validated.template_version,
+        policy_version: validated.policy_version,
+        purpose_version: validated.purpose_version,
+        parser_abi: 1,
+        signed_by: String::new(),
+        cached_path: cached_path.to_string_lossy().to_string(),
+        created_by: created_by.to_string(),
+        created_at: created_at.to_string(),
+    };
+    store
+        .upsert_knowledge_package(&row)
+        .await
+        .map_err(|err| KnowledgeRecordError::Store(format!("落库失败：{err}")))?;
+
+    Ok(RecordedKnowledge {
+        package_id,
+        sha256,
+        cached_path,
+        loaded: validated.loaded,
+    })
+}
+
+/// 激活前的装载：直接读**已录副本**并重新校验（设计 §8.6“先验后切”）。
+///
+/// 为什么要重验而不是直接信任入库时的那次：副本在盘上，可能被改过或被删过；
+/// 拿一个早已损坏的目录去切，等于把网关推到“半可用”。
+pub fn load_recorded_package(
+    config: &AdminConfig,
+    package_id: &str,
+) -> Result<LoadedKnowledge, KnowledgeRecordError> {
+    let dir = config.knowledge_package_dir(package_id);
+    let mut loaded = LoadedKnowledge::load_package_dir(&dir)
+        .map_err(|err| KnowledgeRecordError::ContentInvalid(err.to_string()))?;
+    loaded.source = KnowledgeSource::Package {
+        package_id: package_id.to_string(),
+    };
+    Ok(loaded)
+}
+
+struct ValidatedPackage {
+    package_root: std::path::PathBuf,
+    manifest: PackageManifest,
+    loaded: LoadedKnowledge,
+    catalog_version: Option<i64>,
+    template_version: Option<i64>,
+    policy_version: Option<i64>,
+    purpose_version: Option<i64>,
+}
+
+/// 校验一个已解开的包目录（包根 = 含 `manifest.json` 的那一层）。
+fn validate_package(
+    staging: &Path,
+    package_id: &str,
+) -> Result<ValidatedPackage, KnowledgeRecordError> {
+    let package_root = locate_package_root(staging).ok_or_else(|| {
+        KnowledgeRecordError::ManifestInconsistent(format!(
+            "包内找不到 manifest.json（顶层一层目录应为 `wist-knowledge-<版本>/`）：{}",
+            staging.display()
+        ))
+    })?;
+    let manifest_text =
+        std::fs::read_to_string(package_root.join("manifest.json")).map_err(|err| {
+            KnowledgeRecordError::ManifestInconsistent(format!("读 manifest.json 失败：{err}"))
+        })?;
+    let manifest: PackageManifest = serde_json::from_str(&manifest_text).map_err(|err| {
+        KnowledgeRecordError::ManifestInconsistent(format!("manifest.json 解析失败：{err}"))
+    })?;
+    if manifest.name != PACKAGE_NAME {
+        return Err(KnowledgeRecordError::ManifestInconsistent(format!(
+            "包自报的名字是 {:?}，不是 {PACKAGE_NAME:?} —— 传错包了？",
+            manifest.name
+        )));
+    }
+    if manifest.files.is_empty() {
+        return Err(KnowledgeRecordError::ManifestInconsistent(
+            "manifest.json 的 files 为空：它必须逐条给出包内文件的 sha256".to_string(),
+        ));
+    }
+    // 逐条核对：**不信任任何单一摘要** —— 目录级的摘要说不出“哪个文件被换了”。
+    for (name, expected) in &manifest.files {
+        let path = package_root.join(name);
+        let bytes = std::fs::read(&path).map_err(|err| {
+            KnowledgeRecordError::ManifestInconsistent(format!(
+                "manifest 列了 {name}，但读不到：{err}"
+            ))
+        })?;
+        let actual = crate::infra::bytes_sha256_hex(&bytes);
+        let expected = expected
+            .strip_prefix("sha256:")
+            .unwrap_or(expected)
+            .to_ascii_lowercase();
+        if actual != expected {
+            return Err(KnowledgeRecordError::ManifestInconsistent(format!(
+                "{name} 与 manifest 记的 sha256 不一致（期望 {expected}，实际 {actual}）"
+            )));
+        }
+    }
+    // 真实装载器校验：**用什么装载就用什么校验**（同一份代码，不走两套）。
+    let loaded = LoadedKnowledge::load_package_dir(&package_root)
+        .map_err(|err| KnowledgeRecordError::ContentInvalid(err.to_string()))?;
+
+    // manifest 自洽：声明的版本必须与文件里实际声明的一致。
+    let declared_catalog = manifest_version(&manifest, "catalog_version");
+    let declared_purpose = manifest_version(&manifest, "purpose_version");
+    let declared_policy = manifest_version(&manifest, "policy_version");
+    let actual_catalog = loaded.content.as_ref().map(|set| set.catalog_version);
+    let actual_purpose = loaded
+        .purpose_rules
+        .as_ref()
+        .map(|table| i64::from(table.purpose_version));
+    let actual_policy = loaded
+        .discovery_policies
+        .as_ref()
+        .map(|set| set.policy_version);
+    for (label, declared, actual) in [
+        ("catalog_version", declared_catalog, actual_catalog),
+        ("purpose_version", declared_purpose, actual_purpose),
+        ("policy_version", declared_policy, actual_policy),
+    ] {
+        if let (Some(declared), Some(actual)) = (declared, actual)
+            && declared != actual
+        {
+            return Err(KnowledgeRecordError::ManifestInconsistent(format!(
+                "manifest 声明的 {label} 是 {declared}，文件里实际是 {actual} \
+                 —— 打包后改过内容？重打一版（{package_id}）"
+            )));
+        }
+    }
+    let template_version = manifest_template_version(&manifest);
+    Ok(ValidatedPackage {
+        package_root,
+        manifest,
+        loaded,
+        catalog_version: actual_catalog.or(declared_catalog),
+        template_version,
+        policy_version: actual_policy.or(declared_policy),
+        purpose_version: actual_purpose.or(declared_purpose),
+    })
+}
+
+/// 包根：`manifest.json` 所在的那一层（顶层若套了一层目录就进去）。
+fn locate_package_root(staging: &Path) -> Option<std::path::PathBuf> {
+    if staging.join("manifest.json").is_file() {
+        return Some(staging.to_path_buf());
+    }
+    let mut entries = std::fs::read_dir(staging).ok()?;
+    let children: Vec<_> = entries.by_ref().filter_map(Result::ok).collect();
+    if children.len() != 1 {
+        return None;
+    }
+    let child = children.into_iter().next()?.path();
+    child.join("manifest.json").is_file().then_some(child)
+}
+
+/// 解开 tar.gz 到 `staging`。
+///
+/// 只收 tar.gz（与发布侧制品一致）：目录来源不做特例 —— "什么算同一份内容" 的判据
+/// 会因此分叉（目录没有天然摘要），而摘要正是内容寻址的基础。
+fn unpack_into(bytes: &[u8], staging: &Path) -> Result<(), KnowledgeRecordError> {
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(staging).map_err(|err| {
+        KnowledgeRecordError::ManifestInconsistent(format!("解包失败（期望 tar.gz 制品）：{err}"))
+    })
+}
+
+fn manifest_version(manifest: &PackageManifest, key: &str) -> Option<i64> {
+    match manifest.content_versions.get(key) {
+        Some(serde_json::Value::Number(number)) => number.as_i64(),
+        _ => None,
+    }
+}
+
+/// `template_version` 在包内是**一份名列各模板**的数组，取唯一值；不唯一就留空
+/// （宁可空着，也不要随便挑一个冒充"包版本"）。
+fn manifest_template_version(manifest: &PackageManifest) -> Option<i64> {
+    match manifest.content_versions.get("template_version") {
+        Some(serde_json::Value::Number(number)) => number.as_i64(),
+        Some(serde_json::Value::Array(values)) => {
+            let mut numbers = values.iter().filter_map(serde_json::Value::as_i64);
+            let first = numbers.next()?;
+            numbers.all(|value| value == first).then_some(first)
+        }
+        _ => None,
+    }
+}
+
+/// 读来源字节：`https://` 走 HTTP，`/absolute/path` 读本机文件（容器内路径）。
+async fn read_source(source: &str) -> Result<Vec<u8>, KnowledgeRecordError> {
+    if source.starts_with('/') {
+        let path = Path::new(source);
+        let metadata = std::fs::metadata(path).map_err(|err| {
+            KnowledgeRecordError::SourceUnavailable(format!("读不到来源 {source}：{err}"))
+        })?;
+        if metadata.is_dir() {
+            return Err(KnowledgeRecordError::SourceInvalid(format!(
+                "来源是目录：知识库包必须是 **tar.gz 制品**（{source}）"
+            )));
+        }
+        if metadata.len() > MAX_PACKAGE_BYTES {
+            return Err(KnowledgeRecordError::SourceUnavailable(format!(
+                "来源 {} 有 {} 字节，超过上限 {MAX_PACKAGE_BYTES}",
+                source,
+                metadata.len()
+            )));
+        }
+        return std::fs::read(path).map_err(|err| {
+            KnowledgeRecordError::SourceUnavailable(format!("读不到来源 {source}：{err}"))
+        });
+    }
+    let client = reqwest::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .map_err(|err| {
+            KnowledgeRecordError::SourceUnavailable(format!("构建 http 客户端失败：{err}"))
+        })?;
+    let response = client.get(source).send().await.map_err(|err| {
+        KnowledgeRecordError::SourceUnavailable(format!("拉取 {source} 失败：{err}"))
+    })?;
+    if !response.status().is_success() {
+        return Err(KnowledgeRecordError::SourceUnavailable(format!(
+            "来源 {source} 返回 HTTP {}",
+            response.status()
+        )));
+    }
+    if let Some(len) = response.content_length()
+        && len > MAX_PACKAGE_BYTES
+    {
+        return Err(KnowledgeRecordError::SourceUnavailable(format!(
+            "来源 {source} 有 {len} 字节，超过上限 {MAX_PACKAGE_BYTES}"
+        )));
+    }
+    let bytes = response.bytes().await.map_err(|err| {
+        KnowledgeRecordError::SourceUnavailable(format!("读 {source} 正文失败：{err}"))
+    })?;
+    if bytes.len() as u64 > MAX_PACKAGE_BYTES {
+        return Err(KnowledgeRecordError::SourceUnavailable(format!(
+            "来源 {source} 有 {} 字节，超过上限 {MAX_PACKAGE_BYTES}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes.to_vec())
+}
+
+/// 拉取超时：内容包不大（几 KB～几 MB），但不能无限等。
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 包大小上限：防止误填地址把任意大文件灌进网关磁盘。
+const MAX_PACKAGE_BYTES: u64 = 16 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +721,205 @@ mod tests {
             .expect("corrupt policies");
         let err = LoadedKnowledge::load_package_dir(&dir).expect_err("must refuse");
         assert!(err.to_string().contains("发现方向策略表"), "{err}");
+    }
+
+    // ── 录入（校验链）───────────────────────────────────────────────────────
+
+    /// 与 `test_support::knowledge_package_tarball` 同一件事的本地别名（读起来短一点）。
+    fn build_package_tarball(root: &Path, corrupt_after_manifest: bool) -> std::path::PathBuf {
+        crate::test_support::knowledge_package_tarball(root, corrupt_after_manifest)
+    }
+
+    /// 制品里那层目录名里的版本（与 `test_support` 造制品时用的后缀一致）。
+    const PACKAGE_NAME_SUFFIX: &str = "9.9.9-test";
+
+    async fn record(
+        store: &Arc<dyn Store>,
+        config: &AdminConfig,
+        source: &str,
+    ) -> Result<RecordedKnowledge, KnowledgeRecordError> {
+        record_package(config, store, source, None, "admin", "2026-09-30T00:00:00Z").await
+    }
+
+    #[tokio::test]
+    async fn records_a_package_from_a_local_tarball() {
+        let store: Arc<dyn Store> = Arc::new(
+            crate::infra::SqliteStore::connect("sqlite::memory:")
+                .await
+                .expect("store"),
+        );
+        let (config, root) = test_config();
+        let tarball = build_package_tarball(&root, false);
+
+        let recorded = record(&store, &config, tarball.to_str().expect("path"))
+            .await
+            .expect("record");
+        // 内容寻址：id 就是来源制品摘要的前 16 位。
+        assert!(recorded.package_id.starts_with("kbp-"));
+        assert_eq!(recorded.package_id, package_id_for_sha256(&recorded.sha256));
+        // 副本落在 <state>/knowledge/<id>/，且是**目录**不是文件。
+        assert!(recorded.cached_path.is_dir());
+        assert!(recorded.cached_path.join("catalog.toml").is_file());
+        // 已校验通过的那一份直接可用（激活时不必重装）。
+        assert_eq!(
+            recorded
+                .loaded
+                .content
+                .as_deref()
+                .map(|set| set.catalog_version),
+            Some(2)
+        );
+
+        // 落库：版本从**文件实际声明**取值（不是只信 manifest）。
+        let row = store
+            .knowledge_package(&recorded.package_id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.catalog_version, Some(2));
+        assert_eq!(row.purpose_version, Some(1));
+        assert_eq!(row.policy_version, Some(1));
+        assert_eq!(row.template_version, Some(1));
+        assert_eq!(row.version, PACKAGE_NAME_SUFFIX);
+        assert!(row.package_sha256.starts_with("sha256:"));
+    }
+
+    #[tokio::test]
+    async fn a_tampered_payload_is_rejected() {
+        let store: Arc<dyn Store> = Arc::new(
+            crate::infra::SqliteStore::connect("sqlite::memory:")
+                .await
+                .expect("store"),
+        );
+        let (config, root) = test_config();
+        // manifest 记的是原字节，包里的 catalog.toml 却在打包后被改过。
+        let tarball = build_package_tarball(&root, true);
+        let err = record(&store, &config, tarball.to_str().expect("path"))
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.code(), "package_manifest_inconsistent");
+        assert!(err.to_string().contains("catalog.toml"), "{err}");
+        // 拒收的包不会留下副本（半成品不进 `<state>/knowledge/`）。
+        let knowledge_dir = config.knowledge_dir();
+        let leftovers: Vec<_> = fs::read_dir(&knowledge_dir)
+            .map(|entries| entries.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "拒收后不该留下任何副本：{leftovers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_expected_digest_is_rejected() {
+        let store: Arc<dyn Store> = Arc::new(
+            crate::infra::SqliteStore::connect("sqlite::memory:")
+                .await
+                .expect("store"),
+        );
+        let (config, root) = test_config();
+        let tarball = build_package_tarball(&root, false);
+        let err = record_package(
+            &config,
+            &store,
+            tarball.to_str().expect("path"),
+            Some(&"0".repeat(64)),
+            "admin",
+            "2026-09-30T00:00:00Z",
+        )
+        .await
+        .expect_err("must refuse");
+        assert_eq!(err.code(), "package_sha256_mismatch");
+    }
+
+    #[tokio::test]
+    async fn a_bad_source_is_rejected_before_any_io() {
+        let store: Arc<dyn Store> = Arc::new(
+            crate::infra::SqliteStore::connect("sqlite::memory:")
+                .await
+                .expect("store"),
+        );
+        let (config, root) = test_config();
+        let err = record(&store, &config, "relative/path.tar.gz")
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.code(), "package_source_invalid");
+        // 目录也不行：包的判据是"来源制品的摘要"，目录没有天然摘要。
+        let err = record(&store, &config, root.to_str().expect("path"))
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.code(), "package_source_invalid");
+    }
+
+    #[test]
+    fn loading_a_recorded_package_keeps_its_identity() {
+        let (config, root) = test_config();
+        let tarball = build_package_tarball(&root, false);
+        // 走一次真实录入，拿到 id，再用激活前的那条装载路径读回来。
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let recorded = runtime.block_on(async {
+            let store: Arc<dyn Store> = Arc::new(
+                crate::infra::SqliteStore::connect("sqlite::memory:")
+                    .await
+                    .expect("store"),
+            );
+            record(&store, &config, tarball.to_str().expect("path"))
+                .await
+                .expect("record")
+        });
+        let loaded = load_recorded_package(&config, &recorded.package_id).expect("load recorded");
+        assert_eq!(
+            loaded.source,
+            KnowledgeSource::Package {
+                package_id: recorded.package_id.clone()
+            }
+        );
+        assert_eq!(
+            loaded.content.as_deref().map(|set| set.catalog_version),
+            Some(2)
+        );
+    }
+
+    /// 一个只用来定位临时目录的配置：知识库目录与 sqlite 同址（与真实部署同一约定）。
+    fn test_config() -> (AdminConfig, std::path::PathBuf) {
+        let root = crate::test_support::unique_temp_dir("wist-knowledge-rec");
+        let config = crate::infra::config::config_for_tests(&root);
+        (config, root)
+    }
+
+    /// 用**真实 `scripts/package.sh` 产物**跑一次完整录入。
+    ///
+    /// 默认跳过（要真制品），显式跑：
+    /// `WIST_KNOWLEDGE_TEST_PACKAGE=<tar.gz> cargo test -- --ignored records_the_real_artifact`
+    /// 它验的是**契约**：打包脚本产出的 manifest 形状网关真能吃下。
+    #[tokio::test]
+    #[ignore = "需要真实制品：设 WIST_KNOWLEDGE_TEST_PACKAGE 后加 --ignored 跑"]
+    async fn records_the_real_artifact() {
+        let path = std::env::var("WIST_KNOWLEDGE_TEST_PACKAGE")
+            .expect("WIST_KNOWLEDGE_TEST_PACKAGE 必须指向 scripts/package.sh 产出的 tar.gz");
+        let store: Arc<dyn Store> = Arc::new(
+            crate::infra::SqliteStore::connect("sqlite::memory:")
+                .await
+                .expect("store"),
+        );
+        let (config, _root) = test_config();
+        let recorded = record(&store, &config, &path)
+            .await
+            .expect("record real artifact");
+        let row = store
+            .knowledge_package(&recorded.package_id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(row.version.starts_with("0."), "版本读到了：{}", row.version);
+        assert_eq!(row.purpose_version, Some(1));
+        assert_eq!(
+            recorded
+                .loaded
+                .content
+                .as_deref()
+                .map(|set| set.catalog_version),
+            Some(2)
+        );
     }
 }

@@ -351,6 +351,20 @@ pub struct KnowledgeActivation<'a> {
     pub requested_by: &'a str,
     pub created_at: &'a str,
 }
+
+/// 一条知识库**切换留痕**（`knowledge_activation_log`）。
+///
+/// 回滚也是切换，所以同一条流：`reason` 区分意图，`from_package` 为空表示首次激活。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredKnowledgeActivation {
+    pub from_package: Option<String>,
+    pub to_package: String,
+    pub generation: i64,
+    pub reason: String,
+    pub requested_by: String,
+    pub created_at: String,
+}
 /// 时序指标样本 DTO（历史在 VictoriaMetrics，库里只留最近值）。
 ///
 /// 带 `#[jumo]` 注解是因为它作为 `RecentOnlineRegisteredAgent.metrics_history` 的
@@ -1221,6 +1235,9 @@ pub trait Store: Send + Sync + fmt::Debug {
         package_id: &str,
     ) -> StoreResult<Option<StoredKnowledgePackage>>;
 
+    /// 录入过的包，最近优先（管理面历史列表）。
+    async fn list_knowledge_packages(&self) -> StoreResult<Vec<StoredKnowledgePackage>>;
+
     /// 当前生效指针。从未激活过返回 `None` —— 那是「空载」，不是错误（设计 §8.5）。
     async fn knowledge_active(&self) -> StoreResult<Option<StoredKnowledgeActive>>;
 
@@ -1230,6 +1247,18 @@ pub trait Store: Send + Sync + fmt::Debug {
         &self,
         activation: &KnowledgeActivation<'_>,
     ) -> StoreResult<StoredKnowledgeActive>;
+
+    /// 切换留痕，最近优先（管理面展示“谁什么时候把内容切到了哪一版”）。
+    async fn list_knowledge_activations(
+        &self,
+        limit: u64,
+    ) -> StoreResult<Vec<StoredKnowledgeActivation>>;
+
+    /// **谁还锁在旧版目录**：按 `catalog_version` 分组统计常驻工作数（设计 §8.3）。
+    ///
+    /// 换版**不追改**在跑的工作，它们继续按自己那一版展开 —— 所以“换完了还有多少在跑老目录”
+    /// 必须看得见，否则清理旧包时就是盲删。
+    async fn standing_work_catalog_versions(&self) -> StoreResult<Vec<(i64, u64)>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

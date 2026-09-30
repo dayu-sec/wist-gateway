@@ -848,6 +848,63 @@ fn require_existing_file(field: &str, path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// 只给测试用的最小配置：状态目录 = `root`（SQLite 库与知识库副本都在它下面）。
+///
+/// 为什么集中一份而不是各测试模块各写一遍：`AdminConfig` 字段多，加一个字段就会让
+/// 每一处字面量同时过期 —— 一份就够（`api::tests::TestEnv` 有自己的夹具，那是因为它
+/// 还要挂内容/规则/策略文件；这里只要一个"什么都不配"的干净配置）。
+#[cfg(test)]
+pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
+    let signing_key = root.join("install-signing-ed25519.pkcs8.pem");
+    write_test_signing_key(&signing_key);
+    AdminConfig {
+        listen_addr: "127.0.0.1:3000".to_string(),
+        public_base_url: "https://127.0.0.1:3000".to_string(),
+        tls_cert_file: root.join("admin-tls.crt.pem"),
+        tls_key_file: root.join("admin-tls.key.pem"),
+        admin_api_token_hash: sha256_hex("test-admin-token-0001"),
+        bootstrap_token_ttl_seconds: 900,
+        credential_ttl_seconds: 30 * 24 * 60 * 60,
+        store_file: root.join("state").join("admin-store.json"),
+        database_url: None,
+        sqlite_path: root.join("state").join("wist-gateway.db"),
+        trust_bundle: "internal-ca-stub".to_string(),
+        agent_ca_cert_file: None,
+        agent_ca_key_file: None,
+        client_cert_ttl_seconds: super::agent_ca::DEFAULT_CLIENT_CERT_TTL_SECONDS,
+        install_script_signing_private_key_file: signing_key.clone(),
+        install_script_signing_public_key_pem: load_install_script_public_key_pem(&signing_key)
+            .expect("derive install signing public key"),
+        tenant_id: "tenant-default".to_string(),
+        environment_id: "env-default".to_string(),
+        victoria_metrics_url: "http://127.0.0.1:18429".to_string(),
+        purpose_rules_file: None,
+        discovery_policies_file: None,
+        content_catalog_file: None,
+        content_packs_file: None,
+        content_templates_file: None,
+        ingest_listen_addr: None,
+    }
+}
+
+/// 生成一把测试用的 Ed25519 签名私钥（PEM/PKCS8）。
+#[cfg(test)]
+fn write_test_signing_key(path: &Path) {
+    use base64::Engine;
+    use ring::{rand as ring_rand, signature::Ed25519KeyPair};
+
+    let rng = ring_rand::SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate signing key");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref());
+    let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).expect("base64 utf8"));
+        pem.push('\n');
+    }
+    pem.push_str("-----END PRIVATE KEY-----\n");
+    fs::write(path, pem).expect("write signing key");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

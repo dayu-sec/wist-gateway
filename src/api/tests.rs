@@ -9490,6 +9490,142 @@ async fn get_view(state: &ApiState, uri: &str) -> serde_json::Value {
     decode_json_response(get_from_state(state, uri).await).await
 }
 
+async fn post_to_state(state: &ApiState, uri: &str, body: &serde_json::Value) -> Response {
+    super::router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::from(
+                    serde_json::to_string(body).expect("serialize body"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+}
+
+// ── 知识库管理面：录入 → 激活 → 换版（设计 §7）────────────────────────────
+
+/// 整条链走一遍：录入不生效 → 激活当场换版（同一个 router，**不重启**）→ 回滚留痕。
+///
+/// 这是"没有设置入口"那个问题的闭环回归：包从哪来（tar.gz）、怎么录、怎么切、切完谁能看见。
+#[tokio::test]
+async fn knowledge_endpoints_record_then_activate_without_a_restart() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let root = crate::test_support::unique_temp_dir("wist-knowledge-api");
+    let tarball = crate::test_support::knowledge_package_tarball(&root, false);
+
+    // ① 录入：**不生效**（录入 ≠ 生效，设计 I2）
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages",
+        &serde_json::json!({ "source": tarball.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let recorded: serde_json::Value = decode_json_response(response).await;
+    let package_id = recorded["package_id"]
+        .as_str()
+        .expect("package_id")
+        .to_string();
+    assert!(package_id.starts_with("kbp-"), "{package_id}");
+    assert_eq!(recorded["active"], false);
+    assert_eq!(recorded["available"], true);
+    assert_eq!(recorded["catalog_version"], 2);
+
+    // 内容照旧：还是测试夹具那一版（catalog_version = 1）。
+    let view = get_view(&state, "/api/v1/admin/content").await;
+    assert_eq!(view["catalog_version"], 1);
+
+    // ② 激活 → 内容**当场**变，同一个 state 不重启。
+    let activate_uri = format!("/api/v1/admin/knowledge/packages/{package_id}/activate");
+    let response = post_to_state(
+        &state,
+        &activate_uri,
+        &serde_json::json!({ "requested_by": "tester" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view = get_view(&state, "/api/v1/admin/content").await;
+    assert_eq!(view["catalog_version"], 2);
+
+    // ③ 生效视图：来源是包、世代 1、留痕一条（首次激活 `from_package` 为空）。
+    let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
+    assert_eq!(knowledge["source"], "package");
+    assert_eq!(knowledge["generation"], 1);
+    assert_eq!(knowledge["package_id"], package_id);
+    assert_eq!(knowledge["purpose_version"], 1);
+    assert_eq!(knowledge["policy_version"], 1);
+    assert!(knowledge["hint"].is_null(), "有内容时不该再提示空载");
+    assert_eq!(knowledge["activations"][0]["reason"], "activate");
+    assert!(knowledge["activations"][0]["from_package"].is_null());
+
+    // ④ 回滚（这里指回同一版）：世代继续前进，**不是**回到 1 —— 否则“哪一代算的”会重复。
+    let response = post_to_state(
+        &state,
+        &activate_uri,
+        &serde_json::json!({ "reason": "rollback", "requested_by": "tester" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
+    assert_eq!(knowledge["generation"], 2);
+    assert_eq!(knowledge["activations"][0]["reason"], "rollback");
+    assert_eq!(knowledge["activations"][0]["from_package"], package_id);
+
+    // ⑤ “谁还锁在旧版目录”可读（换版不追改在跑的工作）。
+    let locks = get_view(&state, "/api/v1/admin/knowledge/locks").await;
+    assert_eq!(locks["active_catalog_version"], 2);
+    assert!(locks["locks"].is_array());
+}
+
+/// 空载：`configured: false` + 一句"怎么办"（I5：空载要看得见，不能是 503 哑谜）。
+#[tokio::test]
+async fn knowledge_view_reports_the_unconfigured_state_with_a_hint() {
+    let env = TestEnv::new_without_content().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let view = get_view(&state, "/api/v1/admin/knowledge").await;
+    assert_eq!(view["configured"], false);
+    assert_eq!(view["source"], "none");
+    assert_eq!(view["generation"], 0);
+    let hint = view["hint"].as_str().expect("空载必须给出怎么办");
+    assert!(hint.contains("录入一个包"), "{hint}");
+}
+
+/// 错误要能被机器分支：正文带 `code`，状态码按"谁能修"分。
+#[tokio::test]
+async fn knowledge_endpoints_report_actionable_error_codes() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages",
+        &serde_json::json!({ "source": "relative/path.tar.gz" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["code"], "package_source_invalid");
+
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages/kbp-nope/activate",
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["code"], "package_not_found");
+
+    let response = get_from_state(&state, "/api/v1/admin/knowledge/packages/kbp-nope").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 /// 只抬**整表版本**、分册 id 一字不改 —— 这正是"改了内容却忘了改分册 id"那条路。
 /// 断言落库的建议真的重算了（而不是靠时间戳之类的旁证）。
 #[tokio::test]

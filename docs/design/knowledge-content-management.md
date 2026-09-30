@@ -216,29 +216,38 @@ CREATE TABLE IF NOT EXISTS knowledge_activation_log (
 
 ## 7. 管理面 API（草案）
 
-| 方法 | 路由 | 语义 |
-| --- | --- | --- |
-| `GET` | `/api/v1/admin/knowledge` | **当前生效**：`package_id`、`generation`、五份文件的版本与 sha256、激活人/时间、`parser_abi`；未配置时 `configured: false`（**不是 503**，见 I5） |
-| `POST` | `/api/v1/admin/knowledge/packages` | **录入**一个包：`{source: "https://…" \| "/abs/path" 或容器内路径, sha256?: "…", activate?: bool}`。跑完 §5.4 全链，返回 `package_id` + 校验明细。**默认不激活**（I2） |
-| `GET` | `/api/v1/admin/knowledge/packages` | 录入历史：内容寻址 id、`version`、`content_versions`、sha256、`parser_abi`、签名状态、录入人/时间、**是否当前生效** |
-| `GET` | `/api/v1/admin/knowledge/packages/{package_id}` | 单包的校验明细与文件清单（"它到底装了什么"） |
-| `POST` | `/api/v1/admin/knowledge/packages/{package_id}:activate` | **切生效指针**：热换成这一版，`generation += 1`，写审计 |
-| `GET` | `/api/v1/admin/knowledge/locks` | **谁还锁在旧版**：按 `catalog_version` 分组统计工作数（回答"换版后还有哪些在跑老目录"） |
-| `GET` | `/api/v1/admin/content` | **保留**（`api/mod.rs:367`），作为"当前生效内容集"的只读视图，响应里补 `package_id` / `generation` |
-| `GET` | `/api/v1/admin/discovery-policies` | **保留**（`:401`），同上补字段 |
+| 方法 | 路由 | 语义 | M1 |
+| --- | --- | --- | --- |
+| `GET` | `/api/v1/admin/knowledge` | **当前生效**：`source` / `package_id` / `generation` / 四个内容版本 / 激活人时间 / 最近几次切换；未配置时 `configured: false` + 一句"怎么办"（**不是 503**，见 I5） | ✓ |
+| `POST` | `/api/v1/admin/knowledge/packages` | **录入**：`{source: "https://…" \| "/容器内/绝对/路径", sha256?: "…", activate?: bool}`。跑完 §5.4 全链，返回该包视图（含逐文件 sha256、是否生效）。**默认不激活**（I2） | ✓ |
+| `GET` | `/api/v1/admin/knowledge/packages` | 录入历史：内容寻址 id、版本、四个内容版本、sha256、`available`（副本还在不在）、录入人/时间、**是否当前生效** | ✓ |
+| `GET` | `/api/v1/admin/knowledge/packages/{package_id}` | 单包明细（含副本里实际有哪些文件、各自 sha256） | ✓ |
+| `POST` | `/api/v1/admin/knowledge/packages/{package_id}/activate` | **切生效指针**：`{reason?: activate\|rollback\|repair, requested_by?}` → 热换成这一版，`generation += 1`，写审计 | ✓ |
+| `GET` | `/api/v1/admin/knowledge/locks` | **谁还锁在旧版**：按 `catalog_version` 分组统计**在跑**的常驻工作数 | ✓ |
+| `GET` | `/api/v1/admin/content` | 保留（`api/mod.rs`）："当前生效内容集"的只读视图 —— 激活后就地反映新版，**不重启** | ✓ |
 
-**没有**"设置来源地址"这一对路由（与安装包的差别 2）：录入动作本身带来源，不作为持久设置。
+**为什么 activate 是独立动作而不是录入的副作用**：安装包是"录入即生效"（只有一份要分发出去的东西），
+知识库要先录入、验过、再切，才有"回滚"与"旧版共存"（设计 I2）。
 
-错误码（与既有风格一致，正文带 `code`）：
+**为什么是 `/…/{package_id}/activate` 而不是设计早稿里的 `…/{id}:activate`**：`:activate` 那种写法要靠
+路由库在**同一段**里同时认参数与字面量（matchit 不保证），而仓里已有的 `credentials:revoke` 是**单独一段字面量**
+（本身不含参数）。跟着已有写法走，不赌路由库的行为。
 
-| code | 何时 |
-| --- | --- |
-| `package_sha256_mismatch` | 期望摘要与实际不符 |
-| `package_signature_invalid` | 签名验不过 / 配了公钥但包没签名 |
-| `package_manifest_inconsistent` | `files` 里的 sha256 对不上，或 `content_versions` 与文件声明不一致 |
-| `package_parser_abi_unsupported` | `parser_abi` 不在网关支持区间（**可录入、不可激活**，见 §10） |
-| `package_content_invalid` | 真实装载器校验不过（附逐块错误） |
-| `package_not_activated` | 激活一个不存在/未录入的 `package_id` |
+**没有**"设置来源地址"这一对路由（与安装包的差别 2）：来源是录入动作的参数，不作为持久设置。
+
+错误码（正文 JSON `{code, message}`；状态码按"谁能修"分）：
+
+| code | HTTP | 何时 | M1 |
+| --- | --- | --- | --- |
+| `package_source_invalid` | 400 | 来源写法不合法（不是 https 也不是**容器内**绝对路径），或 `reason` 取值非法 | ✓ |
+| `package_sha256_mismatch` | 400 | 期望摘要与实际不符 | ✓ |
+| `package_source_unavailable` | 502 | 来源拿不到：文件不存在 / HTTP 失败 / 超限 / 落盘失败 | ✓ |
+| `package_manifest_inconsistent` | 422 | `manifest.json` 缺失/解析失败/名字不对；`files` 里的 sha256 对不上；`content_versions` 与文件里声明的不一致 | ✓ |
+| `package_content_invalid` | 422 | 真实装载器校验不过（附逐块错误） | ✓ |
+| `package_not_found` | 404 | 激活/查看一个没录入过的 `package_id` | ✓ |
+| `package_store_failed` | 500 | 落库失败 | ✓ |
+| `package_signature_invalid` | 422 | 签名验不过 / 配了公钥但包没签名 | M2 |
+| `package_parser_abi_unsupported` | 422 | `parser_abi` 不在网关支持区间（**可录入、不可激活**，见 §10） | M2 |
 
 ---
 

@@ -36,6 +36,11 @@ mod rate_limit;
 // NOTE(hand-added): 采集内容目录的只读视图（模板组成 + 面就绪度）。不在 jumo 静态模型
 // binding.mju 的声明里，与 software_ops 同一模式。重新生成控制面代码时需回补本模块与路由。
 mod content_ops;
+// NOTE(hand-added): 知识库内容包的管理面（录入 / 历史 / 激活回滚 / 生效视图 / 锁在旧版的工作）。
+// 与安装包那套的关键差别是**录入 ≠ 生效**。不在 jumo 静态模型 binding.mju 的声明里，
+// 重新生成控制面代码时需回补本模块与下方路由。设计见
+// docs/design/knowledge-content-management.md §7。
+mod knowledge_ops;
 // NOTE(hand-added): L1a 机械资产清单（从事实摘要派生）。不在 jumo 静态模型 binding.mju
 // 的声明里，与 host_metrics / pipeline 同一模式。重新生成控制面代码时需回补本模块与下方路由。
 mod software_ops;
@@ -69,6 +74,10 @@ use ingest::{MAX_INGEST_BODY_BYTES, ingest_agent_facts};
 use install::{
     download_agent_package, download_agent_package_by_id, get_agent_initial_config_with_token,
     get_agent_install_code, get_agent_install_script, get_agent_install_script_signature,
+};
+use knowledge_ops::{
+    activate_knowledge_package, list_knowledge_packages, record_knowledge_package, view_knowledge,
+    view_knowledge_locks, view_knowledge_package,
 };
 use logs::{MAX_LOG_INGEST_BODY_BYTES, ingest_agent_logs, view_agent_logs};
 use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
@@ -344,6 +353,25 @@ pub fn router_with_state(state: ApiState) -> Router {
         // NOTE(hand-added): 采集内容目录的只读视图（模板组成 + 面就绪度）。见
         // api/content_ops.rs 顶部说明。
         .route("/api/v1/admin/content", get(view_content))
+        // NOTE(hand-added): 知识库内容包的管理面（设计 §7）。与安装包那套的差别是
+        // **录入 ≠ 生效**：`POST …/packages` 只落盘登记，切指针要另外调 `…/{id}/activate`。
+        // 重新生成控制面代码时这几条路由与 `api/knowledge_ops.rs` 都要保住。
+        .route("/api/v1/admin/knowledge", get(view_knowledge))
+        .route(
+            "/api/v1/admin/knowledge/packages",
+            get(list_knowledge_packages).post(record_knowledge_package),
+        )
+        .route(
+            "/api/v1/admin/knowledge/packages/{package_id}",
+            get(view_knowledge_package),
+        )
+        // 切生效指针（激活 / 回滚）。为什么是**独立动作**而不是录入的副作用：见设计 I2。
+        .route(
+            "/api/v1/admin/knowledge/packages/{package_id}/activate",
+            post(activate_knowledge_package),
+        )
+        // 谁还锁在旧版目录（换版不追改在跑的工作，所以要看得见）。
+        .route("/api/v1/admin/knowledge/locks", get(view_knowledge_locks))
         // NOTE(hand-added): 采集日志的查看（读本地落盘文件）。见 api/logs.rs 顶部说明。
         .route("/api/v1/admin/logs", get(view_agent_logs))
         // NOTE(hand-added): wist-agentd 安装包地址的读取/设置。已在 jumo 模型

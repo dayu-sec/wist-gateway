@@ -2365,6 +2365,23 @@ impl Store for SqliteStore {
         row.as_ref().map(knowledge_package_from_row).transpose()
     }
 
+    async fn list_knowledge_packages(&self) -> StoreResult<Vec<StoredKnowledgePackage>> {
+        let rows = sqlx::query(
+            "SELECT package_id, source, package_sha256, version, catalog_version, \
+             template_version, policy_version, purpose_version, parser_abi, signed_by, \
+             cached_path, created_by, created_at \
+             FROM knowledge_package ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list knowledge packages"))?;
+        let mut packages = Vec::with_capacity(rows.len());
+        for row in rows {
+            packages.push(knowledge_package_from_row(&row)?);
+        }
+        Ok(packages)
+    }
+
     async fn knowledge_active(&self) -> StoreResult<Option<StoredKnowledgeActive>> {
         let row = sqlx::query(
             "SELECT package_id, generation, activated_by, activated_at \
@@ -2444,6 +2461,49 @@ impl Store for SqliteStore {
             activated_by: activation.requested_by.to_string(),
             activated_at: activation.created_at.to_string(),
         })
+    }
+
+    async fn list_knowledge_activations(
+        &self,
+        limit: u64,
+    ) -> StoreResult<Vec<StoredKnowledgeActivation>> {
+        let rows = sqlx::query(
+            "SELECT from_package, to_package, generation, reason, requested_by, created_at \
+             FROM knowledge_activation_log ORDER BY id DESC LIMIT ?1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list knowledge activations"))?;
+        let mut activations = Vec::with_capacity(rows.len());
+        for row in rows {
+            activations.push(StoredKnowledgeActivation {
+                from_package: column!(row, "from_package"),
+                to_package: column!(row, "to_package"),
+                generation: column!(row, "generation"),
+                reason: column!(row, "reason"),
+                requested_by: column!(row, "requested_by"),
+                created_at: column!(row, "created_at"),
+            });
+        }
+        Ok(activations)
+    }
+
+    async fn standing_work_catalog_versions(&self) -> StoreResult<Vec<(i64, u64)>> {
+        // 只数**在跑**的（active / paused）：superseded / revoked 是历史事实，
+        // 把它们算进来会让“还有多少锁在旧版”看着永远清不完。
+        let rows = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT catalog_version, COUNT(*) FROM standing_work \
+             WHERE status IN ('active', 'paused') GROUP BY catalog_version \
+             ORDER BY catalog_version",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "count standing work catalog versions"))?;
+        Ok(rows
+            .into_iter()
+            .map(|(version, count)| (version, count.max(0) as u64))
+            .collect())
     }
 }
 
