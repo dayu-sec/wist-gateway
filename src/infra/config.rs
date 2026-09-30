@@ -1500,6 +1500,50 @@ environment_id = "env-default"
     }
 
     #[test]
+    fn knowledge_signing_public_key_is_loaded_and_must_parse() {
+        // 不配 → 不验签（现有部署不受影响）。
+        let path = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&path).expect("load config");
+        assert!(config.knowledge_signing_public_key.is_none());
+        assert!(config.knowledge_signing_public_key_file.is_none());
+
+        // 配了合法公钥 → 装载出**裸公钥**（验签用的那 32 字节）。
+        let rng = ring_rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate key");
+        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse key");
+        let raw = key_pair.public_key().as_ref().to_vec();
+        let pem = crate::infra::ed25519_public_key_pem_for_tests(&raw);
+        let pem_path = write_temp_file(&pem);
+        let path = write_temp_config(&format!(
+            "[knowledge]\nsigning_public_key_file = \"{}\"\n\n{}",
+            pem_path.display(),
+            config_with_purpose("")
+        ));
+        let config = AdminConfig::load_from_path(&path).expect("load config");
+        assert_eq!(
+            config.knowledge_signing_public_key.as_deref(),
+            Some(raw.as_slice())
+        );
+        assert_eq!(
+            config.knowledge_signing_public_key_file.as_deref(),
+            Some(pem_path.as_path())
+        );
+
+        // 配了个不是公钥的文件 → **拒绝启动**：它是信任锚，含糊地接受比验不了更糟。
+        let bad_path = write_temp_file("not a pem");
+        let path = write_temp_config(&format!(
+            "[knowledge]\nsigning_public_key_file = \"{}\"\n\n{}",
+            bad_path.display(),
+            config_with_purpose("")
+        ));
+        let err = AdminConfig::load_from_path(&path).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("knowledge signing public key"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn content_files_are_none_when_unset_or_blank() {
         let unset = write_temp_config(&config_with_purpose(""));
         let config = AdminConfig::load_from_path(&unset).expect("config loads");
