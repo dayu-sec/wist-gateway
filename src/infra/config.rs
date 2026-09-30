@@ -70,6 +70,10 @@ pub struct AdminConfig {
     /// 数据面订阅端的内部接入端点（明文 HTTP，只应绑环回）。
     /// `None` = 关闭订阅（见 [`RawIngestConfig`]）。
     pub ingest_listen_addr: Option<String>,
+    /// 知识库内容包的签名公钥文件（Ed25519 SPKI PEM）。`None` = 不验签（只记 sha256）。
+    pub knowledge_signing_public_key_file: Option<PathBuf>,
+    /// 上面那个文件解析出的**裸公钥**（32 字节）。验签用它，省得每次重解 PEM。
+    pub knowledge_signing_public_key: Option<Vec<u8>>,
 }
 
 pub use wist_error::ConfigError;
@@ -100,6 +104,21 @@ struct RawAdminConfig {
     content: RawContentConfig,
     #[serde(default)]
     ingest: RawIngestConfig,
+    #[serde(default)]
+    knowledge: RawKnowledgeConfig,
+}
+
+/// `[knowledge]` 段：知识库内容包的**信任配置**（设计 §9）。
+///
+/// 缺省 = 不验签：录入只记 sha256（M1 行为）。
+/// 给了公钥就**必须**验过签名才允许录入 —— 与安装脚本那把密钥同一简单度：
+/// 一把钥匙，不做多密钥共存，轮换就是换文件 + 重启。
+#[derive(Debug, Default, Deserialize)]
+struct RawKnowledgeConfig {
+    /// 签名公钥（Ed25519，SPKI PEM，相对配置目录）。只验签，不需要私钥 ——
+    /// 私钥在发布侧（wist-knowledge 的 CI），网关永远拿不到也不应该拿到。
+    #[serde(default)]
+    signing_public_key_file: Option<String>,
 }
 
 /// `[ingest]` 段：数据面（warp-parse）**订阅端**的内部接入端点。
@@ -246,6 +265,35 @@ impl AdminConfig {
                 &raw.agent.install_script_signing_private_key_file,
             )?),
         );
+        // 知识库内容包的验签公钥：只读**公钥**（私钥在发布侧，网关不持有）。
+        // 格式错就地拒绝启动 —— 它是信任锚，含糊地接受比验不了更糟。
+        let knowledge_signing_public_key_file = normalize_optional(
+            raw.knowledge
+                .signing_public_key_file
+                .as_deref()
+                .map(expand_env)
+                .transpose()?,
+        )
+        .map(|value| absolutize_path(config_dir, Path::new(&value)));
+        let knowledge_signing_public_key = match knowledge_signing_public_key_file.as_deref() {
+            Some(path) => {
+                let pem = fs::read_to_string(path).map_err(|err| {
+                    config_validation(format!(
+                        "failed to read knowledge signing public key {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                Some(
+                    crate::infra::parse_ed25519_public_key_pem(&pem).map_err(|err| {
+                        config_validation(format!(
+                            "invalid knowledge signing public key {}: {err}",
+                            path.display()
+                        ))
+                    })?,
+                )
+            }
+            None => None,
+        };
         require_non_empty("server.admin_api_token", &admin_api_token)?;
         require_min_secret_length(
             "server.admin_api_token",
@@ -331,6 +379,8 @@ impl AdminConfig {
                 None => Some(DEFAULT_INGEST_LISTEN_ADDR.to_string()),
                 Some(value) => normalize_optional(Some(expand_env(value)?)),
             },
+            knowledge_signing_public_key_file,
+            knowledge_signing_public_key,
         })
     }
 
@@ -884,6 +934,8 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         content_packs_file: None,
         content_templates_file: None,
         ingest_listen_addr: None,
+        knowledge_signing_public_key_file: None,
+        knowledge_signing_public_key: None,
     }
 }
 

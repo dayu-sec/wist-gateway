@@ -249,6 +249,8 @@ pub enum KnowledgeRecordError {
     ManifestInconsistent(String),
     /// 内容不合法（真实装载器校验不过）。
     ContentInvalid(String),
+    /// 配了验签公钥，但签名缺失 / 验不过 / 格式错。
+    SignatureInvalid(String),
     /// 落库失败。
     Store(String),
 }
@@ -262,6 +264,7 @@ impl KnowledgeRecordError {
             Self::DigestMismatch(_) => "package_sha256_mismatch",
             Self::ManifestInconsistent(_) => "package_manifest_inconsistent",
             Self::ContentInvalid(_) => "package_content_invalid",
+            Self::SignatureInvalid(_) => "package_signature_invalid",
             Self::Store(_) => "package_store_failed",
         }
     }
@@ -275,6 +278,7 @@ impl fmt::Display for KnowledgeRecordError {
             | Self::DigestMismatch(message)
             | Self::ManifestInconsistent(message)
             | Self::ContentInvalid(message)
+            | Self::SignatureInvalid(message)
             | Self::Store(message) => f.write_str(message),
         }
     }
@@ -344,6 +348,25 @@ pub async fn record_package(
     }
     let package_id = package_id_for_sha256(&sha256);
 
+    // 验签（设计 §9）：配了公钥就**必须**过。签名放在 `<来源>.sig`（发布侧同名 + `.sig`）。
+    // 网关只拿公钥 —— 私钥在发布侧（wist-knowledge 的 CI），网关永远拿不到也不应该拿到。
+    let signed_by = match config.knowledge_signing_public_key.as_deref() {
+        Some(public_key) => {
+            let signature = read_signature(source).await?;
+            // 签的是**摘要的十六进制文本**：与 `*.sha256` 里那串是同一段字节，
+            // 运维拿 openssl 能手工重验；签裸 tarball 反而要先生成摘要。
+            if !crate::infra::verify_ed25519(public_key, sha256.as_bytes(), &signature) {
+                return Err(KnowledgeRecordError::SignatureInvalid(format!(
+                    "签名验不过：{source}.sig 与 {source} 的 sha256（{sha256}）对不上 —— \
+                     包被动过，或签名不是这套发布私钥签的"
+                )));
+            }
+            crate::infra::public_key_fingerprint(public_key)
+        }
+        // 未配公钥 = 不验签，只记摘要（M1 行为）。
+        None => String::new(),
+    };
+
     // 解到临时目录：校验没过之前，半成品不进 `<state>/knowledge/`。
     let staging = config
         .knowledge_dir()
@@ -406,7 +429,7 @@ pub async fn record_package(
         policy_version: validated.policy_version,
         purpose_version: validated.purpose_version,
         parser_abi: 1,
-        signed_by: String::new(),
+        signed_by,
         cached_path: cached_path.to_string_lossy().to_string(),
         created_by: created_by.to_string(),
         created_at: created_at.to_string(),
@@ -587,6 +610,31 @@ fn manifest_template_version(manifest: &PackageManifest) -> Option<i64> {
         }
         _ => None,
     }
+}
+
+/// 读 `<来源>.sig` 并解 base64。
+///
+/// 为什么签名文件跟着来源名走：发布侧产物就是 `wist-knowledge-<版本>.tar.gz` + `.sha256` + `.sig`，
+/// 三者同名不同后缀。离线投放时一起拷进 `packages/`，不用在管理面多填一个字段。
+async fn read_signature(source: &str) -> Result<Vec<u8>, KnowledgeRecordError> {
+    use base64::Engine as _;
+
+    let path = format!("{source}.sig");
+    let bytes = read_source(&path).await.map_err(|err| match err {
+        // 配了公钥就必须有签名：这里把"来源拿不到"重述成"签名缺失"，
+        // 否则运维看到的是 `读不到来源 …tar.gz.sig`，容易误以为是包本身坏了。
+        KnowledgeRecordError::SourceUnavailable(message) => KnowledgeRecordError::SignatureInvalid(
+            format!("{message}（配了验签公钥，就必须提供 `<来源>.sig`）"),
+        ),
+        other => other,
+    })?;
+    let text = String::from_utf8(bytes)
+        .map_err(|err| KnowledgeRecordError::SignatureInvalid(format!("{path} 不是文本：{err}")))?;
+    base64::engine::general_purpose::STANDARD
+        .decode(text.trim())
+        .map_err(|err| {
+            KnowledgeRecordError::SignatureInvalid(format!("{path} 不是合法 base64：{err}"))
+        })
 }
 
 /// 读来源字节：`https://` 走 HTTP，`/absolute/path` 读本机文件（容器内路径）。
@@ -880,6 +928,107 @@ mod tests {
         );
     }
 
+    // ── 验签（设计 §9：一把公钥，与安装脚本同一简单度）──────────────────
+
+    /// 配了公钥 → 只接受 **发布侧那把私钥**签过的包，并记下公钥指纹。
+    #[tokio::test]
+    async fn verifies_the_release_signature_when_a_public_key_is_configured() {
+        let store: Arc<dyn Store> = Arc::new(
+            crate::infra::SqliteStore::connect("sqlite::memory:")
+                .await
+                .expect("store"),
+        );
+        let (mut config, root) = test_config();
+        let signing = crate::test_support::knowledge_signing_key(&root);
+        config.knowledge_signing_public_key = Some(signing.public_raw.clone());
+        config.knowledge_signing_public_key_file = Some(signing.public_pem_path.clone());
+        let tarball = build_package_tarball(&root, false);
+        crate::test_support::sign_knowledge_package(&tarball, &signing.private_key);
+
+        let recorded = record(&store, &config, tarball.to_str().expect("path"))
+            .await
+            .expect("record signed package");
+        let row = store
+            .knowledge_package(&recorded.package_id)
+            .await
+            .expect("read")
+            .expect("row");
+        // 指纹落库：换钥匙后回头看旧行，能看出它们是被不同锚接受的。
+        assert_eq!(
+            row.signed_by,
+            crate::infra::public_key_fingerprint(&signing.public_raw)
+        );
+        assert!(!row.signed_by.is_empty());
+    }
+
+    /// 配了公钥但包没签名 → 拒。
+    #[tokio::test]
+    async fn refuses_an_unsigned_package_when_a_public_key_is_configured() {
+        let store: Arc<dyn Store> = Arc::new(
+            crate::infra::SqliteStore::connect("sqlite::memory:")
+                .await
+                .expect("store"),
+        );
+        let (mut config, root) = test_config();
+        let signing = crate::test_support::knowledge_signing_key(&root);
+        config.knowledge_signing_public_key = Some(signing.public_raw.clone());
+        let tarball = build_package_tarball(&root, false);
+
+        let err = record(&store, &config, tarball.to_str().expect("path"))
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.code(), "package_signature_invalid");
+        assert!(err.to_string().contains(".sig"), "{err}");
+    }
+
+    /// 签名被动过一个字节 → 拒（换包或换签名都过不了）。
+    #[tokio::test]
+    async fn refuses_a_tampered_signature() {
+        let store: Arc<dyn Store> = Arc::new(
+            crate::infra::SqliteStore::connect("sqlite::memory:")
+                .await
+                .expect("store"),
+        );
+        let (mut config, root) = test_config();
+        let signing = crate::test_support::knowledge_signing_key(&root);
+        config.knowledge_signing_public_key = Some(signing.public_raw.clone());
+        let tarball = build_package_tarball(&root, false);
+        let sig = crate::test_support::sign_knowledge_package(&tarball, &signing.private_key);
+        // 把签名的最后一个 base64 字符换掉：内容合法、形状合法，就是验不过。
+        let text = fs::read_to_string(&sig).expect("read sig");
+        let mut chars: Vec<char> = text.trim().chars().collect();
+        let last = chars.len() - 1;
+        chars[last] = if chars[last] == 'A' { 'B' } else { 'A' };
+        fs::write(&sig, chars.into_iter().collect::<String>()).expect("write sig");
+
+        let err = record(&store, &config, tarball.to_str().expect("path"))
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.code(), "package_signature_invalid");
+    }
+
+    /// 没配公钥 → 不验签（只记摘要），否则今天所有部署都会突然录不进包。
+    #[tokio::test]
+    async fn skips_signature_check_when_no_public_key_is_configured() {
+        let store: Arc<dyn Store> = Arc::new(
+            crate::infra::SqliteStore::connect("sqlite::memory:")
+                .await
+                .expect("store"),
+        );
+        let (config, root) = test_config();
+        assert!(config.knowledge_signing_public_key.is_none());
+        let tarball = build_package_tarball(&root, false);
+        let recorded = record(&store, &config, tarball.to_str().expect("path"))
+            .await
+            .expect("record unsigned package");
+        let row = store
+            .knowledge_package(&recorded.package_id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(row.signed_by.is_empty(), "没验签就不该声称有签发者");
+    }
+
     /// 一个只用来定位临时目录的配置：知识库目录与 sqlite 同址（与真实部署同一约定）。
     fn test_config() -> (AdminConfig, std::path::PathBuf) {
         let root = crate::test_support::unique_temp_dir("wist-knowledge-rec");
@@ -892,6 +1041,9 @@ mod tests {
     /// 默认跳过（要真制品），显式跑：
     /// `WIST_KNOWLEDGE_TEST_PACKAGE=<tar.gz> cargo test -- --ignored records_the_real_artifact`
     /// 它验的是**契约**：打包脚本产出的 manifest 形状网关真能吃下。
+    ///
+    /// 再加 `WIST_KNOWLEDGE_TEST_PUBKEY=<knowledge-signing.pub.pem>` 则一并验签 ——
+    /// 这一步连的是**跨工具**契约：发布侧 openssl 签、网关（ring）验，两边不各自为政。
     #[tokio::test]
     #[ignore = "需要真实制品：设 WIST_KNOWLEDGE_TEST_PACKAGE 后加 --ignored 跑"]
     async fn records_the_real_artifact() {
@@ -902,7 +1054,12 @@ mod tests {
                 .await
                 .expect("store"),
         );
-        let (config, _root) = test_config();
+        let (mut config, _root) = test_config();
+        if let Ok(public_key_path) = std::env::var("WIST_KNOWLEDGE_TEST_PUBKEY") {
+            let pem = fs::read_to_string(&public_key_path).expect("读验签公钥");
+            config.knowledge_signing_public_key =
+                Some(crate::infra::parse_ed25519_public_key_pem(&pem).expect("解析验签公钥"));
+        }
         let recorded = record(&store, &config, &path)
             .await
             .expect("record real artifact");
@@ -921,5 +1078,11 @@ mod tests {
                 .map(|set| set.catalog_version),
             Some(2)
         );
+        if config.knowledge_signing_public_key.is_some() {
+            assert!(
+                !row.signed_by.is_empty(),
+                "配了公钥且验签通过，就该记下签发者指纹"
+            );
+        }
     }
 }

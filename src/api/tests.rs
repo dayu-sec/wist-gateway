@@ -6613,6 +6613,9 @@ impl TestEnv {
             content_templates_file,
             // 内部接入端点默认关：测试走 `router()`，明文监听由 main.rs 单独起。
             ingest_listen_addr: None,
+            // 知识库包默认不验签（要验签的用例自己把公钥填上）。
+            knowledge_signing_public_key_file: None,
+            knowledge_signing_public_key: None,
         };
         // A temp-file DB (not `:memory:`) because the router may use several
         // pooled connections; `SqliteStore` is `Clone` and shares the same pool.

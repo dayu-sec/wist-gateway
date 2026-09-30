@@ -150,15 +150,15 @@ fn knowledge_error(status: StatusCode, code: &'static str, message: String) -> R
 }
 
 fn record_error_response(err: KnowledgeRecordError) -> Response {
-    // 状态码按"谁能修"分：来源/摘要错是**填错了**（400）；内容不合法是**包不对**（422）；
+    // 状态码按"谁能修"分：来源/摘要错是**填错了**（400）；内容/签名不合法是**包不对**（422）；
     // 来源拿不到是**环境问题**（502）；落库失败是服务端（500）。
     let status = match &err {
         KnowledgeRecordError::SourceInvalid(_) | KnowledgeRecordError::DigestMismatch(_) => {
             StatusCode::BAD_REQUEST
         }
-        KnowledgeRecordError::ManifestInconsistent(_) | KnowledgeRecordError::ContentInvalid(_) => {
-            StatusCode::UNPROCESSABLE_ENTITY
-        }
+        KnowledgeRecordError::ManifestInconsistent(_)
+        | KnowledgeRecordError::ContentInvalid(_)
+        | KnowledgeRecordError::SignatureInvalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
         KnowledgeRecordError::SourceUnavailable(_) => StatusCode::BAD_GATEWAY,
         KnowledgeRecordError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };

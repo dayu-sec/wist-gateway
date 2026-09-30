@@ -28,7 +28,12 @@ const MACHINE_CLASSES: &[&str] = &["MacDaily", "MacDev", "LinuxCompute", "LinuxD
 ///
 /// TOML 形状是 `purpose_version = <n>` + `[[rule_set]]` + `[[rule_set.rules]]`，
 /// 因此字段名就是 `rule_set`。
+///
+/// **`deny_unknown_fields`**：与 `content.rs` / 发现策略表同一口径 —— 策展侧写了一个本版网关
+/// 不认识的键，要**当场报错**，不能静默忽略。忽略的后果是“内容看着生效了，行为却没变”，
+/// 而且新内容配旧网关时最难查（这也是不另造 `parser_abi` 字段的理由）。
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PurposeRuleTable {
     /// 规则表版本（**必填**，且 >= 1）。
     ///
@@ -46,6 +51,7 @@ pub struct PurposeRuleTable {
 
 /// 某一平台的规则全集（对应模型 `PurposeRuleSet`）。
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PurposeRuleSet {
     pub rule_set_id: String,
     /// `macos` / `linux`（与 agentd 上报的 `os` 同源：`std::env::consts::OS`）。
@@ -78,6 +84,7 @@ fn default_min_support() -> i64 {
 
 /// 一条规则（对应模型 `PurposeRule`）。
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PurposeRule {
     pub rule_id: String,
     /// `process` / `process_path` / `listen_port` / `package` / `unit`。
@@ -114,9 +121,14 @@ pub fn load_rule_table(path: &Path) -> ConfigResult<PurposeRuleTable> {
 
 /// 解析规则表文本（测试与热加载都用它，避免只能通过文件系统验证）。
 pub fn parse_rule_table(text: &str) -> ConfigResult<PurposeRuleTable> {
-    // 与 config.rs 一致：toml 的 error 走 `source_raw_err`，`source_err` 的 trait bound 不满足。
-    let mut table: PurposeRuleTable =
-        toml::from_str(text).source_raw_err(ConfigReason::Parse, "parse purpose rule table")?;
+    // 注意：与 `config.rs` 的 `source_raw_err` 不同，这里把 toml 的原话**放进 detail**。
+    // 因为 `deny_unknown_fields` 的价值就在那一句里（“unknown field `future_knob`”）——
+    // 而 `source_raw_err` 的 Display 只给一句固定文案，字段名会丢。
+    let mut table: PurposeRuleTable = toml::from_str(text).map_err(|err| {
+        ConfigReason::Parse
+            .to_err()
+            .with_detail(format!("parse purpose rule table: {err}"))
+    })?;
     validate_rule_table(&mut table)?;
     Ok(table)
 }
@@ -773,6 +785,16 @@ weight = 30
         .expect("suggestion");
         assert_eq!(supported.suggested_class, "MacDev");
         assert_eq!(supported.confidence, 100);
+    }
+
+    #[test]
+    fn rejects_an_unknown_key_instead_of_ignoring_it() {
+        // deny_unknown_fields：策展侧写了一个本版网关不认识的键，必须**当场报错**。
+        // 静默忽略的后果是“内容看着生效了，行为却没变”，而且新内容配旧网关时最难查。
+        let text = "purpose_version = 1\n[[rule_set]]\nrule_set_id = \"x\"\nplatform = \"macos\"\nmin_support = 1\nfuture_knob = 1\n";
+        let err = parse_rule_table(text).expect_err("unknown key must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("future_knob"), "{message}");
     }
 
     #[test]
