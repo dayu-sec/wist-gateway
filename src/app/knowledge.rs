@@ -439,11 +439,20 @@ pub async fn record_package(
         .await
         .map_err(|err| KnowledgeRecordError::Store(format!("落库失败：{err}")))?;
 
+    // `load_package_dir` 装出来的这一份 `source` 还是默认的 `None`，而 `activate: true` 的
+    // 一次性路径会把 `loaded` **直接**交给 `activate_loaded`，它只认 `KnowledgeSource::Package`。
+    // 在这里补上标签 —— 与 `load_recorded_package` 同一口径（两条激活路径的输入必须同形）；
+    // 少了这一步，那条路径必然以 HTTP 500「内部错误：切的是未登记的包」收场。
+    let mut loaded = validated.loaded;
+    loaded.source = KnowledgeSource::Package {
+        package_id: package_id.clone(),
+    };
+
     Ok(RecordedKnowledge {
         package_id,
         sha256,
         cached_path,
-        loaded: validated.loaded,
+        loaded,
     })
 }
 

@@ -11,6 +11,8 @@ pub mod install_signing;
 pub use install_signing::*;
 pub mod secret;
 pub use secret::*;
+pub mod single_instance;
+pub use single_instance::*;
 pub mod sqlite_store;
 pub use sqlite_store::*;
 pub mod store;

@@ -3,6 +3,22 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.10-alpha] - 2026-09-30
+
+### 变更
+
+- **Agent 身份收口为客户端证书（mTLS），删除 bearer 凭据**：agent 的日常上报 / 派活 / 数据面 /
+  取包 / 续期都**只认 CA 签的客户端证书**，不再解析 `Authorization` 头；注册回包只下发客户端证书，
+  不再下发 bearer token。
+- **升级取包只接受 bootstrap token（新装）或客户端证书（升级）**，凭据 token 取包路径删除。
+- **注册要求带 CSR**：未配 agent CA 或未带 CSR 直接拒绝（不再静默回落 bearer）。
+
+### 修复
+
+- **库丢失 / 换网关后的“自愈重建”能正常续期**：此前重建登记的实例未知，会把自愈后的第一次
+  证书续期误判为 401；现已放行（身份已由证书验明）。
+- 升级取包不再接受「未登记 / 已删除」agent 的证书。
+
 ## [0.1.9-alpha] - 2026-09-29
 
 ### 变更

@@ -30,7 +30,8 @@ pub fn load_rustls_server_config(
 ///
 /// - **首次注册**的 agent 还没有证书，强制要求会在握手就把它挡在外面；
 /// - 「无证书」不等于「未鉴权」——注册靠 bootstrap token，其余 agent 面路由由应用层
-///   `authenticate_agent` 按「bearer 或证书身份」判定（见 `docs/design/agent-identity-mtls.md` §5.4）。
+///   `authenticate_agent` **只凭客户端证书**判定（bearer 双轨已删，见
+///   `docs/design/agent-identity-mtls.md` §5.2）。
 ///
 /// 出示了证书就一定会被验证（链 + 有效期 + `EKU=clientAuth`）；有证书但验不过，握手仍会失败。
 pub fn load_agent_mtls_server_config(

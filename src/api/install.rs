@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -10,7 +10,8 @@ use axum::{
 use crate::infra::{
     AdminConfig, BootstrapTokenCheck, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
     Store, StoreResult, StoredAgentUplinkAddress, StoredEnrollmentToken,
-    StoredEnrollmentTokenStatus, new_secret_token, sha256_hex, sign_install_script,
+    StoredEnrollmentTokenStatus, VerifiedAgentIdentity, new_secret_token, sha256_hex,
+    sign_install_script,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use ring::digest::{SHA256, digest};
@@ -183,11 +184,19 @@ pub async fn get_agent_initial_config_with_token(
 
 pub async fn download_agent_package(
     State(state): State<ApiState>,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     headers: HeaderMap,
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
-    if let Err(response) = authorize_package_download(&state, &headers, &client_key).await {
+    if let Err(response) = authorize_package_download(
+        &state,
+        client_identity.as_ref().map(|identity| &identity.0),
+        &headers,
+        &client_key,
+    )
+    .await
+    {
         return response;
     }
     let Some(package_path) = effective_package_path(&state.config, &state.store).await else {
@@ -227,11 +236,19 @@ pub async fn download_agent_package(
 pub async fn download_agent_package_by_id(
     State(state): State<ApiState>,
     Path(package_id): Path<String>,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     headers: HeaderMap,
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
-    if let Err(response) = authorize_package_download(&state, &headers, &client_key).await {
+    if let Err(response) = authorize_package_download(
+        &state,
+        client_identity.as_ref().map(|identity| &identity.0),
+        &headers,
+        &client_key,
+    )
+    .await
+    {
         return response;
     }
     let entry = match state
@@ -276,52 +293,61 @@ pub async fn download_agent_package_by_id(
     }
 }
 
-/// 安装包分发端点的鉴权：接受 **bootstrap（注册）token 或 agent 凭据** 二者其一。
+/// 安装包分发端点的鉴权：接受 **bootstrap（注册）token 或 agent 客户端证书** 二者其一。
 ///
-/// 为什么要放两个：新装场景手上是注册 token；而升级场景的机器没有 enrollment
-/// token，只有自己的 agent 凭据，升级器发的是 `Bearer <agent credential>`。两者都是
-/// 「可信的舰队成员」，且包本身不是秘密（install.sh 会内嵌下载地址与摘要）。
+/// 为什么要两个入口：新装场景手上是注册 token（agent 还没证书）；而升级场景的机器没有
+/// enrollment token，靠 mTLS 出示自己的客户端证书（升级器 `/current` 或按 id 取包）。
+/// 两者都是「可信的舰队成员」，且包本身不是秘密（install.sh 会内嵌下载地址与摘要）。
+///
+/// **bearer 凭据路径已随双轨一起删除**（§7 收口）：机器一方的身份只有客户端证书这一条。
 ///
 /// 限流沿用现有 `BOOTSTRAP_AUTH_SCOPE`：这是同一个端点上的**一次**鉴权决策，
 /// 桶按客户端 IP 分；沿用旧 scope 能保持 `/current` 现有行为不变（不新立 scope）。
 #[allow(clippy::result_large_err)]
 async fn authorize_package_download(
     state: &ApiState,
+    client_identity: Option<&VerifiedAgentIdentity>,
     headers: &HeaderMap,
     client_key: &str,
 ) -> Result<(), Response> {
     if let Some(response) = rate_limit::check_rate_limit(state, client_key, BOOTSTRAP_AUTH_SCOPE) {
         return Err(response);
     }
+    // 先按 mTLS 客户端证书（升级路径），再按引导 token（新装路径）。
+    if client_identity.is_some() {
+        return match super::agent_ops::authorize_agent_certificate(state, client_identity).await {
+            Ok(()) => {
+                rate_limit::clear_auth_failures(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+                Ok(())
+            }
+            Err(reason) => {
+                rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+                eprintln!(
+                    "audit package_download_rejected reason=invalid_certificate detail={reason}"
+                );
+                Err(unauthorized_no_store("invalid agent client certificate"))
+            }
+        };
+    }
     let Some(token) = bootstrap_bearer_token(headers) else {
         rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
         // 对外仍是一句不可区分的口径；具体原因只进服务端审计日志（**不记 token 本身**）。
-        eprintln!("audit package_download_rejected reason=missing_token");
+        eprintln!("audit package_download_rejected reason=missing_credential");
         return Err(unauthorized_no_store(
-            "agent package download requires a bootstrap or agent bearer token",
+            "agent package download requires a bootstrap token or a client certificate",
         ));
     };
-    // 先按引导 token 校验（现有安装路径），再按 agent 凭据（升级路径）。
-    if validate_bootstrap_token_for_config(&state.config, &state.store, token)
-        .await
-        .is_ok()
-    {
-        rate_limit::clear_auth_failures(state, client_key, BOOTSTRAP_AUTH_SCOPE);
-        return Ok(());
-    }
-    match super::agent_ops::authenticate_agent_credential_token(state, token).await {
+    match validate_bootstrap_token_for_config(&state.config, &state.store, token).await {
         Ok(()) => {
             rate_limit::clear_auth_failures(state, client_key, BOOTSTRAP_AUTH_SCOPE);
             Ok(())
         }
         Err(reason) => {
             rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
-            // 分辨「没带 token」与「带了但不被接受」是排障关键：前者是升级器太旧 / 没注入凭据，
-            // 后者是凭据过期/被吊销/不在本网关。对外仍是同一句口径。
-            eprintln!("audit package_download_rejected reason=invalid_token detail={reason}");
-            Err(unauthorized_no_store(
-                "invalid bootstrap or agent bearer token",
-            ))
+            eprintln!(
+                "audit package_download_rejected reason=invalid_bootstrap_token detail={reason}"
+            );
+            Err(unauthorized_no_store("invalid bootstrap token"))
         }
     }
 }

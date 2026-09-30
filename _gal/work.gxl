@@ -45,7 +45,6 @@ mod main  {
   #[task(name="pub to local")]
   flow _pub_local   {
     gx.cmd (  "mkdir -p ${MAIN_HOME_BIN}" );
-    gx.cmd (  "cp ${MAIN_BLD_BINS}/jumo ${MAIN_HOME_BIN}/"  );
-    gx.cmd (  "cp ${MAIN_BLD_BINS}/jumo-studio ${MAIN_HOME_BIN}/"  );
+    gx.cmd (  "cp ${MAIN_BLD_BINS}/wist-gateway ${MAIN_HOME_BIN}/"  );
   }
 }

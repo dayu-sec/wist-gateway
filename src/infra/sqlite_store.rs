@@ -93,6 +93,22 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
+/// 凭据轮换时的实例校验。
+///
+/// 首触重建登记（`register_agent_from_certificate`）故意把 `current_instance_id` 留 NULL ——
+/// 那时实例本来就未知。身份已由**客户端证书**验明，再拿一个未知实例去卡续期只会让
+/// 「库丢 / 换网关 → 自愈重建」后第一次续期白撞 401（待状态上报补齐实例才能过）。
+/// 所以：**库里实例未知（NULL/空）→ 放行；已知 → 必须相等**。
+fn instance_matches(stored_instance: Option<&str>, requested_instance: &str) -> bool {
+    match stored_instance
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(stored) => stored == requested_instance,
+        None => true,
+    }
+}
+
 /// SQLite 没有无符号整数类型，`u64` 也不实现 `Encode`（可能溢出 i64），
 /// 因此写入前显式收敛到 i64；读取侧由 sqlx 的 `u64` decode 做溢出检查。
 fn to_sql_int(value: Option<u64>) -> Option<i64> {
@@ -809,11 +825,11 @@ impl Store for SqliteStore {
             .map_err(|err| sql_error(err, "insert agent instance"))?;
         }
 
-        // ④ 凭据
+        // ④ 凭据（auth_scheme = certificate；token_hash 列存的是证书指纹）
         sqlx::query(
             "INSERT INTO agent_credentials (credential_id, agent_id, instance_id, auth_scheme, \
              token_hash, status, issued_at, expires_at, revoked_at) \
-             VALUES (?1, ?2, ?3, 'bearer', ?4, 'active', ?5, ?6, NULL)",
+             VALUES (?1, ?2, ?3, 'certificate', ?4, 'active', ?5, ?6, NULL)",
         )
         .bind(request.credential_id)
         .bind(request.agent_id)
@@ -940,22 +956,6 @@ impl Store for SqliteStore {
             .fetch_optional(&self.pool)
             .await
             .map_err(|err| sql_error(err, "select agent"))?;
-        row.as_ref().map(agent_from_row).transpose()
-    }
-
-    async fn find_agent_by_credential_token_hash(
-        &self,
-        token_hash: &str,
-    ) -> StoreResult<Option<StoredAgentRegistration>> {
-        // 只匹配「当前凭据」：投影的 `c` 是 agents.current_credential_id 指向的那一行，
-        // 所以轮换/吊销过的旧凭据不会命中（与 authenticate_agent 的口径一致）。
-        let mut builder = QueryBuilder::<Sqlite>::new(AGENT_PROJECTION);
-        builder.push(" WHERE c.token_hash = ").push_bind(token_hash);
-        let row = builder
-            .build()
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|err| sql_error(err, "select agent by credential token hash"))?;
         row.as_ref().map(agent_from_row).transpose()
     }
 
@@ -1495,8 +1495,10 @@ impl Store for SqliteStore {
         let token_hash: Option<String> = column!(row, "token_hash");
         let status: Option<String> = column!(row, "status");
 
-        let matches = current_instance.as_deref() == Some(request.instance_id)
-            && token_hash.as_deref() == Some(request.current_token_hash)
+        let matches = instance_matches(current_instance.as_deref(), request.instance_id)
+            && request
+                .current_token_hash
+                .is_none_or(|hash| token_hash.as_deref() == Some(hash))
             && credential_id.is_some()
             && status.as_deref().map(StoredCredentialStatus::parse)
                 == Some(StoredCredentialStatus::Active);
@@ -1519,11 +1521,12 @@ impl Store for SqliteStore {
         sqlx::query(
             "INSERT INTO agent_credentials (credential_id, agent_id, instance_id, auth_scheme, \
              token_hash, status, issued_at, expires_at, revoked_at) \
-             VALUES (?1, ?2, ?3, 'bearer', ?4, 'active', ?5, ?6, NULL)",
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, NULL)",
         )
         .bind(request.new_credential_id)
         .bind(request.agent_id)
         .bind(request.instance_id)
+        .bind(request.auth_scheme)
         .bind(request.new_token_hash)
         .bind(request.issued_at)
         .bind(request.expires_at)
@@ -2806,6 +2809,78 @@ mod tests {
         assert_eq!(agent.node_id, "");
     }
 
+    /// 首触重建的登记（`current_instance_id` 为 NULL）**也能续期**。
+    ///
+    /// 身份已由客户端证书验明；重建时实例本来就未知，若拿「实例必须相等」去卡，
+    /// 「库丢 / 换网关 → 自愈重建」后的第一次续期会白撞 `Ok(false)` → 401。
+    #[tokio::test]
+    async fn renews_a_credential_for_an_agent_rebuilt_from_certificate() {
+        let store = store().await;
+        store
+            .register_agent_from_certificate(&cert_registration(
+                "agent-rebuilt",
+                "cert-1",
+                "fingerprint-1",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ))
+            .await
+            .unwrap();
+
+        // 重建故意不填实例 → 投影退化为空串（与网关发请求时取到的值一致）。
+        let agent = store
+            .get_agent("agent-rebuilt")
+            .await
+            .unwrap()
+            .expect("agent");
+        assert_eq!(agent.instance_id, "");
+
+        let renewed = store
+            .renew_agent_credential(&RenewCredential {
+                agent_id: "agent-rebuilt",
+                instance_id: "",
+                current_token_hash: None,
+                new_credential_id: "cert-2",
+                new_token_hash: "fingerprint-2",
+                auth_scheme: "certificate",
+                issued_at: "2026-02-01T00:00:00+00:00",
+                expires_at: "2027-01-01T00:00:00+00:00",
+            })
+            .await
+            .unwrap();
+        assert!(renewed, "身份由证书验明；实例未知不该把续期卡成 401");
+
+        let after = store
+            .get_agent("agent-rebuilt")
+            .await
+            .unwrap()
+            .expect("agent");
+        assert_eq!(after.credential_id, "cert-2");
+        assert_eq!(after.credential_token_hash, "fingerprint-2");
+    }
+
+    /// 实例**已知**时仍要校验：拿别的实例来续期必须被拒（守住原来的语义）。
+    #[tokio::test]
+    async fn renews_refuse_a_known_instance_mismatch() {
+        let store = store().await;
+        register(&store, "hash-m", "agent-1", "inst-1").await;
+
+        let refused = store
+            .renew_agent_credential(&RenewCredential {
+                agent_id: "agent-1",
+                instance_id: "some-other-instance",
+                current_token_hash: None,
+                new_credential_id: "cred-x",
+                new_token_hash: "cred-hash-x",
+                auth_scheme: "certificate",
+                issued_at: "2026-02-01T00:00:00+00:00",
+                expires_at: "2027-01-01T00:00:00+00:00",
+            })
+            .await
+            .unwrap();
+        assert!(!refused, "已知实例不匹配时必须拒绝");
+    }
+
     /// 幂等：同一张证书重入（并发首触 / 换网关后重复接触）不得改写已存在的登记。
     #[tokio::test]
     async fn register_agent_from_certificate_is_idempotent() {
@@ -3514,9 +3589,10 @@ mod tests {
             .renew_agent_credential(&RenewCredential {
                 agent_id: "agent-1",
                 instance_id: "inst-1",
-                current_token_hash: "cred-hash-agent-1",
+                current_token_hash: Some("cred-hash-agent-1"),
                 new_credential_id: "cred-2",
                 new_token_hash: "cred-hash-2",
+                auth_scheme: "certificate",
                 issued_at: "2026-02-01T00:00:00+00:00",
                 expires_at: "2027-01-01T00:00:00+00:00",
             })
@@ -3534,9 +3610,10 @@ mod tests {
             .renew_agent_credential(&RenewCredential {
                 agent_id: "agent-1",
                 instance_id: "inst-1",
-                current_token_hash: "cred-hash-agent-1",
+                current_token_hash: Some("cred-hash-agent-1"),
                 new_credential_id: "cred-3",
                 new_token_hash: "cred-hash-3",
+                auth_scheme: "certificate",
                 issued_at: "2026-02-02T00:00:00+00:00",
                 expires_at: "2027-01-01T00:00:00+00:00",
             })
@@ -3566,100 +3643,6 @@ mod tests {
 
         let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
         assert_eq!(agent.credential_status, StoredCredentialStatus::Revoked);
-    }
-
-    #[tokio::test]
-    async fn finds_agent_by_current_credential_token_hash_only() {
-        let store = store().await;
-        register(&store, "hash-c", "agent-1", "inst-1").await;
-
-        // 当前凭据 hash 命中（升级取包只有 token，没有 agent_id/instance_id）。
-        let found = store
-            .find_agent_by_credential_token_hash("cred-hash-agent-1")
-            .await
-            .unwrap()
-            .expect("current credential must resolve to its agent");
-        assert_eq!(found.agent_id, "agent-1");
-
-        // 未知 hash → None（不能凭一个不存在的 token 拿到任何 agent）。
-        assert!(
-            store
-                .find_agent_by_credential_token_hash("no-such-hash")
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        // 轮换后旧 hash 不再是“当前凭据”，查不到；新 hash 查得到。
-        assert!(
-            store
-                .renew_agent_credential(&RenewCredential {
-                    agent_id: "agent-1",
-                    instance_id: "inst-1",
-                    current_token_hash: "cred-hash-agent-1",
-                    new_credential_id: "cred-next",
-                    new_token_hash: "cred-hash-next",
-                    issued_at: "2026-02-01T00:00:00+00:00",
-                    expires_at: "2027-01-01T00:00:00+00:00",
-                })
-                .await
-                .unwrap()
-        );
-        assert!(
-            store
-                .find_agent_by_credential_token_hash("cred-hash-agent-1")
-                .await
-                .unwrap()
-                .is_none(),
-            "rotated-out credential must not resolve"
-        );
-        let renewed = store
-            .find_agent_by_credential_token_hash("cred-hash-next")
-            .await
-            .unwrap()
-            .expect("new credential resolves");
-        assert_eq!(renewed.agent_id, "agent-1");
-    }
-
-    #[tokio::test]
-    async fn credential_token_hash_lookup_returns_agent_for_revoked_or_expired_current_credential()
-    {
-        // 该查询只按「当前凭据」那一行匹配 `token_hash`，**不**在 SQL 里过滤状态/有效期：
-        // 吊销/过期的拒绝是 API 层 `authenticate_agent_credential_token` 的职责。
-        // 这里钉住分层契约，防止将来误以为查询本身已经做过状态过滤而省略 API 侧判定。
-        let store = store().await;
-        register(&store, "hash-k", "agent-1", "inst-1").await;
-
-        // 已吊销的当前凭据：行仍在（保留审计），hash 仍解析到 agent，但状态是 revoked。
-        assert!(
-            store
-                .revoke_agent_credential("agent-1", "cred-agent-1")
-                .await
-                .unwrap()
-        );
-        let revoked = store
-            .find_agent_by_credential_token_hash("cred-hash-agent-1")
-            .await
-            .unwrap()
-            .expect("revoked current credential still resolves so the API can reject it");
-        assert_eq!(revoked.agent_id, "agent-1");
-        assert_eq!(revoked.credential_status, StoredCredentialStatus::Revoked);
-
-        // 过期的当前凭据（状态仍 active）：同样解析得到，过期判定交给 API 层。
-        register(&store, "hash-l", "agent-2", "inst-2").await;
-        sqlx::query("UPDATE agent_credentials SET expires_at = ?1 WHERE credential_id = ?2")
-            .bind("2020-01-01T00:00:00+00:00")
-            .bind("cred-agent-2")
-            .execute(store.pool())
-            .await
-            .unwrap();
-        let expired = store
-            .find_agent_by_credential_token_hash("cred-hash-agent-2")
-            .await
-            .unwrap()
-            .expect("expired current credential still resolves so the API can reject it");
-        assert_eq!(expired.credential_status, StoredCredentialStatus::Active);
-        assert_eq!(expired.credential_expires_at, "2020-01-01T00:00:00+00:00");
     }
 
     #[tokio::test]

@@ -1,15 +1,15 @@
 use axum::{
     Json,
     extract::{Extension, State},
-    http::{HeaderMap, StatusCode, header},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 
 use crate::infra::{
     AgentFactSummaryMarks, AgentStatusUpdate, CertificateRegistration, RenewCredential,
     StoredAgentCertificateStatus, StoredAgentFactSummary, StoredAgentRegistration,
-    StoredCredentialStatus, StoredPurposeSuggestion, StoredWorkResult, VerifiedAgentIdentity,
-    effective_standing, new_secret_token, outstanding_one_shot, sha256_hex,
+    StoredPurposeSuggestion, StoredWorkResult, VerifiedAgentIdentity, effective_standing,
+    new_secret_token, outstanding_one_shot,
     victoria_metrics::{import_lines, metric_line},
 };
 use wist_contracts::API_VERSION_V1;
@@ -34,13 +34,11 @@ use super::ApiState;
 
 pub async fn submit_agent_status(
     State(state): State<ApiState>,
-    headers: HeaderMap,
     client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<AgentStatusReport>,
 ) -> Response {
     match authenticate_agent(
         &state,
-        &headers,
         &input.agent_id,
         &input.instance_id,
         client_identity.as_ref().map(|identity| &identity.0),
@@ -219,13 +217,11 @@ pub(super) fn agent_status_metric_lines(
 
 pub async fn poll_control_commands(
     State(state): State<ApiState>,
-    headers: HeaderMap,
     client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<PollControlCommands>,
 ) -> Response {
     match authenticate_agent(
         &state,
-        &headers,
         &input.agent_id,
         &input.instance_id,
         client_identity.as_ref().map(|identity| &identity.0),
@@ -256,7 +252,6 @@ pub async fn poll_control_commands(
 /// 策略表是幂等内容：拉到的 `policy_version` 未变时由 agentd 自行跳过重算。
 pub async fn poll_discovery_policies(
     State(state): State<ApiState>,
-    headers: HeaderMap,
     client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<PollDiscoveryPolicies>,
 ) -> Response {
@@ -265,7 +260,6 @@ pub async fn poll_discovery_policies(
     }
     if let Err(response) = authenticate_agent(
         &state,
-        &headers,
         &input.agent_id,
         &input.instance_id,
         client_identity.as_ref().map(|identity| &identity.0),
@@ -298,7 +292,6 @@ pub async fn poll_discovery_policies(
 /// 正因如此，agentd 断网重启后只需重新拉一次就回到期望，网关不用记「推到哪了」。
 pub async fn poll_work(
     State(state): State<ApiState>,
-    headers: HeaderMap,
     client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<PollWork>,
 ) -> Response {
@@ -307,7 +300,6 @@ pub async fn poll_work(
     }
     if let Err(response) = authenticate_agent(
         &state,
-        &headers,
         &input.agent_id,
         &input.instance_id,
         client_identity.as_ref().map(|identity| &identity.0),
@@ -343,7 +335,6 @@ pub async fn poll_work(
 /// 沿用上一次的期望。宁可让它重试，也不要在读库失败时替它做关机决定。
 pub async fn poll_agent_uplink(
     State(state): State<ApiState>,
-    headers: HeaderMap,
     client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<PollAgentUplink>,
 ) -> Response {
@@ -352,7 +343,6 @@ pub async fn poll_agent_uplink(
     }
     if let Err(response) = authenticate_agent(
         &state,
-        &headers,
         &input.agent_id,
         &input.instance_id,
         client_identity.as_ref().map(|identity| &identity.0),
@@ -429,7 +419,6 @@ pub async fn build_agent_uplink_grant(
 /// 一次性工作被确认时从 `dispatched` 进到 `accepted` —— 这正是那个状态存在的意义。
 pub async fn ack_work(
     State(state): State<ApiState>,
-    headers: HeaderMap,
     client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<AckWork>,
 ) -> Response {
@@ -438,7 +427,6 @@ pub async fn ack_work(
     }
     if let Err(response) = authenticate_agent(
         &state,
-        &headers,
         &input.agent_id,
         &input.instance_id,
         client_identity.as_ref().map(|identity| &identity.0),
@@ -530,7 +518,6 @@ pub async fn ack_work(
 ///     但结果记录照存 —— 机器上确实发生过那次执行，抹掉它只会让事后无法解释。
 pub async fn submit_work_result(
     State(state): State<ApiState>,
-    headers: HeaderMap,
     client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<ReportWorkResult>,
 ) -> Response {
@@ -539,7 +526,6 @@ pub async fn submit_work_result(
     }
     if let Err(response) = authenticate_agent(
         &state,
-        &headers,
         &input.agent_id,
         &input.instance_id,
         client_identity.as_ref().map(|identity| &identity.0),
@@ -639,30 +625,26 @@ pub async fn submit_work_result(
     .into_response()
 }
 
+/// 续期凭据：**只换发客户端证书**（mTLS 是唯一凭据路径，不再签 bearer token）。
+///
+/// 凭据由**证书**验明（`authenticate_agent`）：agent 只需出示一张仍有效的客户端证书 +
+/// 一份新 CSR，网关用 agent CA 签一张新证书。**不再要求客户端同时出示旧 token** —— 那正是
+/// 「库里换了/丢了 → 自愈重建的行不知道旧 token → 续期永远 401（对 agentd 是终态）」的病根。
 pub async fn renew_agent_credential(
     State(state): State<ApiState>,
-    headers: HeaderMap,
     client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<CredentialRenewal>,
 ) -> Response {
-    if input.api_version != "v1" || input.kind != RENEW_AGENT_CREDENTIAL_KIND {
+    if input.api_version != API_VERSION_V1 || input.kind != RENEW_AGENT_CREDENTIAL_KIND {
         return (
             StatusCode::BAD_REQUEST,
             "invalid credential renewal request",
         )
             .into_response();
     }
-    if !matches!(input.credential_request.as_str(), "bearer" | "csr") {
-        return (StatusCode::BAD_REQUEST, "unsupported credential request").into_response();
-    }
-    let Some(current_token) = bearer_token(&headers) else {
-        return (StatusCode::UNAUTHORIZED, "missing bearer credential").into_response();
-    };
-    let current_token_hash = sha256_hex(current_token);
-
+    // 先验凭据（证书是唯一路径），再谈请求体内容 —— 不向未认证调用者泄露「你只是报文体写错了」。
     let agent = match authenticate_agent(
         &state,
-        &headers,
         &input.agent_id,
         &input.instance_id,
         client_identity.as_ref().map(|identity| &identity.0),
@@ -672,90 +654,80 @@ pub async fn renew_agent_credential(
         Ok(agent) => agent,
         Err(response) => return response,
     };
-    let bearer_token = match new_secret_token("wic") {
-        Ok(token) => token,
-        Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
+    // 证书是唯一路径：续期也要重新交 CSR，不签 token。
+    if input.credential_request != "csr" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "unsupported credential request: only csr",
+        )
+            .into_response();
+    }
+    let Some(ca) = state.agent_ca.as_deref() else {
+        // 没配 agent CA = 这台网关没开 mTLS；证书是唯一凭据路径，续期无从谈起。
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent certificate authority is not configured",
+        )
+            .into_response();
     };
-    let issued_at_time = chrono::Utc::now();
-    let issued_at = issued_at_time.to_rfc3339();
-    let not_after = (issued_at_time
-        + chrono::Duration::seconds(state.config.credential_ttl_seconds))
-    .to_rfc3339();
+    let csr = input.certificate_signing_request.trim();
+    if csr.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "missing_certificate_signing_request",
+        )
+            .into_response();
+    }
+    let identity = crate::infra::AgentCertificateIdentity::new(
+        state.config.tenant_id.clone(),
+        state.config.environment_id.clone(),
+        agent.agent_id.clone(),
+    );
+    let issued =
+        match ca.issue_client_certificate(csr, &identity, state.config.client_cert_ttl_seconds) {
+            Ok(issued) => issued,
+            Err(reason) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid_certificate_signing_request: {reason}"),
+                )
+                    .into_response();
+            }
+        };
     let credential_id = match new_secret_token("cred") {
         Ok(id) => id,
         Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
-    };
-
-    // 续期也能**换发客户端证书**：agent 重新交 CSR，网关用 agent CA 签一张新的（§4.2）。
-    // 开了 CA 但 CSR 坏了就拒，不静默降级 —— 与注册同一口径。
-    let issued_certificate = match (
-        input.credential_request.as_str(),
-        state.agent_ca.as_deref(),
-        input.certificate_signing_request.as_deref(),
-    ) {
-        ("csr", Some(ca), Some(csr)) => {
-            let identity = crate::infra::AgentCertificateIdentity::new(
-                state.config.tenant_id.clone(),
-                state.config.environment_id.clone(),
-                agent.agent_id.clone(),
-            );
-            match ca.issue_client_certificate(csr, &identity, state.config.client_cert_ttl_seconds)
-            {
-                Ok(issued) => Some(issued),
-                Err(reason) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("invalid_certificate_signing_request: {reason}"),
-                    )
-                        .into_response();
-                }
-            }
-        }
-        _ => None,
-    };
-
-    // 有效期以**证书**为准（agentd 的续期窗就落在这个时间上），bearer 仍然一起换发（双轨）。
-    let (auth_scheme, bundle_not_before, bundle_not_after) = match issued_certificate.as_ref() {
-        Some(issued) => (
-            "certificate",
-            issued.not_before.clone(),
-            issued.not_after.clone(),
-        ),
-        None => ("bearer", issued_at.clone(), not_after.clone()),
     };
     let bundle = CredentialBundle {
         credential_id: credential_id.clone(),
         agent_id: agent.agent_id.clone(),
         instance_id: agent.instance_id.clone(),
-        auth_scheme: Some(auth_scheme.to_string()),
-        bearer_token: Some(bearer_token.clone()),
-        certificate: issued_certificate
-            .as_ref()
-            .map(|issued| issued.certificate_pem.clone()),
+        certificate: issued.certificate_pem.clone(),
         private_key_ref: None,
         ca_bundle: None,
-        issued_at: issued_at.clone(),
-        not_before: Some(bundle_not_before),
-        not_after: Some(bundle_not_after),
+        issued_at: issued.not_before.clone(),
+        not_before: Some(issued.not_before.clone()),
+        not_after: Some(issued.not_after.clone()),
     };
 
-    let new_token_hash = sha256_hex(&bearer_token);
+    // 库里的当前凭据行轮换到**新证书指纹**（供管理视图与吊销按 credential_id 定位）。
     let update_result = state
         .store
         .renew_agent_credential(&RenewCredential {
             agent_id: &agent.agent_id,
             instance_id: &agent.instance_id,
-            current_token_hash: &current_token_hash,
+            current_token_hash: None,
             new_credential_id: &credential_id,
-            new_token_hash: &new_token_hash,
-            issued_at: &issued_at,
-            expires_at: &not_after,
+            new_token_hash: &issued.fingerprint_sha256_hex,
+            auth_scheme: "certificate",
+            issued_at: &issued.not_before,
+            expires_at: &issued.not_after,
         })
         .await;
     match update_result {
         Ok(true) => {
             eprintln!(
-                "audit credential_renewed agent_id={} instance_id={}",
+                "audit credential_renewed agent_id={} instance_id={} scheme=certificate",
                 agent.agent_id, agent.instance_id,
             );
             (
@@ -777,13 +749,11 @@ pub async fn renew_agent_credential(
 
 pub async fn report_action_result(
     State(state): State<ApiState>,
-    headers: HeaderMap,
     client_identity: Option<Extension<VerifiedAgentIdentity>>,
     Json(input): Json<ReportActionResult>,
 ) -> Response {
     match authenticate_agent(
         &state,
-        &headers,
         &input.agent_id,
         &input.instance_id,
         client_identity.as_ref().map(|identity| &identity.0),
@@ -1176,58 +1146,22 @@ pub(super) async fn ensure_fresh_suggestion(
     }
 }
 
+/// 鉴权：**只有一条凭据路径 —— 客户端证书（mTLS，§5.2）**。
+///
+/// 这里曾经并存一条 bearer 双轨（§7 迁移期）。删它的理由不是「少写点代码」：那条分支的失败面
+/// 是「行在、token 对不上 → 401 `credential_mismatch`（对 agentd 是**终态**）」，而**证书才是权威
+/// 身份** —— 一台凭证书自愈重建过的机器会被它判死（重建出来的行不可能知道它的 bearer token，
+/// 因为重建只读证书），现象是「自愈一次就死」、只能人工重注册（2026-09-30 实撞）。
+///
+/// 没带证书时按网关是否配了 agent CA 区分措辞：配了 = `certificate_required`（该带而没带），
+/// 没配 = `missing_credential`（这台网关压根没开 mTLS）。两者都可自愈/可重装，都不是终态。
 #[allow(clippy::result_large_err)]
 async fn authenticate_agent(
     state: &ApiState,
-    headers: &HeaderMap,
     agent_id: &str,
     instance_id: &str,
     client_identity: Option<&VerifiedAgentIdentity>,
 ) -> Result<StoredAgentRegistration, Response> {
-    // 拒绝名单（§5.6）的判定**放在凭据验明之后**（见下面两处），不放在最前面 ——
-    // 否则一个不带任何凭据的请求也能靠 `certificate_revoked` 探出「某个 agent_id 已被吊销」。
-    // 切断强度不受影响：被吊销的 agent 手上必有凭据，验明后同样立刻被拒（续签也走这里）。
-    // ① bearer 双轨：迁移期的旧凭据照旧可用（docs/design/agent-identity-mtls.md §7）。
-    if let Some(token) = bearer_token(headers) {
-        let token_hash = sha256_hex(token);
-        let agent = state
-            .store
-            .get_agent(agent_id)
-            .await
-            .map_err(store_unavailable)?;
-        let Some(agent) = agent else {
-            // 库里没有这条记录：可能是库丢了。不在这里下结论 —— 交给证书路径重建（§5.3），
-            // 没有证书就还是普通的 401。
-            return match client_identity {
-                Some(identity) => {
-                    certificate_authenticate(state, identity, agent_id, instance_id).await
-                }
-                None => Err(unauthorized_code("unknown_credential")),
-            };
-        };
-        if agent.instance_id != instance_id
-            || !constant_time_eq(
-                agent.credential_token_hash.as_bytes(),
-                token_hash.as_bytes(),
-            )
-        {
-            return Err(unauthorized_code("credential_mismatch"));
-        }
-        if agent.credential_status != StoredCredentialStatus::Active {
-            return Err(unauthorized_code("credential_inactive"));
-        }
-        if credential_is_expired(&agent.credential_expires_at) {
-            return Err(unauthorized_code("credential_expired"));
-        }
-        // 凭据已验明身份：此时才判拒绝名单，命中即固定回 `certificate_revoked`
-        // （agentd 见到就明确报错退出，不静默重试，§5.4）。
-        if agent_is_revoked(state, agent_id).await? {
-            return Err(unauthorized_code("certificate_revoked"));
-        }
-        return Ok(agent);
-    }
-
-    // ② mTLS：证书身份即权威身份（§5.2）。没配 agent CA 就是「没带凭据」。
     match client_identity {
         Some(identity) => certificate_authenticate(state, identity, agent_id, instance_id).await,
         None => Err(unauthorized_code(
@@ -1354,71 +1288,42 @@ async fn agent_is_revoked(state: &ApiState, agent_id: &str) -> Result<bool, Resp
         .map_err(store_unavailable)
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-/// 按明文凭据 token 校验 agent（无 `agent_id` / `instance_id` 的路径用）。
+/// 拒绝名单（§5.6）：被吊销的 agent 连升级包也不该能取 —— 取证 / 升级取包同样是
+/// 「它还能联系网关」的途径，单单卡业务上报不叫切断。
 ///
-/// 与 [`authenticate_agent`] 同一套凭据口径（同一个 `sha256_hex` 哈希、同一种
-/// active + 未过期判定），只是少了「实例必须匹配」那一步 —— 升级取包时升级器手上
-/// 只有凭据 token，没有 agent_id/instance_id。查的是当前凭据（`agent_credentials.token_hash`）。
-pub(crate) async fn authenticate_agent_credential_token(
+/// 取包路径与 [`authenticate_agent`] 同一套证书口径：先由 mTLS 握手验过客户端证书，
+/// 再判拒绝名单（bearer token 路径已随双轨一起删除）。
+#[allow(clippy::result_large_err)]
+pub(crate) async fn authorize_agent_certificate(
     state: &ApiState,
-    token: &str,
+    identity: Option<&VerifiedAgentIdentity>,
 ) -> Result<(), String> {
-    let token_hash = sha256_hex(token);
-    let agent = state
-        .store
-        .find_agent_by_credential_token_hash(&token_hash)
-        .await
-        .map_err(|err| err.to_string())?
-        .ok_or_else(|| "unknown agent credential".to_string())?;
-    if !constant_time_eq(
-        agent.credential_token_hash.as_bytes(),
-        token_hash.as_bytes(),
-    ) {
-        return Err("invalid agent credential".to_string());
+    let Some(identity) = identity else {
+        return Err("missing agent client certificate".to_string());
+    };
+    if identity.tenant_id != state.config.tenant_id
+        || identity.environment_id != state.config.environment_id
+    {
+        return Err("agent certificate is not for this gateway".to_string());
     }
-    if agent.credential_status != StoredCredentialStatus::Active {
-        return Err("agent credential is not active".to_string());
-    }
-    if credential_is_expired(&agent.credential_expires_at) {
-        return Err("agent credential is expired".to_string());
-    }
-    // 拒绝名单（§5.6）：被吊销的 agent 连升级包也不该能取 —— 取证 / 升级取包同样是
-    // 「它还能联系网关」的途径，单单卡业务上报不叫切断。
+    // 证书只证明「CA 签过它」，不证明「它现在还是本网关的成员」：被删掉登记的 agent 仍可能握着
+    // 一张未过期的证书。取包路径**不重建**（与状态上报不同），要求库里确实有这条登记。
     if state
         .store
-        .is_agent_revoked(&agent.agent_id)
+        .get_agent(&identity.agent_id)
+        .await
+        .map_err(|err| err.to_string())?
+        .is_none()
+    {
+        return Err("unknown agent".to_string());
+    }
+    if state
+        .store
+        .is_agent_revoked(&identity.agent_id)
         .await
         .map_err(|err| err.to_string())?
     {
         return Err("agent is revoked".to_string());
     }
     Ok(())
-}
-
-fn credential_is_expired(expires_at: &str) -> bool {
-    let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expires_at) else {
-        return true;
-    };
-    chrono::Utc::now() >= expires_at.with_timezone(&chrono::Utc)
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-    for index in 0..max_len {
-        let left_byte = left.get(index).copied().unwrap_or(0);
-        let right_byte = right.get(index).copied().unwrap_or(0);
-        diff |= (left_byte ^ right_byte) as usize;
-    }
-    diff == 0
 }

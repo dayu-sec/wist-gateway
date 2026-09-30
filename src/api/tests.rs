@@ -42,9 +42,7 @@ use wist_control::types::DateTime;
 
 use super::{
     AdminRuntimeState, ApiState,
-    enrollment::{
-        agent_enrollment_result, agent_enrollment_result_with_token_issuer, enroll_agent,
-    },
+    enrollment::{agent_enrollment_result, enroll_agent},
     install::{
         agent_initial_config_toml, agent_install_code, issue_agent_install_code, token_hash,
         validate_bootstrap_token_for_config,
@@ -641,7 +639,7 @@ async fn enrollment_accepts_valid_token_and_issues_identity() {
     let result = agent_enrollment_result(
         &env.config,
         &env.store_handle,
-        None,
+        Some(&env_agent_ca(&env)),
         enrollment_request(&token),
         "v0.1.0",
     )
@@ -656,13 +654,8 @@ async fn enrollment_accepts_valid_token_and_issues_identity() {
     assert_eq!(identity.tenant_id, "tenant-default");
     assert_eq!(identity.status, AgentIdentityStatus::Active);
     let credential = result.credential_bundle.expect("credential bundle");
-    assert_eq!(credential.auth_scheme.as_deref(), Some("bearer"));
-    assert!(
-        credential
-            .bearer_token
-            .as_deref()
-            .is_some_and(|token| token.starts_with("wic_"))
-    );
+    // mTLS 是唯一凭据路径：注册必须换回一张客户端证书。
+    assert!(credential.certificate.contains("BEGIN CERTIFICATE"));
     assert!(credential.not_after.is_some());
 }
 
@@ -690,13 +683,12 @@ async fn enrollment_rejects_invalid_token_without_identity() {
 #[tokio::test]
 async fn enrollment_rejects_invalid_token_before_generating_credential() {
     let env = TestEnv::new().await;
-    let result = agent_enrollment_result_with_token_issuer(
+    let result = agent_enrollment_result(
         &env.config,
         &env.store_handle,
-        None,
+        Some(&env_agent_ca(&env)),
         enrollment_request("bad-token"),
         "v0.1.0",
-        |_| panic!("credential generation must not run for an invalid token"),
     )
     .await;
 
@@ -712,20 +704,27 @@ async fn enrollment_rejects_invalid_token_before_generating_credential() {
 async fn enrollment_rolls_back_reservation_on_credential_failure() {
     let env = TestEnv::new().await;
     let token = env.issue_token().await;
-    let result = agent_enrollment_result_with_token_issuer(
+    // 预留成功后才失败的时刻：CSR 坏了 → 签不出证书 → 拒绝，并回滚 token 预留。
+    let mut request = enrollment_request(&token);
+    request.certificate_signing_request = "not a csr".to_string();
+    let result = agent_enrollment_result(
         &env.config,
         &env.store_handle,
-        None,
-        enrollment_request(&token),
+        Some(&env_agent_ca(&env)),
+        request,
         "v0.1.0",
-        |_| Err("injected_random_failure".to_string()),
     )
     .await;
 
     assert_eq!(result.status, EnrollmentStatus::Rejected);
-    assert_eq!(
-        result.reason_code.as_deref(),
-        Some("injected_random_failure")
+    assert!(
+        result
+            .reason_code
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("invalid_certificate_signing_request"),
+        "{:?}",
+        result.reason_code
     );
     validate_bootstrap_token_for_config(&env.config, &env.store_handle, &token)
         .await
@@ -780,7 +779,7 @@ async fn enrollment_consumes_token_and_rejects_replay() {
     let first = agent_enrollment_result(
         &env.config,
         &env.store_handle,
-        None,
+        Some(&env_agent_ca(&env)),
         enrollment_request(&token),
         "v0.1.0",
     )
@@ -788,7 +787,7 @@ async fn enrollment_consumes_token_and_rejects_replay() {
     let second = agent_enrollment_result(
         &env.config,
         &env.store_handle,
-        None,
+        Some(&env_agent_ca(&env)),
         enrollment_request(&token),
         "v0.1.0",
     )
@@ -810,7 +809,7 @@ async fn enrollment_rejects_duplicate_agent_without_consuming_token() {
     let first = agent_enrollment_result(
         &env.config,
         &env.store_handle,
-        None,
+        Some(&env_agent_ca(&env)),
         enrollment_request(&first_token),
         "v0.1.0",
     )
@@ -818,7 +817,7 @@ async fn enrollment_rejects_duplicate_agent_without_consuming_token() {
     let duplicate = agent_enrollment_result(
         &env.config,
         &env.store_handle,
-        None,
+        Some(&env_agent_ca(&env)),
         enrollment_request(&second_token),
         "v0.1.0",
     )
@@ -843,8 +842,14 @@ async fn enrollment_ignores_unknown_node_id() {
     request.host_profile.node_id = "unknown".to_string();
     request.host_profile.hostname = "host-a".to_string();
 
-    let result =
-        agent_enrollment_result(&env.config, &env.store_handle, None, request, "v0.1.0").await;
+    let result = agent_enrollment_result(
+        &env.config,
+        &env.store_handle,
+        Some(&env_agent_ca(&env)),
+        request,
+        "v0.1.0",
+    )
+    .await;
 
     assert_eq!(result.agent_id.as_deref(), Some("agent-host-a"));
     assert_eq!(result.instance_id.as_deref(), Some("host-a"));
@@ -858,7 +863,7 @@ async fn enrollment_response_uses_contract_wire_status() {
         result: agent_enrollment_result(
             &env.config,
             &env.store_handle,
-            None,
+            Some(&env_agent_ca(&env)),
             enrollment_request(&token),
             "v0.1.0",
         )
@@ -906,39 +911,24 @@ async fn enrollment_route_accepts_valid_contract_request() {
     assert_eq!(returned.result.agent_id.as_deref(), Some("agent-node-a"));
     assert_eq!(returned.result.instance_id.as_deref(), Some("node-a"));
     assert!(returned.result.issued_identity.is_some());
-    assert!(
-        returned
-            .result
-            .credential_bundle
-            .as_ref()
-            .and_then(|credential| credential.bearer_token.as_deref())
-            .is_some_and(|token| token.starts_with("wic_"))
-    );
+    let bundle = returned
+        .result
+        .credential_bundle
+        .expect("credential bundle");
+    // mTLS 是唯一凭据路径：回包里必须是一张客户端证书。
+    assert!(bundle.certificate.contains("BEGIN CERTIFICATE"));
 }
 
 #[tokio::test]
-async fn agent_status_route_requires_bearer_credential() {
+async fn agent_status_route_requires_a_client_certificate() {
     let env = TestEnv::new().await;
-    let token = env.issue_token().await;
-    let enrollment = post_enrollment_to_router(
-        &env.config,
-        &env.store_handle,
-        enrollment_request_json(&token),
-    )
-    .await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
+    let agent_id = enroll_agent_credential(&env).await;
 
-    let accepted = post_json_to_router(
+    let accepted = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
-        Some(&credential),
+        Some(&agent_id),
         &AgentStatusReport {
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -957,7 +947,7 @@ async fn agent_status_route_requires_bearer_credential() {
     .await;
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
 
-    let rejected = post_json_to_router(
+    let rejected = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -984,26 +974,13 @@ async fn agent_status_route_requires_bearer_credential() {
 #[tokio::test]
 async fn agent_status_route_persists_reported_metrics() {
     let env = TestEnv::new().await;
-    let token = env.issue_token().await;
-    let enrollment = post_enrollment_to_router(
-        &env.config,
-        &env.store_handle,
-        enrollment_request_json(&token),
-    )
-    .await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
+    let agent_id = enroll_agent_credential(&env).await;
 
-    let status = post_json_to_router(
+    let status = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
-        Some(&credential),
+        Some(&agent_id),
         &AgentStatusReport {
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -1037,15 +1014,15 @@ async fn agent_status_route_persists_reported_metrics() {
 /// 发一次带 CPU 字段的状态上报（只关心 `cpu_percent` / `cpu_cores`）。
 async fn post_agent_status_cpu(
     env: &TestEnv,
-    credential: &str,
+    agent_id: &str,
     cpu_percent: Option<f64>,
     cpu_cores: Option<u32>,
 ) -> Response {
-    post_json_to_router(
+    post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
-        Some(credential),
+        Some(agent_id),
         &AgentStatusReport {
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -1207,13 +1184,13 @@ async fn enroll_agent_credential(env: &TestEnv) -> String {
         enrollment_request_json(&token),
     )
     .await;
+    // 返回的是 **agent_id**（不是 bearer token）：agent 侧现在**只有证书**这一条凭据路径，
+    // 测试里就用它当「握手期注入的证书身份」（`post_agent_json_to_router`）。
     decode_enrollment_response(enrollment)
         .await
         .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token")
+        .agent_id
+        .expect("agent id")
 }
 
 /// 把一份摘要当作**数据面转发来的记录**投给网关（这是事实唯一的入口）。
@@ -2481,7 +2458,7 @@ async fn post_discovery_poll(
     credential: Option<&str>,
     request: &PollDiscoveryPolicies,
 ) -> Response {
-    post_json_to_router(
+    post_agent_json_to_router(
         config,
         store,
         "/api/v1/agent/discovery-policies:poll",
@@ -2514,13 +2491,13 @@ async fn enroll_agent_at_node(env: &TestEnv, node_id: &str) -> String {
         serde_json::to_string(&request).expect("serialize enrollment"),
     )
     .await;
+    // 返回 **agent_id**（agent 侧只有证书这一条凭据路径；测试里拿它当握手期注入的身份）。
     decode_enrollment_response(response)
         .await
         .result
         .credential_bundle
         .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token")
+        .agent_id
 }
 
 /// 发一次状态上报。
@@ -2557,7 +2534,7 @@ async fn post_agent_status(
             "version": "v0.1.0",
         }),
     };
-    post_json_to_router(
+    post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -3019,22 +2996,9 @@ async fn agent_purpose_route_recomputes_when_the_rule_set_version_changes() {
 #[tokio::test]
 async fn agent_status_route_persists_work_state_changes() {
     let env = TestEnv::new().await;
-    let token = env.issue_token().await;
-    let enrollment = post_enrollment_to_router(
-        &env.config,
-        &env.store_handle,
-        enrollment_request_json(&token),
-    )
-    .await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
+    let credential = enroll_agent_credential(&env).await;
 
-    let status = post_json_to_router(
+    let status = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -3081,20 +3045,7 @@ async fn agent_status_route_persists_work_state_changes() {
 #[tokio::test]
 async fn the_work_view_exposes_the_agents_local_work_report() {
     let env = TestEnv::new().await;
-    let token = env.issue_token().await;
-    let enrollment = post_enrollment_to_router(
-        &env.config,
-        &env.store_handle,
-        enrollment_request_json(&token),
-    )
-    .await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
+    let credential = enroll_agent_credential(&env).await;
 
     // 还没上报过：`local` 是 null（不是空对象）—— 与「上报了但没东西」区分开。
     let before = get_agent_work(&env).await;
@@ -3125,7 +3076,7 @@ async fn the_work_view_exposes_the_agents_local_work_report() {
         }],
         metrics_interval_seconds: Some(15),
     };
-    let status = post_json_to_router(
+    let status = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -3166,27 +3117,14 @@ async fn the_work_view_exposes_the_agents_local_work_report() {
 #[tokio::test]
 async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
     let env = TestEnv::new().await;
-    let token = env.issue_token().await;
-    let enrollment = post_enrollment_to_router(
-        &env.config,
-        &env.store_handle,
-        enrollment_request_json(&token),
-    )
-    .await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
+    let credential = enroll_agent_credential(&env).await;
 
     // 还没上报过：`uplink_state` 是 null（不是全 false 的对象）。
     let before = get_agent_runtime_status(&env).await;
     assert!(before["uplink_state"].is_null(), "{before}");
 
     // 上报实际生效的上送状态：控制面下发的 tcp 目标，且出口正在写失败。
-    let status = post_json_to_router(
+    let status = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -3223,7 +3161,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
     assert_eq!(view["uplink_state"]["output_write_failing"], true);
 
     // 关键语义：下一次心跳没带这个字段（旧版本 agentd）时保持上一次的值，不清空。
-    let status = post_json_to_router(
+    let status = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -3254,153 +3192,66 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
 }
 
 #[tokio::test]
-async fn agent_status_route_rejects_expired_bearer_credential() {
-    let env = TestEnv::new().await;
-    let token = env.issue_token().await;
-    let enrollment = post_enrollment_to_router(
-        &env.config,
-        &env.store_handle,
-        enrollment_request_json(&token),
-    )
-    .await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
-    let stored = env
+async fn credential_renewal_issues_a_new_certificate_and_rotates_the_stored_credential() {
+    let mut env = TestEnv::new().await;
+    let (_ca, ca_cert_path, ca_key_path) = test_agent_ca();
+    env.config.agent_ca_cert_file = Some(ca_cert_path);
+    env.config.agent_ca_key_file = Some(ca_key_path);
+
+    let agent_id = enroll_agent_credential(&env).await;
+    let before = env
         .store
         .get_agent("agent-node-a")
         .await
         .expect("store read")
         .expect("stored agent");
-    // Test-only seam: the public Store API does not expose arbitrary credential
-    // mutation, so the current credential's expiry is forced directly via SQL.
-    sqlx::query("UPDATE agent_credentials SET expires_at = ?1 WHERE credential_id = ?2")
-        .bind("2026-07-01T00:00:00Z")
-        .bind(&stored.credential_id)
-        .execute(env.store.pool())
-        .await
-        .expect("expire credential");
 
-    let response = post_json_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/status",
-        Some(&credential),
-        &AgentStatusReport {
-            agent_id: "agent-node-a".to_string(),
-            instance_id: "node-a".to_string(),
-            version: "v0.2.0".to_string(),
-            memory_bytes: None,
-            cpu_percent: None,
-            cpu_cores: None,
-            admin_latency_ms: None,
-            discovery_policy_version: None,
-            work_state_changes: None,
-            local_work: None,
-            uplink_state: None,
-            certificate_status: None,
-        },
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn credential_renewal_replaces_previous_credential() {
-    let env = TestEnv::new().await;
-    let token = env.issue_token().await;
-    let enrollment = post_enrollment_to_router(
-        &env.config,
-        &env.store_handle,
-        enrollment_request_json(&token),
-    )
-    .await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let old_bearer = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
-
-    let renewed = post_json_to_router(
+    let renewed = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/credentials:renew",
-        Some(&old_bearer),
+        Some(&agent_id),
         &CredentialRenewal::new(
             "agent-node-a".to_string(),
             "node-a".to_string(),
-            "bearer".to_string(),
-            None,
+            "csr".to_string(),
+            certificate_signing_request(),
             "2026-07-29T00:00:00Z".to_string(),
         ),
     )
     .await;
     assert_eq!(renewed.status(), StatusCode::OK);
     let renewed: CredentialRenewed = decode_json_response(renewed).await;
-    let new_bearer = renewed
-        .credential_bundle
-        .bearer_token
-        .as_deref()
-        .expect("renewed bearer");
-    assert!(new_bearer.starts_with("wic_"));
-    assert_ne!(new_bearer, old_bearer);
+    let bundle = renewed.credential_bundle;
+    assert!(
+        bundle.certificate.contains("BEGIN CERTIFICATE"),
+        "续期应换发新证书"
+    );
 
-    let old_rejected = post_json_to_router(
+    // 库里当前凭据轮换到新的一行（旧行置 revoked），管理视图/吊销仍按 credential_id 定位。
+    let after = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("stored agent");
+    assert_ne!(after.credential_id, before.credential_id);
+    assert_eq!(after.credential_status, StoredCredentialStatus::Active);
+
+    // 续期后证书身份照常能用（续期不会把机器锁死）。
+    let accepted = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
-        Some(&old_bearer),
-        &AgentStatusReport {
-            agent_id: "agent-node-a".to_string(),
-            instance_id: "node-a".to_string(),
-            version: "v0.2.0".to_string(),
-            memory_bytes: None,
-            cpu_percent: None,
-            cpu_cores: None,
-            admin_latency_ms: None,
-            discovery_policy_version: None,
-            work_state_changes: None,
-            local_work: None,
-            uplink_state: None,
-            certificate_status: None,
-        },
+        Some(&agent_id),
+        &status_body("agent-node-a", "node-a"),
     )
     .await;
-    assert_eq!(old_rejected.status(), StatusCode::UNAUTHORIZED);
-
-    let new_accepted = post_json_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/status",
-        Some(new_bearer),
-        &AgentStatusReport {
-            agent_id: "agent-node-a".to_string(),
-            instance_id: "node-a".to_string(),
-            version: "v0.2.0".to_string(),
-            memory_bytes: None,
-            cpu_percent: None,
-            cpu_cores: None,
-            admin_latency_ms: None,
-            discovery_policy_version: None,
-            work_state_changes: None,
-            local_work: None,
-            uplink_state: None,
-            certificate_status: None,
-        },
-    )
-    .await;
-    assert_eq!(new_accepted.status(), StatusCode::ACCEPTED);
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
 }
 
 #[tokio::test]
-async fn agent_credential_renewal_requires_current_bearer() {
+async fn agent_credential_renewal_requires_a_client_certificate() {
     let env = TestEnv::new().await;
     let token = env.issue_token().await;
     let enrollment = post_enrollment_to_router(
@@ -3411,7 +3262,8 @@ async fn agent_credential_renewal_requires_current_bearer() {
     .await;
     assert_eq!(enrollment.status(), StatusCode::CREATED);
 
-    let response = post_json_to_router(
+    // 不带客户端证书 → 401（续期也不能靠 bearer / 裸奔）。
+    let response = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/credentials:renew",
@@ -3419,8 +3271,8 @@ async fn agent_credential_renewal_requires_current_bearer() {
         &CredentialRenewal::new(
             "agent-node-a".to_string(),
             "node-a".to_string(),
-            "bearer".to_string(),
-            None,
+            "csr".to_string(),
+            certificate_signing_request(),
             "2026-07-29T00:00:00Z".to_string(),
         ),
     )
@@ -3430,28 +3282,15 @@ async fn agent_credential_renewal_requires_current_bearer() {
 }
 
 #[tokio::test]
-async fn agent_routes_accept_issued_bearer_credential() {
+async fn agent_routes_accept_a_client_certificate() {
     let env = TestEnv::new().await;
-    let token = env.issue_token().await;
-    let enrollment = post_enrollment_to_router(
-        &env.config,
-        &env.store_handle,
-        enrollment_request_json(&token),
-    )
-    .await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
+    let agent_id = enroll_agent_credential(&env).await;
 
-    let poll = post_json_to_router(
+    let poll = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/control-commands:poll",
-        Some(&credential),
+        Some(&agent_id),
         &PollControlCommands {
             requested_at: DateTime::now(),
             last_seen_sequence: 7,
@@ -3463,11 +3302,11 @@ async fn agent_routes_accept_issued_bearer_credential() {
     .await;
     assert_eq!(poll.status(), StatusCode::OK);
 
-    let report = post_json_to_router(
+    let report = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/action-results",
-        Some(&credential),
+        Some(&agent_id),
         &ReportActionResult::new(
             "report-1".to_string(),
             "action-1".to_string(),
@@ -4416,14 +4255,14 @@ async fn delete_agent_removes_an_offline_agent_and_its_credential() {
             .expect("get")
             .is_none()
     );
-    assert!(
-        env.store_handle
-            .find_agent_by_credential_token_hash(&credential_hash)
+    // 凭据行必须一并删掉，否则旧凭据还能被利用。
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_credentials WHERE token_hash = ?1")
+            .bind(&credential_hash)
+            .fetch_one(env.store.pool())
             .await
-            .expect("lookup")
-            .is_none(),
-        "凭据必须一并删掉，否则旧 token 还能用"
-    );
+            .expect("count credentials");
+    assert_eq!(remaining, 0, "凭据必须一并删掉，否则旧凭据还能用");
 }
 
 #[tokio::test]
@@ -4533,7 +4372,7 @@ async fn admin_revoke_agent_credential_locks_agent_out() {
     let uri = "/api/v1/admin/agents/agent-node-a/credentials:revoke";
 
     // 缺 admin 凭据：拒绝。
-    let unauthorized = post_json_to_router(
+    let unauthorized = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         uri,
@@ -5342,7 +5181,7 @@ async fn install_package_history_entry_carries_derived_download_url() {
 }
 
 #[tokio::test]
-async fn package_download_by_id_accepts_bootstrap_or_agent_credential() {
+async fn package_download_by_id_accepts_bootstrap_token_or_client_certificate() {
     let env = TestEnv::new().await;
     let pkg = tar_gz_with_entry(
         "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
@@ -5352,8 +5191,8 @@ async fn package_download_by_id_accepts_bootstrap_or_agent_credential() {
     let package_id = package_id_for_sha256(&digest);
     let uri = format!("/api/v1/agent/packages/{package_id}");
 
-    // 无凭据 → 401。
-    let unauthorized = get_to_router(&env.config, &env.store_handle, &uri, None).await;
+    // 无凭据（也没证书）→ 401。
+    let unauthorized = get_agent_package(&env, &uri, None).await;
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
     // bootstrap（注册）token → 200 + 字节。
@@ -5362,48 +5201,40 @@ async fn package_download_by_id_accepts_bootstrap_or_agent_credential() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_bytes(response).await.to_vec(), pkg);
 
-    // agent 凭据 → 200 + 字节（升级路径，没 enrollment token）。
-    let credential = enroll_agent_credential(&env).await;
-    let response = get_to_router(&env.config, &env.store_handle, &uri, Some(&credential)).await;
+    // 客户端证书（升级路径，没 enrollment token）→ 200 + 字节。
+    let agent_id = enroll_agent_credential(&env).await;
+    let response = get_agent_package(&env, &uri, Some(&agent_id)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_bytes(response).await.to_vec(), pkg);
 
-    // 未知 id → 404（凭据有效）。
-    let unknown = get_to_router(
-        &env.config,
-        &env.store_handle,
+    // 未知 id → 404（证书有效）。
+    let unknown = get_agent_package(
+        &env,
         "/api/v1/agent/packages/pkg-0000000000000000",
-        Some(&credential),
+        Some(&agent_id),
     )
     .await;
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn current_package_download_also_accepts_agent_credential() {
+async fn current_package_download_accepts_a_client_certificate() {
     let env = TestEnv::new().await;
     let bytes = b"cached-package-current";
     set_install_package_source(&env, "current", bytes).await;
-    let credential = enroll_agent_credential(&env).await;
+    let agent_id = enroll_agent_credential(&env).await;
 
-    let response = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/current",
-        Some(&credential),
-    )
-    .await;
+    let response = get_agent_package(&env, "/api/v1/agent/packages/current", Some(&agent_id)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_bytes(response).await.to_vec(), bytes.to_vec());
 }
 
-/// 安装包分发端点「没带凭据 / 凭据载体格式不对」的对外口径。
-/// 与下面的「带了 token 但无效」是**不同**的一句，但都不泄露任何 token 细节。
-const PACKAGE_NO_TOKEN_BODY: &str =
-    "agent package download requires a bootstrap or agent bearer token";
-/// 「带了 token 但不合法」的统一口径：未知 / 过期 / 已吊销 / 被轮换掉的旧凭据，
+/// 安装包分发端点「没带凭据」的对外口径（无 bootstrap token、也没客户端证书）。
+const PACKAGE_NO_CREDENTIAL_BODY: &str =
+    "agent package download requires a bootstrap token or a client certificate";
+/// 「带了 bootstrap token 但不合法」的统一口径：未知 / 过期 / 已消费 / 已吊销，
 /// 一律回这一句 —— 不区分「token 存在但过期」这类可被用来枚举的信息。
-const PACKAGE_INVALID_TOKEN_BODY: &str = "invalid bootstrap or agent bearer token";
+const PACKAGE_INVALID_BOOTSTRAP_BODY: &str = "invalid bootstrap token";
 
 /// 用**原始** Authorization 头值发一次取包 GET（`get_to_router` 只能给合法 Bearer）。
 async fn get_package_with_raw_authorization(
@@ -5440,125 +5271,36 @@ async fn package_download_rejects_missing_and_malformed_credentials_uniformly() 
     let package_id = package_id_for_sha256(&digest);
     let uri = format!("/api/v1/agent/packages/{package_id}");
 
-    // 根本没带 Authorization 头。
+    // 根本没带 Authorization 头，也没客户端证书。
     assert_auth_rejected(
         get_package_with_raw_authorization(&env, &uri, None).await,
-        PACKAGE_NO_TOKEN_BODY,
+        PACKAGE_NO_CREDENTIAL_BODY,
     )
     .await;
     // `Bearer ` 后面是空 token：被当成「没带 token」（trim + filter 空串）。
     assert_auth_rejected(
         get_package_with_raw_authorization(&env, &uri, Some("Bearer ")).await,
-        PACKAGE_NO_TOKEN_BODY,
+        PACKAGE_NO_CREDENTIAL_BODY,
     )
     .await;
     // 非 Bearer 方案（Basic）：同样按「没带 token」处理，不解析。
     assert_auth_rejected(
         get_package_with_raw_authorization(&env, &uri, Some("Basic dXNlcjpwYXNz")).await,
-        PACKAGE_NO_TOKEN_BODY,
+        PACKAGE_NO_CREDENTIAL_BODY,
     )
     .await;
-    // 未知的 agent 凭据 token：统一口径（不暴露「不存在」）。
-    assert_auth_rejected(
-        get_package_with_raw_authorization(&env, &uri, Some("Bearer wic_does_not_exist")).await,
-        PACKAGE_INVALID_TOKEN_BODY,
-    )
-    .await;
-    // 未知的 bootstrap token：同样统一口径。
+    // 未知的 bootstrap token：统一口径（不暴露「不存在」）。
     assert_auth_rejected(
         get_package_with_raw_authorization(&env, &uri, Some("Bearer wit_does_not_exist")).await,
-        PACKAGE_INVALID_TOKEN_BODY,
+        PACKAGE_INVALID_BOOTSTRAP_BODY,
     )
     .await;
-}
-
-#[tokio::test]
-async fn package_download_rejects_expired_agent_credential_on_both_routes() {
-    let env = TestEnv::new().await;
-    set_install_package_source(&env, "expired-cred", b"expired-cred-bytes").await;
-    let credential = enroll_agent_credential(&env).await;
-    let agent = env
-        .store
-        .get_agent("agent-node-a")
-        .await
-        .expect("load agent")
-        .expect("agent exists");
-    // Test-only seam: 存储层不暴露任意凭据改写，过期时间直接经 SQL 置到过去。
-    sqlx::query("UPDATE agent_credentials SET expires_at = ?1 WHERE credential_id = ?2")
-        .bind("2020-01-01T00:00:00+00:00")
-        .bind(&agent.credential_id)
-        .execute(env.store.pool())
-        .await
-        .expect("expire credential");
-
-    let by_id = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/pkg-0000000000000000",
-        Some(&credential),
+    // 长得像 agent 凭据的 token（旧双轨遗留）：现在没有任何效力，按 bootstrap 校验失败统一口径。
+    assert_auth_rejected(
+        get_package_with_raw_authorization(&env, &uri, Some("Bearer wic_does_not_exist")).await,
+        PACKAGE_INVALID_BOOTSTRAP_BODY,
     )
     .await;
-    assert_auth_rejected(by_id, PACKAGE_INVALID_TOKEN_BODY).await;
-
-    let current = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/current",
-        Some(&credential),
-    )
-    .await;
-    assert_auth_rejected(current, PACKAGE_INVALID_TOKEN_BODY).await;
-}
-
-#[tokio::test]
-async fn package_download_rejects_revoked_agent_credential_immediately() {
-    let env = TestEnv::new().await;
-    set_install_package_source(&env, "revoked-cred", b"revoked-cred-bytes").await;
-    let credential = enroll_agent_credential(&env).await;
-    let agent = env
-        .store
-        .get_agent("agent-node-a")
-        .await
-        .expect("load agent")
-        .expect("agent exists");
-
-    // 吊销前：凭据可用。
-    let before = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/current",
-        Some(&credential),
-    )
-    .await;
-    assert_eq!(before.status(), StatusCode::OK);
-
-    let revoked = post_json_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/admin/agents/agent-node-a/credentials:revoke",
-        Some(TEST_ADMIN_API_TOKEN),
-        &serde_json::json!({ "credential_id": agent.credential_id }),
-    )
-    .await;
-    assert_eq!(revoked.status(), StatusCode::OK);
-
-    // 吊销后**立即**失效：下一次请求就拒，不用等轮换，也没有内存缓存窗口。
-    let by_id = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/pkg-0000000000000000",
-        Some(&credential),
-    )
-    .await;
-    assert_auth_rejected(by_id, PACKAGE_INVALID_TOKEN_BODY).await;
-    let current = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/current",
-        Some(&credential),
-    )
-    .await;
-    assert_auth_rejected(current, PACKAGE_INVALID_TOKEN_BODY).await;
 }
 
 /// 拒绝名单同样拦升级取包：被吊销的 agent 连包也不该能取（§5.6）。
@@ -5566,15 +5308,9 @@ async fn package_download_rejects_revoked_agent_credential_immediately() {
 async fn package_download_rejects_a_revoked_agent() {
     let env = TestEnv::new().await;
     set_install_package_source(&env, "revoked-agent", b"revoked-agent-bytes").await;
-    let credential = enroll_agent_credential(&env).await;
+    let agent_id = enroll_agent_credential(&env).await;
 
-    let before = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/current",
-        Some(&credential),
-    )
-    .await;
+    let before = get_agent_package(&env, "/api/v1/agent/packages/current", Some(&agent_id)).await;
     assert_eq!(before.status(), StatusCode::OK);
 
     assert_eq!(
@@ -5584,63 +5320,8 @@ async fn package_download_rejects_a_revoked_agent() {
         StatusCode::OK
     );
 
-    let after = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/current",
-        Some(&credential),
-    )
-    .await;
-    assert_auth_rejected(after, PACKAGE_INVALID_TOKEN_BODY).await;
-}
-
-#[tokio::test]
-async fn package_download_rejects_rotated_out_credential_but_accepts_the_new_one() {
-    let env = TestEnv::new().await;
-    set_install_package_source(&env, "rotated-cred", b"rotated-cred-bytes").await;
-    let old_bearer = enroll_agent_credential(&env).await;
-
-    let renewed = post_json_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/credentials:renew",
-        Some(&old_bearer),
-        &CredentialRenewal::new(
-            "agent-node-a".to_string(),
-            "node-a".to_string(),
-            "bearer".to_string(),
-            None,
-            "2027-01-01T00:00:00Z".to_string(),
-        ),
-    )
-    .await;
-    assert_eq!(renewed.status(), StatusCode::OK);
-    let renewed: CredentialRenewed = decode_json_response(renewed).await;
-    let new_bearer = renewed
-        .credential_bundle
-        .bearer_token
-        .expect("renewed bearer");
-    assert_ne!(new_bearer, old_bearer);
-
-    // 轮换掉的旧凭据：查的是「当前凭据」，旧 hash 已不再命中 → 统一口径拒绝。
-    let old_attempt = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/current",
-        Some(&old_bearer),
-    )
-    .await;
-    assert_auth_rejected(old_attempt, PACKAGE_INVALID_TOKEN_BODY).await;
-
-    // 新凭据：放行。
-    let ok = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/current",
-        Some(&new_bearer),
-    )
-    .await;
-    assert_eq!(ok.status(), StatusCode::OK);
+    let after = get_agent_package(&env, "/api/v1/agent/packages/current", Some(&agent_id)).await;
+    assert_auth_rejected(after, "invalid agent client certificate").await;
 }
 
 #[tokio::test]
@@ -5664,9 +5345,8 @@ async fn any_registered_agent_credential_can_fetch_any_package_by_id() {
     // 端点上刻意不做按 agent 的归属/租户校验。本测试钉住现状，改语义前必须先改这里。
     let credential = enroll_agent_credential(&env).await;
     for (package_id, bytes) in [(&id_one, &pkg_one), (&id_two, &pkg_two)] {
-        let response = get_to_router(
-            &env.config,
-            &env.store_handle,
+        let response = get_agent_package(
+            &env,
             &format!("/api/v1/agent/packages/{package_id}"),
             Some(&credential),
         )
@@ -5706,7 +5386,7 @@ async fn package_download_by_id_rejects_path_traversal_ids_without_reading_disk(
     ];
     for variant in variants {
         let uri = format!("/api/v1/agent/packages/{variant}");
-        let response = get_to_router(&env.config, &env.store_handle, &uri, Some(&credential)).await;
+        let response = get_agent_package(&env, &uri, Some(&credential)).await;
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
@@ -5728,23 +5408,16 @@ async fn package_download_by_id_rejects_path_traversal_ids_without_reading_disk(
 
     // 超长 id（>1KB）：不 panic、不读盘，按「库里没有」处理。
     let long_uri = format!("/api/v1/agent/packages/{}", "a".repeat(2_000));
-    let long = get_to_router(&env.config, &env.store_handle, &long_uri, Some(&credential)).await;
+    let long = get_agent_package(&env, &long_uri, Some(&credential)).await;
     assert_eq!(long.status(), StatusCode::NOT_FOUND);
 
     // 空 package_id（尾斜杠）：路由层没有可匹配的动态段，同样不是 200。
-    let empty = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/",
-        Some(&credential),
-    )
-    .await;
+    let empty = get_agent_package(&env, "/api/v1/agent/packages/", Some(&credential)).await;
     assert_eq!(empty.status(), StatusCode::NOT_FOUND);
 
     // 正常 id 仍能取到原字节（确认上面的 404 不是「整个端点坏了」）。
-    let ok = get_to_router(
-        &env.config,
-        &env.store_handle,
+    let ok = get_agent_package(
+        &env,
         &format!("/api/v1/agent/packages/{package_id}"),
         Some(&credential),
     )
@@ -5794,13 +5467,8 @@ async fn recorded_package_with_a_missing_copy_is_unavailable() {
     // 录入过，但网关那份副本丢了：没有可用包（不会回落到别的来源）。
     std::fs::remove_file(env.config.install_package_cache_path()).expect("remove cached copy");
 
-    let current = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/current",
-        Some(&credential),
-    )
-    .await;
+    let current =
+        get_agent_package(&env, "/api/v1/agent/packages/current", Some(&credential)).await;
     assert_eq!(current.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_no_store(&current);
 
@@ -5853,13 +5521,8 @@ async fn package_download_without_a_recorded_package_is_no_store() {
         .execute(env.store.pool())
         .await
         .expect("clear recorded package");
-    let current = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/packages/current",
-        Some(&credential),
-    )
-    .await;
+    let current =
+        get_agent_package(&env, "/api/v1/agent/packages/current", Some(&credential)).await;
     assert_eq!(current.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_no_store(&current);
     let body = decode_text_response(current).await;
@@ -5870,9 +5533,8 @@ async fn package_download_without_a_recorded_package_is_no_store() {
         .execute(env.store.pool())
         .await
         .expect("drop history table");
-    let by_id = get_to_router(
-        &env.config,
-        &env.store_handle,
+    let by_id = get_agent_package(
+        &env,
         "/api/v1/agent/packages/pkg-0000000000000000",
         Some(&credential),
     )
@@ -5886,7 +5548,7 @@ async fn current_package_download_still_enforces_one_time_bootstrap_tokens() {
     let env = TestEnv::new().await;
     set_install_package_source(&env, "one-time", b"one-time-bytes").await;
 
-    // 放宽到「也接受 agent 凭据」没有放松 bootstrap token 的既有语义：
+    // 取包端点同时接受客户端证书，没有放松 bootstrap token 的既有语义：
     // 1) 首次可用。
     let token = env.issue_token().await;
     let first = get_to_router(
@@ -5913,7 +5575,7 @@ async fn current_package_download_still_enforces_one_time_bootstrap_tokens() {
         Some(&token),
     )
     .await;
-    assert_auth_rejected(replay, PACKAGE_INVALID_TOKEN_BODY).await;
+    assert_auth_rejected(replay, PACKAGE_INVALID_BOOTSTRAP_BODY).await;
 
     // 3) 过期 token 同样被拒。
     let expired = env.issue_token().await;
@@ -5930,7 +5592,7 @@ async fn current_package_download_still_enforces_one_time_bootstrap_tokens() {
         Some(&expired),
     )
     .await;
-    assert_auth_rejected(after, PACKAGE_INVALID_TOKEN_BODY).await;
+    assert_auth_rejected(after, PACKAGE_INVALID_BOOTSTRAP_BODY).await;
 }
 
 #[tokio::test]
@@ -6204,7 +5866,7 @@ async fn agent_package_url_by_id_trims_trailing_slash_base() {
 }
 
 #[tokio::test]
-async fn package_download_by_id_requires_a_valid_credential() {
+async fn package_download_by_id_requires_bootstrap_token_or_certificate() {
     let env = TestEnv::new().await;
     let pkg = tar_gz_with_entry(
         "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
@@ -6213,13 +5875,12 @@ async fn package_download_by_id_requires_a_valid_credential() {
     let (_, digest) = set_install_package_source(&env, "auth-byid", &pkg).await;
     let uri = format!("/api/v1/agent/packages/{}", package_id_for_sha256(&digest));
 
-    // 无凭据 → 401；有凭据但 token 无效 → 401。
+    // 无凭据（也没证书）→ 401。
     assert_eq!(
-        get_to_router(&env.config, &env.store_handle, &uri, None)
-            .await
-            .status(),
+        get_agent_package(&env, &uri, None).await.status(),
         StatusCode::UNAUTHORIZED
     );
+    // 带了但不合法的 bootstrap token → 401。
     assert_eq!(
         get_to_router(
             &env.config,
@@ -6230,6 +5891,14 @@ async fn package_download_by_id_requires_a_valid_credential() {
         .await
         .status(),
         StatusCode::UNAUTHORIZED
+    );
+    // 客户端证书 → 200。
+    let agent_id = enroll_agent_credential(&env).await;
+    assert_eq!(
+        get_agent_package(&env, &uri, Some(&agent_id))
+            .await
+            .status(),
+        StatusCode::OK
     );
 }
 
@@ -6246,14 +5915,14 @@ async fn package_download_by_id_returns_404_when_cached_copy_is_missing() {
     let credential = enroll_agent_credential(&env).await;
 
     // 行在、副本在 → 200。
-    let ok = get_to_router(&env.config, &env.store_handle, &uri, Some(&credential)).await;
+    let ok = get_agent_package(&env, &uri, Some(&credential)).await;
     assert_eq!(ok.status(), StatusCode::OK);
     assert_eq!(body_bytes(ok).await.to_vec(), pkg);
 
     // 磁盘上的副本被清掉（行还在）：当前实现按「这个包不在了」处理 —— 404、非空体，不 panic。
     std::fs::remove_file(env.config.install_package_history_path(&package_id))
         .expect("remove cached copy");
-    let response = get_to_router(&env.config, &env.store_handle, &uri, Some(&credential)).await;
+    let response = get_agent_package(&env, &uri, Some(&credential)).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = body_bytes(response).await;
     assert!(
@@ -6273,7 +5942,7 @@ async fn package_download_by_id_rejects_path_traversal() {
         "/api/v1/agent/packages/pkg-..%2F..%2Fetc%2Fpasswd",
         "/api/v1/agent/packages/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
     ] {
-        let response = get_to_router(&env.config, &env.store_handle, uri, Some(&credential)).await;
+        let response = get_agent_package(&env, uri, Some(&credential)).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "uri {uri}");
     }
 }
@@ -6386,9 +6055,8 @@ async fn install_package_history_records_non_tar_package_without_identity() {
 
     // 而且能按 id 取回原字节（不因“没身份”而阻断升级）。
     let credential = enroll_agent_credential(&env).await;
-    let response = get_to_router(
-        &env.config,
-        &env.store_handle,
+    let response = get_agent_package(
+        &env,
         &format!("/api/v1/agent/packages/{package_id}"),
         Some(&credential),
     )
@@ -6402,8 +6070,8 @@ fn enrollment_request(token: &str) -> EnrollmentRequest {
         api_version: "v1".to_string(),
         kind: "submit_enrollment_request".to_string(),
         token: token.to_string(),
-        credential_request: "none".to_string(),
-        certificate_signing_request: None,
+        credential_request: "csr".to_string(),
+        certificate_signing_request: certificate_signing_request(),
         host_profile: wist_contracts::enrollment::HostProfile {
             node_id: "node-a".to_string(),
             hostname: "host-a".to_string(),
@@ -6590,8 +6258,8 @@ impl TestEnv {
             database_url: None,
             sqlite_path: db_path.clone(),
             trust_bundle: "internal-ca-stub".to_string(),
-            agent_ca_cert_file: None,
-            agent_ca_key_file: None,
+            agent_ca_cert_file: Some(shared_test_agent_ca_paths().0),
+            agent_ca_key_file: Some(shared_test_agent_ca_paths().1),
             client_cert_ttl_seconds: crate::infra::agent_ca::DEFAULT_CLIENT_CERT_TTL_SECONDS,
             install_script_signing_private_key_file: install_signing_private_key_file,
             install_script_signing_public_key_pem,
@@ -6680,6 +6348,21 @@ async fn issue_token_for_state(state: &ApiState) -> String {
 
 fn enrollment_request_json(token: &str) -> String {
     serde_json::to_string(&enrollment_request(token)).expect("serialize request")
+}
+
+/// 共享一份**测试用 agent CA**（证书 + 私钥），只在首次调用时生成。
+///
+/// mTLS 是 agent 唯一的凭据路径，注册/续期都必须有 CA 可签；每个 `TestEnv` 现造一份会白白
+/// 重复做密钥生成，所以就共享一份（文件落在系统临时目录，进程退出即随 `TestEnv` 一起被忽略）。
+fn shared_test_agent_ca_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    static PATHS: std::sync::OnceLock<(std::path::PathBuf, std::path::PathBuf)> =
+        std::sync::OnceLock::new();
+    PATHS
+        .get_or_init(|| {
+            let (_ca, cert_path, key_path) = test_agent_ca();
+            (cert_path, key_path)
+        })
+        .clone()
 }
 
 /// 采集内容只读视图：模板组成 + 各平台的面就绪度（“部分可用”的可见面）。
@@ -6873,6 +6556,29 @@ async fn get_to_router(
         .expect("route response")
 }
 
+/// agent 取包路由的 GET：第 4 个参数是 **agent_id**，注入「握手期验过的客户端证书身份」。
+///
+/// 与 [`get_to_router`]（管理面 admin token）分开，理由同 [`post_agent_json_to_router`]：
+/// agent 只有一条凭据路径 —— 客户端证书。
+async fn get_agent_package(
+    env: &TestEnv,
+    uri: &str,
+    agent_id: Option<&str>,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request");
+    if let Some(agent_id) = agent_id {
+        request.extensions_mut().insert(client_identity(agent_id));
+    }
+    router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(request)
+        .await
+        .expect("route response")
+}
+
 async fn delete_to_router(
     config: &AdminConfig,
     store: &Arc<dyn Store>,
@@ -6939,6 +6645,35 @@ async fn post_json_to_router<T: serde::Serialize>(
                 ))
                 .expect("request"),
         )
+        .await
+        .expect("route response")
+}
+
+/// agent 路由的请求：第 4 个参数是 **agent_id**，注入「握手期验过的客户端证书身份」。
+///
+/// 为什么和管理面那个助手分开：管理面走的是 **admin token**（bearer 头，人的凭据），而 agent
+/// **只有一条凭据路径 —— 客户端证书**（§5.2，2026-09-30 起删掉了 bearer 双轨）。两者靠 header
+/// 与否已经分不开了，所以在测试里就用两个助手区分，别让「同一个 helper 既能当人又能当机器」。
+async fn post_agent_json_to_router<T: serde::Serialize>(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    uri: &str,
+    agent_id: Option<&str>,
+    body: &T,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(body).expect("serialize body"),
+        ))
+        .expect("request");
+    if let Some(agent_id) = agent_id {
+        request.extensions_mut().insert(client_identity(agent_id));
+    }
+    router(config.clone(), Arc::clone(store))
+        .oneshot(request)
         .await
         .expect("route response")
 }
@@ -7068,7 +6803,7 @@ async fn get_agent_runtime_status(env: &TestEnv) -> serde_json::Value {
 }
 
 async fn poll_work(env: &TestEnv, credential: Option<&str>) -> Response {
-    post_json_to_router(
+    post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/work:poll",
@@ -7087,7 +6822,7 @@ async fn poll_work(env: &TestEnv, credential: Option<&str>) -> Response {
 }
 
 async fn poll_uplink(env: &TestEnv, credential: Option<&str>) -> Response {
-    post_json_to_router(
+    post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/uplink:poll",
@@ -7110,7 +6845,7 @@ async fn poll_uplink_with(
     api_version: &str,
     kind: &str,
 ) -> Response {
-    post_json_to_router(
+    post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/uplink:poll",
@@ -7181,7 +6916,7 @@ async fn ack_work(
     work_id: &str,
     version: i64,
 ) -> Response {
-    post_json_to_router(
+    post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/work:ack",
@@ -7402,7 +7137,7 @@ async fn submit_work_result_as(
     status: &str,
     detail: &str,
 ) -> Response {
-    post_json_to_router(
+    post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/work:result",
@@ -7737,7 +7472,7 @@ async fn the_uplink_grant_needs_an_agent_credential() {
 async fn the_uplink_poll_rejects_a_wrong_kind() {
     let env = TestEnv::new().await;
     let credential = enroll_agent_credential(&env).await;
-    let response = post_json_to_router(
+    let response = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/uplink:poll",
@@ -8642,6 +8377,46 @@ async fn mtls_certificate_rebuilds_unknown_agent_on_first_touch() {
     assert_eq!(rebuilt.credential_status, StoredCredentialStatus::Active);
 }
 
+/// §5.3 只保证**第一次**心跳能自愈 —— 除非「证书 + 陈旧 bearer」也按证书放行。
+///
+/// 重建出来的那行**不可能**知道这台机器的 bearer token（重建只读证书），而双轨期的 agent
+/// （§7）照旧会把 token 一起带上。若 bearer 先判，第二次心跳就是「行在、token 对不上」→
+/// 401 `credential_mismatch`（对 agentd 是**终态**：停重试、只能人工重注册）。
+/// 现象就是「自愈一次就死」。2026-09-30 实撞，所以这条测试锁死：证书已验证且未吊销时，
+/// 陈旧的 bearer 不该把请求判死。
+#[tokio::test]
+async fn a_certificate_authenticated_agent_survives_a_stale_bearer_token() {
+    let env = TestEnv::new().await;
+
+    // ① 库是空的：只有证书 → 凭证书首触重建（§5.3）。
+    let first = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None, // 库丢了，旧 bearer 凭据也没了 —— 只有证书
+        Some(client_identity("agent-rehydrated")),
+        &status_body("agent-rehydrated", "host-a"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    // ② 同一个 agent 的**下一次**心跳：它照旧带上自己那份 bearer（重建后库里并没这条 token）。
+    let second = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        Some("wic_stale_bearer_from_before_the_rebuild"),
+        Some(client_identity("agent-rehydrated")),
+        &status_body("agent-rehydrated", "host-a"),
+    )
+    .await;
+    let second_status = second.status();
+    let second_body = response_text(second).await;
+    assert_eq!(
+        second_status,
+        StatusCode::ACCEPTED,
+        "证书已验、未吊销时，陈旧的 bearer 不该把请求判死（正文：{second_body}）"
+    );
+}
+
 /// 证书身份与请求体不一致必须被拒：不能拿 A 的证书代表 B。
 #[tokio::test]
 async fn mtls_certificate_identity_mismatch_is_rejected() {
@@ -8667,6 +8442,9 @@ async fn mtls_certificate_identity_mismatch_is_rejected() {
 }
 
 /// 既没凭据也没证书：拒绝，并给出可辨识的 code。
+///
+/// `TestEnv` 配了 agent CA（mTLS 开启）⇒ 该带而没带 → `certificate_required`；
+/// 没配 CA 的网关则回 `missing_credential`（两者都可自愈/可重装，都不是终态）。
 #[tokio::test]
 async fn agent_request_without_credential_or_certificate_is_rejected() {
     let env = TestEnv::new().await;
@@ -8680,23 +8458,124 @@ async fn agent_request_without_credential_or_certificate_is_rejected() {
     .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let body = response_text(response).await;
-    assert!(body.contains("missing_credential"), "{body}");
+    assert!(body.contains("certificate_required"), "{body}");
 }
 
-/// 双轨：bearer 路径不受影响（带正确凭据仍可上报，不要求证书）。
+/// 凭据路径只有一条 —— **客户端证书**：有证书（哪怕不带 Authorization 头）就放行；
+/// 只有 bearer token、没有证书一律拒绝（双轨已删）。
 #[tokio::test]
-async fn bearer_credential_still_works_without_certificate() {
+async fn certificate_is_the_only_credential_path() {
     let env = TestEnv::new().await;
-    let credential = enroll_agent_credential(&env).await;
-    let response = post_agent_with_client_identity(
+    let agent_id = enroll_agent_credential(&env).await;
+
+    // 有证书、**不带任何 Authorization 头** → 放行（证明 bearer 已彻底删除）。
+    let accepted = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&agent_id),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    // 只有 bearer token、没有证书 → 拒绝（token 不再有任何效力）。
+    let rejected = post_agent_with_client_identity(
         &env,
         "/api/v1/agent/status",
-        Some(&credential),
+        Some("wic_some_old_bearer"),
         None,
         &status_body("agent-node-a", "node-a"),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// **核心回归**：库丢 / 换网关后，agent 凭证书**自愈重建** → **续期也必须能成**。
+///
+/// 重建登记的 `current_instance_id` 是 NULL（首触时实例本就未知），而网关续期时取的是库里
+/// 的 instance_id（投影退化为 `''`）。若续期按「实例必须相等」硬卡，自愈后的第一次续期会
+/// 白撞 401 —— 而身份明明已由证书验明。
+#[tokio::test]
+async fn a_rebuilt_agent_can_renew_its_certificate() {
+    let env = TestEnv::new().await;
+    let agent_id = "agent-rebuilt";
+
+    // ① 空库 + 只有证书 → 首触重建（§5.3）。
+    let first = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(agent_id),
+        &status_body(agent_id, "host-a"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    assert!(
+        env.store.get_agent(agent_id).await.expect("read").is_some(),
+        "凭证书首触应重建登记"
+    );
+
+    // ② 续期：带 CSR，必须换回一张新证书（而不是 401）。
+    let renewed = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/credentials:renew",
+        Some(agent_id),
+        &CredentialRenewal::new(
+            agent_id.to_string(),
+            "host-a".to_string(),
+            "csr".to_string(),
+            certificate_signing_request(),
+            "2026-07-29T00:00:00Z".to_string(),
+        ),
+    )
+    .await;
+    let status = renewed.status();
+    let body = response_text(renewed).await;
+    assert_eq!(status, StatusCode::OK, "自愈后的续期不该被拒：{body}");
+    assert!(body.contains("BEGIN CERTIFICATE"), "{body}");
+}
+
+/// 续期**必须**带 CSR：空 CSR 直接 400（mTLS 是唯一凭据路径，不签 token）。
+#[tokio::test]
+async fn renewal_without_a_csr_is_rejected() {
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/credentials:renew",
+        Some(&agent_id),
+        &CredentialRenewal::new(
+            "agent-node-a".to_string(),
+            "node-a".to_string(),
+            "csr".to_string(),
+            String::new(),
+            "2026-07-29T00:00:00Z".to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// 证书只证明「CA 签过它」，不证明「它现在还是本网关的成员」：没登记过的 agent 不能取包。
+///
+/// 取包路径与状态上报不同，**不重建**登记 —— 比照「被删掉的登记不该还能拉包」。
+#[tokio::test]
+async fn package_download_rejects_a_certificate_for_an_unknown_agent() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "unknown-agent", b"unknown-agent-bytes").await;
+
+    let rejected =
+        get_agent_package(&env, "/api/v1/agent/packages/current", Some("agent-ghost")).await;
+    assert_auth_rejected(rejected, "invalid agent client certificate").await;
+
+    // 登记一台后放行（证明拒绝来自「未知」，不是端点坏了）。
+    let agent_id = enroll_agent_credential(&env).await;
+    let ok = get_agent_package(&env, "/api/v1/agent/packages/current", Some(&agent_id)).await;
+    assert_eq!(ok.status(), StatusCode::OK);
 }
 
 // ── 注册时拿 CSR 换客户端证书（docs/design/agent-identity-mtls.md §5.1）──
@@ -8744,22 +8623,27 @@ fn certificate_signing_request() -> String {
         .expect("csr pem")
 }
 
-/// 核心：带了 CSR + 配了 agent CA → 回包里带客户端证书，且证书身份就是刚注册的 agent。
+/// `TestEnv` 里配置的那份测试 agent CA（`load_agent_ca` 从配置装载）。
+///
+/// mTLS 是 agent 唯一凭据路径，所以注册 / 续期都需要真 CA 可签；测试直接用它。
+fn env_agent_ca(env: &TestEnv) -> std::sync::Arc<crate::infra::AgentCa> {
+    super::load_agent_ca(&env.config).expect("test agent CA is configured")
+}
+
+/// 核心：带 CSR + 配了 agent CA → 回包里带客户端证书，且证书身份就是刚注册的 agent。
 #[tokio::test]
 async fn enrollment_with_a_csr_issues_a_client_certificate() {
     let env = TestEnv::new().await;
     let token = env.issue_token().await;
     let (ca, _, _) = test_agent_ca();
-    let mut request = enrollment_request(&token);
-    request.certificate_signing_request = Some(certificate_signing_request());
+    let request = enrollment_request(&token);
 
     let result =
         agent_enrollment_result(&env.config, &env.store_handle, Some(&ca), request, "v0.1.0").await;
     assert_eq!(result.status, EnrollmentStatus::Accepted);
 
     let bundle = result.credential_bundle.clone().expect("credential bundle");
-    assert_eq!(bundle.auth_scheme.as_deref(), Some("certificate"));
-    let certificate_pem = bundle.certificate.expect("client certificate");
+    let certificate_pem = bundle.certificate;
 
     // 证书里的身份 = 刚注册的 agent，且能被 agent CA 验链接受。
     let (_, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes()).expect("pem");
@@ -8772,14 +8656,14 @@ async fn enrollment_with_a_csr_issues_a_client_certificate() {
     assert_eq!(identity.environment_id, "env-default");
 }
 
-/// 开了 agent CA 但 CSR 是坏的：**拒绝**，不静默降级成 bearer。
+/// 开了 agent CA 但 CSR 是坏的：**拒绍**，不静默降级。
 #[tokio::test]
 async fn enrollment_with_a_broken_csr_is_rejected_not_downgraded() {
     let env = TestEnv::new().await;
     let token = env.issue_token().await;
     let (ca, _, _) = test_agent_ca();
     let mut request = enrollment_request(&token);
-    request.certificate_signing_request = Some("not a csr".to_string());
+    request.certificate_signing_request = "not a csr".to_string();
 
     let result =
         agent_enrollment_result(&env.config, &env.store_handle, Some(&ca), request, "v0.1.0").await;
@@ -8795,21 +8679,26 @@ async fn enrollment_with_a_broken_csr_is_rejected_not_downgraded() {
     );
 }
 
-/// 没配 agent CA（双轨默认）：CSR 被忽略，回到只发 bearer。
+/// 没配 agent CA = 这台网关没开 mTLS：注册**直接拒**（没有 bearer 可以回落）。
 #[tokio::test]
-async fn enrollment_ignores_a_csr_when_no_agent_ca_is_configured() {
+async fn enrollment_without_an_agent_ca_is_rejected() {
     let env = TestEnv::new().await;
     let token = env.issue_token().await;
-    let mut request = enrollment_request(&token);
-    request.certificate_signing_request = Some(certificate_signing_request());
 
-    let result =
-        agent_enrollment_result(&env.config, &env.store_handle, None, request, "v0.1.0").await;
-    assert_eq!(result.status, EnrollmentStatus::Accepted);
-    let bundle = result.credential_bundle.expect("credential bundle");
-    assert_eq!(bundle.auth_scheme.as_deref(), Some("bearer"));
-    assert!(bundle.certificate.is_none());
-    assert!(bundle.bearer_token.is_some());
+    let result = agent_enrollment_result(
+        &env.config,
+        &env.store_handle,
+        None,
+        enrollment_request(&token),
+        "v0.1.0",
+    )
+    .await;
+    assert_eq!(result.status, EnrollmentStatus::Rejected);
+    assert_eq!(
+        result.reason_code.as_deref(),
+        Some("agent_certificate_authority_not_configured")
+    );
+    assert!(result.credential_bundle.is_none());
 }
 
 /// 续期也能换发新证书：agent 重新交 CSR，网关用 agent CA 签一张新的（§4.2）。
@@ -8831,7 +8720,7 @@ async fn credential_renewal_with_a_csr_issues_a_new_client_certificate() {
         "requested_at": "2026-09-28T00:00:00Z",
     });
 
-    let response = post_json_to_router(
+    let response = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/credentials:renew",
@@ -8843,8 +8732,7 @@ async fn credential_renewal_with_a_csr_issues_a_new_client_certificate() {
 
     let renewed: CredentialRenewed = decode_json_response(response).await;
     let bundle = renewed.credential_bundle;
-    assert_eq!(bundle.auth_scheme.as_deref(), Some("certificate"));
-    let certificate_pem = bundle.certificate.expect("renewed client certificate");
+    let certificate_pem = bundle.certificate;
     let (_, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes()).expect("pem");
     let identity =
         crate::infra::agent_identity_from_certificate_der(&pem.contents).expect("identity");
@@ -8857,7 +8745,7 @@ async fn agent_certificate_status_is_stored_and_exposed_to_admins() {
     let env = TestEnv::new().await;
     let credential = enroll_agent_credential(&env).await;
 
-    let response = post_json_to_router(
+    let response = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -8908,7 +8796,7 @@ async fn agent_certificate_status_is_stored_and_exposed_to_admins() {
     );
 
     // 旧版本 agentd（不带 last_renewal）：**保留**上一次的续签记录，必填子字段照常覆盖。
-    let legacy = post_json_to_router(
+    let legacy = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -8960,7 +8848,7 @@ async fn a_revoked_agent_is_rejected_on_the_bearer_path() {
     let env = TestEnv::new().await;
     let credential = enroll_agent_credential(&env).await;
 
-    let ok = post_json_to_router(
+    let ok = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -8973,7 +8861,7 @@ async fn a_revoked_agent_is_rejected_on_the_bearer_path() {
     let revoked = revoke_agent_via_admin(&env, "agent-node-a", "compromised").await;
     assert_eq!(revoked.status(), StatusCode::OK);
 
-    let blocked = post_json_to_router(
+    let blocked = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -9053,7 +8941,7 @@ async fn lifting_a_revocation_restores_access_and_the_list_shows_entries() {
     .await;
     assert_eq!(lifted.status(), StatusCode::OK);
 
-    let ok = post_json_to_router(
+    let ok = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -9130,7 +9018,7 @@ async fn a_revoked_agent_cannot_renew_its_credential() {
         StatusCode::OK
     );
 
-    let renew = post_json_to_router(
+    let renew = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/credentials:renew",
@@ -9138,8 +9026,8 @@ async fn a_revoked_agent_cannot_renew_its_credential() {
         &CredentialRenewal::new(
             "agent-node-a".to_string(),
             "node-a".to_string(),
-            "bearer".to_string(),
-            None,
+            "csr".to_string(),
+            certificate_signing_request(),
             "2026-07-29T00:00:00Z".to_string(),
         ),
     )
@@ -9168,7 +9056,7 @@ async fn a_revocation_past_its_retention_no_longer_blocks() {
         .await
         .expect("inject a stale revocation");
 
-    let ok = post_json_to_router(
+    let ok = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -9251,7 +9139,7 @@ async fn an_unauthenticated_probe_cannot_reveal_revocation() {
     );
 
     // 凭据没验明（错的 bearer）同样不泄露。
-    let wrong = post_json_to_router(
+    let wrong = post_agent_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/agent/status",
@@ -9584,6 +9472,53 @@ async fn knowledge_endpoints_record_then_activate_without_a_restart() {
     let locks = get_view(&state, "/api/v1/admin/knowledge/locks").await;
     assert_eq!(locks["active_catalog_version"], 2);
     assert!(locks["locks"].is_array());
+}
+
+/// `activate: true` 的一次性路径：录入与切换一趟做完（页面上的「立即激活」）。
+///
+/// 回归的是这条路径曾经 **100% 失败**：`record_package` 交出的 `LoadedKnowledge.source` 还是默认的
+/// `None`，而 `activate_loaded` 只认 `KnowledgeSource::Package`，于是它回 HTTP 500
+/// `{"code":"package_store_failed","message":"内部错误：切的是未登记的包"}`。
+/// 两条激活路径（本接口 / 单独的 `/activate`）的输入必须同形，所以这里把两种情形都钉住：
+/// 全新录入，以及重复录入同一份（幂等 upsert）后的一次性激活。
+#[tokio::test]
+async fn knowledge_record_can_activate_in_one_shot() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let root = crate::test_support::unique_temp_dir("wist-knowledge-one-shot");
+    let tarball = crate::test_support::knowledge_package_tarball(&root, false);
+    let body = serde_json::json!({
+        "source": tarball.to_string_lossy(),
+        "activate": true,
+        "requested_by": "tester",
+    });
+
+    // ① 录完即生效：同一个请求里既登记又切换。
+    let response = post_to_state(&state, "/api/v1/admin/knowledge/packages", &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let recorded: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(recorded["active"], true, "一次性路径应当录完就生效");
+    let package_id = recorded["package_id"]
+        .as_str()
+        .expect("package_id")
+        .to_string();
+
+    // 内容当场就是包里的那一版（不重启），且留痕是 activate。
+    let content = get_view(&state, "/api/v1/admin/content").await;
+    assert_eq!(content["catalog_version"], 2);
+    let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
+    assert_eq!(knowledge["source"], "package");
+    assert_eq!(knowledge["generation"], 1);
+    assert_eq!(knowledge["package_id"], package_id);
+    assert_eq!(knowledge["activations"][0]["reason"], "activate");
+
+    // ② 同一份再录一次（幂等 upsert）也仍然能一次性激活 —— 这半边盖的是
+    //    「记录已存在，但交出去的 `loaded` 仍要带上 `Package` 标签」。
+    let response = post_to_state(&state, "/api/v1/admin/knowledge/packages", &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
+    assert_eq!(knowledge["generation"], 2);
+    assert_eq!(knowledge["activations"][0]["from_package"], package_id);
 }
 
 /// 空载：`configured: false` + 一句"怎么办"（I5：空载要看得见，不能是 503 哑谜）。

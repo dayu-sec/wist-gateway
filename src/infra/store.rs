@@ -847,13 +847,18 @@ pub struct AgentStatusUpdate<'a> {
 }
 
 /// 轮换 Agent 凭据（校验当前凭据后写入新凭据）。
+///
+/// `current_token_hash` 为 `None` = 凭据已由**证书**验明（mTLS 是唯一凭据路径），不再要求
+/// 客户端同时出示旧 token —— 那正是「自愈一次就死」的病根。`new_token_hash` 在证书路径下
+/// 存的是**新证书指纹**（`auth_scheme = 'certificate'`）。
 #[derive(Debug, Clone)]
 pub struct RenewCredential<'a> {
     pub agent_id: &'a str,
     pub instance_id: &'a str,
-    pub current_token_hash: &'a str,
+    pub current_token_hash: Option<&'a str>,
     pub new_credential_id: &'a str,
     pub new_token_hash: &'a str,
+    pub auth_scheme: &'a str,
     pub issued_at: &'a str,
     pub expires_at: &'a str,
 }
@@ -920,16 +925,6 @@ pub trait Store: Send + Sync + fmt::Debug {
     // ── Agent ──
 
     async fn get_agent(&self, agent_id: &str) -> StoreResult<Option<StoredAgentRegistration>>;
-
-    /// 按凭据 token hash 查当前时点的 agent（注册在本机的凭据唯一命中一行）。
-    ///
-    /// 为什么要单独开一个：升级取包这类路径手上只有 `Authorization: Bearer <credential>`，
-    /// 没有 `agent_id` / `instance_id`，无法走 [`Store::get_agent`]。查的是
-    /// `agents.current_credential_id` 指向的那一份（轮换过的旧凭据不再当前，自然查不到）。
-    async fn find_agent_by_credential_token_hash(
-        &self,
-        token_hash: &str,
-    ) -> StoreResult<Option<StoredAgentRegistration>>;
 
     async fn agent_exists(&self, agent_id: &str) -> StoreResult<bool>;
 

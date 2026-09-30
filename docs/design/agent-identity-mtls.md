@@ -11,6 +11,13 @@
 - 私钥丢失（agent 侧）与锚丢失（网关侧）的**代价边界**；
 - 迁移与验收。
 
+> **进度（2026-09-30）**：**已全量收口** —— agent 的凭据路径只剩**客户端证书（mTLS）**，bearer
+> 双轨在网关（`authenticate_agent` / 续期 / 升级取包）、**契约**（`wist-contracts` 删字段）、
+> **agentd**（控制面上行不再发 `bearer_auth`）三处一起删干净。验证：`wist-contracts` 107、
+> `wist-validate` 102、`wist-gateway` 475、`wist-agentd` 606，全绿；fmt / clippy 干净。
+> 模型侧（`wist-design` 的 `Control.Agent.Identity.CredentialBundle`）已同步去掉 bearer；
+> 生成的 `wist-control` 需待 `jumo-code generate` 解除阻塞后重新生成（见 §7）。
+
 > 服务端身份（域名 + 每客户 CA + KMS/HSM）已在 `gateway-access-security.md` 定稿，本文不重复。
 
 > **标注约定**：**【现状】** = 代码已具备；**【待做】** = 本方案要求、今天还不具备。
@@ -140,6 +147,10 @@ spiffe://<tenant_id>/<environment_id>/agent/<agent_id>
 agent 走 **mTLS**（出示客户端证书）→ 网关 `WebPkiClientVerifier` 验链 → 身份取自证书
 → 库查/建附加状态。
 
+**这是**唯一**的凭据路径**：agent 的 `Authorization` 头不再被解析（bearer 双轨已删，2026-09-30）。
+网关对**所有** agent 路由（上报 / 派活 / 取包 / 续期）都只认握手期验过的客户端证书；没带证书时
+按「该带而没带（`certificate_required`）」或「这台网关没开 mTLS（`missing_credential`）」拒绝。
+
 ### 5.3 库丢失 / 换网关（**关键：自动恢复**）
 
 - agent 仍持**有效客户端证书** → 网关 **首触重建登记**：以证书 URI SAN 里的 `agent_id`
@@ -200,8 +211,8 @@ agent 走 **mTLS**（出示客户端证书）→ 网关 `WebPkiClientVerifier` �
   **为什么不放在 `ClientCertVerifier`（握手期）**：§5.4 要求网关对「能拿到请求」的拒绝给出**可辨识
   错误码**，而握手期拒绝是 rustls 的 TLS alert，HTTP 层拿不到、agent 只看到不透明错误（也无法据此
   决定「明确报错退出」）。所以信任判定仍留在握手期（信任库 / 链路），**名单判定放在拿到请求之后**。
-- 覆盖范围：**两条凭据路径同一条闸门**（bearer 与证书都拦，续签自然也拦）；升级取包
-  （`authenticate_agent_credential_token`）与**数据面 ingest** 走的是另外的路径，也各自查一次，
+- 覆盖范围：**唯一一条闸门**（`authenticate_agent`，证书路径；续签续期自然也拦）；升级取包
+  （`authorize_agent_certificate`，同一套证书口径）与**数据面 ingest** 走的是另外的路径，也各自查一次，
   但按各自**统一的 401 正文**回（不额外区分「已吊销」）—— 否则会出现「业务被切断、却还能拉包 / 推数据」。
   且**名单判定在凭据验明之后**：不带凭据的请求不会因某 `agent_id` 在名单里而拿到不同的错误码。
 - **列表 GC**：条目只需保留到**那张证书自然过期**为止（≤ 有效期），过期即清 —— 列表不会无限增长。
@@ -228,13 +239,24 @@ agent 走 **mTLS**（出示客户端证书）→ 网关 `WebPkiClientVerifier` �
 
 ## 7. 迁移与兼容
 
-- **现状差距**：agentd 只支持 `bearer scheme`（其它直接拒）；网关 TLS 目前是
-  `ServerConfig::builder().with_no_client_auth()`。
-- **双轨期**：bearer 路径继续可用；新装 / 重注册走 mTLS；提供一次性迁移（重 enroll 换证书）。
-- **一次性成本**：现有 agent 需**重注册一次**（任何方案都躲不掉 —— 当前锚/身份已经变过）。
-  但因 `agent_id` 是稳定哈希，**不会产生重复 agent**。
-- **过渡缓解（便宜，先做）**：备份保持**小时级**；或让**续期不轮换 token**（旧 token 短期共存）。
-  两者都能把「要逐台动手」的尾巴缩小到很小。
+- **收口（2026-09-30，已完成）**：agent 与网关**唯一一致的凭据路径是客户端证书**。
+  - 网关：`authenticate_agent` / `renew_agent_credential` / `authorize_agent_certificate`（取包）
+    都只认证书；bearer 分支与 `credential_mismatch` / `unknown_credential` / `credential_inactive`
+    这些基于 bearer 行的终态 code 已删。注册回包不再发 `bearer_token`，回包 `certificate` 为必填。
+  - 契约（`wist-contracts`）：`CredentialBundle` 删 `bearer_token` / `auth_scheme`、`certificate`
+    由 `Option` 改必填；`EnrollmentRequest` / `CredentialRenewal` 的 `certificate_signing_request`
+    由 `Option` 改必填；`ControlPlaneSection` / `AgentRuntimeState` 删 `bearer_token`。
+  - agentd：控制面上行（状态 / 派活 / 数据面 / 发现策略 / 续期 / 取包）都靠 `enrollment_http_client`
+    挂的客户端证书，不再发 `Authorization`；续期固定带 CSR 并把新证书落盘（新证书必须持久化，
+    否则续期后仍用旧证书）。
+- **生成物未刷新**：`wist-design` 的模型已同步（`Control.Agent.Identity.CredentialBundle` 与
+  注册 sample 都不再带 bearer），但 `wist-control` 的 `@jumo generated` 代码需重新生成 ——
+  `jumo-code generate wist-design` 当前 **Blocked**（interface entry binding 缺失、draft 字段等，
+  与本改动无关）。在解除之前，`wist-control::CredentialBundle` 仍带旧字段（仅供模型契约测试）。
+- **一次性成本**：现有 agent 需**重装 / 重注册一次**（要拿到客户端证书）。因 `agent_id` 是稳定哈希，
+  **不会产生重复 agent**。系统尚未发布，不做双轨向后兼容。
+- **发布序**：先发 `wist-contracts`，再把 `wist-gateway` / `wist-agentd` / `wist-validate` 的
+  `[patch.crates-io]`（本地联调用）去掉、按依赖序切回 registry 版本后发布。
 
 ---
 

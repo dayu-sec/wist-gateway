@@ -31,6 +31,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let config =
         wist_gateway::infra::AdminConfig::load_from_env().map_err(|err| err.into_boxed_std())?;
+
+    // 单实例闸门：**一个操作系统上只允许一个网关**。放在打开库之前 —— 真正的破坏是两个实例
+    // 同时写一份 SQLite，而不是端口被占（端口可以配成不同的）。
+    // 锁跟进程走：进程死了（含 kill -9）内核就放锁，不留需要人清理的脏状态。
+    let instance_lock = match wist_gateway::infra::InstanceLock::acquire() {
+        Ok(lock) => lock,
+        Err(err) => {
+            // 拒绝启动是给**运维**看的一句话：不要让它套上 `Error: "…"` 那层 Debug 引号与转义，
+            // 原文打出来再退。（这里还没开库、没占端口，没有要清理的东西。）
+            eprintln!("wist-gateway 拒绝启动：{err}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "wist-gateway single-instance lock: {}",
+        instance_lock.path().display()
+    );
+
     let addr = config.listen_addr.clone();
     let ingest_addr = config.ingest_listen_addr.clone();
     let store = build_store(&config).await?;
@@ -177,7 +195,7 @@ async fn serve_tls(
             };
             // mTLS 开启时，从**已完成握手**的连接里取已验的客户端证书并解出 agent 身份。
             // 链验过了但认不出身份（缺 URI SAN / 段非法）就不当作已认证 ——
-            // 交给应用层回 401，而不是静默落回未认证的 bearer 路径。
+            // 交给应用层回 401，而不是静默当成未认证放行。
             let client_identity = if mtls_enabled {
                 match wist_gateway::infra::peer_leaf_certificate_der(tls_stream.get_ref().1) {
                     Some(der) => match VerifiedAgentIdentity::from_certificate_der(&der) {

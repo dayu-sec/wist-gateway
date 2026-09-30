@@ -13,7 +13,7 @@ use wist_contracts::enrollment::{
 
 use crate::infra::{
     AdminConfig, AgentCa, AgentCertificateIdentity, CommitRegistration, ReserveEnrollmentToken,
-    Store, new_secret_token, sha256_hex,
+    Store,
 };
 
 use super::{
@@ -94,25 +94,6 @@ pub async fn agent_enrollment_result(
     input: EnrollmentRequest,
     version: &str,
 ) -> EnrollmentOutcome {
-    agent_enrollment_result_with_token_issuer(
-        config,
-        store,
-        agent_ca,
-        input,
-        version,
-        new_secret_token,
-    )
-    .await
-}
-
-pub(super) async fn agent_enrollment_result_with_token_issuer(
-    config: &AdminConfig,
-    store: &Arc<dyn Store>,
-    agent_ca: Option<&AgentCa>,
-    input: EnrollmentRequest,
-    version: &str,
-    issue_secret_token: impl FnOnce(&str) -> Result<String, String>,
-) -> EnrollmentOutcome {
     if let Err(reason) = validate_enrollment_message(&input) {
         return rejected_result(reason);
     }
@@ -129,38 +110,34 @@ pub(super) async fn agent_enrollment_result_with_token_issuer(
         Ok(reservation) => reservation,
         Err(reason) => return rejected_result(reason),
     };
-    let bearer_token = match issue_secret_token("wic") {
-        Ok(token) => token,
+    let issued_at = chrono::Utc::now().to_rfc3339();
+
+    // 拿 CSR 换客户端证书（mTLS）—— 这是 agent **唯一**的凭据路径（bearer 已删）。
+    // 没配 agent CA、或没带 CSR，都直接拒：不做任何静默降级。
+    let Some(ca) = agent_ca else {
+        let _ = rollback_enrollment_token_reservation(store, &reservation).await;
+        return rejected_result("agent_certificate_authority_not_configured".to_string());
+    };
+    let csr = input.certificate_signing_request.trim();
+    if csr.is_empty() {
+        let _ = rollback_enrollment_token_reservation(store, &reservation).await;
+        return rejected_result("missing_certificate_signing_request".to_string());
+    }
+    let certificate_identity = AgentCertificateIdentity::new(
+        config.tenant_id.clone(),
+        config.environment_id.clone(),
+        agent_id.clone(),
+    );
+    let issued_certificate = match ca.issue_client_certificate(
+        csr,
+        &certificate_identity,
+        config.client_cert_ttl_seconds,
+    ) {
+        Ok(issued) => issued,
         Err(reason) => {
             let _ = rollback_enrollment_token_reservation(store, &reservation).await;
-            return rejected_result(reason);
+            return rejected_result(format!("invalid_certificate_signing_request: {reason}"));
         }
-    };
-    let issued_at_time = chrono::Utc::now();
-    let issued_at = issued_at_time.to_rfc3339();
-    let bearer_not_after =
-        (issued_at_time + chrono::Duration::seconds(config.credential_ttl_seconds)).to_rfc3339();
-
-    // 拿 CSR 换客户端证书（mTLS）。网关没配 agent CA 时忽略 CSR，回落 bearer 双轨（§7）。
-    // agent 既然开口要证书，就**不能静默降级**：签不出来就拒，并给出可诊断的原因。
-    let issued_certificate = match (agent_ca, input.certificate_signing_request.as_deref()) {
-        (Some(ca), Some(csr)) => {
-            let identity = AgentCertificateIdentity::new(
-                config.tenant_id.clone(),
-                config.environment_id.clone(),
-                agent_id.clone(),
-            );
-            match ca.issue_client_certificate(csr, &identity, config.client_cert_ttl_seconds) {
-                Ok(issued) => Some(issued),
-                Err(reason) => {
-                    let _ = rollback_enrollment_token_reservation(store, &reservation).await;
-                    return rejected_result(format!(
-                        "invalid_certificate_signing_request: {reason}"
-                    ));
-                }
-            }
-        }
-        _ => None,
     };
 
     let credential_id = format!("cred-{}", stable_identifier(&agent_id));
@@ -174,31 +151,18 @@ pub(super) async fn agent_enrollment_result_with_token_issuer(
         expires_at: None,
         status: AgentIdentityStatus::Active,
     };
-    // 有效期以**证书**为准（agentd 的续期窗就落在这个到期时间上，§4.2）：
-    // bearer 仍然一起发（双轨），但它的 30 天口子不写在回包里。
-    let (auth_scheme, not_before, not_after) = match issued_certificate.as_ref() {
-        Some(issued) => (
-            "certificate",
-            issued.not_before.clone(),
-            issued.not_after.clone(),
-        ),
-        None => ("bearer", issued_at.clone(), bearer_not_after.clone()),
-    };
+    // 有效期以**证书**为准（agentd 的续期窗就落在这个到期时间上，§4.2）。
     let credential_bundle = CredentialBundle {
         credential_id: credential_id.clone(),
         agent_id: agent_id.clone(),
         instance_id: instance_id.clone(),
-        auth_scheme: Some(auth_scheme.to_string()),
-        bearer_token: Some(bearer_token.clone()),
-        certificate: issued_certificate
-            .as_ref()
-            .map(|issued| issued.certificate_pem.clone()),
+        certificate: issued_certificate.certificate_pem.clone(),
         // 私钥永不上送（本地生成）；服务端信任锚已经走 trust_bundle，不重复放进凭据包。
         private_key_ref: None,
         ca_bundle: None,
         issued_at: issued_at.clone(),
-        not_before: Some(not_before),
-        not_after: Some(not_after),
+        not_before: Some(issued_certificate.not_before.clone()),
+        not_after: Some(issued_certificate.not_after.clone()),
     };
 
     let result = EnrollmentOutcome {
@@ -217,8 +181,8 @@ pub(super) async fn agent_enrollment_result_with_token_issuer(
         &input,
         &result,
         version,
-        &bearer_token,
-        &bearer_not_after,
+        &issued_certificate.fingerprint_sha256_hex,
+        &issued_certificate.not_after,
     )
     .await
     {
@@ -272,8 +236,8 @@ async fn commit_reserved_registration(
     input: &EnrollmentRequest,
     result: &EnrollmentOutcome,
     version: &str,
-    bearer_token: &str,
-    bearer_not_after: &str,
+    credential_fingerprint: &str,
+    credential_expires_at: &str,
 ) -> Result<(), String> {
     let token_hash = token_hash(&input.token);
     let agent_id = result
@@ -292,10 +256,8 @@ async fn commit_reserved_registration(
     let registered_at = chrono::DateTime::parse_from_rfc3339(&input.requested_at)
         .map(|value| value.with_timezone(&chrono::Utc).to_rfc3339())
         .unwrap_or_else(|_| now.clone());
-    let credential_token_hash = sha256_hex(bearer_token);
-    // 库里记的仍是 bearer 凭据的到期时间（bearer 鉴权路径按它判过期）；
-    // 证书的到期时间在回包的 credential_bundle 里，agent 侧据此算续期窗。
-    let credential_expires_at = bearer_not_after.to_string();
+    // 库里记的凭据“哈希” = **新证书指纹**，auth_scheme = `certificate`（bearer 凭据已删）。
+    let credential_token_hash = credential_fingerprint.to_string();
 
     // token 状态收尾（used/reserved_at）与 agents 落库现在都在 store 单事务内完成。
     let rejection = store
@@ -313,7 +275,7 @@ async fn commit_reserved_registration(
             credential_id: &credential.credential_id,
             credential_token_hash: &credential_token_hash,
             credential_issued_at: &credential.issued_at,
-            credential_expires_at: &credential_expires_at,
+            credential_expires_at,
             registered_at: &registered_at,
             now: &now,
         })
