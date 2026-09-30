@@ -51,8 +51,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         wist_gateway::infra::load_admin_tls_config(&config)?
     };
-    // 两个监听共用一份状态：规则表、策略表、会话运行态与限流器都只能有一份。
-    let state = wist_gateway::api::build_state(config, store);
+    // 两个监听共用一份状态：知识库内容、会话运行态与限流器都只能有一份。
+    //
+    // 知识库在这里（async 上下文）按**管理面登记的生效包**装载：生效包损坏就返回 Err 拒绝
+    // 启动（设计 §8.5）—— 带着空内容起会让平台悄悄停掉建议与派活，比起不来更难查。
+    let knowledge = wist_gateway::app::knowledge::LoadedKnowledge::from_store(&config, &store)
+        .await
+        .map_err(|err| format!("load knowledge content: {err}"))?;
+    let state = wist_gateway::api::build_state_with_knowledge(config, store, knowledge);
 
     // 一次性工作的到期判定：过了截止的标 expired、预算尽的标 timed_out。
     // 与 agent 在不在线无关 —— 掉线的 agent 恰恰是活最容易卡住的时候。

@@ -13,6 +13,10 @@ pub mod purpose;
 // agentd；与 purpose 同类 —— 模型留结构、值留 content/。重新生成控制面代码时需回补本模块。
 pub mod discovery_policy;
 
+// NOTE(hand-added): 知识库内容的装载与持有（采集目录三件套 + 用途规则 + 发现策略；
+// 管理面登记生效包，运行时切换）。重生成控制面代码时需回补本模块。
+pub mod knowledge;
+
 // NOTE(hand-added): L1a 机械资产清单（从事实摘要派生，见 doc/design/center/
 // agent-work-delivery-plan.md §8.2）。只做机械归并，不做识别（识别在采集侧）。
 // 重新生成控制面代码时需回补本模块。

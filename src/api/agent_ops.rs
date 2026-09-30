@@ -274,7 +274,8 @@ pub async fn poll_discovery_policies(
     {
         return response;
     }
-    match state.discovery_policies.as_deref() {
+    let knowledge = state.knowledge();
+    match knowledge.discovery_policies.as_deref() {
         Some(set) => (
             StatusCode::OK,
             Json(DiscoveryPoliciesReturned::from_set(
@@ -1133,16 +1134,24 @@ pub(super) async fn ensure_fresh_suggestion(
     current: Option<StoredPurposeSuggestion>,
     computed_at: &str,
 ) -> Result<Option<StoredPurposeSuggestion>, String> {
-    let Some(table) = state.purpose_rules.as_deref() else {
+    let knowledge = state.knowledge();
+    let Some(table) = knowledge.purpose_rules.as_deref() else {
         return Ok(current);
     };
-    // 过期判据：规则册换了版本（`rule_set_id` 变了）。所以**改规则必须 bump rule_set_id**，
-    // 否则内容变了而版本没变，这里看不出来。
+    // 过期判据：**规则册换了版本**。两个锚都要看：
+    //   - `rule_set_id`（如 `macos-v1`）= 分册 id；
+    //   - `purpose_version` = 整表版本。
+    // 只看前者，策展侧"改了内容却忘了改分册 id"就会让读取路径看不出过期、把旧结论当现役；
+    // 只看后者，分册更换又感知不到。两者任一变了就重算（设计 §8.2）。
+    // 迁移前的老行 `purpose_version` 为 NULL → 这里会判成过期、重算一次并把版本补上
+    // （只发生一次，是为了把锚补齐，不是 bug）。
     let expected = table
         .for_platform(&summary.os)
         .map(|set| set.rule_set_id.clone());
+    let expected_version = Some(i64::from(table.purpose_version));
     if let Some(suggestion) = current.as_ref()
         && suggestion.rule_set_id.as_deref() == expected.as_deref()
+        && suggestion.purpose_version == expected_version
     {
         return Ok(current);
     }

@@ -417,6 +417,7 @@ fetch_timeout_seconds = 60
 | **M3 体验与治理** | 完整 `/knowledge` 页（历史/明细/锁旧版下钻）+ dev svc.sh 改走 API + stack 的 localize 钩子 + 旧包清理策略 | 部署后自动有知识库；运维无需看 toml |
 
 **M1 的第一步就是改 `ApiState` 的持有方式**（§8.1 已定选 B）——它是所有后续工作的地基。
+**已完成**：连同 §17.1 的 `purpose_version` 前置（规则表顶层字段 + 建议行记版本 + 装载/校验）。
 
 ---
 

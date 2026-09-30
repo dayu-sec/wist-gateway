@@ -539,6 +539,24 @@ fn agent_install_package_from_row(row: &SqliteRow) -> StoreResult<StoredAgentIns
     })
 }
 
+fn knowledge_package_from_row(row: &SqliteRow) -> StoreResult<StoredKnowledgePackage> {
+    Ok(StoredKnowledgePackage {
+        package_id: column!(row, "package_id"),
+        source: column!(row, "source"),
+        package_sha256: column!(row, "package_sha256"),
+        version: column!(row, "version"),
+        catalog_version: column!(row, "catalog_version"),
+        template_version: column!(row, "template_version"),
+        policy_version: column!(row, "policy_version"),
+        purpose_version: column!(row, "purpose_version"),
+        parser_abi: column!(row, "parser_abi"),
+        signed_by: column!(row, "signed_by"),
+        cached_path: column!(row, "cached_path"),
+        created_by: column!(row, "created_by"),
+        created_at: column!(row, "created_at"),
+    })
+}
+
 async fn insert_token(tx: &mut SqliteConnection, token: &StoredEnrollmentToken) -> StoreResult<()> {
     sqlx::query(
         "INSERT OR REPLACE INTO enrollment_tokens (token_id, token_hash, tenant_id, \
@@ -1815,7 +1833,7 @@ impl Store for SqliteStore {
     ) -> StoreResult<Option<StoredPurposeSuggestion>> {
         let row = sqlx::query(
             "SELECT agent_id, suggestion_id, suggested_class, confidence, method, rule_set_id, \
-             signals, observed_at, computed_at \
+             purpose_version, signals, observed_at, computed_at \
              FROM agent_purpose_suggestion WHERE agent_id = ?1",
         )
         .bind(agent_id)
@@ -1832,11 +1850,12 @@ impl Store for SqliteStore {
         let signals = serialize_json_array(&suggestion.signals, "serialize purpose signals")?;
         sqlx::query(
             "INSERT INTO agent_purpose_suggestion (agent_id, suggestion_id, suggested_class, \
-             confidence, method, rule_set_id, signals, observed_at, computed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             confidence, method, rule_set_id, purpose_version, signals, observed_at, computed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
              ON CONFLICT (agent_id) DO UPDATE SET suggestion_id = excluded.suggestion_id, \
              suggested_class = excluded.suggested_class, confidence = excluded.confidence, \
              method = excluded.method, rule_set_id = excluded.rule_set_id, \
+             purpose_version = excluded.purpose_version, \
              signals = excluded.signals, observed_at = excluded.observed_at, \
              computed_at = excluded.computed_at",
         )
@@ -1846,6 +1865,7 @@ impl Store for SqliteStore {
         .bind(suggestion.confidence)
         .bind(&suggestion.method)
         .bind(&suggestion.rule_set_id)
+        .bind(suggestion.purpose_version)
         .bind(signals)
         .bind(&suggestion.observed_at)
         .bind(&suggestion.computed_at)
@@ -2291,6 +2311,140 @@ impl Store for SqliteStore {
         .map_err(|err| sql_error(err, "find rollout plan entry by work"))?;
         row.as_ref().map(rollout_plan_entry_from_row).transpose()
     }
+
+    // ── 知识库内容包（设计 §6.1）──
+
+    async fn upsert_knowledge_package(&self, package: &StoredKnowledgePackage) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO knowledge_package (package_id, source, package_sha256, version, \
+             catalog_version, template_version, policy_version, purpose_version, parser_abi, \
+             signed_by, cached_path, created_by, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT (package_id) DO UPDATE SET source = excluded.source, \
+             package_sha256 = excluded.package_sha256, version = excluded.version, \
+             catalog_version = excluded.catalog_version, \
+             template_version = excluded.template_version, \
+             policy_version = excluded.policy_version, \
+             purpose_version = excluded.purpose_version, parser_abi = excluded.parser_abi, \
+             signed_by = excluded.signed_by, cached_path = excluded.cached_path, \
+             created_by = excluded.created_by, created_at = excluded.created_at",
+        )
+        .bind(&package.package_id)
+        .bind(&package.source)
+        .bind(&package.package_sha256)
+        .bind(&package.version)
+        .bind(package.catalog_version)
+        .bind(package.template_version)
+        .bind(package.policy_version)
+        .bind(package.purpose_version)
+        .bind(package.parser_abi)
+        .bind(&package.signed_by)
+        .bind(&package.cached_path)
+        .bind(&package.created_by)
+        .bind(&package.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert knowledge package"))?;
+        Ok(())
+    }
+
+    async fn knowledge_package(
+        &self,
+        package_id: &str,
+    ) -> StoreResult<Option<StoredKnowledgePackage>> {
+        let row = sqlx::query(
+            "SELECT package_id, source, package_sha256, version, catalog_version, \
+             template_version, policy_version, purpose_version, parser_abi, signed_by, \
+             cached_path, created_by, created_at \
+             FROM knowledge_package WHERE package_id = ?1",
+        )
+        .bind(package_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select knowledge package"))?;
+        row.as_ref().map(knowledge_package_from_row).transpose()
+    }
+
+    async fn knowledge_active(&self) -> StoreResult<Option<StoredKnowledgeActive>> {
+        let row = sqlx::query(
+            "SELECT package_id, generation, activated_by, activated_at \
+             FROM knowledge_active WHERE setting_id = ?1",
+        )
+        .bind(DEFAULT_KNOWLEDGE_SETTING_ID)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select active knowledge"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(StoredKnowledgeActive {
+            package_id: column!(row, "package_id"),
+            generation: column!(row, "generation"),
+            activated_by: column!(row, "activated_by"),
+            activated_at: column!(row, "activated_at"),
+        }))
+    }
+
+    async fn activate_knowledge(
+        &self,
+        activation: &KnowledgeActivation<'_>,
+    ) -> StoreResult<StoredKnowledgeActive> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin activate knowledge"))?;
+        // 世代号在上一版基础上 +1：必须**单调**，否则"哪一代算的"会重复、归因就失真。
+        // 同时读出上一版包 id —— 它是审计里的 `from_package`。
+        let previous: Option<(i64, String)> = sqlx::query_as(
+            "SELECT generation, package_id FROM knowledge_active WHERE setting_id = ?1",
+        )
+        .bind(DEFAULT_KNOWLEDGE_SETTING_ID)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "select knowledge generation"))?;
+        let (generation, from_package) = match previous {
+            Some((generation, package_id)) => (generation + 1, Some(package_id)),
+            None => (1, None),
+        };
+        sqlx::query(
+            "INSERT INTO knowledge_active (setting_id, package_id, generation, activated_by, \
+             activated_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (setting_id) DO UPDATE SET package_id = excluded.package_id, \
+             generation = excluded.generation, activated_by = excluded.activated_by, \
+             activated_at = excluded.activated_at",
+        )
+        .bind(DEFAULT_KNOWLEDGE_SETTING_ID)
+        .bind(activation.package_id)
+        .bind(generation)
+        .bind(activation.requested_by)
+        .bind(activation.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "activate knowledge"))?;
+        sqlx::query(
+            "INSERT INTO knowledge_activation_log (from_package, to_package, generation, reason, \
+             requested_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(from_package)
+        .bind(activation.package_id)
+        .bind(generation)
+        .bind(activation.reason)
+        .bind(activation.requested_by)
+        .bind(activation.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "log knowledge activation"))?;
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit activate knowledge"))?;
+        Ok(StoredKnowledgeActive {
+            package_id: activation.package_id.to_string(),
+            generation,
+            activated_by: activation.requested_by.to_string(),
+            activated_at: activation.created_at.to_string(),
+        })
+    }
 }
 
 /// 列清单单独提出来：读单行与读全表必须选同一组列，
@@ -2438,6 +2592,7 @@ fn purpose_suggestion_from_row(row: &SqliteRow) -> StoreResult<StoredPurposeSugg
         confidence: column!(row, "confidence"),
         method: column!(row, "method"),
         rule_set_id: column!(row, "rule_set_id"),
+        purpose_version: column!(row, "purpose_version"),
         signals: deserialize_json_array(&signals, "read purpose signals")?,
         observed_at: column!(row, "observed_at"),
         computed_at: column!(row, "computed_at"),
@@ -4406,5 +4561,92 @@ mod tests {
         assert_eq!(kept.last_renewal.as_ref(), Some(&renewal));
         // 必填子字段照常覆盖（只有可选的那份保留）。
         assert_eq!(kept.state, "valid");
+    }
+
+    // ── 知识库内容包（设计 §6.1）──
+
+    fn knowledge_package(package_id: &str) -> StoredKnowledgePackage {
+        StoredKnowledgePackage {
+            package_id: package_id.to_string(),
+            source: "/packages/wist-knowledge-0.1.0.tar.gz".to_string(),
+            package_sha256: format!("sha256:{package_id}"),
+            version: "0.1.0".to_string(),
+            catalog_version: Some(2),
+            template_version: Some(1),
+            policy_version: Some(1),
+            purpose_version: Some(1),
+            parser_abi: 1,
+            signed_by: String::new(),
+            cached_path: format!("/state/knowledge/{package_id}"),
+            created_by: "admin".to_string(),
+            created_at: "2026-09-30T00:00:00Z".to_string(),
+        }
+    }
+
+    fn knowledge_activation<'a>(package_id: &'a str, reason: &'a str) -> KnowledgeActivation<'a> {
+        KnowledgeActivation {
+            package_id,
+            reason,
+            requested_by: "admin",
+            created_at: "2026-09-30T00:00:00Z",
+        }
+    }
+
+    #[tokio::test]
+    async fn activates_knowledge_with_monotonic_generations_and_an_audit_trail() {
+        let store = store().await;
+        // 从未激活过 = 空载，**不是**错误（设计 §8.5）。
+        assert!(store.knowledge_active().await.unwrap().is_none());
+
+        for package_id in ["kbp-a", "kbp-b"] {
+            store
+                .upsert_knowledge_package(&knowledge_package(package_id))
+                .await
+                .unwrap();
+        }
+        // 内容寻址幂等：同一个包重复录入落同一行。
+        store
+            .upsert_knowledge_package(&knowledge_package("kbp-a"))
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_package")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let first = store
+            .activate_knowledge(&knowledge_activation("kbp-a", "activate"))
+            .await
+            .unwrap();
+        assert_eq!((first.generation, first.package_id.as_str()), (1, "kbp-a"));
+        let second = store
+            .activate_knowledge(&knowledge_activation("kbp-b", "activate"))
+            .await
+            .unwrap();
+        assert_eq!(second.generation, 2);
+        // 回滚也是一次切换：世代继续往前走（**不是**回到 1）—— 否则"哪一代算的"会重复。
+        let rolled = store
+            .activate_knowledge(&knowledge_activation("kbp-a", "rollback"))
+            .await
+            .unwrap();
+        assert_eq!(rolled.generation, 3);
+        assert_eq!(
+            store.knowledge_active().await.unwrap().unwrap().package_id,
+            "kbp-a"
+        );
+
+        // 审计：三次切换各一条，首条的 `from_package` 为空（首次激活没有"从哪来"）。
+        let log: Vec<(Option<String>, String, i64, String)> = sqlx::query_as(
+            "SELECT from_package, to_package, generation, reason \
+             FROM knowledge_activation_log ORDER BY id",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(log.len(), 3);
+        assert!(log[0].0.is_none());
+        assert_eq!(log[0].1.as_str(), "kbp-a");
+        assert_eq!((log[2].3.as_str(), log[2].2), ("rollback", 3));
     }
 }

@@ -643,7 +643,8 @@ async fn grant_standing_work(
     agent_id: &str,
     input: &GrantWorkRequest,
 ) -> Response {
-    let Some(content) = state.content.as_deref() else {
+    let knowledge = state.knowledge();
+    let Some(content) = knowledge.content.as_deref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "collection content is not loaded: 配置 [content] 三件套后重启网关",
@@ -2043,7 +2044,8 @@ pub async fn view_discovery_policies(
         })
         .collect();
     agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
-    match state.discovery_policies.as_deref() {
+    let knowledge = state.knowledge();
+    match knowledge.discovery_policies.as_deref() {
         Some(set) => Json(DiscoveryPoliciesView {
             configured: true,
             policy: Some(set.clone()),

@@ -73,7 +73,8 @@ pub async fn view_content(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    let Some(content) = state.content.as_deref() else {
+    let knowledge = state.knowledge();
+    let Some(content) = knowledge.content.as_deref() else {
         // 不是 404：端点存在，只是这台网关**没配**内容目录 —— 与「没发布」区分开，
         // 与 discovery-policies 未配置时回 503 同一约定。
         return (

@@ -1,7 +1,7 @@
 // @jumo generated
 // @jumo hash=2ff63c2da808b5ca
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum::{
     Router,
@@ -9,10 +9,8 @@ use axum::{
     routing::{delete, get, post},
 };
 
-use crate::app::content::ContentSet;
-use crate::app::purpose::PurposeRuleTable;
+use crate::app::knowledge::LoadedKnowledge;
 use crate::infra::{AdminConfig, AgentCa, Store};
-use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 
 mod admin_auth;
 mod admin_ops;
@@ -97,21 +95,15 @@ pub struct ApiState {
     pub store: Arc<dyn Store>,
     pub runtime: Arc<Mutex<AdminRuntimeState>>,
     pub rate_limits: Arc<Mutex<rate_limit::RateLimitState>>,
-    /// 已装载的用途推断规则表；未配置 `[purpose] rules_file` 时为 `None`。
+    /// 当前装载着的**知识库内容**（采集目录三件套 + 用途规则 + 发现策略）。
     ///
-    /// 启动时装载一次并缓存（改规则通过重启生效）：规则表是策展数据，改它要走审定，
-    /// 不做热加载 —— 热加载会让"哪一版规则算出的这个建议"变得说不清。
-    pub purpose_rules: Option<Arc<PurposeRuleTable>>,
-    /// 已装载的发现方向策略表；未配置 `[discovery] policies_file` 时为 `None`。
+    /// 三个块放在**同一个 `Arc` 里整体换**，而不是三个各自可换的字段：切版时"模板已是新的、
+    /// 规则还是旧的"这种半新半旧视图，会让"这条建议按哪版算的"又变得说不清。
     ///
-    /// 与规则表同理：启动时装载一次并缓存（改策略通过重启生效）。`None` 时下发端点
-    /// 回 503，而不是发一份空表 —— 空表会让「平台没发布策略」与「从未配置」无法区分。
-    pub discovery_policies: Option<Arc<DiscoveryAspectPolicySet>>,
-    /// 已装载的采集内容集（catalog + packs + templates）；三者缺一则为 `None`。
-    ///
-    /// 与规则表/策略表同理：启动时装载一次并缓存（改内容通过重启生效）。`None` 时
-    /// 内容相关能力（模板展开）不可用，但不影响事实入库 / 用途推断 / 资产清单。
-    pub content: Option<Arc<ContentSet>>,
+    /// 为什么是 `RwLock<Arc<…>>` 而不是一个普通字段：管理面激活/回滚要在**不重启**的前提下
+    /// 换掉它（设计 §8.1 选 B）。读多写极少，所以用读写锁；读路径必须先 `clone` 出 `Arc`
+    /// 再放开锁（`RwLockReadGuard` 不能跨 `.await` 持有）。
+    knowledge: Arc<RwLock<Arc<LoadedKnowledge>>>,
     /// agent 客户端证书的签发 CA。`None` = 未配置（不开 mTLS 签发，注册只发 bearer）。
     ///
     /// 启动时装载一次（配置错了 `AdminConfig::validate` 就已经拒绝启动）。它的根**只留服务端**
@@ -119,59 +111,36 @@ pub struct ApiState {
     pub agent_ca: Option<Arc<AgentCa>>,
 }
 
-/// 启动时装载规则表。
-///
-/// `AdminConfig::validate` 已经解析过一次（配置错就起不来），走到这里还失败，
-/// 说明文件在启动后被改动过 —— 记一条警告并当作"未配置"。事实照常入库。
-fn load_purpose_rules(config: &AdminConfig) -> Option<Arc<PurposeRuleTable>> {
-    let path = config.purpose_rules_file.as_deref()?;
-    match crate::app::purpose::load_rule_table(path) {
-        Ok(table) => Some(Arc::new(table)),
-        Err(err) => {
-            eprintln!(
-                "warning: failed to load purpose rule table {}: {err}",
-                path.display()
-            );
-            None
-        }
+impl ApiState {
+    /// 当前装载着的知识库内容（采集目录 / 用途规则 / 发现策略三块的整体快照）。
+    ///
+    /// 返回 `Arc` 快照而不是 guard：读写锁的 guard 不是 `Send`，持着它跨 `.await`
+    /// 会让 handler 编不过；而且拿到快照后即使中途有人激活了新版，本次请求看到的
+    /// 仍是**一致的一份**（不会一半新一半旧）。
+    pub fn knowledge(&self) -> Arc<LoadedKnowledge> {
+        // 写侧只在“激活/回滚”这一条管理动作上持锁，且持锁期间不做 I/O（先验后切），
+        // 所以中毒（写侧 panic）按“取回最后一版”处理，比把整个控制面带崩合理。
+        Arc::clone(&self.knowledge.read().unwrap_or_else(|err| err.into_inner()))
+    }
+
+    /// 整体换掉知识库内容（管理面激活/回滚时调用）。
+    ///
+    /// 换的是 `Arc`，读侧下一次取到的就是新的一份。**调用方必须“先验后切”**：
+    /// 新版内容已经装载成功才允许换（设计 §8.6），否则等于把网关推到半可用。
+    pub fn replace_knowledge(&self, knowledge: Arc<LoadedKnowledge>) {
+        let mut guard = self
+            .knowledge
+            .write()
+            .unwrap_or_else(|err| err.into_inner());
+        *guard = knowledge;
     }
 }
 
-/// 启动时装载发现方向策略表。
+/// 会话运行态（最近上线过的 agent 等），进程内一份。
 ///
-/// 与规则表同样的退化策略：`AdminConfig::validate` 已经校验过一次（配置错就起不来），
-/// 走到这里还失败，说明文件在启动后被改动过 —— 记一条警告并当作"未配置"（端点回 503）。
-fn load_discovery_policies(config: &AdminConfig) -> Option<Arc<DiscoveryAspectPolicySet>> {
-    let path = config.discovery_policies_file.as_deref()?;
-    match crate::app::discovery_policy::load_policy_table(path) {
-        Ok(set) => Some(Arc::new(set)),
-        Err(err) => {
-            eprintln!(
-                "warning: failed to load discovery aspect policy table {}: {err}",
-                path.display()
-            );
-            None
-        }
-    }
-}
-
-/// 启动时装载采集内容三件套（catalog / packs / templates）。
-///
-/// 与规则表/策略表同样的退化策略：`AdminConfig::validate` 已用真实装载器校验过一次
-/// （内容写错就起不来），走到这里还失败说明文件在启动后被改动过 —— 记警告并当作“未装载”。
-fn load_content(config: &AdminConfig) -> Option<Arc<ContentSet>> {
-    let catalog = config.content_catalog_file.as_deref()?;
-    let packs = config.content_packs_file.as_deref()?;
-    let templates = config.content_templates_file.as_deref()?;
-    match crate::app::content::load_content(catalog, packs, templates) {
-        Ok(set) => Some(Arc::new(set)),
-        Err(err) => {
-            eprintln!("warning: failed to load collection content: {err}");
-            None
-        }
-    }
-}
-
+/// 知识库三个块（采集目录 / 用途规则 / 发现策略）的装载不在这里：
+/// 它们已收到 [`crate::app::knowledge`] —— 那里还要管"从管理面登记的生效包装载"、
+/// "运行时整体换版"与"生效包损坏就拒绝启动"三件本模块管不了的事。
 #[derive(Debug, Default)]
 pub struct AdminRuntimeState {
     pub recent_online_agents: Vec<RecentOnlineRegisteredAgent>,
@@ -181,21 +150,31 @@ pub fn router(config: AdminConfig, store: Arc<dyn Store>) -> Router {
     router_with_state(build_state(config, store))
 }
 
-/// 装配共享状态。两个监听（对外 HTTPS / 数据面内部 HTTP）**共用同一份**：
-/// 规则表、策略表、会话运行态与限流器都只能有一份，否则两条路径的行为会不一致。
+/// 装配共享状态（**过渡期**入口：知识库从配置文件装载）。
+///
+/// 保留它是因为它被大量测试当夹具用（测试确实是通过 `[content]` 等文件路径喂内容的）。
+/// 生产路径走 [`build_state_with_knowledge`]。
 pub fn build_state(config: AdminConfig, store: Arc<dyn Store>) -> ApiState {
-    let purpose_rules = load_purpose_rules(&config);
-    let discovery_policies = load_discovery_policies(&config);
-    let content = load_content(&config);
+    let knowledge = LoadedKnowledge::from_config(&config);
+    build_state_with_knowledge(config, store, knowledge)
+}
+
+/// 装配共享状态，知识库内容由调用方给定（启动期：`LoadedKnowledge::from_store`）。
+///
+/// 两个监听（对外 HTTPS / 数据面内部 HTTP）**共用同一份**：知识库三个块、会话运行态与
+/// 限流器都只能有一份，否则两条路径的行为会不一致。
+pub fn build_state_with_knowledge(
+    config: AdminConfig,
+    store: Arc<dyn Store>,
+    knowledge: LoadedKnowledge,
+) -> ApiState {
     let agent_ca = load_agent_ca(&config);
     ApiState {
         config,
         store,
         runtime: Arc::new(Mutex::new(AdminRuntimeState::default())),
         rate_limits: Arc::new(Mutex::new(rate_limit::RateLimitState::default())),
-        purpose_rules,
-        discovery_policies,
-        content,
+        knowledge: Arc::new(RwLock::new(Arc::new(knowledge))),
         agent_ca,
     }
 }

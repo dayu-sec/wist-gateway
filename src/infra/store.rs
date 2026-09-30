@@ -197,6 +197,9 @@ pub const DEFAULT_AGENT_UPLINK_SETTING_ID: &str = "default";
 /// 单例设置行 id：网关对外地址只有一个生效值。
 pub const DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID: &str = "default";
 
+/// 知识库生效指针的单例 id（`knowledge_active.setting_id`）。
+pub const DEFAULT_KNOWLEDGE_SETTING_ID: &str = "default";
+
 /// 数据面 TCP 入口的约定默认端口（与 wparse `topology/sources/tcp_1` 一致）。
 pub const DEFAULT_AGENT_UPLINK_PORT: u16 = 9000;
 
@@ -296,6 +299,58 @@ pub struct StoredAgentInstallPackage {
     pub created_at: String,
 }
 
+/// 知识库**内容包**：管理面录入的策展数据，内容寻址，一行一个包。
+///
+/// 设计见 `docs/design/knowledge-content-management.md` §6.1。与安装包历史表
+/// ([`StoredAgentInstallPackage`]) 同构（`package_id` 幂等、`source` 只留痕、
+/// 网关自己存副本），差别是 `cached_path` 指向**目录**而不是单个文件 ——
+/// 网关解析的是解开的五份数据，不是归档。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredKnowledgePackage {
+    /// 内容寻址键：`kbp-<sha256 前 16 位>`；同一个包重复录入落在同一行。
+    pub package_id: String,
+    /// 原始录入（`/abs/path` 或 `https://…`），只作留痕。
+    pub source: String,
+    /// 网关据自己缓存的那份字节算出的摘要，统一 `sha256:<64 hex>`。
+    pub package_sha256: String,
+    /// 制品版本（包内目录名 / `manifest.json` 的 `version`）。
+    pub version: String,
+    /// 五份数据各自声明的版本（读不到就留 `None`）。
+    pub catalog_version: Option<i64>,
+    pub template_version: Option<i64>,
+    pub policy_version: Option<i64>,
+    pub purpose_version: Option<i64>,
+    /// 内容所依赖的解析器契约版本（设计 §10）。
+    pub parser_abi: i64,
+    /// 签发者公钥指纹；未签名时为空串。
+    pub signed_by: String,
+    /// 网关自己存的那份**目录**路径（每版一份，旧版留着）。
+    pub cached_path: String,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+/// 知识库**生效指针**（单例）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredKnowledgeActive {
+    pub package_id: String,
+    /// 单调递增的世代号：每次激活 +1。派生结果"算自哪一版"的表级锚（设计 §8.2）。
+    pub generation: i64,
+    pub activated_by: String,
+    pub activated_at: String,
+}
+
+/// 切生效指针的参数。
+#[derive(Debug, Clone)]
+pub struct KnowledgeActivation<'a> {
+    pub package_id: &'a str,
+    /// `activate` | `rollback` | `repair`。
+    pub reason: &'a str,
+    pub requested_by: &'a str,
+    pub created_at: &'a str,
+}
 /// 时序指标样本 DTO（历史在 VictoriaMetrics，库里只留最近值）。
 ///
 /// 带 `#[jumo]` 注解是因为它作为 `RecentOnlineRegisteredAgent.metrics_history` 的
@@ -378,6 +433,10 @@ pub struct StoredPurposeSuggestion {
     /// `rule` | `model`（模型线在中心）。
     pub method: String,
     pub rule_set_id: Option<String>,
+    /// 算这条建议时规则表的 `purpose_version`；老行（迁移前）为 `None`。
+    ///
+    /// 与 `rule_set_id` 一起构成**过期判据**：两者任一变了就要重算（§8.2）。
+    pub purpose_version: Option<i64>,
     /// 逐条命中依据；没有依据的建议不给人工看。
     pub signals: Vec<StoredPurposeSignal>,
     /// 依据哪一版事实算的，与 `computed_at` 区分开。
@@ -1151,6 +1210,26 @@ pub trait Store: Send + Sync + fmt::Debug {
         agent_id: &str,
         credential_id: &str,
     ) -> StoreResult<bool>;
+
+    // ── 知识库内容包（设计 §6.1）──
+
+    /// 录入一个包（幂等 upsert）：同一个 `package_id` 重复录入落同一行。
+    async fn upsert_knowledge_package(&self, package: &StoredKnowledgePackage) -> StoreResult<()>;
+
+    async fn knowledge_package(
+        &self,
+        package_id: &str,
+    ) -> StoreResult<Option<StoredKnowledgePackage>>;
+
+    /// 当前生效指针。从未激活过返回 `None` —— 那是「空载」，不是错误（设计 §8.5）。
+    async fn knowledge_active(&self) -> StoreResult<Option<StoredKnowledgeActive>>;
+
+    /// 切生效指针：`generation` 在上一次基础上 +1，并写一条审计，**单事务**。
+    /// 返回切换后的指针（调用方据此换内存里的那一份）。
+    async fn activate_knowledge(
+        &self,
+        activation: &KnowledgeActivation<'_>,
+    ) -> StoreResult<StoredKnowledgeActive>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

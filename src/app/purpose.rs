@@ -26,9 +26,20 @@ const MACHINE_CLASSES: &[&str] = &["MacDaily", "MacDev", "LinuxCompute", "LinuxD
 
 /// 规则表：按平台分册的集合。
 ///
-/// TOML 形状是 `[[rule_set]]` + `[[rule_set.rules]]`，因此字段名就是 `rule_set`。
+/// TOML 形状是 `purpose_version = <n>` + `[[rule_set]]` + `[[rule_set.rules]]`，
+/// 因此字段名就是 `rule_set`。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PurposeRuleTable {
+    /// 规则表版本（**必填**，且 >= 1）。
+    ///
+    /// 为什么必须有：建议里记的 `rule_set_id` 只说"哪一册"，不说"哪一版" ——
+    /// 只改值不改版本，就再也说不清"这条建议是哪版规则算的"。它是建议的**归因锚**
+    /// （见 `docs/design/knowledge-content-management.md` §8.2），也是内容包
+    /// `manifest.json` 里的 `content_versions.purpose_version`（打包时从这里读）。
+    ///
+    /// 刻意**不给** `#[serde(default)]`：缺字段要在**解析期就报错**（与 `policy_version`
+    /// 同口径），而不是默认成某一版去冒充"有版本"。
+    pub purpose_version: u32,
     #[serde(default)]
     rule_set: Vec<PurposeRuleSet>,
 }
@@ -126,6 +137,13 @@ fn invalid(detail: impl Into<String>) -> ConfigError {
 ///
 /// 宁可在启动时失败并指出是哪一册/哪条规则，也不要静默地不推断。
 fn validate_rule_table(table: &mut PurposeRuleTable) -> ConfigResult<()> {
+    if table.purpose_version < 1 {
+        // 版本是建议的归因锚：缺了它，"这条建议是哪版规则算的"就无从回答（§8.2）。
+        return Err(invalid(format!(
+            "purpose_version {} must be >= 1",
+            table.purpose_version
+        )));
+    }
     for rule_set in &mut table.rule_set {
         let rule_set_id = rule_set.rule_set_id.clone();
         if rule_set_id.trim().is_empty() {
@@ -316,6 +334,8 @@ pub fn infer(
         confidence,
         method: "rule".to_string(),
         rule_set_id: Some(rule_set.rule_set_id.clone()),
+        // 归因锚：记下整表版本，与 `rule_set_id` 一起构成过期判据（见 `ensure_fresh_suggestion`）。
+        purpose_version: Some(i64::from(table.purpose_version)),
         signals,
         observed_at: summary.observed_at.clone(),
         computed_at: computed_at.to_string(),
@@ -327,6 +347,7 @@ mod tests {
     use super::*;
 
     const RULE_TABLE: &str = r#"
+purpose_version = 1
 [[rule_set]]
 rule_set_id = "macos-v1"
 platform = "macos"
@@ -589,6 +610,7 @@ weight = 40
     fn table_with_rule(rule_body: &str) -> String {
         format!(
             r#"
+purpose_version = 1
 [[rule_set]]
 rule_set_id = "macos-v1"
 platform = "macos"
@@ -634,7 +656,7 @@ weak_score = 20
     #[test]
     fn rejects_an_unknown_platform() {
         // platform 大小写写错会让整册规则永不匹配，而且不报错。
-        let text = "[[rule_set]]\nrule_set_id = \"x\"\nplatform = \"macOS\"\n";
+        let text = "purpose_version = 1\n[[rule_set]]\nrule_set_id = \"x\"\nplatform = \"macOS\"\n";
         let err = parse_rule_table(text).expect_err("unknown platform must be rejected");
         assert!(err.to_string().contains("unknown platform"), "{err}");
     }
@@ -670,6 +692,7 @@ weak_score = 20
         // 打对折 → 50。若先打折再夹取，会得 130 → 100，把「弱信号不冒充有把握」抹掉。
         let table = parse_rule_table(
             r#"
+purpose_version = 1
 [[rule_set]]
 rule_set_id = "macos-v1"
 platform = "macos"
@@ -711,6 +734,7 @@ weight = -40
         // `min_support = 2` 要求至少两条判据才算成案，所以这里打折成 50。
         let table = parse_rule_table(
             r#"
+purpose_version = 1
 [[rule_set]]
 rule_set_id = "macos-v1"
 platform = "macos"
@@ -753,7 +777,7 @@ weight = 30
 
     #[test]
     fn rejects_a_min_support_below_one() {
-        let text = "[[rule_set]]\nrule_set_id = \"x\"\nplatform = \"macos\"\nmin_support = 0\n";
+        let text = "purpose_version = 1\n[[rule_set]]\nrule_set_id = \"x\"\nplatform = \"macos\"\nmin_support = 0\n";
         let err = parse_rule_table(text).expect_err("min_support = 0 must be rejected");
         assert!(err.to_string().contains("min_support"), "{err}");
     }
@@ -763,6 +787,7 @@ weight = 30
         // 并列是真实的可能：置信度 0 但依据非空 —— 页面必须能把它与「基线兜底」区分开。
         let table = parse_rule_table(
             r#"
+purpose_version = 1
 [[rule_set]]
 rule_set_id = "macos-v1"
 platform = "macos"

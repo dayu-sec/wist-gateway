@@ -532,6 +532,22 @@ impl AdminConfig {
             .join(package_id)
     }
 
+    /// 知识库内容包副本的**根目录**：`<state>/knowledge/`。
+    ///
+    /// 与安装包缓存同一约定：放在 SQLite 库同目录（`state/`）下，随 `state/` 一起备份或清理。
+    /// 目录下每个包一份（`<package_id>/`）；与安装包不同的是，这里是**目录**（解开的五份
+    /// 数据加 `manifest.json`），而且**每版都要留着**：在跑的常驻工作锁在它展开时那一版
+    /// 目录上（见 `docs/design/knowledge-content-management.md` §4）。
+    pub fn knowledge_dir(&self) -> PathBuf {
+        let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
+        state_dir.join("knowledge")
+    }
+
+    /// 某一个知识库内容包的目录。
+    pub fn knowledge_package_dir(&self, package_id: &str) -> PathBuf {
+        self.knowledge_dir().join(package_id)
+    }
+
     /// 采集日志（数据面转发的 `LOGRAW:` 记录）的本地落盘文件。
     ///
     /// 与安装包缓存同一约定：放在 SQLite 库同目录（`state/`）下，随 `state/` 一起备份或清理。
@@ -958,6 +974,7 @@ environment_id = "env-default"
     }
 
     const RULES_TOML: &str = r#"
+purpose_version = 1
 [[rule_set]]
 rule_set_id = "macos-v1"
 platform = "macos"

@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -19,11 +19,13 @@ use wist_contracts::enrollment::{
     EnrollmentRequest, EnrollmentStatus,
 };
 
+use crate::app::knowledge::{KnowledgeSource, LoadedKnowledge};
 use crate::infra::{
     AdminConfig, AgentStatusUpdate, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
-    DEFAULT_INSTALL_PACKAGE_SETTING_ID, SqliteStore, Store, StoredAgentInstallPackage,
-    StoredAgentInstallPackageAddress, StoredAgentRevocation, StoredAgentUplinkAddress,
-    StoredCredentialStatus, StoredEnrollmentTokenStatus, VerifiedAgentIdentity, bytes_sha256_hex,
+    DEFAULT_INSTALL_PACKAGE_SETTING_ID, KnowledgeActivation, SqliteStore, Store,
+    StoredAgentInstallPackage, StoredAgentInstallPackageAddress, StoredAgentRevocation,
+    StoredAgentUplinkAddress, StoredCredentialStatus, StoredEnrollmentTokenStatus,
+    StoredKnowledgePackage, VerifiedAgentIdentity, bytes_sha256_hex,
     load_install_script_public_key_pem, sha256_hex,
 };
 use wist_contracts::action_result::{ActionResult, FinalStatus};
@@ -1107,6 +1109,7 @@ async fn admin_agent_list_derives_machine_cpu_percent_from_cores() {
 
 /// 精简规则表：只留推得动最小闭环的几条（完整策展数据在 jumo 模型仓）。
 const TEST_PURPOSE_RULES: &str = r#"
+purpose_version = 1
 [[rule_set]]
 rule_set_id = "macos-v1"
 platform = "macos"
@@ -6654,15 +6657,14 @@ impl TestEnv {
 
 async fn test_state() -> ApiState {
     let env = TestEnv::new().await;
+    let knowledge = LoadedKnowledge::from_config(&env.config);
     ApiState {
-        purpose_rules: super::load_purpose_rules(&env.config),
-        discovery_policies: super::load_discovery_policies(&env.config),
-        content: super::load_content(&env.config),
         agent_ca: super::load_agent_ca(&env.config),
         config: env.config.clone(),
         store: Arc::clone(&env.store_handle),
         runtime: Arc::new(Mutex::new(AdminRuntimeState::default())),
         rate_limits: Arc::new(Mutex::new(super::rate_limit::RateLimitState::default())),
+        knowledge: Arc::new(RwLock::new(Arc::new(knowledge))),
     }
 }
 
@@ -9329,5 +9331,207 @@ async fn ingest_endpoint_rejects_a_revoked_agent() {
             .unwrap_or_default()
             .contains("is revoked"),
         "{body}"
+    );
+}
+
+// ── 知识库：从管理面登记的生效包装载 + 运行时整体换版（设计 §6 / §8）──────────────
+
+/// 在环境的状态目录里造一个包目录，并写入五份**真实**策展数据。
+fn stage_knowledge_package(env: &TestEnv, package_id: &str) -> std::path::PathBuf {
+    let dir = env.config.knowledge_package_dir(package_id);
+    std::fs::create_dir_all(&dir).expect("create knowledge package dir");
+    for name in crate::app::knowledge::PACKAGE_FILES {
+        std::fs::copy(crate::test_support::knowledge_file(name), dir.join(name))
+            .unwrap_or_else(|err| panic!("copy {name}: {err}"));
+    }
+    dir
+}
+
+fn knowledge_package_row(package_id: &str, dir: &std::path::Path) -> StoredKnowledgePackage {
+    StoredKnowledgePackage {
+        package_id: package_id.to_string(),
+        source: dir.display().to_string(),
+        package_sha256: format!("sha256:{package_id}"),
+        version: "0.1.0".to_string(),
+        catalog_version: Some(2),
+        template_version: Some(1),
+        policy_version: Some(1),
+        purpose_version: Some(1),
+        parser_abi: 1,
+        signed_by: String::new(),
+        cached_path: dir.display().to_string(),
+        created_by: "admin".to_string(),
+        created_at: "2026-09-30T00:00:00Z".to_string(),
+    }
+}
+
+async fn record_and_activate_knowledge(env: &TestEnv, package_id: &str) {
+    let dir = stage_knowledge_package(env, package_id);
+    env.store_handle
+        .upsert_knowledge_package(&knowledge_package_row(package_id, &dir))
+        .await
+        .expect("record knowledge package");
+    env.store_handle
+        .activate_knowledge(&KnowledgeActivation {
+            package_id,
+            reason: "activate",
+            requested_by: "admin",
+            created_at: "2026-09-30T00:00:00Z",
+        })
+        .await
+        .expect("activate knowledge");
+}
+
+/// 生效包优先于配置里的 `*_file`：管理面切过的网关，不再看卡器里写了什么。
+#[tokio::test]
+async fn knowledge_loads_from_the_active_package_in_the_store() {
+    // `TestEnv::new()` 的配置里本来就有内容（catalog_version = 2），用来证明**优先级**。
+    let env = TestEnv::new().await;
+    record_and_activate_knowledge(&env, "kbp-test").await;
+
+    let loaded = LoadedKnowledge::from_store(&env.config, &env.store_handle)
+        .await
+        .expect("load from store");
+    assert_eq!(
+        loaded.source,
+        KnowledgeSource::Package {
+            package_id: "kbp-test".to_string()
+        }
+    );
+    assert_eq!(loaded.generation, 1);
+    assert_eq!(
+        loaded.content.as_deref().map(|set| set.catalog_version),
+        Some(2)
+    );
+    assert_eq!(
+        loaded
+            .purpose_rules
+            .as_deref()
+            .map(|table| table.purpose_version),
+        Some(1)
+    );
+    assert!(loaded.discovery_policies.is_some());
+}
+
+/// 从未录入过 = 空载：过渡期回落配置文件（今天的部署就是这样跑起来的）。
+#[tokio::test]
+async fn knowledge_falls_back_to_config_files_before_anything_is_activated() {
+    let env = TestEnv::new().await;
+    let loaded = LoadedKnowledge::from_store(&env.config, &env.store_handle)
+        .await
+        .expect("load from config");
+    assert_eq!(loaded.source, KnowledgeSource::ConfigFiles);
+    assert_eq!(loaded.generation, 0);
+    assert!(loaded.content.is_some());
+}
+
+/// **生效包损坏 = 拒绝启动**（设计 §8.5）：这是 `main` 里那个 `?` 的依据。
+#[tokio::test]
+async fn knowledge_refuses_a_broken_active_package() {
+    let env = TestEnv::new().await;
+    // 登记并激活一个"目录根本不存在"的包。
+    env.store_handle
+        .upsert_knowledge_package(&knowledge_package_row(
+            "kbp-broken",
+            &env.config.knowledge_package_dir("kbp-broken"),
+        ))
+        .await
+        .expect("record broken package");
+    env.store_handle
+        .activate_knowledge(&KnowledgeActivation {
+            package_id: "kbp-broken",
+            reason: "activate",
+            requested_by: "admin",
+            created_at: "2026-09-30T00:00:00Z",
+        })
+        .await
+        .expect("activate broken package");
+
+    let err = LoadedKnowledge::from_store(&env.config, &env.store_handle)
+        .await
+        .expect_err("a broken active package must refuse startup");
+    let text = err.to_string();
+    assert!(text.contains("生效知识包不可用"), "{text}");
+    assert!(text.contains("kbp-broken"), "{text}");
+}
+
+/// 换版**不需要重启**：换掉的是 `ApiState` 里那一份 `Arc`，同一个 router 立刻跟着变。
+#[tokio::test]
+async fn admin_content_view_follows_a_knowledge_swap_without_a_restart() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+
+    // 起始：`TestEnv` 配置里的那份内容（`TEST_CONTENT_CATALOG`，catalog_version = 1）。
+    let view = get_view(&state, "/api/v1/admin/content").await;
+    assert_eq!(view["catalog_version"], 1);
+
+    // 不重启、不换 router：只把装载着的内容整体换成"空载"。
+    state.replace_knowledge(Arc::new(LoadedKnowledge::none()));
+
+    let response = get_from_state(&state, "/api/v1/admin/content").await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+async fn get_from_state(state: &ApiState, uri: &str) -> axum::response::Response {
+    super::router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+}
+
+async fn get_view(state: &ApiState, uri: &str) -> serde_json::Value {
+    decode_json_response(get_from_state(state, uri).await).await
+}
+
+/// 只抬**整表版本**、分册 id 一字不改 —— 这正是"改了内容却忘了改分册 id"那条路。
+/// 断言落库的建议真的重算了（而不是靠时间戳之类的旁证）。
+#[tokio::test]
+async fn agent_purpose_route_recomputes_when_only_the_purpose_version_changes() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    post_facts(&env, &fact_report(&["xcodebuild"])).await;
+    assert_eq!(
+        get_purpose_view(&env, "agent-node-a").await["suggestion"]["rule_set_id"],
+        "macos-v1"
+    );
+    let recorded = env
+        .store_handle
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("read suggestion")
+        .expect("suggestion");
+    assert_eq!(recorded.purpose_version, Some(1));
+
+    // 内容改了、版本抬了、分册 id 没动：旧行必须被判成过期并重算。
+    let v2 = TEST_PURPOSE_RULES.replace("purpose_version = 1", "purpose_version = 2");
+    assert_ne!(v2, TEST_PURPOSE_RULES, "夹具里应当有 purpose_version");
+    let with_v2 = config_with_purpose_rules(&env, &v2);
+    let response = get_to_router(
+        &with_v2,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/purpose",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["suggestion"]["rule_set_id"], "macos-v1");
+
+    let recomputed = env
+        .store_handle
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("read suggestion")
+        .expect("suggestion");
+    assert_eq!(
+        recomputed.purpose_version,
+        Some(2),
+        "版本抬了就必须重算并把新版本记下来"
     );
 }
