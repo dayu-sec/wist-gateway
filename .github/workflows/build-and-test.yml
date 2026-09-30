@@ -20,9 +20,33 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-14]
+    defaults:
+      run:
+        working-directory: wist-gateway
     steps:
-      - name: Checkout repository
+      - name: Checkout wist-gateway
         uses: actions/checkout@v7
+        with:
+          path: wist-gateway
+
+      # 跨仓数据：网关的「真实数据」用例要读它们（缺了会**失败**，不再静默跳过）。
+      # 摆成同级目录，与本地开发仓组一致：测试期按 `<crate 根>/../<仓名>` 找。
+      # 注意 `ref: main` 是**浮动**的 —— 知识仓改坏会连带这里变红（这正是想要的信号）；
+      # 要可复现就改成两者发布出来的 tag（如 `ref: v0.1.0`），
+      # 把「网关跑过的是哪一版知识/模型」钉在 workflow 里。
+      - name: Checkout wist-knowledge（策展知识）
+        uses: actions/checkout@v7
+        with:
+          repository: dayu-sec/wist-knowledge
+          ref: main
+          path: wist-knowledge
+
+      - name: Checkout wist-design（jumo 模型）
+        uses: actions/checkout@v7
+        with:
+          repository: dayu-sec/wist-design
+          ref: main
+          path: wist-design
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -41,9 +65,29 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: wist-gateway
     steps:
-      - name: Checkout repository
+      - name: Checkout wist-gateway
         uses: actions/checkout@v7
+        with:
+          path: wist-gateway
+
+      # 同上：覆盖统计也要带上这些用例，否则跑不到的分支看不出差距。
+      - name: Checkout wist-knowledge（策展知识）
+        uses: actions/checkout@v7
+        with:
+          repository: dayu-sec/wist-knowledge
+          ref: main
+          path: wist-knowledge
+
+      - name: Checkout wist-design（jumo 模型）
+        uses: actions/checkout@v7
+        with:
+          repository: dayu-sec/wist-design
+          ref: main
+          path: wist-design
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -51,7 +95,10 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
 
+      # 仓根不再是 workspace 根（代码在 wist-gateway/），缓存路径要显式给。
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "wist-gateway -> target"
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -66,7 +113,8 @@ jobs:
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
         with:
-          files: ./lcov.info
+          # 代码在 wist-gateway/ 下，报告也写在那里（工作目录已切过去）。
+          files: wist-gateway/lcov.info
           flags: unittests
           name: coverage-${{ github.ref_name }}
           token: ${{ secrets.CODECOV_TOKEN }}

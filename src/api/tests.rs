@@ -2384,14 +2384,11 @@ async fn agent_purpose_route_returns_404_for_an_unknown_agent() {
 
 /// 用**真实策展规则表**跑通全链：上报 → 入库 → 按规则打一分 → 页面读得到依据。
 ///
-/// 这是“用夹具数据验证计算”的那份证据；规则表文件缺失（如单独拷本仓）时跳过。
+/// 这是“用夹具数据验证计算”的那份证据；数据来自知识库仓 `wist-knowledge`（缺则失败）。
 #[tokio::test]
 async fn fact_summary_ingest_infers_with_the_checked_in_rule_table() {
-    // 相对本 crate 根：../../wist-design/jumo/model/content/purpose-rules.toml
-    let path = std::path::Path::new("../../wist-design/jumo/model/content/purpose-rules.toml");
-    let Ok(rules) = std::fs::read_to_string(path) else {
-        return;
-    };
+    let rules = std::fs::read_to_string(crate::test_support::knowledge_file("purpose-rules.toml"))
+        .expect("read checked-in rule table");
 
     let env = TestEnv::new_with_purpose_rules(Some(&rules)).await;
     enroll_agent_credential(&env).await;
@@ -2835,14 +2832,12 @@ async fn agent_status_metric_reports_cpu_cores_when_present() {
 
 /// 用**真实策展策略表**跑通下发：装载校验通过，且下发的是七个方向那一版。
 ///
-/// 这是“用夹具数据验证契约”的那份证据；策略表文件缺失（如单独拷本仓）时跳过。
+/// 这是“用夹具数据验证契约”的那份证据；数据来自知识库仓 `wist-knowledge`（缺则失败）。
 #[tokio::test]
 async fn discovery_policies_poll_serves_the_checked_in_table() {
-    // 相对本 crate 根：../../wist-design/jumo/model/content/aspect-policies.toml
-    let path = std::path::Path::new("../../wist-design/jumo/model/content/aspect-policies.toml");
-    let Ok(policies) = std::fs::read_to_string(path) else {
-        return;
-    };
+    let policies =
+        std::fs::read_to_string(crate::test_support::knowledge_file("aspect-policies.toml"))
+            .expect("read checked-in policy table");
     // 换个实现就能在这里早失败：装载校验不过不会走到端点。
     let env = TestEnv::new().await;
     let config = config_with_discovery_policies(&env, &policies);

@@ -1,10 +1,10 @@
 //! 用途推断：按规则表从事实摘要算出「建议 + 逐条依据 + 置信度」。
 //!
 //! 规则线在网关（可解释、可测、离线自足），规则表本身是**策展数据**
-//! （模型仓 `jumo/model/content/purpose-rules.toml`），改它要走审定。
+//! （知识库仓 `wist-knowledge/purpose-rules.toml`），改它要走审定。
 //!
 //! 所以这里只**读**表，不在代码里内嵌默认副本 —— 内嵌就会有两份真相，
-//! 改规则时必然漂移（这也是把发现方向策略值放进 jumo 模型的同一条理由）。
+//! 改规则时必然漂移（这也是把发现方向策略值拿进平台策展的同一条理由）。
 //! 未配置规则表时：摘要照常入库，但不产出建议（宁可不猜）。
 
 use std::collections::BTreeMap;
@@ -570,11 +570,8 @@ weight = 40
     #[test]
     fn parses_the_checked_in_rule_table() {
         // 真实策展数据必须能解析（防止手改 TOML 后网关静默不推断）。
-        let path = std::path::Path::new("../../wist-design/jumo/model/content/purpose-rules.toml");
-        if !path.exists() {
-            return;
-        }
-        let table = load_rule_table(path).expect("load checked-in rule table");
+        let path = crate::test_support::knowledge_file("purpose-rules.toml");
+        let table = load_rule_table(&path).expect("load checked-in rule table");
         assert!(!table.is_empty());
         let macos = table.for_platform("macos").expect("macos rule set");
         assert_eq!(macos.rule_set_id, "macos-v1");

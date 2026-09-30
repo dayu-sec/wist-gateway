@@ -1,7 +1,7 @@
 //! 发现方向策略表：平台策展，网关启动时装载并**校验**，再通过控制面下发给 agentd。
 //!
 //! 与用途规则表同类（`purpose.rs`）：表本身是**策展数据**
-//! （模型仓 `jumo/model/content/aspect-policies.toml`），改它要走审定。
+//! （知识库仓 `wist-knowledge/aspect-policies.toml`），改它要走审定。
 //! 所以这里只**读**表，不在代码里内嵌默认副本 —— 内嵌就会有两份真相，
 //! 改策略时必然漂移（agentd 的 `refresh_interval()` 里那份字面量正是漂移的样本）。
 //! 未配置策略表时不提供端点：agentd 继续用自己的内建默认值，行为与从前一致。
@@ -223,13 +223,8 @@ mod tests {
     #[test]
     fn parses_the_checked_in_policy_table() {
         // 真实策展数据必须能通过校验（防止手改 TOML 后网关带病下发）。
-        // 相对本 crate 根：../../wist-design/jumo/model/content/aspect-policies.toml
-        let path =
-            std::path::Path::new("../../wist-design/jumo/model/content/aspect-policies.toml");
-        if !path.exists() {
-            return;
-        }
-        let set = load_policy_table(path).expect("load checked-in policy table");
+        let path = crate::test_support::knowledge_file("aspect-policies.toml");
+        let set = load_policy_table(&path).expect("load checked-in policy table");
         assert!(set.policy_version >= 1);
         assert_eq!(set.policies.len(), DISCOVERY_ASPECTS.len());
         for aspect in DISCOVERY_ASPECTS {

@@ -30,7 +30,7 @@ environment_id = "env-default"
 listen_addr = "127.0.0.1:3001"
 
 # ── 可选段（默认都不装载；要启用就把文件放进配置目录并取消注释）──
-# 源头是 jumo 模型仓的 jumo/model/content/*.toml；改了内容要同步 bump 相应版本号。
+# 源头是知识库仓 wist-knowledge/*.toml；改了内容要同步 bump 相应版本号。
 #
 # [purpose]   rules_file    = "content/purpose-rules.toml"    # 用途推断规则表
 # [discovery] policies_file = "content/aspect-policies.toml"  # 发现方向策略表

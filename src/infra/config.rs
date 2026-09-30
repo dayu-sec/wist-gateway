@@ -119,7 +119,7 @@ struct RawIngestConfig {
 /// `[purpose]` 段。缺省时不装载规则表：摘要照常入库，但不产出建议。
 #[derive(Debug, Default, Deserialize)]
 struct RawPurposeConfig {
-    /// 源头是 jumo 模型仓的 `jumo/model/content/purpose-rules.toml`，由部署侧提供给网关。
+    /// 源头是知识库仓 `wist-knowledge/purpose-rules.toml`，由部署侧提供给网关。
     /// 为什么不做内嵌默认副本：那会有两份真相，改规则时必然漂移。
     #[serde(default)]
     rules_file: Option<String>,
@@ -128,7 +128,7 @@ struct RawPurposeConfig {
 /// `[discovery]` 段。缺省时不装载策略表：不提供下发端点，Agent 用自己的内建默认值。
 #[derive(Debug, Default, Deserialize)]
 struct RawDiscoveryConfig {
-    /// 源头是 jumo 模型仓的 `jumo/model/content/aspect-policies.toml`，由部署侧提供给网关。
+    /// 源头是知识库仓 `wist-knowledge/aspect-policies.toml`，由部署侧提供给网关。
     /// 为什么不做内嵌默认副本：那会有两份真相，改策略时必然漂移。
     #[serde(default)]
     policies_file: Option<String>,
@@ -138,13 +138,13 @@ struct RawDiscoveryConfig {
 /// 三份文件互相引用，**要么都给、要么都不给**（校验在 `validate` 里）。
 #[derive(Debug, Default, Deserialize)]
 struct RawContentConfig {
-    /// 源头是 jumo 模型仓的 `jumo/model/content/catalog.toml`。
+    /// 源头是知识库仓 `wist-knowledge/catalog.toml`。
     #[serde(default)]
     catalog_file: Option<String>,
-    /// `jumo/model/content/packs.toml`。
+    /// `wist-knowledge/packs.toml`。
     #[serde(default)]
     packs_file: Option<String>,
-    /// `jumo/model/content/templates.toml`。
+    /// `wist-knowledge/templates.toml`。
     #[serde(default)]
     templates_file: Option<String>,
 }

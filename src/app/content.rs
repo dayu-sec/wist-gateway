@@ -1,6 +1,6 @@
 //! 采集内容目录：`catalog` / `packs` / `templates` 三份策展数据的装载、校验与「按面展开」。
 //!
-//! 与 `purpose.rs` / `discovery_policy.rs` 同类：内容值留模型仓的 `jumo/model/content/`，
+//! 与 `purpose.rs` / `discovery_policy.rs` 同类：内容值留知识库仓 `wist-knowledge/`，
 //! 这里只**读**，不内嵌默认副本（内嵌就有两份真相，改内容时必然漂移）。
 //!
 //! 三层 + 一层积木（对应模型 `Control.Agent.Content`）：
@@ -1132,14 +1132,10 @@ status = "active"
         // 采集面是**闭集**：网关白名单与模型必须逐字一致，否则会出现
         // 「模型里有个面、网关拒了它」或「网关放行了一个模型里不存在的面」。
         // 靠人守必然漂（现在就有一个：launchd 的归属两处说法不同），所以钉在这里。
-        let path = Path::new(
-            "../../wist-design/jumo/model/static/control/module/agent/content/families.mju",
+        let path = crate::test_support::model_file(
+            "jumo/model/static/control/module/agent/content/families.mju",
         );
-        if !path.exists() {
-            // 未随模型仓部署时跳过（与 `reads_the_checked_in_content_set` 同一取舍）。
-            return;
-        }
-        let text = std::fs::read_to_string(path).expect("read families.mju");
+        let text = std::fs::read_to_string(&path).expect("read families.mju");
         let mut model = parse_family_variant(&text);
         assert!(
             !model.is_empty(),
@@ -1211,14 +1207,10 @@ status = "active"
     #[test]
     fn reads_the_checked_in_content_set() {
         // 真实策展数据必须能通过校验（防止手改 TOML 后网关带病启动）。
-        let dir = Path::new("../../wist-design/jumo/model/content");
-        if !dir.exists() {
-            return;
-        }
         let set = load_content(
-            &dir.join("catalog.toml"),
-            &dir.join("packs.toml"),
-            &dir.join("templates.toml"),
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
         )
         .expect("load checked-in content");
         // 目录版本要随内容一起抬（见 catalog.toml 头部约定）：旧工作锁在它展开时那一版上。
@@ -1269,14 +1261,10 @@ status = "active"
 
     #[test]
     fn expands_the_collect_ready_families_and_records_the_rest() {
-        let dir = Path::new("../../wist-design/jumo/model/content");
-        if !dir.exists() {
-            return;
-        }
         let set = load_content(
-            &dir.join("catalog.toml"),
-            &dir.join("packs.toml"),
-            &dir.join("templates.toml"),
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
         )
         .expect("load checked-in content");
         let expansion = set
