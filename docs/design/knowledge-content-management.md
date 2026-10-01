@@ -305,13 +305,31 @@ CREATE TABLE IF NOT EXISTS knowledge_activation_log (
 因为**每一版的副本都留着**（§4 差别 3），回滚不需要重新下载；
 但**回滚也不会撤销**新版期间产出的建议（同 §8.2"算完就算完"）。
 
-### 8.5 启动期行为
+### 8.5 启动期行为（**已改：不再拒启**）
 
-| 情形 | 行为 |
-| --- | --- |
-| 生效指针为空（从未录入） | **正常启动**、空载；`/admin/knowledge` 回 `configured:false` 并给出"怎么配"（I5） |
-| 生效指针指向的副本缺失/损坏 | **拒绝启动**（与"内容写错就起不来"同口径）：静默空载会让平台悄悄停掉建议与派活 |
-| 有包但解析器校验不过 | 同上（这份内容本来就不该被激活；能走到这一步说明磁盘副本被改过） |
+按固定优先级解析"这次启动用哪份内容"，任一层不可用**只告警、继续往下回落**：
+
+| 顺序 | 来源 | 不可用时 |
+| --- | --- | --- |
+| 1 | 管理面生效包 `<state>/knowledge/<package_id>/` | 告警，落到 2 |
+| 2 | 启动期知识源 `[knowledge] source_dir`（**出厂初始包**） | 告警，落到 3 |
+| 3 | 配置文件 `[content]` / `[purpose]` / `[discovery]` | 告警，落到 4 |
+| 4 | 空载 | —— |
+
+**为什么改掉原来的"生效包损坏 = 拒绝启动"**：拒启会把**处置入口**（管理面）一起关掉 ——
+原来的报错让人"用管理面切到另一个包"，而管理面正是起不来的那个进程（鸡生蛋）。
+而"静默空载"这个原本要防的东西，现在由启动时那一行兜住：
+
+```
+knowledge source = package:kbp-c291a27fd2721e59
+knowledge source = dir:/config/knowledge/initial
+knowledge source = none（空载：不产建议；发现策略用 agentd 内建默认值）
+```
+
+`[knowledge] source_dir` 是**出厂初始包**的位置：干净机器上管理面还没激活过任何包时用它，
+一旦管理面切了可用包，包就接管（1 优先于 2）。它**不做存在性校验** —— 配错/没铺只告警回落。
+
+读不到库（存储故障）仍然是 `Err`：那不是内容问题。
 
 ### 8.6 失败原子性与并发
 
@@ -525,7 +543,9 @@ signing_public_key_file = "state/knowledge-signing.pub.pem"
    把 `catalog_version` 改坏 → `package_content_invalid`。
 6. **空载可见**：清库启动 → `/admin/knowledge` 回 `configured:false` 且带"怎么办"；
    `/admin/content` **不再**只回 503。
-7. **生效包损坏**：手动删掉 `<state>/knowledge/<生效 id>/catalog.toml` → 网关**拒绝启动**并指出路径。
+7. **生效包损坏/悬空**：手动删掉 `<state>/knowledge/<生效 id>/catalog.toml`（或整个目录）→
+   网关**照常启动**，日志一行 `warning: 生效知识包不可用…` + `knowledge source = …` 指出实际用了哪一份
+   （有 `source_dir` 就用它，否则回落到配置/空载）。
 8. **离线投放**：只在宿主放包、容器内调 `import-knowledge.sh --set` → 端到端可用（不出现 502）。
 9. **签名**：没签名的包在配了公钥的网关上被拒（`package_signature_invalid`）；签名被改一个字节被拒；
    跨工具契约（发布侧 openssl 签 → 网关 ring 验）有过一次真实制品的验证。

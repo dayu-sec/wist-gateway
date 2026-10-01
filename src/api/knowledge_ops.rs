@@ -233,10 +233,11 @@ pub async fn view_knowledge(
         .await
         .unwrap_or_default();
 
-    let (source, package_id) = match &loaded.source {
-        KnowledgeSource::None => ("none", None),
-        KnowledgeSource::ConfigFiles => ("config-files", None),
-        KnowledgeSource::Package { package_id } => ("package", Some(package_id.clone())),
+    let source = loaded.source.label();
+    let package_id = match &loaded.source {
+        KnowledgeSource::Package { package_id } => Some(package_id.clone()),
+        // 出厂初始包（`[knowledge] source_dir`）：来源是本地目录，没有 package_id。
+        _ => None,
     };
     let content = loaded.content.as_deref();
     let template_version = content.and_then(|set| {

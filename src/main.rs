@@ -71,11 +71,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     // 两个监听共用一份状态：知识库内容、会话运行态与限流器都只能有一份。
     //
-    // 知识库在这里（async 上下文）按**管理面登记的生效包**装载：生效包损坏就返回 Err 拒绝
-    // 启动（设计 §8.5）—— 带着空内容起会让平台悄悄停掉建议与派活，比起不来更难查。
-    let knowledge = wist_gateway::app::knowledge::LoadedKnowledge::from_store(&config, &store)
+    // 知识库在这里（async 上下文）按优先级解析：管理面生效包 → `[knowledge] source_dir`（出厂
+    // 初始包）→ 配置里的 `*_file` → 空载。任何一层不可用都只告警回落，**不拒启** ——
+    // 拒启会把处置入口（管理面）一起关掉；而“空载”由下面这行 source 日志兜住，不再静默。
+    let knowledge = wist_gateway::app::knowledge::LoadedKnowledge::resolve(&config, &store)
         .await
         .map_err(|err| format!("load knowledge content: {err}"))?;
+    println!("knowledge source = {}", knowledge.source.describe());
     let state = wist_gateway::api::build_state_with_knowledge(config, store, knowledge);
 
     // 一次性工作的到期判定：过了截止的标 expired、预算尽的标 timed_out。

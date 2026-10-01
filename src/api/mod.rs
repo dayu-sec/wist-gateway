@@ -148,8 +148,8 @@ impl ApiState {
 /// 会话运行态（最近上线过的 agent 等），进程内一份。
 ///
 /// 知识库三个块（采集目录 / 用途规则 / 发现策略）的装载不在这里：
-/// 它们已收到 [`crate::app::knowledge`] —— 那里还要管"从管理面登记的生效包装载"、
-/// "运行时整体换版"与"生效包损坏就拒绝启动"三件本模块管不了的事。
+/// 它们已收到 [`crate::app::knowledge`] —— 那里还要管"按优先级解析来源（生效包 / 启动期
+/// `source_dir` / 配置文件）"与"运行时整体换版"两件本模块管不了的事。
 #[derive(Debug, Default)]
 pub struct AdminRuntimeState {
     pub recent_online_agents: Vec<RecentOnlineRegisteredAgent>,
@@ -168,7 +168,7 @@ pub fn build_state(config: AdminConfig, store: Arc<dyn Store>) -> ApiState {
     build_state_with_knowledge(config, store, knowledge)
 }
 
-/// 装配共享状态，知识库内容由调用方给定（启动期：`LoadedKnowledge::from_store`）。
+/// 装配共享状态，知识库内容由调用方给定（启动期：`LoadedKnowledge::resolve`）。
 ///
 /// 两个监听（对外 HTTPS / 数据面内部 HTTP）**共用同一份**：知识库三个块、会话运行态与
 /// 限流器都只能有一份，否则两条路径的行为会不一致。

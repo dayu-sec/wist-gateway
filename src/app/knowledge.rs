@@ -5,9 +5,14 @@
 //!
 //! 本模块负责三件事：
 //!   1. 把一份内容（三个块）装成 [`LoadedKnowledge`]，供 [`crate::api::ApiState`] 换进换出；
-//!   2. 决定**从哪来**：管理面登记的生效包（`<state>/knowledge/<package_id>/`）优先；
-//!      还没有生效包时，过渡期回落配置文件里的 `*_file`（设计 §13：入口落地后删掉这条）；
-//!   3. 装载失败的语义（设计 §8.5）：**生效包损坏 = 拒绝启动**；从未录入 = 正常启动、空载。
+//!   2. 决定**从哪来**（优先级见 [`LoadedKnowledge::resolve`]）：管理面登记的生效包
+//!      （`<state>/knowledge/<package_id>/`）→ 启动期配置的包目录（`[knowledge] source_dir`，
+//!      出厂初始包）→ 配置文件里的 `*_file` → 空载；
+//!   3. 装载失败的语义：**任何来源不可用都只告警并继续回落，不拒启**。
+//!
+//! 关于第 3 点（改了原设计 §8.5 的「生效包损坏 = 拒绝启动」）：拒启等于把**处置入口**
+//! （管理面）一起关掉 —— 报错里让人“用管理面切到另一个包”，而管理面正是起不来的那个，
+//! 鸡生蛋。而“静默空载”这个原来要防的东西，现在由启动时那行 `knowledge source = …` 兜住。
 //!
 //! 为什么值得热加载（设计 §8.1 选 B）：归因靠三个锚 —— 本模块的 `generation`、
 //! `standing_work.catalog_version`、`agent_purpose_suggestion.rule_set_id + purpose_version`。
@@ -57,6 +62,32 @@ pub enum KnowledgeSource {
     ConfigFiles,
     /// 管理面登记的生效包。
     Package { package_id: String },
+    /// 启动期配置的包目录（`[knowledge] source_dir`）：出厂初始包。
+    /// 只在自己装载成功、**且管理面没有可用生效包**时才会出现。
+    Dir { path: String },
+}
+
+impl KnowledgeSource {
+    /// 短标签：`/api/v1/admin/knowledge` 的 `source` 字段（页面据它决定怎么表述来源）。
+    /// 启动日志用 [`Self::describe`]（带上是哪一份）。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ConfigFiles => "config-files",
+            Self::Package { .. } => "package",
+            Self::Dir { .. } => "dir",
+        }
+    }
+
+    /// 启动日志用的完整描述（带上是哪一份）。
+    pub fn describe(&self) -> String {
+        match self {
+            Self::None => "none（空载：不产建议；发现策略用 agentd 内建默认值）".to_string(),
+            Self::ConfigFiles => "config-files（配置里的 *_file）".to_string(),
+            Self::Package { package_id } => format!("package:{package_id}"),
+            Self::Dir { path } => format!("dir:{path}"),
+        }
+    }
 }
 
 impl Default for LoadedKnowledge {
@@ -140,12 +171,18 @@ impl LoadedKnowledge {
         }
     }
 
-    /// 按**管理面登记的生效包**装载（启动期调用，见设计 §8.5）。
+    /// 解析**这次启动到底用哪份知识内容**，按固定优先级：
     ///
-    /// * 没有生效指针 → 回落 [`Self::from_config`]（过渡期），即今天的空载/配置态不变；
-    /// * 有生效指针 → 从 `<state>/knowledge/<package_id>/` 装载五份数据，
-    ///   **任一失败即返回 `Err`**，由调用方拒绝启动（静默空载会让平台悄悄停掉建议与派活）。
-    pub async fn from_store(
+    /// 1. 管理面登记的生效包（`<state>/knowledge/<package_id>/`）；
+    /// 2. 启动期配置的包目录 `[knowledge] source_dir`（出厂初始包）；
+    /// 3. 配置文件里的 `[content]` / `[purpose]` / `[discovery]`（过渡期路径）；
+    /// 4. 空载。
+    ///
+    /// 1、2 任一层**不可用都只告警、继续往下回落**，不拒启 —— 拒启会把处置入口（管理面）
+    /// 一起关掉。挑中的来源由调用方打一行 `knowledge source = …`，"空载"因此不再静默。
+    ///
+    /// 只有**读不到库**才返回 `Err`（那是存储故障，不是内容问题）。
+    pub async fn resolve(
         config: &AdminConfig,
         store: &Arc<dyn Store>,
     ) -> Result<Self, KnowledgeLoadError> {
@@ -153,20 +190,56 @@ impl LoadedKnowledge {
             .knowledge_active()
             .await
             .map_err(|err| KnowledgeLoadError::new(format!("读取知识库生效指针失败：{err}")))?;
-        let Some(active) = active else {
-            return Ok(Self::from_config(config));
-        };
-        let dir = config.knowledge_package_dir(&active.package_id);
-        let mut loaded = Self::load_package_dir(&dir)?;
-        loaded.source = KnowledgeSource::Package {
-            package_id: active.package_id,
-        };
-        loaded.generation = active.generation;
-        Ok(loaded)
+        if let Some(active) = active {
+            let dir = config.knowledge_package_dir(&active.package_id);
+            match Self::load_package_dir(&dir) {
+                Ok(mut loaded) => {
+                    loaded.source = KnowledgeSource::Package {
+                        package_id: active.package_id,
+                    };
+                    loaded.generation = active.generation;
+                    return Ok(loaded);
+                }
+                // 目录悬空 / 内容损坏都回落 —— 见方法头注释。
+                Err(err) => eprintln!(
+                    "warning: 生效知识包不可用，按后续来源回落（package_id={}）: {err}",
+                    active.package_id
+                ),
+            }
+        }
+        if let Some(dir) = config.knowledge_source_dir.as_deref() {
+            match Self::load_package_dir(dir) {
+                Ok(mut loaded) => {
+                    loaded.source = KnowledgeSource::Dir {
+                        path: dir.display().to_string(),
+                    };
+                    return Ok(loaded);
+                }
+                Err(err) => {
+                    eprintln!("warning: 启动期知识源不可用，继续按配置/空载回落: {err}")
+                }
+            }
+        }
+        Ok(Self::from_config(config))
     }
 
     /// 从一个包目录装载五份数据；缺文件、内容非法都以 `Err` 报出（附目录路径）。
     fn load_package_dir(dir: &Path) -> Result<Self, KnowledgeLoadError> {
+        // 把"目录不在"与"目录在但内容坏了"分开：前者几乎总是部署事故（搬库/搬盘没搬全），
+        // 告警里能直接说清，不用让人去猜一个裸 io 报错。再单独认一下"指到了 tar.gz"：
+        // 出厂初始包这一步最容易犯的就是拿制品当目录。
+        if !dir.exists() {
+            return Err(KnowledgeLoadError::at(
+                dir,
+                "目录不存在（这份副本没跟过来？）",
+            ));
+        }
+        if !dir.is_dir() {
+            return Err(KnowledgeLoadError::at(
+                dir,
+                "不是目录（这里要的是**已解开**的包目录，不是 tar.gz 制品）",
+            ));
+        }
         let at = |name: &str| dir.join(name);
         let content = crate::app::content::load_content(
             &at("catalog.toml"),
@@ -189,7 +262,9 @@ impl LoadedKnowledge {
     }
 }
 
-/// 生效知识包装载失败：**这个错误会让网关拒绝启动**（设计 §8.5），所以消息必须能直接指导处置。
+/// 知识包（或启动期知识源目录）不可用。**注意：它不再意味着拒绝启动** ——
+/// `LoadedKnowledge::resolve` 会告警后回落；这里保留精细的原因只是为了让消息能直接指导处置
+/// （管理面激活前的重验也复用同一份文案）。
 #[derive(Debug)]
 pub struct KnowledgeLoadError(String);
 
@@ -200,9 +275,9 @@ impl KnowledgeLoadError {
 
     fn at(dir: &Path, detail: impl fmt::Display) -> Self {
         Self(format!(
-            "生效知识包不可用（{}）：{detail}\n  \
-             处置：修好这份副本，或用管理面切到另一个包；\n  \
-             在此之前网关不会启动 —— 带着空内容起会让平台悄悄停掉建议与派活。",
+            "知识包不可用（{}）：{detail}\n  \
+             五份数据（catalog / packs / templates / purpose-rules / aspect-policies）必须齐全且合法；\
+             修好这份副本，或在管理面切到另一个包。",
             dir.display()
         ))
     }
@@ -755,19 +830,72 @@ mod tests {
             Some(1)
         );
         assert!(loaded.discovery_policies.is_some());
-        // 这份还只是"装好了"：来源与世代由 `from_store` 在登记之后填上。
+        // 这份还只是"装好了"：来源与世代由 `resolve` 在登记之后填上。
         assert_eq!(loaded.source, KnowledgeSource::None);
         assert_eq!(loaded.generation, 0);
+    }
+
+    /// 目录不存在也要给出**能直接读**的原因（不是一句裸 io 报错）——
+    /// 这是「搬库没搬盘」那类部署事故最常见的形态。
+    #[test]
+    fn a_missing_directory_says_so() {
+        let dir = std::env::temp_dir().join(format!(
+            "wist-knowledge-missing-{}-{}",
+            std::process::id(),
+            PACKAGE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let err = LoadedKnowledge::load_package_dir(&dir).expect_err("must report an error");
+        let text = err.to_string();
+        assert!(text.contains("目录不存在"), "{text}");
+        assert!(text.contains(&dir.display().to_string()), "{text}");
+    }
+
+    /// 指到一个文件（最容易犯：拿 tar.gz 制品当目录）也要说清楚要的是什么。
+    #[test]
+    fn a_file_instead_of_a_directory_says_so() {
+        let file = std::env::temp_dir().join(format!(
+            "wist-knowledge-tarball-{}-{}.tar.gz",
+            std::process::id(),
+            PACKAGE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&file, "not a directory").expect("write file");
+        let err = LoadedKnowledge::load_package_dir(&file).expect_err("must report an error");
+        let text = err.to_string();
+        assert!(text.contains("不是目录"), "{text}");
+        assert!(text.contains("tar.gz"), "{text}");
+        let _ = fs::remove_file(&file);
+    }
+
+    /// 来源标签与启动日志文案：页面（`source` 字段）与运维（`knowledge source = …`）都靠它，
+    /// 属于对外措辞 —— 别在后续重构里被改歪。
+    #[test]
+    fn source_labels_stay_stable() {
+        assert_eq!(KnowledgeSource::None.label(), "none");
+        assert_eq!(KnowledgeSource::ConfigFiles.label(), "config-files");
+        let package = KnowledgeSource::Package {
+            package_id: "kbp-x".to_string(),
+        };
+        let dir = KnowledgeSource::Dir {
+            path: "/config/knowledge/initial".to_string(),
+        };
+        assert_eq!(package.label(), "package");
+        assert_eq!(dir.label(), "dir");
+
+        // `describe` 必须带上是哪一份 —— 只说"用了 dir"、不带路径，运维还得回头猜。
+        assert!(package.describe().contains("kbp-x"));
+        assert!(dir.describe().contains("/config/knowledge/initial"));
+        assert!(KnowledgeSource::None.describe().contains("空载"));
     }
 
     #[test]
     fn a_missing_file_makes_the_package_unusable() {
         let dir = stage_real_package();
         fs::remove_file(dir.join("templates.toml")).expect("remove templates");
-        let err = LoadedKnowledge::load_package_dir(&dir).expect_err("must refuse");
+        let err = LoadedKnowledge::load_package_dir(&dir).expect_err("must report an error");
         let text = err.to_string();
-        // 拒启的消息必须能直接指导处置：说清是哪一份包、哪个目录。
-        assert!(text.contains("生效知识包不可用"), "{text}");
+        // 消息必须能直接指导处置：说清是哪一份包、哪个目录。
+        assert!(text.contains("知识包不可用"), "{text}");
         assert!(text.contains(&dir.display().to_string()), "{text}");
     }
 

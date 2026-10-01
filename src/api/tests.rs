@@ -6387,6 +6387,7 @@ impl TestEnv {
             // 内部接入端点默认关：测试走 `router()`，明文监听由 main.rs 单独起。
             ingest_listen_addr: None,
             // 知识库包默认不验签（要验签的用例自己把公钥填上）。
+            knowledge_source_dir: None,
             knowledge_signing_public_key_file: None,
             knowledge_signing_public_key: None,
         };
@@ -9449,13 +9450,18 @@ async fn ingest_endpoint_rejects_a_revoked_agent() {
 
 /// 在环境的状态目录里造一个包目录，并写入五份**真实**策展数据。
 fn stage_knowledge_package(env: &TestEnv, package_id: &str) -> std::path::PathBuf {
-    let dir = env.config.knowledge_package_dir(package_id);
-    std::fs::create_dir_all(&dir).expect("create knowledge package dir");
+    stage_knowledge_dir(&env.config.knowledge_package_dir(package_id))
+}
+
+/// 把五份**真实**数据铺到任意目录 —— 包目录与 `[knowledge] source_dir`（启动期知识源）共用这一手。
+/// 用真数据而不是内联夹具：这里要验的正是“策展数据能被装载器吃下”。
+fn stage_knowledge_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).expect("create knowledge dir");
     for name in crate::app::knowledge::PACKAGE_FILES {
         std::fs::copy(crate::test_support::knowledge_file(name), dir.join(name))
             .unwrap_or_else(|err| panic!("copy {name}: {err}"));
     }
-    dir
+    dir.to_path_buf()
 }
 
 fn knowledge_package_row(package_id: &str, dir: &std::path::Path) -> StoredKnowledgePackage {
@@ -9500,7 +9506,7 @@ async fn knowledge_loads_from_the_active_package_in_the_store() {
     let env = TestEnv::new().await;
     record_and_activate_knowledge(&env, "kbp-test").await;
 
-    let loaded = LoadedKnowledge::from_store(&env.config, &env.store_handle)
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
         .await
         .expect("load from store");
     assert_eq!(
@@ -9524,11 +9530,51 @@ async fn knowledge_loads_from_the_active_package_in_the_store() {
     assert!(loaded.discovery_policies.is_some());
 }
 
-/// 从未录入过 = 空载：过渡期回落配置文件（今天的部署就是这样跑起来的）。
+/// **生效包优先于启动期知识源**：管理面切过的包，不能被出厂初始包顶掉。
+#[tokio::test]
+async fn an_active_package_wins_over_the_startup_source_dir() {
+    let mut env = TestEnv::new().await;
+    env.config.knowledge_source_dir = Some(stage_knowledge_dir(&env._root.join("initial")));
+    record_and_activate_knowledge(&env, "kbp-test").await;
+
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("resolve");
+    assert_eq!(
+        loaded.source,
+        KnowledgeSource::Package {
+            package_id: "kbp-test".to_string()
+        }
+    );
+}
+
+/// 启动期知识源（出厂初始包）：管理面还没激活过任何包时，用它而不是空载/配置态。
+#[tokio::test]
+async fn knowledge_uses_the_startup_source_dir_before_any_package_is_activated() {
+    let mut env = TestEnv::new().await;
+    let dir = stage_knowledge_dir(&env._root.join("initial"));
+    env.config.knowledge_source_dir = Some(dir.clone());
+
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("resolve");
+    assert_eq!(
+        loaded.source,
+        KnowledgeSource::Dir {
+            path: dir.display().to_string()
+        }
+    );
+    assert_eq!(loaded.generation, 0);
+    assert!(loaded.content.is_some());
+    assert!(loaded.purpose_rules.is_some());
+    assert!(loaded.discovery_policies.is_some());
+}
+
+/// 从未录入过 = 空载：回落配置文件（今天的部署就是这样跑起来的）。
 #[tokio::test]
 async fn knowledge_falls_back_to_config_files_before_anything_is_activated() {
     let env = TestEnv::new().await;
-    let loaded = LoadedKnowledge::from_store(&env.config, &env.store_handle)
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
         .await
         .expect("load from config");
     assert_eq!(loaded.source, KnowledgeSource::ConfigFiles);
@@ -9536,34 +9582,70 @@ async fn knowledge_falls_back_to_config_files_before_anything_is_activated() {
     assert!(loaded.content.is_some());
 }
 
-/// **生效包损坏 = 拒绝启动**（设计 §8.5）：这是 `main` 里那个 `?` 的依据。
+/// **悬空的生效包不再拒启**（曾经是“生效包损坏 = 拒绝启动”）：
+/// 搬了库没搬盘时会撞上，拒启等于把处置入口（管理面）一起关掉 —— 回落并告警就行。
 #[tokio::test]
-async fn knowledge_refuses_a_broken_active_package() {
+async fn a_dangling_active_package_no_longer_refuses_startup() {
     let env = TestEnv::new().await;
-    // 登记并激活一个"目录根本不存在"的包。
+    activate_missing_package(&env, "kbp-broken").await;
+
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("a missing package copy must not refuse startup");
+    // 没有启动期知识源 → 落到配置文件那份（`TestEnv` 配了内容）。
+    assert_eq!(loaded.source, KnowledgeSource::ConfigFiles);
+    assert!(loaded.content.is_some());
+}
+
+/// 悬空的生效包 + 有启动期知识源 → 用后者（“搬库没搬盘”现场的实际回归）。
+#[tokio::test]
+async fn a_dangling_active_package_falls_back_to_the_startup_source_dir() {
+    let mut env = TestEnv::new().await;
+    let dir = stage_knowledge_dir(&env._root.join("initial"));
+    env.config.knowledge_source_dir = Some(dir.clone());
+    activate_missing_package(&env, "kbp-broken").await;
+
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("resolve");
+    assert_eq!(
+        loaded.source,
+        KnowledgeSource::Dir {
+            path: dir.display().to_string()
+        }
+    );
+}
+
+/// 启动期知识源配错/没铺 → 告警回落，不当启动失败。
+#[tokio::test]
+async fn a_broken_startup_source_dir_falls_back_without_refusing() {
+    let mut env = TestEnv::new().await;
+    env.config.knowledge_source_dir = Some(env._root.join("no-such-knowledge"));
+
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("a broken source_dir must not refuse startup");
+    assert_eq!(loaded.source, KnowledgeSource::ConfigFiles);
+}
+
+/// 登记并激活一个**目录不存在**的包（模拟“搬库没搬盘”）。
+async fn activate_missing_package(env: &TestEnv, package_id: &str) {
     env.store_handle
         .upsert_knowledge_package(&knowledge_package_row(
-            "kbp-broken",
-            &env.config.knowledge_package_dir("kbp-broken"),
+            package_id,
+            &env.config.knowledge_package_dir(package_id),
         ))
         .await
         .expect("record broken package");
     env.store_handle
         .activate_knowledge(&KnowledgeActivation {
-            package_id: "kbp-broken",
+            package_id,
             reason: "activate",
             requested_by: "admin",
             created_at: "2026-09-30T00:00:00Z",
         })
         .await
         .expect("activate broken package");
-
-    let err = LoadedKnowledge::from_store(&env.config, &env.store_handle)
-        .await
-        .expect_err("a broken active package must refuse startup");
-    let text = err.to_string();
-    assert!(text.contains("生效知识包不可用"), "{text}");
-    assert!(text.contains("kbp-broken"), "{text}");
 }
 
 /// 换版**不需要重启**：换掉的是 `ApiState` 里那一份 `Arc`，同一个 router 立刻跟着变。
