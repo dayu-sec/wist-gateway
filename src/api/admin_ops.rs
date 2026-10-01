@@ -173,6 +173,16 @@ pub struct SetAgentUplinkRequest {
     /// 用 `i64` 收下再校验：用 `u16` 的话越界值会被 axum 的 JSON 提取器判成 422，
     /// 而这里约定一律用 400 + 纯文本原因回给管理面。
     pub port: i64,
+    /// 部署级启用开关：`true` = 本网关授权的所有 agent 都启用主机内容上送（日志 / 指标），
+    /// 不必先派工。
+    ///
+    /// **缺省（不带这个键）= 保持已存的值**，而不是「关掉」：
+    ///   * 已存值没有（从未录入过）→ `false`，所以老客户端**永远不可能顺手把全队打开**；
+    ///   * 已存值是 `true` → 保持 `true`，所以老客户端改一下地址也不会**静默掉全队的上送**。
+    ///
+    /// 只有显式 `false` 才关。两个方向都是安全的那一侧。
+    #[serde(default)]
+    pub enabled: Option<bool>,
     pub requested_by: Option<String>,
 }
 
@@ -182,9 +192,16 @@ pub struct AgentUplinkResponse {
     pub setting_id: String,
     pub host: String,
     pub port: u16,
+    /// 部署级启用开关的生效值（见 [`SetAgentUplinkRequest::enabled`]）。
+    pub enabled: bool,
     pub updated_by: String,
     /// 未设置过时为 null。
     pub updated_at: Option<DateTime>,
+    /// 这个 `enabled` 是不是管理面**录入**的（而不是部署派生的默认 `false`）。
+    ///
+    /// 为什么需要它：地址与开关共用一个响应，页面要能区分「没录入过」与「录入过一次不开」。
+    /// 与 `updated_at` 同口径（它是同一行设置的更新时刻，派生值里为空）。
+    pub enabled_configured: bool,
 }
 
 /// 设置网关对外地址的请求体。
@@ -2093,8 +2110,10 @@ pub async fn view_agent_uplink(
             setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
             host: String::new(),
             port: DEFAULT_AGENT_UPLINK_PORT,
+            enabled: false,
             updated_by: String::new(),
             updated_at: None,
+            enabled_configured: false,
         })
         .into_response(),
         Err(err) => (
@@ -2105,7 +2124,7 @@ pub async fn view_agent_uplink(
     }
 }
 
-/// 设置 Agent 数据面上送地址（管理面）。
+/// 设置 Agent 数据面上送地址与**部署级启用开关**（管理面）。
 ///
 /// 记录的是「数据面（warp-parse）在哪」这个控制面事实：它既是新签发初始配置里
 /// `[telemetry.logs.output.tcp]` 的取值，也是运行期 `uplink:poll` 现算上送授权时的
@@ -2115,7 +2134,10 @@ pub async fn view_agent_uplink(
 /// 只在「要指到别处」时才需要用它：没设过时生效的是**部署配置派生**的目标（同一域名 + 数据面端口，
 /// 见 [`super::install::effective_agent_uplink`]），所以「一台机器、一个域名」的部署不必录入。
 ///
-/// 但只有地址不等于启用：是否上送还要看该 Agent 有没有生效工作（派活即启用、撤回即待命）。
+/// 但只有地址不等于启用：网关现算的判据是「**该 Agent 有生效工作** 或 **开关打开**」且「有目标」。
+/// 开关回答的是另一半问题 —— 「这套网关现在收不收数据」—— 所以新装机不必先派工也能开始上送；
+/// 代价是开关打开时，**撤回工作不再能把某一台单独关掉**（要单独停就关开关或吊销那台 agent，
+/// 见 `docs/design/agent-uplink-enablement.md` §4.1）。
 pub async fn set_agent_uplink(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -2130,10 +2152,26 @@ pub async fn set_agent_uplink(
         Ok(value) => value,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    // 缺省 = 保持已存值（见 `SetAgentUplinkRequest::enabled`）。读不到已存值就 500，
+    // 不把「读库失败」伪装成「关掉」——那会静默掐掉全队的上送。
+    let enabled = match input.enabled {
+        Some(value) => value,
+        None => match state.store.get_agent_uplink().await {
+            Ok(stored) => stored.map(|setting| setting.enabled).unwrap_or(false),
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to load agent uplink address: {err}"),
+                )
+                    .into_response();
+            }
+        },
+    };
     let setting = StoredAgentUplinkAddress {
         setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
         host: host.to_string(),
         port,
+        enabled,
         updated_by: input
             .requested_by
             .unwrap_or_else(|| "platform-maintenance-engineer".to_string()),
@@ -2154,8 +2192,11 @@ fn uplink_response(setting: &StoredAgentUplinkAddress) -> AgentUplinkResponse {
         setting_id: setting.setting_id.clone(),
         host: setting.host.clone(),
         port: setting.port,
+        enabled: setting.enabled,
         updated_by: setting.updated_by.clone(),
         updated_at: DateTime::from_rfc3339(&setting.updated_at),
+        // 派生值没有 updated_at（构造时留空），它就是「不是管理面录入的」。
+        enabled_configured: !setting.updated_at.is_empty(),
     }
 }
 

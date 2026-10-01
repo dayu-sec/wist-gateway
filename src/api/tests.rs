@@ -555,6 +555,7 @@ async fn initial_config_records_uplink_target_stays_idle() {
         setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
         host: "10.0.1.9".to_string(),
         port: 9100,
+        enabled: false,
         updated_by: "ops".to_string(),
         updated_at: "2026-09-21T00:00:00+00:00".to_string(),
     };
@@ -4450,6 +4451,10 @@ async fn uplink_view_reports_the_target_derived_from_the_deployment_config() {
     assert_eq!(body["port"], 9000);
     assert_eq!(body["updated_by"], "");
     assert_eq!(body["updated_at"], serde_json::Value::Null);
+    // 派生只说明「能连到哪」，不说明「该不该连」：开关恒为关，
+    // 而且必须标出它是**派生的**（页面据此区分「没录入」与「录入过一次不开」）。
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["enabled_configured"], false);
 }
 
 /// 连派生都派不出（对外基址里取不出主机名）才是真的「未设置」：页面据此提示「没有上送目标」。
@@ -4487,7 +4492,7 @@ async fn effective_uplink_prefers_the_admin_setting_over_the_derived_target() {
     // 派生值的 `updated_at` 为空 —— 它是「不是管理面录入的」的判据。
     assert_eq!(derived.updated_at, "");
 
-    set_agent_uplink_address(&env, "10.0.1.9", 9100).await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, false).await;
     let chosen = super::install::effective_agent_uplink(&env.config, &env.store_handle)
         .await
         .expect("resolve")
@@ -4622,6 +4627,7 @@ async fn uplink_set_validates_and_round_trips() {
         &env.store_handle,
         uri,
         Some(TEST_ADMIN_API_TOKEN),
+        // 故意**不带** `enabled`：老前端 / 老脚本只发地址，不得顺手把全队打开。
         &serde_json::json!({ "host": "10.0.1.9", "port": 9100, "requested_by": "ops" }),
     )
     .await;
@@ -4630,6 +4636,7 @@ async fn uplink_set_validates_and_round_trips() {
     assert_eq!(stored["host"], "10.0.1.9");
     assert_eq!(stored["port"], 9100);
     assert_eq!(stored["updated_by"], "ops");
+    assert_eq!(stored["enabled"], false, "缺省必须落在「不启用」这侧");
 
     let view = get_to_router(
         &env.config,
@@ -4642,6 +4649,104 @@ async fn uplink_set_validates_and_round_trips() {
     assert_eq!(body["host"], "10.0.1.9");
     assert_eq!(body["port"], 9100);
     assert_eq!(body["updated_at"], stored["updated_at"]);
+    assert_eq!(body["enabled"], false);
+    // 录入过一次（哪怕是 false）——「已配置」看的是**有没有录入**，不是那个布尔值本身。
+    assert_eq!(body["enabled_configured"], true);
+}
+
+/// 部署级启用开关：录入 → 立即被响应回带；再录一次能关上。
+#[tokio::test]
+async fn uplink_switch_round_trips_through_the_admin_route() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/uplink";
+
+    let on = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9100, "enabled": true }),
+    )
+    .await;
+    assert_eq!(on.status(), StatusCode::OK);
+    let stored: serde_json::Value = decode_json_response(on).await;
+    assert_eq!(stored["enabled"], true);
+    assert_eq!(stored["enabled_configured"], true);
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["enabled"], true);
+
+    // 关回去：开关是可逆的，不需要删设置（删了会回落到派生目标，那又是另一回事）。
+    let off = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9100, "enabled": false }),
+    )
+    .await;
+    let stored: serde_json::Value = decode_json_response(off).await;
+    assert_eq!(stored["enabled"], false);
+    assert_eq!(stored["enabled_configured"], true);
+}
+
+/// **缺省 `enabled` = 保持已存值**，不是「关掉」。
+///
+/// 两个方向都得是这个形状：
+///   * 已存值是 `true` → 老客户端/脚本只改地址，**不能**把全队的上送静默掉；
+///   * 从未录入过 → `false`，**不能**顺手把全队打开。
+/// 不钉住第二条就会出现「一台 curl 把整个机队掐了」这种没人能一眼看出的故障。
+#[tokio::test]
+async fn omitting_the_switch_keeps_the_stored_value_instead_of_turning_it_off() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/uplink";
+
+    // ① 从未录入过：不带 `enabled` 的旧式请求落 `false`。
+    let first = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9100 }),
+    )
+    .await;
+    let stored: serde_json::Value = decode_json_response(first).await;
+    assert_eq!(stored["enabled"], false, "缺省绝不可能把全队打开");
+
+    // ② 显式打开。
+    let on = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9100, "enabled": true }),
+    )
+    .await;
+    let stored: serde_json::Value = decode_json_response(on).await;
+    assert_eq!(stored["enabled"], true);
+
+    // ③ 再发一次**不带 `enabled`** 的旧式请求（典型：老客户端只改端口）→ 开关必须留着。
+    let legacy = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9200 }),
+    )
+    .await;
+    let stored: serde_json::Value = decode_json_response(legacy).await;
+    assert_eq!(stored["port"], 9200, "地址要按请求改掉");
+    assert_eq!(
+        stored["enabled"], true,
+        "缺省必须保留已打开的开关 —— 否则一次地址变更就静默掐掉全队上送"
+    );
 }
 
 #[tokio::test]
@@ -6880,33 +6985,39 @@ async fn the_uplink_poll_rejects_a_wrong_envelope() {
 }
 
 /// 「授权前不上送」的回归护栏：网关签发的初始配置**永远**是待命 ——
-/// 无论管理面有没有设上送地址。启用只能来自运行期的 `uplink:poll`（有生效工作 + 有地址）。
+/// 无论管理面有没有设上送地址、有没有打开部署级开关。启用只能来自运行期的
+/// `uplink:poll`（`（有生效工作 或 开关打开）且 有地址`）。
 /// 有人把模板改成 `enabled = true`，就会让新装 Agent 在授权前外发；这条测试要拦住它。
 #[tokio::test]
 async fn initial_config_never_enables_the_uplink() {
     let env = TestEnv::new().await;
-    let uplink = StoredAgentUplinkAddress {
-        setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
-        host: "10.0.1.9".to_string(),
-        port: 9100,
-        updated_by: "ops".to_string(),
-        updated_at: "2026-09-21T00:00:00+00:00".to_string(),
-    };
-    for with_target in [false, true] {
-        let text = agent_initial_config_toml(
-            &env.config,
-            "install-token-a",
-            with_target.then_some(&uplink),
-            &env.config.public_base_url,
-        );
-        // 只信解析结果，不做文本匹配：模板里 `[control_plane] enabled = true` 也会命中
-        // 子串/行匹配（`enabled` 这个键名不止一处），而解析后看的是**输出那一段**的真值。
-        let parsed: wist_contracts::agent_config::AgentConfig =
-            toml::from_str(&text).expect("valid agent config toml");
-        assert!(
-            !parsed.telemetry.logs.output.enabled,
-            "网关签发的初始配置必须待命（with_target={with_target}）:\n{text}"
-        );
+    for switch in [false, true] {
+        let uplink = StoredAgentUplinkAddress {
+            setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
+            host: "10.0.1.9".to_string(),
+            port: 9100,
+            // 关键：连「开关已打开」也不得写进安装期配置 —— 安装脚本是死数据，
+            // 开关是运行期的（改了开关不需要重装）。
+            enabled: switch,
+            updated_by: "ops".to_string(),
+            updated_at: "2026-09-21T00:00:00+00:00".to_string(),
+        };
+        for with_target in [false, true] {
+            let text = agent_initial_config_toml(
+                &env.config,
+                "install-token-a",
+                with_target.then_some(&uplink),
+                &env.config.public_base_url,
+            );
+            // 只信解析结果，不做文本匹配：模板里 `[control_plane] enabled = true` 也会命中
+            // 子串/行匹配（`enabled` 这个键名不止一处），而解析后看的是**输出那一段**的真值。
+            let parsed: wist_contracts::agent_config::AgentConfig =
+                toml::from_str(&text).expect("valid agent config toml");
+            assert!(
+                !parsed.telemetry.logs.output.enabled,
+                "网关签发的初始配置必须待命（switch={switch} with_target={with_target}）:\n{text}"
+            );
+        }
     }
 }
 
@@ -7442,12 +7553,15 @@ async fn the_work_grant_needs_an_agent_credential() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// 直接经 store 设上送地址（比走管理面路由少一层，测试只关心授权计算结果）。
-async fn set_agent_uplink_address(env: &TestEnv, host: &str, port: u16) {
+///
+/// `enabled` 就是那个部署级开关；绝大多数用例需要的是「只按派工启用」，所以走这个偏门写法。
+async fn set_agent_uplink_address(env: &TestEnv, host: &str, port: u16, enabled: bool) {
     env.store
         .upsert_agent_uplink(&StoredAgentUplinkAddress {
             setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
             host: host.to_string(),
             port,
+            enabled,
             updated_by: "ops".to_string(),
             updated_at: "2026-09-26T00:00:00+00:00".to_string(),
         })
@@ -7490,18 +7604,124 @@ async fn the_uplink_poll_rejects_a_wrong_kind() {
     assert_eq!(decode_text_response(response).await, "invalid uplink poll");
 }
 
-/// 没有生效工作就必须待命 —— 即使管理面已设了上送地址：
+/// 没有生效工作就必须待命 —— 只要**开关也关着**：
 /// 地址只回答「能连到哪」，不回答「该不该连」。
 #[tokio::test]
 async fn uplink_poll_is_standby_without_any_work() {
     let env = TestEnv::new().await;
-    set_agent_uplink_address(&env, "10.0.1.9", 9000).await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9000, false).await;
     let credential = enroll_agent_credential(&env).await;
 
     let grant: AgentUplinkGrant =
         decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
     assert!(!grant.enabled);
     assert_eq!(grant.target(), None);
+}
+
+/// 部署级开关打开 → **没有派任何活也启用**（新装机不再需要人工派工才能开始上送）。
+///
+/// 这是 §4.1 的核心行为：开关回答「这套网关收不收数据」，与「这台干什么活」正交。
+#[tokio::test]
+async fn the_deployment_switch_opens_the_uplink_without_any_work() {
+    let env = TestEnv::new().await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, true).await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(grant.enabled, "开关打开时不必先派工");
+    assert_eq!(grant.target(), Some(("10.0.1.9", 9100)));
+}
+
+/// 开关**不能凭空造出去处**：取不到目标（对外基址里没有主机名）时照样待命。
+#[tokio::test]
+async fn the_deployment_switch_alone_cannot_open_the_uplink_without_a_target() {
+    let mut env = TestEnv::new().await;
+    env.config.public_base_url = "https://".to_string();
+    // 管理面也没设过 → 两条来源都取不出目标。
+    let credential = enroll_agent_credential(&env).await;
+
+    // 先把开关打开（用一份能存下的设置：开关与地址同在一行，所以得带个地址）。
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, true).await;
+    let with_address: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(with_address.enabled);
+
+    // 删掉那一行 → 只剩派生，而派生不出主机名 → 待命（不猜目标）。
+    sqlx::query("DELETE FROM agent_uplink")
+        .execute(env.store.pool())
+        .await
+        .expect("clear uplink setting");
+    let standby: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!standby.enabled, "没有目标可指时必须待命（开关也不例外）");
+    assert_eq!(standby.target(), None);
+}
+
+/// 开关是**并集**不是替代：关掉开关不影响「有工作即启用」这条原有路径。
+#[tokio::test]
+async fn turning_the_switch_off_still_leaves_worked_agents_enabled() {
+    let env = TestEnv::new().await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, false).await;
+    let credential = a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(grant.enabled, "开关关着时，派工这条路径必须原样生效");
+}
+
+/// 开关打开时的**粒度代价**，钉住它是刻意的：撤回工作不再能把这一台单独关掉。
+///
+/// 要单独停只有两条路：关掉部署级开关（会连带停掉其他「没有工作」的机器），或吊销这台 agent。
+/// 写下来是因为它会让人意外 —— 但反过来（让撤回压过开关）会使开关对**新装机**完全失效，
+/// 而「新装机不必先派工就能开始上送」正是这个开关存在的理由（设计 §4.1）。
+#[tokio::test]
+async fn with_the_switch_on_revoking_work_no_longer_stops_a_single_agent() {
+    let env = TestEnv::new().await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, true).await;
+    let credential = a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let view = get_agent_work(&env).await;
+    let work_id = view["standing"][0]["work_id"].as_str().expect("work id");
+    let revoked = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/revoke"),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(
+        grant.enabled,
+        "开关打开时，撤回工作不再单独关掉这一台（刻意的粒度取舍）"
+    );
+
+    // 而关掉开关就会回到待命 —— 这才是「停一台」的代价：粒度是部署级。
+    let off = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/uplink",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9100, "enabled": false }),
+    )
+    .await;
+    assert_eq!(off.status(), StatusCode::OK);
+    let standby: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!standby.enabled, "关掉开关后这台才回到待命");
 }
 
 /// 派活即启用 —— **不必先有人在管理面录入上送地址**：没设过时目标派生自部署配置
@@ -7552,7 +7772,7 @@ async fn uplink_poll_with_work_but_no_target_stays_standby() {
 #[tokio::test]
 async fn a_paused_standing_work_still_authorizes_uplink() {
     let env = TestEnv::new().await;
-    set_agent_uplink_address(&env, "10.0.1.9", 9000).await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9000, false).await;
     let credential = a_classified_macos_agent(&env).await;
     let receipt: serde_json::Value = decode_json_response(
         grant_work(
@@ -7599,7 +7819,7 @@ async fn a_paused_standing_work_still_authorizes_uplink() {
 async fn uplink_poll_enables_on_effective_work_and_target_then_returns_to_standby() {
     let env = TestEnv::new().await;
     let credential = a_classified_macos_agent(&env).await;
-    set_agent_uplink_address(&env, "10.0.1.9", 9100).await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, false).await;
 
     // 还没派活：待命。
     let standby: AgentUplinkGrant =

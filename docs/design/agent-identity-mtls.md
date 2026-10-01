@@ -269,10 +269,13 @@ agent 走 **mTLS**（出示客户端证书）→ 网关 `WebPkiClientVerifier` �
   （`src/control/runtime_entry.rs:524`），需补定时任务（§4.2）；过期判定靠**本地读 `notAfter`**（§5.4）；
 - **续签留痕与上报**：续签结果 / 证书状态落 state 并上报（§5.5）；过期置「需重装」并上报；
 - `enroll --force`（丢弃本地身份、凭 token 重新注册）——现已缺失，是「重装 ≠ 重注册」的补口。
-- 收到 `unknown_credential` → 网关侧首触重建（agent 无需动作）；收到 `certificate_revoked` → 进**终态**：
+- 收到终态 code（`TERMINAL_AUTH_CODES`：`certificate_revoked` / `certificate_mismatch`）→ 进**终态**：
   停止一切控制面请求（状态 / 工作 / 上送 / 续期）并把上送压成待命，落台账
-  （`identity/renewal.json` 记 `revoked`）并打一行可操作的 `event=AgentRevoked`。**进程不退出**
-  （launchd/systemd 的 KeepAlive 会把退出变成重启风暴）；恢复只有一条路——运维在网关**解除拒绝名单**后重启。
+  （`identity/renewal.json` 记 `revoked`）并打一行可操作的 `event=AgentAuthTerminal code=…`。
+  **进程不退出**（launchd/systemd 的 KeepAlive 会把退出变成重启风暴）。
+  **恢复**：见 [`agent-uplink-enablement.md`](./agent-uplink-enablement.md) §4.2 —— 终态**可自愈**
+  （低频重试状态上报，网关恢复接受即自动清）且**可诊断**（落盘 + `diagnose` 报 FAIL），
+  不再要求人工重启。
   注：被吊销时 agent 也**无法**上报（网关会拒），所以「被吊销」在页面上以**网关侧**为准，不指望 agent 上报。
 
 **wist-gateway**

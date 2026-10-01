@@ -432,6 +432,9 @@ pub async fn effective_agent_uplink(
 /// 部署配置派生的上送目标（管理面没设过时的回落）。
 ///
 /// `None` = 连基址里都取不出主机名 —— 这时才是真的「没有上送目标」，调用方按未设置处理。
+///
+/// `enabled` 恒为 `false`：派生只说明「能连到哪」（同一域名 + 数据面端口），不说明「该不该连」。
+/// 把 `true` 当成默认就等于「升级即开始上送」，与「默认零行为变化」相冲。
 pub async fn derived_agent_uplink(
     config: &AdminConfig,
     store: &Arc<dyn Store>,
@@ -441,6 +444,7 @@ pub async fn derived_agent_uplink(
         setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
         host,
         port: DEFAULT_AGENT_UPLINK_PORT,
+        enabled: false,
         updated_by: String::new(),
         updated_at: String::new(),
     })

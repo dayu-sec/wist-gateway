@@ -381,16 +381,24 @@ pub async fn build_work_grant(
     })
 }
 
-/// 现算某 Agent 的数据面上送期望状态：`enabled = 有生效工作 且 有上送目标`。
+/// 现算某 Agent 的数据面上送期望状态：`enabled = （有生效工作 或 开关打开）且 有上送目标`。
 ///
-/// 没有新状态、没有推送通道 —— 每次被问到时从两个既有事实推出来：
+/// 没有新状态、没有推送通道 —— 每次被问到时从既有事实推出来：
 ///   * 「有生效工作」复用工作授权同一口径（[`effective_standing`] / [`outstanding_one_shot`]，
-///     两者都空即没有工作），所以「派活即启用、撤回即待命」自动发生，无需管理面多一个动作；
+///     两者都空即没有工作）。
+///   * 「开关打开」是管理面在**同一行设置**上的部署级开关
+///     （`StoredAgentUplinkAddress::enabled`，`docs/design/agent-uplink-enablement.md` §4.1）：
+///     它回答的另一半问题 —— 派工回答「这台干什么活」，开关回答「这套网关现在收不收数据」。
+///     新装的机器没有活，光靠前者就永远待命（注册成功却什么也干不了）。
 ///   * 「上送目标」取生效值：管理面设置 → 部署配置派生（同一个域名 + 数据面端口，
 ///     见 [`super::install::effective_agent_uplink`]）。
 ///
-/// 缺任一条都只能待命：有工作但连目标都派生不出 = 没目标可指（**不猜**目标）；有目标但没工作 =
-/// 目标只表示「能连到哪」，不表示「该不该连」。
+/// 两者是**并集**：`开关开` 或 `有工作` 都启用。因为开关回答的是部署级问题（「这套网关收不收
+/// 数据」），它**会盖过**「该 Agent 没有工作」——所以开关打开时，撤回工作不再能把某一台单独
+/// 关掉（要单独停就关开关，或吊销那台 agent）。这是刻意的粒度取舍，见
+/// `docs/design/agent-uplink-enablement.md` §4.1。
+/// 缺任一条都只能待命：有工作但连目标都派生不出 = 没目标可指（**不猜**目标）；有目标但两个
+/// 都关着 = 目标只表示「能连到哪」，不表示「该不该连」。
 pub async fn build_agent_uplink_grant(
     state: &ApiState,
     agent_id: &str,
@@ -399,7 +407,8 @@ pub async fn build_agent_uplink_grant(
         || !outstanding_one_shot(&state.store.list_one_shot_work(agent_id).await?).is_empty();
     let uplink = super::install::effective_agent_uplink(&state.config, &state.store).await?;
     let granted_at = chrono::Utc::now().to_rfc3339();
-    match (has_work, uplink) {
+    let wants_uplink = has_work || uplink.as_ref().is_some_and(|setting| setting.enabled);
+    match (wants_uplink, uplink) {
         (true, Some(setting)) => Ok(AgentUplinkGrant::enabled_at(
             setting.host,
             setting.port,

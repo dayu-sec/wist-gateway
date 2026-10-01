@@ -204,11 +204,19 @@ pub const DEFAULT_KNOWLEDGE_SETTING_ID: &str = "default";
 pub const DEFAULT_AGENT_UPLINK_PORT: u16 = 9000;
 
 /// Agent 数据面上送地址设置（网关据此渲染 Agent 初始配置里的 tcp 上送段）。
+///
+/// `enabled` 是本设置上的**部署级启用开关**（`0022_agent_uplink_enabled.sql`）：它说的是
+/// 「这套网关现在收不收数据面数据」，与「这台机器有没有活」是**并集**关系
+/// （见 `agent_ops::build_agent_uplink_grant`）。默认 `false` = 只按派工启用，即升级前的行为。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredAgentUplinkAddress {
     pub setting_id: String,
     pub host: String,
     pub port: u16,
+    /// 部署级启用开关（见类型文档）。派生值恒为 `false` —— 派生只说明「能连到哪」，
+    /// 不说明「该不该连」。
+    #[serde(default)]
+    pub enabled: bool,
     pub updated_by: String,
     pub updated_at: String,
 }

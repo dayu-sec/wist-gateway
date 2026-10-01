@@ -1089,7 +1089,7 @@ impl Store for SqliteStore {
 
     async fn get_agent_uplink(&self) -> StoreResult<Option<StoredAgentUplinkAddress>> {
         let row = sqlx::query(
-            "SELECT setting_id, host, port, updated_by, updated_at \
+            "SELECT setting_id, host, port, enabled, updated_by, updated_at \
              FROM agent_uplink WHERE setting_id = ?1",
         )
         .bind(DEFAULT_AGENT_UPLINK_SETTING_ID)
@@ -1101,6 +1101,11 @@ impl Store for SqliteStore {
                 setting_id: column!(row, "setting_id"),
                 host: column!(row, "host"),
                 port: column!(row, "port"),
+                // 显式按 `i64` 读再判零：不依赖驱动对 bool ⇄ INTEGER 的隐式映射。
+                enabled: {
+                    let enabled: i64 = column!(row, "enabled");
+                    enabled != 0
+                },
                 updated_by: column!(row, "updated_by"),
                 updated_at: column!(row, "updated_at"),
             })),
@@ -1110,15 +1115,16 @@ impl Store for SqliteStore {
 
     async fn upsert_agent_uplink(&self, setting: &StoredAgentUplinkAddress) -> StoreResult<()> {
         sqlx::query(
-            "INSERT INTO agent_uplink (setting_id, host, port, updated_by, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
+            "INSERT INTO agent_uplink (setting_id, host, port, enabled, updated_by, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT (setting_id) DO UPDATE SET host = excluded.host, \
-             port = excluded.port, updated_by = excluded.updated_by, \
+             port = excluded.port, enabled = excluded.enabled, updated_by = excluded.updated_by, \
              updated_at = excluded.updated_at",
         )
         .bind(DEFAULT_AGENT_UPLINK_SETTING_ID)
         .bind(&setting.host)
         .bind(i64::from(setting.port))
+        .bind(i64::from(setting.enabled))
         .bind(&setting.updated_by)
         .bind(&setting.updated_at)
         .execute(&self.pool)
@@ -3930,6 +3936,8 @@ mod tests {
             setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
             host: "10.0.1.9".to_string(),
             port: 9000,
+            // 默认（未打开开关）——旧库升上来读到的也是这个值。
+            enabled: false,
             updated_by: "platform-eng".to_string(),
             updated_at: "2026-01-01T00:00:00+00:00".to_string(),
         };
@@ -3939,17 +3947,57 @@ mod tests {
         assert_eq!(loaded.host, "10.0.1.9");
         assert_eq!(loaded.port, 9000);
         assert_eq!(loaded.updated_by, "platform-eng");
+        // 开关要能**往返**：它是这一行设置里唯一的布尔量，读错就是静默改变了上送行为。
+        assert!(!loaded.enabled);
 
-        // 单例覆盖写入（端口也要跟着换）。
+        // 单例覆盖写入（端口与开关都要跟着换）。
         let updated = StoredAgentUplinkAddress {
             host: "10.0.2.10".to_string(),
             port: 9100,
+            enabled: true,
             ..setting.clone()
         };
         store.upsert_agent_uplink(&updated).await.unwrap();
         let loaded = store.get_agent_uplink().await.unwrap().expect("setting");
         assert_eq!(loaded.host, "10.0.2.10");
         assert_eq!(loaded.port, 9100);
+        assert!(loaded.enabled, "开关必须能往返（true 要读回 true）");
+    }
+
+    /// 迁移 0022 加的启用开关：列必须真在，而且**不写它时按 0（关）落库**。
+    ///
+    /// 后者是关键：旧库升上来的行走的就是这条路径（它们的存在早于这一列），
+    /// 默认读成「开」等于把一次升级变成「全队开始上送」。
+    #[tokio::test]
+    async fn migration_adds_agent_uplink_enabled_column_defaulting_to_off() {
+        let store = store().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('agent_uplink')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert!(columns.iter().any(|name| name == "enabled"), "{columns:?}");
+
+        // 模拟升级前的行：INSERT 里没有 `enabled`（那时这一列还不存在）。
+        sqlx::query(
+            "INSERT INTO agent_uplink (setting_id, host, port, updated_by, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(DEFAULT_AGENT_UPLINK_SETTING_ID)
+        .bind("10.0.1.9")
+        .bind(9000_i64)
+        .bind("legacy")
+        .bind("2026-01-01T00:00:00+00:00")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let loaded = store
+            .get_agent_uplink()
+            .await
+            .unwrap()
+            .expect("legacy row must be readable");
+        assert!(!loaded.enabled, "旧行升上来必须是「关」");
     }
 
     #[tokio::test]
