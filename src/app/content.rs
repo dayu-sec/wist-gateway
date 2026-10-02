@@ -83,7 +83,13 @@ pub const UNIT_STATUSES: &[&str] = &["active", "draft", "deprecated"];
 /// 包的性质。
 pub const PACK_KINDS: &[&str] = &["Baseline", "Feature"];
 /// 机器类别闭集（与模型 `variant MachineClass` 一致）。
-pub const MACHINE_CLASSES: &[&str] = &["MacDaily", "MacDev", "LinuxCompute", "LinuxData"];
+pub const MACHINE_CLASSES: &[&str] = &[
+    "MacDaily",
+    "MacDev",
+    "LinuxHost",
+    "LinuxCompute",
+    "LinuxData",
+];
 
 fn invalid(detail: impl Into<String>) -> ConfigError {
     ConfigReason::Validation.to_err().with_detail(detail)
@@ -687,7 +693,7 @@ fn validate_templates(
 pub fn platform_for_machine_class(machine_class: &str) -> Option<&'static str> {
     match machine_class {
         "MacDaily" | "MacDev" => Some("macos"),
-        "LinuxCompute" | "LinuxData" => Some("linux"),
+        "LinuxHost" | "LinuxCompute" | "LinuxData" => Some("linux"),
         _ => None,
     }
 }
@@ -1214,8 +1220,8 @@ status = "active"
         )
         .expect("load checked-in content");
         // 目录版本要随内容一起抬（见 catalog.toml 头部约定）：旧工作锁在它展开时那一版上。
-        assert_eq!(set.catalog_version, 2);
-        assert_eq!(set.templates().count(), 4);
+        assert_eq!(set.catalog_version, 3);
+        assert_eq!(set.templates().count(), 5);
         assert_eq!(
             set.template("macos-daily")
                 .expect("macos-daily")
@@ -1257,6 +1263,50 @@ status = "active"
         assert!(reboot.collect_ready() && !reboot.parse_ready());
         let tcc = by_family("PrivacyTcc");
         assert!(!tcc.collect_ready());
+
+        // Linux 侧**先开的唯一一个面**：HostMetrics 现在采集就绪、且解析就绪
+        // （指标帧由平台无关的 `agent_uplink` 承接）。没有它，Linux 判了用途也派不出活。
+        assert!(set.is_family_ready("linux", "HostMetrics"));
+        let linux_metrics = set
+            .family_readiness("linux")
+            .into_iter()
+            .find(|entry| entry.family == "HostMetrics")
+            .expect("linux HostMetrics readiness");
+        assert!(
+            linux_metrics.collect_ready() && linux_metrics.parse_ready(),
+            "linux HostMetrics 应当采集就绪且解析就绪（rule_ref = agent_uplink）"
+        );
+    }
+
+    #[test]
+    fn every_machine_class_can_be_classified_and_dispatched() {
+        // 不变量：一个机器类别若没有平台映射、没有模板，或模板展开后一个可派面都没有，
+        // 「归档判定」过后就**一定派不出工作**（能判用途却不产采集任务）。
+        // 加了类别却漏配模板/映射、或单元没开采集就绪，靠这条当场挡住 ——
+        // `LinuxHost` 与 `linux-host-metrics` 就是为此。
+        let set = load_content(
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
+        )
+        .expect("load checked-in content");
+        for class in MACHINE_CLASSES {
+            let platform = platform_for_machine_class(class)
+                .unwrap_or_else(|| panic!("机器类别 {class} 没有平台映射"));
+            let template = set.template_for_machine_class(class).unwrap_or_else(|| {
+                panic!("机器类别 {class} 没有模板：派活会在 derive_spec 处被拒")
+            });
+            // 空事实下也要**至少有一个面能派**：模板存在但每个面都「采集未就绪」，
+            // 等于给运维一个能归档、却什么都派不出去的类别。
+            let expansion = set
+                .expand(&template.template_id, &facts(platform, &[]))
+                .expect("expand");
+            assert!(
+                !expansion.works.is_empty(),
+                "机器类别 {class} 的模板 {} 展开后 0 个可派面（单元没有 status = active？）",
+                template.template_id
+            );
+        }
     }
 
     #[test]

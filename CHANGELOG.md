@@ -3,6 +3,20 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.13-alpha] - 2026-10-02
+
+### 变更
+
+- **新增机器类别 `LinuxHost`（通用 Linux 服务器）**。以前 Linux 只有「计算服务器 / 数据服务器」两类，
+  一台普通服务器（docker/nginx/… 这类）用途规则一条都不命中，于是**永远没有用途建议** ——
+  工作页也就无从归档、更派不出采集任务。现在 `linux-v1` 规则册带上了基线兜底：无命中时给出
+  `LinuxHost`（置信度 0），普通 Linux 机器从此有建议可采纳。
+- **Linux 侧第一个能真正派下去的采集面**：`linux-host-metrics`（主机指标，周期采）标为采集就绪。
+  以前 Linux 的单元全是 `draft`，「面就绪」闸门对 Linux 全关 —— 判了类别也派不出活。
+- **知识库版本抬档**：目录 `catalog_version` 2 → 3、用途规则 `purpose_version` 1 → 2。内容改了
+  版本号要跟着走，否则 0.1.1 与 0.1.2 两版内容同标一版，`standing_work.catalog_version`
+  这个归因锚就说不清「这条工作算自哪一版」。
+
 ## [0.1.12-alpha] - 2026-10-01
 
 ### 变更

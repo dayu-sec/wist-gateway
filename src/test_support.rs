@@ -86,10 +86,10 @@ pub(crate) fn knowledge_package_tarball(root: &Path, tamper_catalog: bool) -> Pa
         "created_at": "2026-09-30T00:00:00Z",
         "commit": "deadbee",
         "content_versions": {
-            "catalog_version": 2,
+            "catalog_version": 3,
             "template_version": [1],
             "policy_version": 1,
-            "purpose_version": 1,
+            "purpose_version": 2,
         },
         "files": digests,
     });

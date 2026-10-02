@@ -448,7 +448,7 @@ pub struct StoredPurposeSignal {
 pub struct StoredPurposeSuggestion {
     pub agent_id: String,
     pub suggestion_id: String,
-    /// `MachineClass` 裸名（MacDaily / MacDev / LinuxCompute / LinuxData）。
+    /// `MachineClass` 裸名（MacDaily / MacDev / LinuxHost / LinuxCompute / LinuxData）。
     pub suggested_class: String,
     /// 0..100。
     pub confidence: i64,
@@ -473,7 +473,7 @@ pub struct StoredPurposeSuggestion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredAgentClassification {
     pub agent_id: String,
-    /// `MachineClass` 裸名（MacDaily / MacDev / LinuxCompute / LinuxData）。
+    /// `MachineClass` 裸名（MacDaily / MacDev / LinuxHost / LinuxCompute / LinuxData）。
     pub machine_class: String,
     /// 采纳了哪次建议；人工直判/推翻建议时为空。
     pub suggestion_id: Option<String>,

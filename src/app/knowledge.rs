@@ -820,14 +820,14 @@ mod tests {
         let loaded = LoadedKnowledge::load_package_dir(&dir).expect("load package");
         assert_eq!(
             loaded.content.as_deref().map(|set| set.catalog_version),
-            Some(2)
+            Some(3)
         );
         assert_eq!(
             loaded
                 .purpose_rules
                 .as_deref()
                 .map(|table| table.purpose_version),
-            Some(1)
+            Some(2)
         );
         assert!(loaded.discovery_policies.is_some());
         // 这份还只是"装好了"：来源与世代由 `resolve` 在登记之后填上。
@@ -952,7 +952,7 @@ mod tests {
                 .content
                 .as_deref()
                 .map(|set| set.catalog_version),
-            Some(2)
+            Some(3)
         );
 
         // 落库：版本从**文件实际声明**取值（不是只信 manifest）。
@@ -961,8 +961,8 @@ mod tests {
             .await
             .expect("read")
             .expect("row");
-        assert_eq!(row.catalog_version, Some(2));
-        assert_eq!(row.purpose_version, Some(1));
+        assert_eq!(row.catalog_version, Some(3));
+        assert_eq!(row.purpose_version, Some(2));
         assert_eq!(row.policy_version, Some(1));
         assert_eq!(row.template_version, Some(1));
         assert_eq!(row.version, PACKAGE_NAME_SUFFIX);
@@ -1061,7 +1061,7 @@ mod tests {
         );
         assert_eq!(
             loaded.content.as_deref().map(|set| set.catalog_version),
-            Some(2)
+            Some(3)
         );
     }
 
@@ -1206,14 +1206,23 @@ mod tests {
             .expect("read")
             .expect("row");
         assert!(row.version.starts_with("0."), "版本读到了：{}", row.version);
-        assert_eq!(row.purpose_version, Some(1));
-        assert_eq!(
+        // 制品版本各异，不钉具体值（旧制品 catalog=2 / purpose=1；`linux-host` 那一版 catalog=3 / purpose=2）。
+        assert!(
+            row.purpose_version.is_some(),
+            "purpose_version 应当被读出来"
+        );
+        assert!(
+            row.catalog_version.is_some(),
+            "catalog_version 应当被读出来"
+        );
+        assert!(
             recorded
                 .loaded
                 .content
                 .as_deref()
-                .map(|set| set.catalog_version),
-            Some(2)
+                .map(|set| set.catalog_version)
+                .is_some(),
+            "装载出来的 catalog_version 应当被读出来"
         );
         if config.knowledge_signing_public_key.is_some() {
             assert!(

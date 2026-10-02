@@ -22,7 +22,13 @@ const RULE_KINDS: &[&str] = &["process", "process_path", "listen_port", "package
 /// 规则册的平台取值（与 agentd 上报的 `os` 同源）。
 const RULE_PLATFORMS: &[&str] = &["macos", "linux"];
 /// `MachineClass` 的闭合取值（与模型 `variant MachineClass` 一致）。
-const MACHINE_CLASSES: &[&str] = &["MacDaily", "MacDev", "LinuxCompute", "LinuxData"];
+const MACHINE_CLASSES: &[&str] = &[
+    "MacDaily",
+    "MacDev",
+    "LinuxHost",
+    "LinuxCompute",
+    "LinuxData",
+];
 
 /// 规则表：按平台分册的集合。
 ///
@@ -574,10 +580,41 @@ weight = 40
 
     #[test]
     fn no_rule_set_for_the_platform_means_no_suggestion() {
-        // linux 那册没有 baseline_class：无命中就不猜（`None` 不是空建议）。
+        // 这份精简规则表的 linux 那册**没配** baseline_class：无命中就不猜（`None` 不是空建议）。
+        // 真实策展数据给 linux 配了 `LinuxHost` 基线，见下面那条。
         assert!(infer(&summary("linux", &["/usr/bin/nothing"]), &table(), "s", "t").is_none());
         // 完全认不出的平台更是如此。
         assert!(infer(&summary("windows", &[]), &table(), "s", "t").is_none());
+    }
+
+    #[test]
+    fn linux_without_a_matching_rule_falls_back_to_the_linux_host_baseline() {
+        // 普通服务器（dockerd/nginx/… 这类）一条 compute/data 规则都不命中：
+        // 有基线就给 `LinuxHost`、置信度 0 —— 下游「归档判定」因此有建议可采纳，采集链不会断在第一步。
+        let table = parse_rule_table(
+            r#"
+purpose_version = 1
+[[rule_set]]
+rule_set_id = "linux-v1"
+platform = "linux"
+baseline_class = "LinuxHost"
+weak_score = 20
+
+[[rule_set.rules]]
+rule_id = "linux-data-postgres"
+kind = "process"
+pattern = "postgres"
+machine_class = "LinuxData"
+weight = 40
+"#,
+        )
+        .expect("parse rule table");
+
+        let suggestion = infer(&summary("linux", &["dockerd", "nginx"]), &table, "s", "t")
+            .expect("baseline suggestion");
+        assert_eq!(suggestion.suggested_class, "LinuxHost");
+        assert_eq!(suggestion.confidence, 0);
+        assert!(suggestion.signals.is_empty());
     }
 
     #[test]
@@ -611,6 +648,8 @@ weight = 40
         assert_eq!(macos.baseline_class.as_deref(), Some("MacDaily"));
         let linux = table.for_platform("linux").expect("linux rule set");
         assert_eq!(linux.rule_set_id, "linux-v1");
+        // linux 也必须有基线（普通服务器无命中时兜底到 LinuxHost），否则它永远不产建议。
+        assert_eq!(linux.baseline_class.as_deref(), Some("LinuxHost"));
         // 两个平台判据完全不同，所以必须各有一册。
         assert!(!macos.rules.is_empty());
         assert!(!linux.rules.is_empty());

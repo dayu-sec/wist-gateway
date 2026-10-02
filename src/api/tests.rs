@@ -6587,6 +6587,31 @@ async fn admin_classify_agent_rejects_a_platform_mismatch() {
 }
 
 #[tokio::test]
+async fn admin_classify_agent_accepts_a_generic_linux_host() {
+    // 通用 Linux 服务器（`LinuxHost`）：平台对得上（linux 事实 + linux 类别）就应当被接受。
+    // 没有它，普通 Linux 机器在闭集里就没有可归档的类别，采集链就断在第一步。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let mut report = fact_report(&["dockerd", "nginx"]);
+    report.os = "linux".to_string();
+    report.content_digest = digest_of(&report);
+    post_facts(&env, &report).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "LinuxHost" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["machine_class"], "LinuxHost");
+    assert_eq!(body["decided_by"], "admin");
+}
+
+#[tokio::test]
 async fn admin_classify_agent_rejects_an_unobserved_agent() {
     let env = TestEnv::new().await;
     enroll_agent_credential(&env).await;
@@ -9470,10 +9495,10 @@ fn knowledge_package_row(package_id: &str, dir: &std::path::Path) -> StoredKnowl
         source: dir.display().to_string(),
         package_sha256: format!("sha256:{package_id}"),
         version: "0.1.0".to_string(),
-        catalog_version: Some(2),
+        catalog_version: Some(3),
         template_version: Some(1),
         policy_version: Some(1),
-        purpose_version: Some(1),
+        purpose_version: Some(2),
         parser_abi: 1,
         signed_by: String::new(),
         cached_path: dir.display().to_string(),
@@ -9502,7 +9527,7 @@ async fn record_and_activate_knowledge(env: &TestEnv, package_id: &str) {
 /// 生效包优先于配置里的 `*_file`：管理面切过的网关，不再看卡器里写了什么。
 #[tokio::test]
 async fn knowledge_loads_from_the_active_package_in_the_store() {
-    // `TestEnv::new()` 的配置里本来就有内容（catalog_version = 2），用来证明**优先级**。
+    // `TestEnv::new()` 的配置里本来就有内容（夹具那版是 `catalog_version = 1`），用来证明**优先级**。
     let env = TestEnv::new().await;
     record_and_activate_knowledge(&env, "kbp-test").await;
 
@@ -9518,14 +9543,14 @@ async fn knowledge_loads_from_the_active_package_in_the_store() {
     assert_eq!(loaded.generation, 1);
     assert_eq!(
         loaded.content.as_deref().map(|set| set.catalog_version),
-        Some(2)
+        Some(3)
     );
     assert_eq!(
         loaded
             .purpose_rules
             .as_deref()
             .map(|table| table.purpose_version),
-        Some(1)
+        Some(2)
     );
     assert!(loaded.discovery_policies.is_some());
 }
@@ -9728,7 +9753,7 @@ async fn knowledge_endpoints_record_then_activate_without_a_restart() {
     assert!(package_id.starts_with("kbp-"), "{package_id}");
     assert_eq!(recorded["active"], false);
     assert_eq!(recorded["available"], true);
-    assert_eq!(recorded["catalog_version"], 2);
+    assert_eq!(recorded["catalog_version"], 3);
 
     // 内容照旧：还是测试夹具那一版（catalog_version = 1）。
     let view = get_view(&state, "/api/v1/admin/content").await;
@@ -9744,14 +9769,14 @@ async fn knowledge_endpoints_record_then_activate_without_a_restart() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let view = get_view(&state, "/api/v1/admin/content").await;
-    assert_eq!(view["catalog_version"], 2);
+    assert_eq!(view["catalog_version"], 3);
 
     // ③ 生效视图：来源是包、世代 1、留痕一条（首次激活 `from_package` 为空）。
     let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
     assert_eq!(knowledge["source"], "package");
     assert_eq!(knowledge["generation"], 1);
     assert_eq!(knowledge["package_id"], package_id);
-    assert_eq!(knowledge["purpose_version"], 1);
+    assert_eq!(knowledge["purpose_version"], 2);
     assert_eq!(knowledge["policy_version"], 1);
     assert!(knowledge["hint"].is_null(), "有内容时不该再提示空载");
     assert_eq!(knowledge["activations"][0]["reason"], "activate");
@@ -9772,7 +9797,7 @@ async fn knowledge_endpoints_record_then_activate_without_a_restart() {
 
     // ⑤ “谁还锁在旧版目录”可读（换版不追改在跑的工作）。
     let locks = get_view(&state, "/api/v1/admin/knowledge/locks").await;
-    assert_eq!(locks["active_catalog_version"], 2);
+    assert_eq!(locks["active_catalog_version"], 3);
     assert!(locks["locks"].is_array());
 }
 
@@ -9807,7 +9832,7 @@ async fn knowledge_record_can_activate_in_one_shot() {
 
     // 内容当场就是包里的那一版（不重启），且留痕是 activate。
     let content = get_view(&state, "/api/v1/admin/content").await;
-    assert_eq!(content["catalog_version"], 2);
+    assert_eq!(content["catalog_version"], 3);
     let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
     assert_eq!(knowledge["source"], "package");
     assert_eq!(knowledge["generation"], 1);
