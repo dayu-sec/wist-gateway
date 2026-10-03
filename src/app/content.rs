@@ -254,7 +254,7 @@ pub struct Pack {
     /// `Baseline` | `Feature`。
     pub kind: String,
     pub unit_refs: Vec<String>,
-    /// 策展成熟度（人定，与单元规则就绪度无关）。
+    /// 策展成熟度（人定，与单元的采集就绪度无关）。
     pub status: String,
 }
 
@@ -495,8 +495,8 @@ fn validate_unit(unit: &UnitRow) -> ConfigResult<()> {
     //
     // 这里刻意**不看** `rule_ref`：采原文不需要解析规则，拿它当闸门是把「能解析」当成「能采」。
     // 卡住的是「这条来源采集端到底能不能执行」（`is_executable_source`，与 agentd 同源：
-    // kind 要能执行，`FileGlob` 的 target 还要是**显式绝对路径** —— 通配与 `~` 采集端还没实现）。
-    // 否则就会出现「网关说可采、agent 拿到后报 unsupported」这种自相矛盾的运行态。
+    // kind 要能执行，`FileGlob` 的 target 还要是**显式绝对路径**、`Exporter` 的 ID 还要在
+    // `EXPORTER_IDS` 里）。否则就会出现「网关说可采、agent 拿到后报 unsupported」这种自相矛盾的运行态。
     if unit.status == "active"
         && !unit
             .sources
@@ -505,8 +505,8 @@ fn validate_unit(unit: &UnitRow) -> ConfigResult<()> {
     {
         return Err(invalid(format!(
             "unit {id}: status = active but no source agentd can collect \
-             (kind 要去 {EXECUTABLE_SOURCE_KINDS:?}，且 FileGlob 的 target 必须是显式绝对路径：\
-              通配与 `~` 采集端尚未实现，见 wist-agentd/docs/design/log-file-input-spec.md §2)"
+             (kind 要去 {EXECUTABLE_SOURCE_KINDS:?}；FileGlob 的 target 要是显式绝对路径、\
+              Exporter 的 ID 要在 EXPORTER_IDS 里)"
         )));
     }
     Ok(())
@@ -1220,7 +1220,7 @@ status = "active"
         )
         .expect("load checked-in content");
         // 目录版本要随内容一起抬（见 catalog.toml 头部约定）：旧工作锁在它展开时那一版上。
-        assert_eq!(set.catalog_version, 3);
+        assert_eq!(set.catalog_version, 4);
         assert_eq!(set.templates().count(), 5);
         assert_eq!(
             set.template("macos-daily")
@@ -1264,14 +1264,43 @@ status = "active"
         let tcc = by_family("PrivacyTcc");
         assert!(!tcc.collect_ready());
 
-        // Linux 侧**先开的唯一一个面**：HostMetrics 现在采集就绪、且解析就绪
-        // （指标帧由平台无关的 `agent_uplink` 承接）。没有它，Linux 判了用途也派不出活。
-        assert!(set.is_family_ready("linux", "HostMetrics"));
-        let linux_metrics = set
-            .family_readiness("linux")
-            .into_iter()
-            .find(|entry| entry.family == "HostMetrics")
-            .expect("linux HostMetrics readiness");
+        // Linux 侧现在开了 5 个面：4 个**显式路径**的日志面（auth.log/secure、sudo.log、
+        //   dpkg/apt/dnf/yum、kern.log/messages）+ 指标面；其余面靠 Exporter / 通配，仍不可执行。
+        //   这四个日志面 `rule_ref` 为空 = **可采但解析未就绪**（原文照收，只归在泛化 agent.log）。
+        for family in [
+            "LoginSession",
+            "PrivilegeExecution",
+            "SoftwareChange",
+            "KernelSystem",
+        ] {
+            assert!(
+                set.is_family_ready("linux", family),
+                "linux {family} 应当采集就绪"
+            );
+        }
+        assert!(!set.is_family_ready("linux", "ServiceLifecycle")); // 唯一来源是 Exporter
+        assert!(!set.is_family_ready("linux", "StorageHealth")); // Exporter + 通配
+        let linux_readiness = set.family_readiness("linux");
+        let linux_by_family = |family: &str| {
+            linux_readiness
+                .iter()
+                .find(|entry| entry.family == family)
+                .unwrap_or_else(|| panic!("no linux readiness for {family}"))
+        };
+        let login = linux_by_family("LoginSession");
+        assert!(
+            login.collect_ready() && !login.parse_ready(),
+            "linux LoginSession 应当可采但解析未就绪（rule_ref 为空）"
+        );
+        assert_eq!(
+            (
+                login.active_units,
+                login.parse_ready_units,
+                login.total_units
+            ),
+            (1, 0, 1)
+        );
+        let linux_metrics = linux_by_family("HostMetrics");
         assert!(
             linux_metrics.collect_ready() && linux_metrics.parse_ready(),
             "linux HostMetrics 应当采集就绪且解析就绪（rule_ref = agent_uplink）"
@@ -1365,6 +1394,59 @@ status = "active"
     }
 
     #[test]
+    fn linux_host_expands_the_collect_ready_families() {
+        // LinuxHost 模板（`linux-base` 包）：4 个显式路径日志面 + 指标面采集就绪；
+        // 其余面（Exporter / 通配）留痕 —— 别让「Linux 只能采指标」的旧状态悄悄回来。
+        let set = load_content(
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
+        )
+        .expect("load checked-in content");
+        let expansion = set
+            .expand("linux-host", &facts("linux", &[]))
+            .expect("expand");
+        assert_eq!(
+            expansion
+                .works
+                .iter()
+                .map(|work| work.family.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "LoginSession",
+                "PrivilegeExecution",
+                "SoftwareChange",
+                "KernelSystem",
+                "HostMetrics"
+            ]
+        );
+        assert_eq!(
+            expansion.works[0].selected_units,
+            vec!["linux-auth-session"]
+        );
+        assert_eq!(
+            expansion
+                .excluded_units
+                .iter()
+                .map(|unit| unit.unit_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "linux-service-lifecycle",
+                "linux-crash-panic",
+                "linux-network-firewall",
+                "linux-reboot-power",
+                "linux-storage-health"
+            ]
+        );
+        assert!(
+            expansion
+                .excluded_units
+                .iter()
+                .all(|unit| unit.reason_code == "collect_not_ready")
+        );
+    }
+
+    #[test]
     fn match_is_three_state() {
         let set = minimal();
 
@@ -1421,14 +1503,29 @@ status = "active"
 
     #[test]
     fn rejects_an_active_unit_whose_sources_agentd_cannot_execute() {
-        // 反过来：「采集就绪」不能只靠人喊 —— 唯一来源换成 Exporter（agentd 还没实现）就拦。
+        // 反过来：「采集就绪」不能只靠人喊 —— 唯一来源换成**未知导出器 ID** 就拦。
         let catalog = CATALOG.replacen("kind = \"MetricInterval\"", "kind = \"Exporter\"", 1);
+        // target 仍是 `15s`：不是已知导出器 ID（见 `EXPORTER_IDS`）。
         let err = parse_with(&catalog, PACKS, TEMPLATES)
             .expect_err("active without an executable source");
         assert!(
             err.to_string().contains("no source agentd can collect"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn accepts_an_active_unit_backed_by_a_known_exporter() {
+        // 已知导出器 ID（契约 `EXPORTER_IDS`）= 可执行：`Exporter` 来源能撑起一个 active 单元。
+        let catalog = CATALOG
+            .replacen("kind = \"MetricInterval\"", "kind = \"Exporter\"", 1)
+            .replacen("target = \"15s\"", "target = \"smartctl\"", 1);
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("known exporter is executable");
+        let unit = set
+            .units()
+            .find(|unit| unit.unit_id == "mac-metrics")
+            .expect("mac-metrics");
+        assert!(unit.collect_ready());
     }
 
     #[test]

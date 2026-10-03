@@ -586,8 +586,8 @@ struct PurposeCoverageResponse {
 ///
 /// 三档分开是有意的：
 ///   * `BadRequest` —— 请求本身不成立（写错了面名、把 macOS 专有面派给 Linux 机器）；
-///   * `Conflict` —— 请求成立但与当前状态冲突（规则未就绪、版本回退、不可中断却要暂停）：
-///     它是「现在不行」，人该做的是等规则就绪或换个动作，而不是改请求；
+///   * `Conflict` —— 请求成立但与当前状态冲突（采集未就绪、版本回退、不可中断却要暂停）：
+///     它是「现在不行」，人该做的是等采集就绪或换个动作，而不是改请求；
 ///   * `NotFound` —— 目标不存在。
 fn rejection_response(rejection: WorkRejection) -> Response {
     let status = match &rejection {
@@ -653,7 +653,7 @@ pub async fn grant_work(
 
 /// 派一份常驻工作：面就绪度闸门 → 用途判定 → 按事实展开或校验 spec → 落库。
 ///
-/// 顺序不是随意排的：先要判定（否则不知道是哪类机器、取不到模板），再要规则就绪
+/// 顺序不是随意排的：先要判定（否则不知道是哪类机器、取不到模板），再要采集就绪
 /// （否则展开出来的单元落不了数据面），最后才谈内容。
 async fn grant_standing_work(
     state: &ApiState,

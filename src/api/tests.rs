@@ -9495,7 +9495,7 @@ fn knowledge_package_row(package_id: &str, dir: &std::path::Path) -> StoredKnowl
         source: dir.display().to_string(),
         package_sha256: format!("sha256:{package_id}"),
         version: "0.1.0".to_string(),
-        catalog_version: Some(3),
+        catalog_version: Some(4),
         template_version: Some(1),
         policy_version: Some(1),
         purpose_version: Some(2),
@@ -9543,7 +9543,7 @@ async fn knowledge_loads_from_the_active_package_in_the_store() {
     assert_eq!(loaded.generation, 1);
     assert_eq!(
         loaded.content.as_deref().map(|set| set.catalog_version),
-        Some(3)
+        Some(4)
     );
     assert_eq!(
         loaded
@@ -9753,7 +9753,7 @@ async fn knowledge_endpoints_record_then_activate_without_a_restart() {
     assert!(package_id.starts_with("kbp-"), "{package_id}");
     assert_eq!(recorded["active"], false);
     assert_eq!(recorded["available"], true);
-    assert_eq!(recorded["catalog_version"], 3);
+    assert_eq!(recorded["catalog_version"], 4);
 
     // 内容照旧：还是测试夹具那一版（catalog_version = 1）。
     let view = get_view(&state, "/api/v1/admin/content").await;
@@ -9769,7 +9769,7 @@ async fn knowledge_endpoints_record_then_activate_without_a_restart() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let view = get_view(&state, "/api/v1/admin/content").await;
-    assert_eq!(view["catalog_version"], 3);
+    assert_eq!(view["catalog_version"], 4);
 
     // ③ 生效视图：来源是包、世代 1、留痕一条（首次激活 `from_package` 为空）。
     let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
@@ -9797,7 +9797,7 @@ async fn knowledge_endpoints_record_then_activate_without_a_restart() {
 
     // ⑤ “谁还锁在旧版目录”可读（换版不追改在跑的工作）。
     let locks = get_view(&state, "/api/v1/admin/knowledge/locks").await;
-    assert_eq!(locks["active_catalog_version"], 3);
+    assert_eq!(locks["active_catalog_version"], 4);
     assert!(locks["locks"].is_array());
 }
 
@@ -9832,7 +9832,7 @@ async fn knowledge_record_can_activate_in_one_shot() {
 
     // 内容当场就是包里的那一版（不重启），且留痕是 activate。
     let content = get_view(&state, "/api/v1/admin/content").await;
-    assert_eq!(content["catalog_version"], 3);
+    assert_eq!(content["catalog_version"], 4);
     let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
     assert_eq!(knowledge["source"], "package");
     assert_eq!(knowledge["generation"], 1);

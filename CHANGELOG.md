@@ -3,6 +3,23 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.14-alpha] - 2026-10-03
+
+### 新增
+
+- **`Exporter`（定时导出器）来源可采**：采集内容目录里配了 `Exporter` 的单元不再被一律判成
+  「接不了」—— 只要目标是**已知导出器 ID**（journald / `last` / `smartctl` / `nft` /
+  `iptables-save` / `dmesg` / `auditd`），该单元就能置 `active` 并派下去采。
+  判据与 agentd **同一个**（`wist-contracts::work::is_executable_source`，随 contracts 0.1.13 抬档）。
+
+### 修复
+
+- **知识库目录抬档后，知识包相关用例跟着走**：不再因 `catalog_version` 变化而假红。
+
+### 说明
+
+- 采集就绪度（单元 `status`）与解析就绪度（单元 `rule_ref`）口径不变：导出器只解决「采得到」。
+
 ## [0.1.13-alpha] - 2026-10-02
 
 ### 变更
