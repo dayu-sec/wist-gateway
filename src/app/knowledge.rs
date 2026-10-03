@@ -820,7 +820,7 @@ mod tests {
         let loaded = LoadedKnowledge::load_package_dir(&dir).expect("load package");
         assert_eq!(
             loaded.content.as_deref().map(|set| set.catalog_version),
-            Some(4)
+            Some(crate::test_support::real_catalog_version())
         );
         assert_eq!(
             loaded
@@ -952,7 +952,7 @@ mod tests {
                 .content
                 .as_deref()
                 .map(|set| set.catalog_version),
-            Some(4)
+            Some(crate::test_support::real_catalog_version())
         );
 
         // 落库：版本从**文件实际声明**取值（不是只信 manifest）。
@@ -961,7 +961,10 @@ mod tests {
             .await
             .expect("read")
             .expect("row");
-        assert_eq!(row.catalog_version, Some(4));
+        assert_eq!(
+            row.catalog_version,
+            Some(crate::test_support::real_catalog_version())
+        );
         assert_eq!(row.purpose_version, Some(2));
         assert_eq!(row.policy_version, Some(1));
         assert_eq!(row.template_version, Some(1));
@@ -1061,7 +1064,7 @@ mod tests {
         );
         assert_eq!(
             loaded.content.as_deref().map(|set| set.catalog_version),
-            Some(4)
+            Some(crate::test_support::real_catalog_version())
         );
     }
 

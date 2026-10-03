@@ -50,6 +50,21 @@ pub(crate) fn knowledge_file(name: &str) -> PathBuf {
     require_file(locate_repo("wist-knowledge", KNOWLEDGE_DIRS).join(name))
 }
 
+/// 知识库**当前目录版本**（读真实 `catalog.toml` 顶层 `catalog_version`）。
+///
+/// 用例拿它当**期望值**，而不是写死一个数字：目录抬档是常态，写死只会让网关用例每换一版
+/// 知识就假红一次 —— 而用例真正要验的是「装载结果 == 文件里声明的版本」，与数字是多少无关。
+pub(crate) fn real_catalog_version() -> i64 {
+    #[derive(serde::Deserialize)]
+    struct Head {
+        catalog_version: i64,
+    }
+    let text = std::fs::read_to_string(knowledge_file("catalog.toml")).expect("read catalog.toml");
+    toml::from_str::<Head>(&text)
+        .expect("parse catalog.toml head")
+        .catalog_version
+}
+
 /// jumo 模型仓（`wist-design`）里的一份模型文件。
 pub(crate) fn model_file(relative: &str) -> PathBuf {
     require_file(locate_repo("wist-design", DESIGN_DIRS).join(relative))
@@ -86,7 +101,7 @@ pub(crate) fn knowledge_package_tarball(root: &Path, tamper_catalog: bool) -> Pa
         "created_at": "2026-09-30T00:00:00Z",
         "commit": "deadbee",
         "content_versions": {
-            "catalog_version": 4,
+            "catalog_version": real_catalog_version(),
             "template_version": [1],
             "policy_version": 1,
             "purpose_version": 2,

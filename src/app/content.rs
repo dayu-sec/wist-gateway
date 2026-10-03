@@ -1220,7 +1220,10 @@ status = "active"
         )
         .expect("load checked-in content");
         // 目录版本要随内容一起抬（见 catalog.toml 头部约定）：旧工作锁在它展开时那一版上。
-        assert_eq!(set.catalog_version, 4);
+        assert_eq!(
+            set.catalog_version,
+            crate::test_support::real_catalog_version()
+        );
         assert_eq!(set.templates().count(), 5);
         assert_eq!(
             set.template("macos-daily")
@@ -1264,22 +1267,29 @@ status = "active"
         let tcc = by_family("PrivacyTcc");
         assert!(!tcc.collect_ready());
 
-        // Linux 侧现在开了 5 个面：4 个**显式路径**的日志面（auth.log/secure、sudo.log、
-        //   dpkg/apt/dnf/yum、kern.log/messages）+ 指标面；其余面靠 Exporter / 通配，仍不可执行。
-        //   这四个日志面 `rule_ref` 为空 = **可采但解析未就绪**（原文照收，只归在泛化 agent.log）。
+        // Linux 侧现在 10 个面全开：4 个**显式路径**日志面（auth.log/secure、sudo.log、
+        //   dpkg/apt/dnf/yum、kern.log/messages）+ 4 个**导出器**面
+        //   （ServiceLifecycle/CrashPanic/NetworkFirewall/RebootPower/StorageHealth）+ 指标面。
+        //   日志面 `rule_ref` 为空 = **可采但解析未就绪**（原文照收，只归在泛化 agent.log）。
         for family in [
             "LoginSession",
             "PrivilegeExecution",
             "SoftwareChange",
+            "ServiceLifecycle",
+            "CrashPanic",
+            "NetworkFirewall",
+            "RebootPower",
             "KernelSystem",
+            "StorageHealth",
+            "HostMetrics",
         ] {
             assert!(
                 set.is_family_ready("linux", family),
                 "linux {family} 应当采集就绪"
             );
         }
-        assert!(!set.is_family_ready("linux", "ServiceLifecycle")); // 唯一来源是 Exporter
-        assert!(!set.is_family_ready("linux", "StorageHealth")); // Exporter + 通配
+        // 靠**通配**的来源仍不可执行：DB 服务面（`/var/log/*/*`）还没开。
+        assert!(!set.is_family_ready("linux", "DatabaseService"));
         let linux_readiness = set.family_readiness("linux");
         let linux_by_family = |family: &str| {
             linux_readiness
@@ -1395,8 +1405,8 @@ status = "active"
 
     #[test]
     fn linux_host_expands_the_collect_ready_families() {
-        // LinuxHost 模板（`linux-base` 包）：4 个显式路径日志面 + 指标面采集就绪；
-        // 其余面（Exporter / 通配）留痕 —— 别让「Linux 只能采指标」的旧状态悄悄回来。
+        // LinuxHost 模板（`linux-base` 包）10 个面全采集就绪：4 个显式路径日志面
+        // + 4 个导出器面 + 指标面。别让「Linux 只能采指标」的旧状态悄悄回来。
         let set = load_content(
             &crate::test_support::knowledge_file("catalog.toml"),
             &crate::test_support::knowledge_file("packs.toml"),
@@ -1416,7 +1426,12 @@ status = "active"
                 "LoginSession",
                 "PrivilegeExecution",
                 "SoftwareChange",
+                "ServiceLifecycle",
+                "CrashPanic",
+                "NetworkFirewall",
+                "RebootPower",
                 "KernelSystem",
+                "StorageHealth",
                 "HostMetrics"
             ]
         );
@@ -1424,25 +1439,11 @@ status = "active"
             expansion.works[0].selected_units,
             vec!["linux-auth-session"]
         );
-        assert_eq!(
-            expansion
-                .excluded_units
-                .iter()
-                .map(|unit| unit.unit_id.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "linux-service-lifecycle",
-                "linux-crash-panic",
-                "linux-network-firewall",
-                "linux-reboot-power",
-                "linux-storage-health"
-            ]
-        );
+        // 全部采集就绪 → 没有被排除的单元。
         assert!(
-            expansion
-                .excluded_units
-                .iter()
-                .all(|unit| unit.reason_code == "collect_not_ready")
+            expansion.excluded_units.is_empty(),
+            "{:?}",
+            expansion.excluded_units
         );
     }
 
