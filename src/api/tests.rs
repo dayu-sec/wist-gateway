@@ -931,6 +931,7 @@ async fn agent_status_route_requires_a_client_certificate() {
         "/api/v1/agent/status",
         Some(&agent_id),
         &AgentStatusReport {
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -954,6 +955,7 @@ async fn agent_status_route_requires_a_client_certificate() {
         "/api/v1/agent/status",
         None,
         &AgentStatusReport {
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -983,6 +985,7 @@ async fn agent_status_route_persists_reported_metrics() {
         "/api/v1/agent/status",
         Some(&agent_id),
         &AgentStatusReport {
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -1025,6 +1028,7 @@ async fn post_agent_status_cpu(
         "/api/v1/agent/status",
         Some(agent_id),
         &AgentStatusReport {
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -2527,6 +2531,7 @@ async fn post_agent_status(
             local_work: None,
             uplink_state: None,
             certificate_status: None,
+            machine_profile: None,
         })
         .expect("serialize status"),
         None => serde_json::json!({
@@ -3005,6 +3010,7 @@ async fn agent_status_route_persists_work_state_changes() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -3083,6 +3089,7 @@ async fn the_work_view_exposes_the_agents_local_work_report() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -3131,6 +3138,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -3168,6 +3176,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
@@ -3190,6 +3199,72 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
     assert_eq!(view["uplink_state"]["target"], "10.0.1.9:9000");
     assert_eq!(view["uplink_state"]["source"], "grant");
     assert_eq!(view["uplink_state"]["output_write_failing"], true);
+}
+
+/// 状态上报携带机器画像 → 运行状态视图能读到主机名与 IP；而且**空值不覆盖**已知画像。
+#[tokio::test]
+async fn a_status_report_with_a_machine_profile_backfills_the_registry() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let report = |profile: Option<wist_contracts::enrollment::HostProfile>| AgentStatusReport {
+        machine_profile: profile,
+        agent_id: "agent-node-a".to_string(),
+        instance_id: "node-a".to_string(),
+        version: "v0.3.0".to_string(),
+        memory_bytes: None,
+        cpu_percent: None,
+        cpu_cores: None,
+        admin_latency_ms: None,
+        discovery_policy_version: None,
+        work_state_changes: None,
+        local_work: None,
+        uplink_state: None,
+        certificate_status: None,
+    };
+    let profile = wist_contracts::enrollment::HostProfile {
+        node_id: "node-1".to_string(),
+        hostname: "host-1".to_string(),
+        os: "linux".to_string(),
+        arch: "x86_64".to_string(),
+        machine_id: "mid-1".to_string(),
+        cloud_instance_id: None,
+        k8s_node_uid: None,
+        ip_addresses: vec!["en0 10.0.0.5/24".to_string()],
+    };
+
+    let status = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &report(Some(profile)),
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+
+    let view = get_agent_runtime_status(&env).await;
+    assert_eq!(view["hostname"], "host-1");
+    assert_eq!(view["node_id"], "node-1");
+    assert_eq!(view["ip_addresses"], serde_json::json!(["en0 10.0.0.5/24"]));
+
+    // 下一次心跳没带机器画像（旧版本 agentd）：保留上一次的值，不擦掉。
+    let status = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &report(None),
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+    let view = get_agent_runtime_status(&env).await;
+    assert_eq!(view["hostname"], "host-1", "空值不得擦掉已知画像");
+    assert_eq!(
+        view["ip_addresses"],
+        serde_json::json!(["en0 10.0.0.5/24"]),
+        "省略不得擦掉已知地址"
+    );
 }
 
 #[tokio::test]

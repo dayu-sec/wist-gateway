@@ -35,7 +35,7 @@ const TOKEN_COLUMNS: &str = "token_id, token_hash, tenant_id, environment_id, is
 
 /// Agent 读投影：身份 + 当前实例 + 当前凭据。
 const AGENT_PROJECTION: &str = "SELECT a.agent_id, a.tenant_id, a.environment_id, a.node_id, \
-     a.hostname, a.machine_id, a.registered_at, \
+     a.hostname, a.machine_id, a.ip_addresses, a.registered_at, \
      COALESCE(a.current_instance_id, '') AS instance_id, \
      COALESCE(i.version, '') AS version, \
      COALESCE(i.last_seen_at, '') AS last_seen_at, \
@@ -400,6 +400,14 @@ fn deserialize_uplink_state(
     }
 }
 
+/// 网卡地址列表：存的是 JSON 数组文本；空串 / 解析失败都当空表 —— 这是展示信息，坏值不该影响整行读取。
+fn deserialize_ip_addresses(raw: Option<String>) -> Vec<String> {
+    match raw.as_deref() {
+        Some(value) if !value.is_empty() => serde_json::from_str(value).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// 最近一次续签判定落一个 TEXT 列（只留最近一份），与 `serialize_uplink_state` 同形。
 fn serialize_renewal_report(
     value: Option<wist_contracts::gateway::AgentCredentialRenewal>,
@@ -514,6 +522,7 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
     let work_state_changes: Option<String> = column!(row, "work_state_changes");
     let local_work: Option<String> = column!(row, "local_work");
     let uplink_state: Option<String> = column!(row, "uplink_state");
+    let ip_addresses: Option<String> = column!(row, "ip_addresses");
     Ok(StoredAgentRegistration {
         agent_id: column!(row, "agent_id"),
         instance_id: column!(row, "instance_id"),
@@ -522,6 +531,7 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
         node_id: column!(row, "node_id"),
         hostname: column!(row, "hostname"),
         machine_id: column!(row, "machine_id"),
+        ip_addresses: deserialize_ip_addresses(ip_addresses),
         version: column!(row, "version"),
         credential_id: column!(row, "credential_id"),
         credential_token_hash: column!(row, "credential_token_hash"),
@@ -1474,6 +1484,34 @@ impl Store for SqliteStore {
             .await
             .map_err(|err| sql_error(err, "commit record agent status"))?;
         Ok(true)
+    }
+
+    async fn record_agent_machine_profile(
+        &self,
+        update: &AgentMachineProfileUpdate<'_>,
+    ) -> StoreResult<bool> {
+        // 只在字段非空时覆盖：老版本 agentd / 本次没带，都不该把已知的画像擦掉
+        // （与 local_work / uplink_state 同口径）。`ip_addresses` 用 COALESCE：NULL 保持原值。
+        let affected = sqlx::query(
+            "UPDATE agents SET \
+             node_id = CASE WHEN ?2 <> '' THEN ?2 ELSE node_id END, \
+             hostname = CASE WHEN ?3 <> '' THEN ?3 ELSE hostname END, \
+             machine_id = CASE WHEN ?4 <> '' THEN ?4 ELSE machine_id END, \
+             ip_addresses = COALESCE(?5, ip_addresses), \
+             updated_at = ?6 \
+             WHERE agent_id = ?1",
+        )
+        .bind(update.agent_id)
+        .bind(update.node_id)
+        .bind(update.hostname)
+        .bind(update.machine_id)
+        .bind(update.ip_addresses)
+        .bind(update.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "update agent machine profile"))?
+        .rows_affected();
+        Ok(affected > 0)
     }
 
     async fn renew_agent_credential(&self, request: &RenewCredential<'_>) -> StoreResult<bool> {
@@ -3232,6 +3270,103 @@ mod tests {
         assert!(
             columns.iter().any(|name| name == "local_work"),
             "{columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_adds_agent_ip_addresses_column() {
+        // 迁移 0023 是 ALTER TABLE ADD COLUMN（SQLite 不支持 ADD COLUMN IF NOT EXISTS），
+        // 直接查 pragma 确认列真存在。
+        let store = store().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('agents')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            columns.iter().any(|name| name == "ip_addresses"),
+            "{columns:?}"
+        );
+    }
+
+    /// 凭证书首触重建登记的机器画像是空的，靠状态上报**回填**；而且只在字段非空时覆盖 ——
+    /// 老版本 / 本次没带不能把已知的画像擦掉。
+    #[tokio::test]
+    async fn machine_profile_backfills_an_empty_registration_and_keeps_last_known_values() {
+        let store = store().await;
+        // 凭证书重建：机器画像全空（只有稳定身份）。
+        assert!(
+            store
+                .register_agent_from_certificate(&CertificateRegistration {
+                    agent_id: "agent-1",
+                    tenant_id: TENANT,
+                    environment_id: ENVIRONMENT,
+                    credential_id: "cert-1",
+                    credential_fingerprint: "fp-1",
+                    credential_issued_at: "2026-01-01T00:00:00+00:00",
+                    credential_expires_at: "2026-12-31T00:00:00+00:00",
+                    registered_at: "2026-01-01T00:00:00+00:00",
+                    now: "2026-01-01T00:00:00+00:00",
+                })
+                .await
+                .unwrap()
+        );
+        let before = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(before.hostname, "", "证书重建时机器画像应为空");
+
+        // 首次上报：补齐画像。
+        assert!(
+            store
+                .record_agent_machine_profile(&AgentMachineProfileUpdate {
+                    agent_id: "agent-1",
+                    node_id: "node-1",
+                    hostname: "host-1",
+                    machine_id: "machine-1",
+                    ip_addresses: Some(r#"["en0 10.0.0.5/24"]"#),
+                    updated_at: "2026-01-02T00:00:00+00:00",
+                })
+                .await
+                .unwrap()
+        );
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.node_id, "node-1");
+        assert_eq!(agent.hostname, "host-1");
+        assert_eq!(agent.machine_id, "machine-1");
+        assert_eq!(agent.ip_addresses, vec!["en0 10.0.0.5/24".to_string()]);
+
+        // 后续一次「本次没带」：空字段 / null 都保留上一次的值。
+        store
+            .record_agent_machine_profile(&AgentMachineProfileUpdate {
+                agent_id: "agent-1",
+                node_id: "",
+                hostname: "",
+                machine_id: "",
+                ip_addresses: None,
+                updated_at: "2026-01-03T00:00:00+00:00",
+            })
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.hostname, "host-1", "空值不得覆盖已知画像");
+        assert_eq!(
+            agent.ip_addresses,
+            vec!["en0 10.0.0.5/24".to_string()],
+            "null 不得擦掉已知地址"
+        );
+
+        // 未知 agent：如实返回 false（与 record_agent_status 同口径）。
+        assert!(
+            !store
+                .record_agent_machine_profile(&AgentMachineProfileUpdate {
+                    agent_id: "agent-unknown",
+                    node_id: "n",
+                    hostname: "h",
+                    machine_id: "m",
+                    ip_addresses: None,
+                    updated_at: "t",
+                })
+                .await
+                .unwrap()
         );
     }
 

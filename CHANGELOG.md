@@ -3,6 +3,19 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.15-alpha] - 2026-10-03
+
+### 新增
+
+- **Agent 列表与运行状态能看到「这是哪台机器」**：机队页新增 **IP 列**，运行状态响应带上
+  `hostname` / `node_id` / `ip_addresses`。凭客户端证书首触注册的机器以前机器画像是空的，
+  现在由 agent 的状态上报自动补齐（网关侧新增原子回填，空值不覆盖已知画像）。
+  依赖 `wist-contracts` 0.1.14。
+
+### 说明
+
+- **上线须先网关、后 agent**：状态上报契约新增了字段，旧网关会拒收带新字段的上报。
+
 ## [0.1.14-alpha] - 2026-10-03
 
 ### 新增

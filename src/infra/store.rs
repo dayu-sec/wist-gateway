@@ -134,6 +134,9 @@ pub struct StoredAgentRegistration {
     pub node_id: String,
     pub hostname: String,
     pub machine_id: String,
+    /// 机器级「最近一次已知网卡地址」（形如 `en0 192.168.1.5/24`，来自状态上报的机器画像）；
+    /// 空表 = 还没报过 / 确实没有地址。
+    pub ip_addresses: Vec<String>,
     pub version: String,
     pub credential_id: String,
     pub credential_token_hash: String,
@@ -854,6 +857,22 @@ pub struct AgentStatusUpdate<'a> {
     pub uplink_state: Option<wist_contracts::agent_uplink::AgentUplinkState>,
 }
 
+/// 机器画像回填（agentd 状态上报携带的 `HostProfile`）。
+///
+/// 为什么单独一条写路径（而不是塞进 `AgentStatusUpdate`）：机器画像只在注册方式为**证书首触重建**
+/// 时为空、需要补齐，且变化极少 —— 单列一条 `UPDATE` 既不动状态写入那条热路径，也避免把每个
+/// `AgentStatusUpdate` 构造点都拖着改。
+#[derive(Debug, Clone)]
+pub struct AgentMachineProfileUpdate<'a> {
+    pub agent_id: &'a str,
+    pub node_id: &'a str,
+    pub hostname: &'a str,
+    pub machine_id: &'a str,
+    /// 网卡地址的 JSON 数组文本；`None` = 本次没带（保持上一次的值）。
+    pub ip_addresses: Option<&'a str>,
+    pub updated_at: &'a str,
+}
+
 /// 轮换 Agent 凭据（校验当前凭据后写入新凭据）。
 ///
 /// `current_token_hash` 为 `None` = 凭据已由**证书**验明（mTLS 是唯一凭据路径），不再要求
@@ -1217,6 +1236,15 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 写入最近一次状态上报；返回 `false` 表示该 Agent 不存在（不再静默丢弃）。
     async fn record_agent_status(&self, update: &AgentStatusUpdate<'_>) -> StoreResult<bool>;
+
+    /// 回填机器画像（机器名 / `node_id` / `machine_id` / 网卡地址）。
+    ///
+    /// 只在字段非空时覆盖 —— 老版本 agentd / 本次没带，都不该把已知的画像擦掉。
+    /// 返回 `false` 表示该 Agent 不存在。
+    async fn record_agent_machine_profile(
+        &self,
+        update: &AgentMachineProfileUpdate<'_>,
+    ) -> StoreResult<bool>;
 
     /// 轮换凭据；返回 `false` 表示校验未通过（Agent/实例/当前凭据不匹配或已非 active）。
     async fn renew_agent_credential(&self, request: &RenewCredential<'_>) -> StoreResult<bool>;

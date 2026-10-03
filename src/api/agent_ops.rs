@@ -92,6 +92,28 @@ pub async fn submit_agent_status(
                         .into_response();
                 }
             }
+            // 机器画像回填（机器名 / node_id / 网卡地址）：凭证书首触重建登记时是空的，靠这里补齐。
+            // best-effort：主状态已经落了，这只是可观测性，存不动只记一行。
+            if let Some(profile) = input.machine_profile.as_ref() {
+                let ip_addresses = serde_json::to_string(&profile.ip_addresses).ok();
+                if let Err(err) = state
+                    .store
+                    .record_agent_machine_profile(&crate::infra::AgentMachineProfileUpdate {
+                        agent_id: &agent.agent_id,
+                        node_id: &profile.node_id,
+                        hostname: &profile.hostname,
+                        machine_id: &profile.machine_id,
+                        ip_addresses: ip_addresses.as_deref(),
+                        updated_at: &last_seen_at,
+                    })
+                    .await
+                {
+                    eprintln!(
+                        "event=AgentMachineProfileStoreFailed agent_id={} detail=\"{err}\"",
+                        agent.agent_id
+                    );
+                }
+            }
             // 客户端证书状态（mTLS）：agent 本地判定、网关只存最近一份供页面看。
             // 存不动**不**断上报 —— 主状态已经落了，这只是可观测性。
             if let Some(certificate) = input.certificate_status.as_ref()

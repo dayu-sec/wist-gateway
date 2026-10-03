@@ -60,6 +60,8 @@ pub struct AgentListEntry {
     pub environment_id: String,
     pub node_id: String,
     pub hostname: String,
+    /// 机器级「最近一次已知网卡地址」（形如 `en0 192.168.1.5/24`）；空表 = 还没报过。
+    pub ip_addresses: Vec<String>,
     pub version: String,
     pub status: String,
     pub health: String,
@@ -333,6 +335,9 @@ pub async fn get_agent_runtime_status(
         // 与列表页共用同一在线口径：不写死 "online"，否则同一台机器两处答案会相反。
         agent_status_label(&agent.last_seen_at),
         "healthy",
+        &agent.node_id,
+        &agent.hostname,
+        &agent.ip_addresses,
         &agent.last_seen_at,
         agent.last_memory_bytes,
         agent.last_cpu_percent,
@@ -1831,6 +1836,7 @@ fn agent_list_entry(agent: &crate::infra::StoredAgentRegistration) -> AgentListE
         environment_id: agent.environment_id.clone(),
         node_id: agent.node_id.clone(),
         hostname: agent.hostname.clone(),
+        ip_addresses: agent.ip_addresses.clone(),
         version: agent.version.clone(),
         status: agent_status_label(&agent.last_seen_at).to_string(),
         health: "healthy".to_string(),
@@ -2405,6 +2411,9 @@ fn runtime_status(
     version: &str,
     status: &str,
     health: &str,
+    node_id: &str,
+    hostname: &str,
+    ip_addresses: &[String],
     last_seen_at: &str,
     memory_bytes: Option<u64>,
     cpu_percent: Option<f64>,
@@ -2420,6 +2429,9 @@ fn runtime_status(
         version: version.to_string(),
         status: status.to_string(),
         health: health.to_string(),
+        node_id: node_id.to_string(),
+        hostname: hostname.to_string(),
+        ip_addresses: ip_addresses.to_vec(),
         memory_bytes: memory_bytes.map(|value| value as i64),
         cpu_percent,
         cpu_cores,
@@ -2458,6 +2470,11 @@ pub struct AgentRuntimeStatusView {
     pub version: String,
     pub status: String,
     pub health: String,
+    /// 机器名 / `node_id` / 网卡地址：注册表里「这是哪台机器」的展示依据。
+    /// 凭证书首触重建登记的机器靠状态上报补齐（见迁移 0023）。
+    pub node_id: String,
+    pub hostname: String,
+    pub ip_addresses: Vec<String>,
     pub last_seen_at: DateTime,
     pub memory_bytes: Option<i64>,
     /// 单核口径的进程 CPU 占比（100% = 占满一个核，可能 >100），只统计 agent 进程自身。
