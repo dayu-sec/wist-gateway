@@ -94,3 +94,45 @@ async fn self_state(state: &ApiState, gateway_id: &str) -> GatewaySelfState {
         last_error,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// 自述面 JSON 的**键集契约**（snake_case）。
+    /// gwlinkd 侧有同一份 fixture 的**解析**测试（`parses_the_gateway_self_state_contract`）——
+    /// 两侧同钉一份形状，任一侧改名即爆（防三份拷贝漂移）。
+    #[test]
+    fn serializes_the_self_state_contract_keys() {
+        let state = GatewaySelfState {
+            gateway_id: "gw-1".into(),
+            version: "0.1.15".into(),
+            collected_at: DateTime::now(),
+            store_healthy: true,
+            agent_count: 3,
+            uplink_enabled: true,
+            last_error: None,
+        };
+        let value: Value = serde_json::to_value(&state).expect("serialize");
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "agent_count",
+                "collected_at",
+                "gateway_id",
+                "last_error",
+                "store_healthy",
+                "uplink_enabled",
+                "version"
+            ]
+        );
+    }
+}
