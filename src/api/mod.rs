@@ -48,6 +48,9 @@ mod software_ops;
 // 计划是编排层，批准/推进时才物化成 OneShotWork；与 agent_ops 的 submit_work_result
 // 通过 reconcile_rollout_entry 回填条目。重新生成控制面代码时需回补本模块与下方路由。
 mod rollout_ops;
+// NOTE(hand-added): 网关自述面（环回；CR-003）。对应 jumo 模型 Control.GatewayApp.SelfInterface
+// 的 QuerySelfState（模型 bind 未定、环回鉴权未决），故路由手加。供 host 侧 wist-gwlinkd 消费。
+mod self_state;
 
 pub mod wist_gateway_management_interface;
 pub mod wist_gateway_public_install_interface;
@@ -226,6 +229,11 @@ pub fn ingest_router(state: ApiState) -> Router {
 pub fn router_with_state(state: ApiState) -> Router {
     Router::new()
         .route("/api/v1/agent/install-code", get(get_agent_install_code))
+        // NOTE(hand-added): 网关自述面（环回；CR-003）。见上方 `mod self_state` 说明。
+        .route(
+            "/api/v1/gateway/self-state",
+            get(self_state::query_self_state),
+        )
         .route(
             "/api/v1/agent/install/{arch}/install.sh",
             get(get_agent_install_script),
