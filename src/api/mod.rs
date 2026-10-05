@@ -58,6 +58,10 @@ mod link_request;
 // NOTE(hand-added): gwlinkd 状态心跳（环回；CR-003）。gwlinkd 纯出站、页面拉不到它，故它每拍
 // 把自身状态推到网关。见 api/linkd_status.rs 与设计 `wist-design/doc/design/edge/gateway-linkd-status.md`。
 mod linkd_status;
+// NOTE(hand-added): agent 面（edge seam B：gateway ↔ agentd）的路由按 API 版本集中到
+// `api/agent_api/`（版本并存约定见 design/foundation/api-seam-inventory.md §7）。
+// 加 v2 = 新增版本子模块 + 往 `VERSIONS` 加一行。重新生成控制面代码时需回补本模块。
+mod agent_api;
 
 pub mod wist_gateway_management_interface;
 pub mod wist_gateway_public_install_interface;
@@ -73,12 +77,7 @@ use admin_ops::{
     view_agent_install_package, view_agent_purpose, view_agent_uplink, view_agent_work,
     view_discovery_policies, view_purpose_coverage,
 };
-use agent_ops::{
-    ack_work, poll_agent_uplink, poll_control_commands, poll_discovery_policies, poll_work,
-    renew_agent_credential, report_action_result, submit_agent_status, submit_work_result,
-};
 use content_ops::view_content;
-use enrollment::enroll_agent;
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
 use ingest::{MAX_INGEST_BODY_BYTES, ingest_agent_facts};
 use install::{
@@ -240,7 +239,7 @@ pub fn ingest_router(state: ApiState) -> Router {
 }
 
 pub fn router_with_state(state: ApiState) -> Router {
-    Router::new()
+    let router: Router<ApiState> = Router::new()
         .route("/api/v1/agent/install-code", get(get_agent_install_code))
         // NOTE(hand-added): 网关自述面（环回；CR-003）。见上方 `mod self_state` 说明。
         .route(
@@ -284,43 +283,8 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/agent/packages/{package_id}",
             get(download_agent_package_by_id),
         )
-        .route("/api/v1/agent/enroll", post(enroll_agent))
-        .route("/api/v1/agent/status", post(submit_agent_status))
-        // （agentd 上报事实**摘要**的原控制面路由 `POST /api/v1/agent/facts` 已删。）
-        // 事实统一走数据面：agentd 发 `OBSFACT:` 帧 → warp-parse → 网关的**内部**端点
-        // `/api/v1/ingest/agent-facts`（见 `ingest_router` 与 api/ingest.rs）。
-        // 见 doc/design/center/agent-work-delivery-plan.md §4.1。
-        .route(
-            "/api/v1/agent/credentials:renew",
-            post(renew_agent_credential),
-        )
-        .route(
-            "/api/v1/agent/control-commands:poll",
-            post(poll_control_commands),
-        )
-        .route("/api/v1/agent/action-results", post(report_action_result))
-        // NOTE(hand-added): agentd 拉取发现方向策略表。带 `:poll` 后缀以标明它是幂等的
-        // “拉当前版本”，而不是一次汇报。已在 jumo 模型 WistAgentdOnlineRegistrationInterface
-        // 声明；重新生成控制面代码时需回补本路由。
-        .route(
-            "/api/v1/agent/discovery-policies:poll",
-            post(poll_discovery_policies),
-        )
-        // NOTE(hand-added): 工作授权快照的拉取与确认（jumo 模型
-        // WistAgentdOnlineRegistrationInterface 的 PollWork / AckWork）。
-        // 与策略表同类：幂等内容、可重复拉取；断网重启后重新拉一次就回到期望状态。
-        .route("/api/v1/agent/work:poll", post(poll_work))
-        // NOTE(hand-added): 数据面上送启用的拉取。模型侧已补齐
-        // `message` / `entry` / `flow` / `actor can` / 用例 / `bind`（见设计文档 §7）。
-        // 与 work:poll 同类：幂等内容、可重复拉取，但刻意走**独立端点**而不是给 WorkGrant 加字段 ——
-        // WorkGrant 两侧都 `deny_unknown_fields`，加字段会让「新网关 + 旧 agentd」解析失败（舰队级停摆）。
-        // 旧 agentd 不调它，新 agentd 遇旧网关得 404 后回落本机配置。
-        // 重新生成控制面代码时需回补本路由。
-        .route("/api/v1/agent/uplink:poll", post(poll_agent_uplink))
-        .route("/api/v1/agent/work:ack", post(ack_work))
-        // 一次性工作的执行结果（进度/终态）。与 ack 分开：确认回答「我收到了」，
-        // 结果回答「我做得怎么样了」——失效代价不同，不挤一条路。
-        .route("/api/v1/agent/work:result", post(submit_work_result))
+        // agent 面（edge seam B：gateway ↔ agentd）路由集中在 `api/agent_api/`：按 API 版本分表，
+        // 由 `agent_api::mount` 统一挂上（版本并存约定见 api-seam-inventory.md §7）。
         .route("/api/v1/admin/agents/overview", get(get_agent_overview))
         .route(
             "/api/v1/admin/agents/host-metrics",
@@ -496,8 +460,8 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/rollout-plans/{plan_id}",
             get(view_rollout_plan),
-        )
-        .with_state(state)
+        );
+    agent_api::mount(router).with_state(state)
 }
 
 #[cfg(test)]
