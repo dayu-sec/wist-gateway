@@ -5,7 +5,8 @@
 //
 // 两个面：
 // - **admin（页面）**：`POST/GET /api/v1/admin/gateway/link-request`（admin bearer）。
-//   运维把 Center 页给的接入物（中心地址 + 一次性接入券 + CA-S 信任锚）提交到本机网关。
+//   运维把 Center 页给的接入物（中心地址 + 一次性接入券 + CA-S 信任锚）提交到本机网关；
+//   CA 仅对 **https** 中心必需（明文 http 无 TLS 可校，可省）。
 // - **环回（gwlinkd）**：`GET /api/v1/gateway/link-request` + `POST /api/v1/gateway/link-result`
 //   （loopback-only）。host 侧常驻拉取待办、完成接入后回报结果。
 //
@@ -148,10 +149,19 @@ pub async fn admin_set_gateway_link_request(
     let center_endpoint = input.center_endpoint.trim();
     let link_token = input.link_token.trim();
     let trust_bundle_pem = input.trust_bundle_pem.trim();
-    if center_endpoint.is_empty() || link_token.is_empty() || trust_bundle_pem.is_empty() {
+    if center_endpoint.is_empty() || link_token.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            "center_endpoint / link_token / trust_bundle_pem must not be empty",
+            "center_endpoint / link_token must not be empty",
+        )
+            .into_response();
+    }
+    // CA 信任锚仅对 **https** 中心必需：明文 http 无 TLS 可校，允许为空；
+    // 而 https 无 CA 则拒绝 —— 否则 gwlinkd 会静默回落到系统根（信任被悄悄放宽）。
+    if center_endpoint.starts_with("https://") && trust_bundle_pem.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "https center requires trust_bundle_pem (CA trust anchor)",
         )
             .into_response();
     }

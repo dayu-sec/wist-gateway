@@ -3,6 +3,14 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 变更
+
+- **接入请求的 CA 改为按 scheme 条件必需**：`POST /api/v1/admin/gateway/link-request` 只在
+  `center_endpoint` 为 `https://` 时才要求 `trust_bundle_pem`；明文 `http://` 中心允许为空（无 TLS 可校）。
+  https 无 CA 仍拒绝 —— 不允许静默回落到系统根。
+
 ## [0.1.16-alpha] - 2026-10-05
 
 ### 新增

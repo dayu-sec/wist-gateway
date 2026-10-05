@@ -10131,6 +10131,54 @@ async fn gateway_link_request_flow_round_trips() {
     assert_eq!(view["status"], "Connected");
 }
 
+/// CA 信任锚仅对 **https** 中心必需：http 明文可省；https 无 CA 则 400（不得静默回落）。
+#[tokio::test]
+async fn link_request_ca_is_required_only_for_https_centers() {
+    let env = TestEnv::new().await;
+    let app = router(env.config.clone(), env.store_handle.clone());
+
+    async fn post(app: axum::Router, body: serde_json::Value) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/gateway/link-request")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+        .status()
+    }
+
+    // http 明文中心 + 无 CA → 接受。
+    let http = post(
+        app.clone(),
+        serde_json::json!({
+            "gateway_id": "gw-http",
+            "center_endpoint": "http://center.local:3100",
+            "link_token": "link_http",
+            "trust_bundle_pem": "",
+        }),
+    )
+    .await;
+    assert_eq!(http, StatusCode::OK, "http 明文中心无需 CA");
+
+    // https 中心 + 无 CA → 拒绝（不允许静默回落到系统根）。
+    let https = post(
+        app.clone(),
+        serde_json::json!({
+            "gateway_id": "gw-https",
+            "center_endpoint": "https://center.example",
+            "link_token": "link_https",
+            "trust_bundle_pem": "",
+        }),
+    )
+    .await;
+    assert_eq!(https, StatusCode::BAD_REQUEST, "https 中心必须带 CA");
+}
+
 /// 终态 `Failed` 不再派发（避免 gwlinkd 用同一张已消费的券反复重试）。
 #[tokio::test]
 async fn gateway_link_request_failed_is_not_reserved() {
