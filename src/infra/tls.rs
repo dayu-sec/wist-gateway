@@ -291,9 +291,11 @@ AQID
     #[test]
     #[ignore = "depends on a locally generated dev certificate"]
     fn rustls_accepts_gateway_certificate() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let path = std::env::var("WIST_GATEWAY_TLS_CERT")
-            .unwrap_or_else(|_| format!("{home}/.wist-gateway/state/admin-tls.crt.pem"));
+        // dev 态网关 home：`<栈根>/dev/configs/gateway`（本 crate 的兄弟目录 `wist-gateway-stack`）。
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let path = std::env::var("WIST_GATEWAY_TLS_CERT").unwrap_or_else(|_| {
+            format!("{manifest}/../wist-gateway-stack/dev/configs/gateway/state/admin-tls.crt.pem")
+        });
         let server_name = std::env::var("WIST_GATEWAY_TLS_SERVER_NAME")
             .unwrap_or_else(|_| "127.0.0.1".to_string());
         let pem = fs::read_to_string(&path).expect("read gateway certificate");
