@@ -3,6 +3,14 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.21-alpha] - 2026-10-05
+
+### 变更
+
+- **`agent/status` 报文改用独立 seam crate `wist-api` 0.2**：`AgentStatusReport` / `AgentStatusAck` /
+  `AgentWorkState` / `AgentWorkStateChange` / `AgentCertificateStatus` / `AgentCredentialRenewal`
+  由 `wist_api::agent_status` 提供（`wist_contracts::gateway` 里的对应报文已移出）。**线上 JSON 不变**。
+
 ## [0.1.20-alpha] - 2026-10-05
 
 ### 变更

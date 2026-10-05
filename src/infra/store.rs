@@ -19,7 +19,7 @@ use std::fmt;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use wist_contracts::gateway::AgentWorkStateChange;
+use wist_api::agent_status::AgentWorkStateChange;
 // `pub use`：SQLite 后端用 `use super::store::*` 取领域类型（与 `StoreError` 同理）。
 pub use wist_contracts::work::{OneShotWork, StandingWork};
 pub use wist_error::{StoreError, StoreReason};
@@ -291,7 +291,7 @@ pub struct StoredAgentCertificateStatus {
     /// `valid` / `renew_due` / `expired`（agent 本地判定，网关不重算）。
     pub state: String,
     /// agent 本机**最近一次续签判定**（§5.5）；`None` = 老版本 agentd 没报过（落库时保留上一次）。
-    pub last_renewal: Option<wist_contracts::gateway::AgentCredentialRenewal>,
+    pub last_renewal: Option<wist_api::agent_status::AgentCredentialRenewal>,
     pub reported_at: String,
 }
 
