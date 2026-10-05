@@ -3,6 +3,15 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.20-alpha] - 2026-10-05
+
+### 变更
+
+- **对齐 `wist-contracts` 0.3；agent 注册/续期报文改用独立 seam crate `wist-api` 0.1**：
+  `agent/enroll`、`agent/credentials:renew` 的请求/响应体由 `wist_api::enrollment` 提供
+  （`wist_contracts::enrollment` 里的报文已移出）。**线上 JSON 不变**，纯依赖归位。
+  报文引用的领域类型（`HostProfile` / `CredentialBundle` 等）仍在 `wist-contracts`。
+
 ## [0.1.19-alpha] - 2026-10-05
 
 ### 变更

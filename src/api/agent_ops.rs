@@ -12,11 +12,11 @@ use crate::infra::{
     new_secret_token, outstanding_one_shot,
     victoria_metrics::{import_lines, metric_line},
 };
-use wist_contracts::API_VERSION_V1;
-use wist_contracts::agent_uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND, PollAgentUplink};
-use wist_contracts::enrollment::{
+use wist_api::enrollment::{
     CredentialBundle, CredentialRenewal, CredentialRenewed, RENEW_AGENT_CREDENTIAL_KIND,
 };
+use wist_contracts::API_VERSION_V1;
+use wist_contracts::agent_uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND, PollAgentUplink};
 use wist_contracts::fact_summary::FactContent;
 use wist_contracts::gateway::{
     ActionResultAck, AgentStatusAck, AgentStatusReport, DiscoveryPoliciesReturned,

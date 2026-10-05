@@ -1,7 +1,9 @@
 // @jumo generated
 // @jumo hash=91638372490551d3
 
-use wist_control::SubmitEnrollmentRequest;
+// seam 报文只有一份定义：`wist-api::enrollment`（独立 seam crate，两侧共依赖）。
+// 模型里的 `SubmitEnrollmentRequest` 在 control 侧的生成骨架已删除，避免同一条 seam 两份定义。
+use wist_api::enrollment::EnrollmentRequest as SubmitEnrollmentRequest;
 
 #[derive(::jumo_derive::Jumo)]
 #[jumo(

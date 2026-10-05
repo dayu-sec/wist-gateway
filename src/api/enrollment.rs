@@ -6,7 +6,7 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use wist_contracts::enrollment::{
+use wist_api::enrollment::{
     AgentIdentity, AgentIdentityStatus, CredentialBundle, EnrollmentEnvelope, EnrollmentOutcome,
     EnrollmentRequest, EnrollmentStatus,
 };

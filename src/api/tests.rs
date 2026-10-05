@@ -14,7 +14,7 @@ use ring::{
     signature::{self, Ed25519KeyPair, KeyPair},
 };
 use tower::ServiceExt;
-use wist_contracts::enrollment::{
+use wist_api::enrollment::{
     AgentIdentityStatus, CredentialRenewal, CredentialRenewed, EnrollmentEnvelope,
     EnrollmentRequest, EnrollmentStatus,
 };
