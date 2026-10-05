@@ -51,6 +51,10 @@ mod rollout_ops;
 // NOTE(hand-added): 网关自述面（环回；CR-003）。对应 jumo 模型 Control.GatewayApp.SelfInterface
 // 的 QuerySelfState（模型 bind 未定、环回鉴权未决），故路由手加。供 host 侧 wist-gwlinkd 消费。
 mod self_state;
+// NOTE(hand-added): 网关侧「接入请求」通道（页面发起接入；CR-003）。对应 jumo 模型
+// Control.GatewayApp.LinkRequestInterface（环回），故路由手加。见 api/link_request.rs 与设计
+// `wist-design/doc/design/edge/gateway-onboard-request.md`。重新生成控制面代码时需回补本模块与下方路由。
+mod link_request;
 
 pub mod wist_gateway_management_interface;
 pub mod wist_gateway_public_install_interface;
@@ -234,6 +238,15 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/gateway/self-state",
             get(self_state::query_self_state),
         )
+        // NOTE(hand-added): 接入请求通道（环回；CR-003）。见上方 `mod link_request` 说明。
+        .route(
+            "/api/v1/gateway/link-request",
+            get(link_request::query_gateway_link_request),
+        )
+        .route(
+            "/api/v1/gateway/link-result",
+            post(link_request::report_gateway_link_result),
+        )
         .route(
             "/api/v1/agent/install/{arch}/install.sh",
             get(get_agent_install_script),
@@ -408,6 +421,13 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agent/advertise-url",
             get(view_agent_advertise_url).post(set_agent_advertise_url),
+        )
+        // NOTE(hand-added): 页面发起接入（网关侧命令源，供 host gwlinkd 环回拉取）。见
+        // api/link_request.rs 与设计 edge/gateway-onboard-request.md。
+        .route(
+            "/api/v1/admin/gateway/link-request",
+            get(link_request::admin_view_gateway_link_request)
+                .post(link_request::admin_set_gateway_link_request),
         )
         // NOTE(hand-added): Agent 管理面列表与凭据吊销。已在 jumo 模型
         // WistGatewayManagementInterface（AdminListAgents / AdminRevokeAgentCredential）中声明，

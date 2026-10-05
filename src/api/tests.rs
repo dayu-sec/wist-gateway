@@ -10023,3 +10023,110 @@ async fn agent_purpose_route_recomputes_when_only_the_purpose_version_changes() 
         "版本抬了就必须重算并把新版本记下来"
     );
 }
+
+/// 接入请求通道：admin 提交 → gwlinkd 环回拉取 → 回报结果 → 终态；环回限定。
+#[tokio::test]
+async fn gateway_link_request_flow_round_trips() {
+    use std::net::SocketAddr;
+
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let env = TestEnv::new().await;
+    let app = router(env.config.clone(), env.store_handle.clone());
+    let loopback = || MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    // 1. admin 提交（含地址 + 券 + CA）。
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/gateway/link-request")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "gateway_id": "gw-1",
+                        "center_endpoint": "https://center.example",
+                        "link_token": "link_abc",
+                        "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\n",
+                        "requested_by": "admin",
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["has_request"], true);
+    assert_eq!(view["status"], "Pending");
+    // admin 视图**不得**回传券与 CA。
+    assert!(view.get("link_token").is_none());
+    assert!(view.get("trust_bundle_pem").is_none());
+
+    // 2. gwlinkd 环回拉取：拿到券与 CA，Pending → Connecting。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["has_request"], true);
+    assert_eq!(body["link_token"], "link_abc");
+    assert_eq!(body["status"], "Connecting");
+
+    // 3. 非环回拒绝。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request
+        .extensions_mut()
+        .insert(MockConnectInfo(SocketAddr::from(([192, 0, 2, 1], 40_001))));
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // 4. 回报 Connected → 清掉明文券。
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/link-result")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "gateway_id": "gw-1", "status": "Connected", "detail": "" })
+                .to_string(),
+        ))
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 5. 终态：环回不再派发待办，页面看到 Connected。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["has_request"], false);
+
+    let stored = env
+        .store_handle
+        .get_gateway_link_request()
+        .await
+        .expect("read")
+        .expect("request");
+    assert_eq!(stored.status, "Connected");
+    assert!(stored.link_token.is_empty(), "消费后必须清掉明文券");
+
+    let view: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/gateway/link-request").await).await;
+    assert_eq!(view["status"], "Connected");
+}
