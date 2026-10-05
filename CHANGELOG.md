@@ -5,6 +5,13 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **gwlinkd 状态通道**（CR-003）：环回 `POST /api/v1/gateway/linkd-status`（host 侧 `wist-gwlinkd` 心跳推
+  自身状态）+ admin `GET /api/v1/admin/gateway/linkd-status`（页面读；含服务端按**网关时钟**算的
+  `age_seconds` / `stale`）。单行表 `gateway_linkd_status`（迁移 0025）；载荷**无密钥**（admin 可原样回显）。
+  设计 `wist-design/doc/design/edge/gateway-linkd-status.md`。
+
 ### 变更
 
 - **接入请求的 CA 改为按 scheme 条件必需**：`POST /api/v1/admin/gateway/link-request` 只在

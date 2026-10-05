@@ -206,6 +206,9 @@ pub const DEFAULT_KNOWLEDGE_SETTING_ID: &str = "default";
 /// 单例设置行 id：网关接入请求只有一个生效值。
 pub const DEFAULT_GATEWAY_LINK_REQUEST_SETTING_ID: &str = "default";
 
+/// 单例设置行 id：gwlinkd 状态（心跳）只有一个生效值。
+pub const DEFAULT_GATEWAY_LINKD_STATUS_SETTING_ID: &str = "default";
+
 /// 数据面 TCP 入口的约定默认端口（与 wparse `topology/sources/tcp_1` 一致）。
 pub const DEFAULT_AGENT_UPLINK_PORT: u16 = 9000;
 
@@ -247,6 +250,33 @@ pub struct StoredGatewayLinkRequest {
     pub requested_by: String,
     pub requested_at: String,
     pub updated_at: String,
+}
+
+/// 网关侧「gwlinkd 状态」：host 侧 gwlinkd **周期心跳**推来、网关 Web 读展示。
+///
+/// gwlinkd 纯出站（无入站面），页面拉不到它，所以状态只能由它推。载荷**无密钥**（admin 可原样回显）。
+/// 设计 `wist-design/doc/design/edge/gateway-linkd-status.md`。可选字段用空串（不用 NULL）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoredGatewayLinkdStatus {
+    pub setting_id: String,
+    pub gateway_id: String,
+    pub instance_id: String,
+    /// gwlinkd 版本。
+    pub version: String,
+    /// 当前接入的中心（未接入时空串）。
+    pub center_endpoint: String,
+    /// `WaitingLinkRequest` / `Linking` / `Linked` / `Degraded`。
+    pub state: String,
+    /// 客户端证书到期（RFC3339；空串 = 无）。
+    pub credential_expires_at: String,
+    /// 最近一次成功向中心 status 上报的时刻（RFC3339；空串 = 未成功过）。
+    pub last_center_report_at: String,
+    /// 最近失败摘要（空串 = 无）。
+    pub last_error: String,
+    /// gwlinkd 打的心跳时刻（RFC3339，原样存，供对齐排障）。
+    pub reported_at: String,
+    /// 网关收到本心跳的时刻（RFC3339，**网关时钟**）——失联判定用它，不受时钟偏移影响。
+    pub received_at: String,
 }
 
 /// agent 上报的**客户端证书状态**（最近一次）。
@@ -1034,6 +1064,15 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 清空网关接入请求（消费 / 完成接入后移除待办）。
     async fn clear_gateway_link_request(&self) -> StoreResult<()>;
+
+    /// 读取 gwlinkd 状态（最近一次心跳）；从未上报过返回 `None`。
+    async fn get_gateway_linkd_status(&self) -> StoreResult<Option<StoredGatewayLinkdStatus>>;
+
+    /// 写入/覆盖 gwlinkd 状态（单例；幂等心跳）。
+    async fn upsert_gateway_linkd_status(
+        &self,
+        status: &StoredGatewayLinkdStatus,
+    ) -> StoreResult<()>;
 
     /// 落 agent 上报的客户端证书状态（最近一次为准）。
     async fn upsert_agent_certificate_status(

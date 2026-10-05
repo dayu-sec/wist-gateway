@@ -55,6 +55,9 @@ mod self_state;
 // Control.GatewayApp.LinkRequestInterface（环回），故路由手加。见 api/link_request.rs 与设计
 // `wist-design/doc/design/edge/gateway-onboard-request.md`。重新生成控制面代码时需回补本模块与下方路由。
 mod link_request;
+// NOTE(hand-added): gwlinkd 状态心跳（环回；CR-003）。gwlinkd 纯出站、页面拉不到它，故它每拍
+// 把自身状态推到网关。见 api/linkd_status.rs 与设计 `wist-design/doc/design/edge/gateway-linkd-status.md`。
+mod linkd_status;
 
 pub mod wist_gateway_management_interface;
 pub mod wist_gateway_public_install_interface;
@@ -247,6 +250,11 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/gateway/link-result",
             post(link_request::report_gateway_link_result),
         )
+        // NOTE(hand-added): gwlinkd 状态心跳（环回；CR-003）。见 api/linkd_status.rs 说明。
+        .route(
+            "/api/v1/gateway/linkd-status",
+            post(linkd_status::report_gateway_linkd_status),
+        )
         .route(
             "/api/v1/agent/install/{arch}/install.sh",
             get(get_agent_install_script),
@@ -428,6 +436,11 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/admin/gateway/link-request",
             get(link_request::admin_view_gateway_link_request)
                 .post(link_request::admin_set_gateway_link_request),
+        )
+        // NOTE(hand-added): gwlinkd 状态读侧（页面）。见 api/linkd_status.rs。
+        .route(
+            "/api/v1/admin/gateway/linkd-status",
+            get(linkd_status::admin_view_gateway_linkd_status),
         )
         // NOTE(hand-added): Agent 管理面列表与凭据吊销。已在 jumo 模型
         // WistGatewayManagementInterface（AdminListAgents / AdminRevokeAgentCredential）中声明，

@@ -1209,6 +1209,68 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn get_gateway_linkd_status(&self) -> StoreResult<Option<StoredGatewayLinkdStatus>> {
+        let row = sqlx::query(
+            "SELECT setting_id, gateway_id, instance_id, version, center_endpoint, state, \
+             credential_expires_at, last_center_report_at, last_error, reported_at, received_at \
+             FROM gateway_linkd_status WHERE setting_id = ?1",
+        )
+        .bind(DEFAULT_GATEWAY_LINKD_STATUS_SETTING_ID)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "get gateway linkd status"))?;
+        match row {
+            Some(row) => Ok(Some(StoredGatewayLinkdStatus {
+                setting_id: column!(row, "setting_id"),
+                gateway_id: column!(row, "gateway_id"),
+                instance_id: column!(row, "instance_id"),
+                version: column!(row, "version"),
+                center_endpoint: column!(row, "center_endpoint"),
+                state: column!(row, "state"),
+                credential_expires_at: column!(row, "credential_expires_at"),
+                last_center_report_at: column!(row, "last_center_report_at"),
+                last_error: column!(row, "last_error"),
+                reported_at: column!(row, "reported_at"),
+                received_at: column!(row, "received_at"),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert_gateway_linkd_status(
+        &self,
+        status: &StoredGatewayLinkdStatus,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO gateway_linkd_status (setting_id, gateway_id, instance_id, version, \
+             center_endpoint, state, credential_expires_at, last_center_report_at, last_error, \
+             reported_at, received_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT (setting_id) DO UPDATE SET gateway_id = excluded.gateway_id, \
+             instance_id = excluded.instance_id, version = excluded.version, \
+             center_endpoint = excluded.center_endpoint, state = excluded.state, \
+             credential_expires_at = excluded.credential_expires_at, \
+             last_center_report_at = excluded.last_center_report_at, \
+             last_error = excluded.last_error, reported_at = excluded.reported_at, \
+             received_at = excluded.received_at",
+        )
+        .bind(DEFAULT_GATEWAY_LINKD_STATUS_SETTING_ID)
+        .bind(&status.gateway_id)
+        .bind(&status.instance_id)
+        .bind(&status.version)
+        .bind(&status.center_endpoint)
+        .bind(&status.state)
+        .bind(&status.credential_expires_at)
+        .bind(&status.last_center_report_at)
+        .bind(&status.last_error)
+        .bind(&status.reported_at)
+        .bind(&status.received_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert gateway linkd status"))?;
+        Ok(())
+    }
+
     async fn upsert_agent_certificate_status(
         &self,
         status: &StoredAgentCertificateStatus,
@@ -4212,6 +4274,44 @@ mod tests {
 
         store.clear_gateway_link_request().await.unwrap();
         assert!(store.get_gateway_link_request().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stores_gateway_linkd_status() {
+        let store = store().await;
+        // 从未上报过 → None（调用方按「未检测到 gwlinkd」处理）。
+        assert!(store.get_gateway_linkd_status().await.unwrap().is_none());
+
+        let status = StoredGatewayLinkdStatus {
+            setting_id: DEFAULT_GATEWAY_LINKD_STATUS_SETTING_ID.to_string(),
+            gateway_id: "gw-1".to_string(),
+            instance_id: "gw-1/inst-1".to_string(),
+            version: "0.4.0".to_string(),
+            center_endpoint: "https://center.example".to_string(),
+            state: "Linked".to_string(),
+            credential_expires_at: "2026-12-01T00:00:00+00:00".to_string(),
+            last_center_report_at: "2026-10-05T00:00:00+00:00".to_string(),
+            last_error: String::new(),
+            reported_at: "2026-10-05T00:00:00+00:00".to_string(),
+            received_at: "2026-10-05T00:00:00+00:00".to_string(),
+        };
+        store.upsert_gateway_linkd_status(&status).await.unwrap();
+        let loaded = store.get_gateway_linkd_status().await.unwrap().expect("status");
+        assert_eq!(loaded.state, "Linked");
+        assert_eq!(loaded.received_at, "2026-10-05T00:00:00+00:00");
+
+        // 单例覆盖：重复心跳更新同一行（幂等）。
+        let updated = StoredGatewayLinkdStatus {
+            state: "Degraded".to_string(),
+            last_error: "中心不可达".to_string(),
+            received_at: "2026-10-05T00:01:00+00:00".to_string(),
+            ..status.clone()
+        };
+        store.upsert_gateway_linkd_status(&updated).await.unwrap();
+        let loaded = store.get_gateway_linkd_status().await.unwrap().expect("status");
+        assert_eq!(loaded.state, "Degraded");
+        assert_eq!(loaded.last_error, "中心不可达");
+        assert_eq!(loaded.received_at, "2026-10-05T00:01:00+00:00");
     }
 
     #[tokio::test]
