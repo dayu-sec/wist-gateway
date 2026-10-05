@@ -3,6 +3,16 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **页面发起接入的网关侧通道**（CR-003）：新增 admin 面 `POST/GET /api/v1/admin/gateway/link-request`
+  （页面提交/查看接入物；视图**不回传**接入券与 CA）与环回 `GET /api/v1/gateway/link-request`
+  + `POST /api/v1/gateway/link-result`（供 host 侧 `wist-gwlinkd` 拉取/回报）。
+  存储：新增 `gateway_link_request` 单例表（迁移 0024）。见设计
+  `wist-design/doc/design/edge/gateway-onboard-request.md`。
+
 ## [0.1.15-alpha] - 2026-10-03
 
 ### 新增
