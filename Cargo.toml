@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.1.17" #@gxl:set(version)
+version = "0.1.18" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -24,7 +24,7 @@ rustls-pki-types = "1"
 rustls-webpki = "0.103"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 wist-contracts = { version = "0.1" }
-wist-control = { version = "0.1" }
+wist-control = { version = "0.6" }
 wist-error = { version = "0.1" }
 
 #wist-control = { version = "0.1.1", path = "../wist-control" }

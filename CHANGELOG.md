@@ -3,6 +3,14 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.18-alpha] - 2026-10-05
+
+### 变更
+
+- **对齐 `wist-control` 依赖**：由 `0.1` 升至 `0.6`（实际 0.6.1），与 `wist-center` / `wist-gwlinkd`
+  统一契约版本、消除版本漂移。本网关用到的类型（`PollControlCommands` / `SubmitEnrollmentRequest` /
+  `AgentInstallCode` / `AgentRuntimeStatus` / `DateTime` 等）在 0.6.1 中保持兼容。
+
 ## [0.1.17-alpha] - 2026-10-05
 
 ### 新增
