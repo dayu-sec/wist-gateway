@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.1.21" #@gxl:set(version)
+version = "0.1.22" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -24,9 +24,9 @@ rustls-pki-types = "1"
 rustls-webpki = "0.103"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 wist-contracts = { version = "0.3" }
-# 跨进程 seam 报文（enrollment / agent_status）。CI/发布走 registry；本地联调可改用下面注释的 path 行。
-wist-api = { version = "0.2" }
-#wist-api = { version = "0.2", path = "../wist-api" }
+# 跨进程 seam 报文（enrollment / agent_status / gateway）。CI/发布走 registry；本地联调可改用下面注释的 path 行。
+wist-api = { version = "0.3" }
+#wist-api = { version = "0.3", path = "../wist-api" }
 wist-control = { version = "0.6" }
 wist-error = { version = "0.1" }
 

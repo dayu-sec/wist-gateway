@@ -3,6 +3,15 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.22-alpha] - 2026-10-05
+
+### 变更
+
+- **agent 面其余 seam 报文改用 `wist-api::gateway`**：action-plan / action-results / facts /
+  discovery-policies（`DispatchActionPlan` / `ActionPlanAck` / `ReportActionResult` /
+  `ReportAgentFactSummary` / `PollDiscoveryPolicies` 等）由 `wist-api` 提供
+  （`wist_contracts::gateway` 已整体移出）。**线上 JSON 不变**。
+
 ## [0.1.21-alpha] - 2026-10-05
 
 ### 变更

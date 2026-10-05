@@ -29,13 +29,13 @@ use crate::infra::{
     StoredKnowledgePackage, VerifiedAgentIdentity, bytes_sha256_hex,
     load_install_script_public_key_pem, sha256_hex,
 };
-use wist_contracts::action_result::{ActionResult, FinalStatus};
-use wist_contracts::agent_uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND};
-use wist_contracts::fact_summary::FactContent;
-use wist_contracts::gateway::{
+use wist_api::gateway::{
     DiscoveryPoliciesReturned, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
     ReportActionResult, ReportAgentFactSummary, ResultAttestation,
 };
+use wist_contracts::action_result::{ActionResult, FinalStatus};
+use wist_contracts::agent_uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND};
+use wist_contracts::fact_summary::FactContent;
 use wist_contracts::work::{ACK_WORK_KIND, POLL_WORK_KIND, REPORT_WORK_RESULT_KIND, WorkSpec};
 use wist_control::PollControlCommands;
 use wist_control::types::DateTime;
