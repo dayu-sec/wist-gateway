@@ -10130,3 +10130,68 @@ async fn gateway_link_request_flow_round_trips() {
         decode_json_response(get_admin(&env, "/api/v1/admin/gateway/link-request").await).await;
     assert_eq!(view["status"], "Connected");
 }
+
+/// 终态 `Failed` 不再派发（避免 gwlinkd 用同一张已消费的券反复重试）。
+#[tokio::test]
+async fn gateway_link_request_failed_is_not_reserved() {
+    use std::net::SocketAddr;
+
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let env = TestEnv::new().await;
+    // 直接落一条 Pending 请求（绕过 admin 面，聚焦状态机）。
+    env.store_handle
+        .upsert_gateway_link_request(&crate::infra::StoredGatewayLinkRequest {
+            setting_id: crate::infra::DEFAULT_GATEWAY_LINK_REQUEST_SETTING_ID.to_string(),
+            gateway_id: "gw-1".to_string(),
+            center_endpoint: "https://center.example".to_string(),
+            link_token: "link_abc".to_string(),
+            trust_bundle_pem: "CA".to_string(),
+            status: "Pending".to_string(),
+            result_detail: String::new(),
+            requested_by: "admin".to_string(),
+            requested_at: "t".to_string(),
+            updated_at: "t".to_string(),
+        })
+        .await
+        .expect("seed");
+
+    let app = router(env.config.clone(), env.store_handle.clone());
+    let loopback = || MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    // gwlinkd 拉一次 → Connecting。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let body: serde_json::Value =
+        decode_json_response(app.clone().oneshot(request).await.expect("route response")).await;
+    assert_eq!(body["has_request"], true);
+
+    // 回报 Failed → 变终态。
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/link-result")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "gateway_id": "gw-1", "status": "Failed", "detail": "bad token" })
+                .to_string(),
+        ))
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 再拉：不再派发。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let body: serde_json::Value =
+        decode_json_response(app.clone().oneshot(request).await.expect("route response")).await;
+    assert_eq!(body["has_request"], false, "Failed 不应再被派发");
+}

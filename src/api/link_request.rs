@@ -211,7 +211,9 @@ pub async fn query_gateway_link_request(
         return (StatusCode::FORBIDDEN, "link-request is loopback-only").into_response();
     }
     match state.store.get_gateway_link_request().await {
-        Ok(Some(mut request)) if request.status != STATUS_CONNECTED => {
+        // 只派发**未终态**的请求：`Pending`（推进到 `Connecting`）/ `Connecting`。
+        // `Failed` 不再派发 —— 同一张（多半已被消费的）券重试只会反复失败；让操作者在页面重提。
+        Ok(Some(mut request)) if is_serveable(&request.status) => {
             if request.status == STATUS_PENDING {
                 request.status = STATUS_CONNECTING.to_string();
                 request.updated_at = now_rfc3339();
@@ -226,6 +228,11 @@ pub async fn query_gateway_link_request(
         )
             .into_response(),
     }
+}
+
+/// 可派发给 gwlinkd 的状态：未终态（`Pending` / `Connecting`）。
+fn is_serveable(status: &str) -> bool {
+    status == STATUS_PENDING || status == STATUS_CONNECTING
 }
 
 /// gwlinkd 回报结果：`POST /api/v1/gateway/link-result`（loopback-only）。
