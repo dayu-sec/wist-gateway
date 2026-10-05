@@ -163,6 +163,12 @@ impl ApiState {
 #[derive(Debug, Default)]
 pub struct AdminRuntimeState {
     pub recent_online_agents: Vec<RecentOnlineRegisteredAgent>,
+    /// 累计接收的数据面事实条数（自进程启动）—— 数据面吞吐的一个信号。
+    pub ingest_accepted_total: u64,
+    /// 累计被拒的事实条数（自进程启动）。
+    pub ingest_rejected_total: u64,
+    /// 最近一次接收事实的时刻（未接收过为 `None`）。
+    pub last_ingest_at: Option<wist_control::types::DateTime>,
 }
 
 pub fn router(config: AdminConfig, store: Arc<dyn Store>) -> Router {
@@ -441,6 +447,12 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/gateway/linkd-status",
             get(linkd_status::admin_view_gateway_linkd_status),
+        )
+        // NOTE(hand-added): 网关**自身**状态读侧（页面）—— 环回自述面只服务本机 gwlinkd，
+        // 浏览器够不到；这是同一份计算的 admin 读口。见 api/self_state.rs。
+        .route(
+            "/api/v1/admin/gateway/self-state",
+            get(self_state::admin_view_gateway_self_state),
         )
         // NOTE(hand-added): Agent 管理面列表与凭据吊销。已在 jumo 模型
         // WistGatewayManagementInterface（AdminListAgents / AdminRevokeAgentCredential）中声明，

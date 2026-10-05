@@ -3,7 +3,7 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.1.17-alpha] - 2026-10-05
 
 ### 新增
 
@@ -17,6 +17,14 @@
 - **接入请求的 CA 改为按 scheme 条件必需**：`POST /api/v1/admin/gateway/link-request` 只在
   `center_endpoint` 为 `https://` 时才要求 `trust_bundle_pem`；明文 `http://` 中心允许为空（无 TLS 可校）。
   https 无 CA 仍拒绝 —— 不允许静默回落到系统根。
+
+- **自述面富化（进程 / 机队 / 存储 / 数据面 / 主机资源）**：`GatewaySelfState`（环回
+  `GET /api/v1/gateway/self-state`）与 admin 读口（`GET /api/v1/admin/gateway/self-state`）新增
+  `uptime_seconds` / 进程 `cpu_percent` / `memory_bytes` / 机队 `agent_count` / `online_agents` / `offline_agents` /
+  `last_seen_lag_seconds` / `store_bytes` / 数据面 `ingest_accepted_total` / `ingest_rejected_total` /
+  `last_ingest_at` / 主机 `memory_total_bytes` / `load_1m` / `load_5m` / `load_15m` /
+  `disk_usage_percent` / `disk_total_bytes` / `disk_available_bytes`。量不出即 `null`。
+  新增依赖 `sysinfo`（与 `wist-agentd` 同版本）。
 
 ## [0.1.16-alpha] - 2026-10-05
 

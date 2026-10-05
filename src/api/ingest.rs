@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use wist_contracts::gateway::ReportAgentFactSummary;
+use wist_control::types::DateTime;
 
 use super::ApiState;
 use super::agent_ops::{MAX_FACT_SUMMARY_BODY_BYTES, ingest_fact_summary};
@@ -72,6 +73,17 @@ pub async fn ingest_agent_facts(
             Ok(()) => ingested += 1,
             Err(detail) => failures.push(format!("record #{index}: {detail}")),
         }
+    }
+
+    // 累计计数（自述面 / 上报中心读它）：数据面吞吐的一个信号；无论成败都记「最后一次接收」。
+    {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.ingest_accepted_total += ingested as u64;
+        runtime.ingest_rejected_total += failures.len() as u64;
+        runtime.last_ingest_at = Some(DateTime::now());
     }
 
     // 不在响应里区分 accepted / duplicate：`ingest_fact_summary` 对两者都回 202，

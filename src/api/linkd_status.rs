@@ -104,7 +104,9 @@ fn view(status: &StoredGatewayLinkdStatus) -> GatewayLinkdStatusView {
         received_at: status.received_at.clone(),
         age_seconds: age.unwrap_or(0),
         // 解析不出来时按**失联**处理（宁可疑，不假装在线）。
-        stale: age.map(|seconds| seconds > STALE_AFTER_SECONDS).unwrap_or(true),
+        stale: age
+            .map(|seconds| seconds > STALE_AFTER_SECONDS)
+            .unwrap_or(true),
     }
 }
 
@@ -143,8 +145,16 @@ pub async fn report_gateway_linkd_status(
         version: input.version.trim().to_string(),
         center_endpoint: input.center_endpoint.trim().to_string(),
         state: input.state.trim().to_string(),
-        credential_expires_at: input.credential_expires_at.unwrap_or_default().trim().to_string(),
-        last_center_report_at: input.last_center_report_at.unwrap_or_default().trim().to_string(),
+        credential_expires_at: input
+            .credential_expires_at
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        last_center_report_at: input
+            .last_center_report_at
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
         last_error: input.last_error.unwrap_or_default().trim().to_string(),
         reported_at: input.reported_at.trim().to_string(),
         received_at: received_at.clone(),
@@ -235,5 +245,61 @@ mod tests {
             ..Default::default()
         };
         assert!(view(&stored).stale, "5 分钟前的心跳应判失联");
+    }
+
+    /// 失联阈值边界：`stale = age > 90s`（恰 90 不算，越 1 秒才算）。
+    /// 阈值写错（>= / >）会让页面在 90s 整点儿误报或迟报一格。
+    #[test]
+    fn stale_boundary_is_three_heartbeats() {
+        let aged = |secs: i64| StoredGatewayLinkdStatus {
+            received_at: (chrono::Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339(),
+            ..Default::default()
+        };
+        assert!(!view(&aged(90)).stale, "恰 90s 未越界，不算失联");
+        assert!(view(&aged(91)).stale, "越 90s 即失联");
+    }
+
+    /// `received_at` 解析不出时**按失联处理**（宁可疑，不假装在线）：
+    /// 不能用「解析失败 → 当作刚刚心跳」把一台状态未知的机器报成健康。
+    #[test]
+    fn unparseable_received_at_is_treated_as_stale() {
+        let stored = StoredGatewayLinkdStatus {
+            received_at: "not-a-timestamp".into(),
+            ..Default::default()
+        };
+        let value = view(&stored);
+        assert_eq!(value.age_seconds, 0, "解析不出就报 0，不 panic");
+        assert!(value.stale, "解析不出应按失联处理");
+    }
+
+    /// 空态（从未上报）也是**全字段契约**：前端 `normalize` 每个键都 required，空态不能缺键。
+    #[test]
+    fn empty_view_keeps_the_full_false_contract() {
+        let value: Value = serde_json::to_value(empty_view()).expect("serialize");
+        let object = value.as_object().expect("object");
+        for key in [
+            "has_status",
+            "gateway_id",
+            "instance_id",
+            "version",
+            "center_endpoint",
+            "state",
+            "credential_expires_at",
+            "last_center_report_at",
+            "last_error",
+            "reported_at",
+            "received_at",
+            "age_seconds",
+            "stale",
+        ] {
+            assert!(object.contains_key(key), "空态缺键 {key}: {value}");
+        }
+        assert_eq!(value["has_status"], Value::Bool(false));
+        assert_eq!(
+            value["stale"],
+            Value::Bool(false),
+            "空态不是「失联」，是「从未有过」"
+        );
+        assert_eq!(value["age_seconds"], Value::from(0));
     }
 }

@@ -4296,7 +4296,11 @@ mod tests {
             received_at: "2026-10-05T00:00:00+00:00".to_string(),
         };
         store.upsert_gateway_linkd_status(&status).await.unwrap();
-        let loaded = store.get_gateway_linkd_status().await.unwrap().expect("status");
+        let loaded = store
+            .get_gateway_linkd_status()
+            .await
+            .unwrap()
+            .expect("status");
         assert_eq!(loaded.state, "Linked");
         assert_eq!(loaded.received_at, "2026-10-05T00:00:00+00:00");
 
@@ -4308,7 +4312,11 @@ mod tests {
             ..status.clone()
         };
         store.upsert_gateway_linkd_status(&updated).await.unwrap();
-        let loaded = store.get_gateway_linkd_status().await.unwrap().expect("status");
+        let loaded = store
+            .get_gateway_linkd_status()
+            .await
+            .unwrap()
+            .expect("status");
         assert_eq!(loaded.state, "Degraded");
         assert_eq!(loaded.last_error, "中心不可达");
         assert_eq!(loaded.received_at, "2026-10-05T00:01:00+00:00");

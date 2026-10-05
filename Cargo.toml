@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.1.16" #@gxl:set(version)
+version = "0.1.17" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -44,6 +44,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # flate2 默认走纯 Rust 后端（miniz_oxide），不引入 C 依赖。
 flate2 = "1"
 tar = "0.4"
+
+# 网关**进程自身**资源（CPU / 内存 / 运行时长）：自述面与上报中心用。
+# 版本与 wist-agentd 对齐（同一 sysinfo，避免依赖图里出现两份）。
+sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
 
 # 持久化：SQLite（默认，内嵌）+ 同一 Store trait 下可选的 Postgres 实现。
 # - sqlite-bundled：从源码编译 libsqlite3，构建期需要 C 编译器（release 流水线按架构原生构建，满足）。

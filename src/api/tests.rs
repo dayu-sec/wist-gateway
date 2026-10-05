@@ -1577,6 +1577,45 @@ async fn ingest_endpoint_accepts_a_batch_of_records() {
     assert_eq!(body["rejected"], 0);
 }
 
+/// 数据面累计计数：接收事实后，自述面（admin 读口）的 `ingest_accepted_total` / `last_ingest_at` 要动。
+#[tokio::test]
+async fn ingest_bumps_self_state_data_plane_counters() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    // **同一份 state** 串内两点（接入 + 自述面），否则计数随每次 build_state 重置。
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+
+    let before: serde_json::Value =
+        decode_json_response(get_from_state(&state, "/api/v1/admin/gateway/self-state").await)
+            .await;
+    assert_eq!(before["ingest_accepted_total"], 0);
+    assert_eq!(before["last_ingest_at"], serde_json::Value::Null);
+
+    let record = data_plane_record("agent-node-a", &fact_report(&["/usr/bin/xcodebuild"]));
+    let response = super::ingest_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ingest/agent-facts")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&record).expect("body")))
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let after: serde_json::Value =
+        decode_json_response(get_from_state(&state, "/api/v1/admin/gateway/self-state").await)
+            .await;
+    assert_eq!(after["ingest_accepted_total"], 1, "收到一条事实应 +1");
+    assert_eq!(after["ingest_rejected_total"], 0);
+    assert!(
+        !after["last_ingest_at"].is_null(),
+        "last_ingest_at 应被记下"
+    );
+}
+
 #[tokio::test]
 async fn ingest_endpoint_rejects_an_unregistered_agent() {
     // 「不存在的机器」不得被写进库：登记表是这条路径唯一的身份锚。
@@ -10242,4 +10281,146 @@ async fn gateway_link_request_failed_is_not_reserved() {
     let body: serde_json::Value =
         decode_json_response(app.clone().oneshot(request).await.expect("route response")).await;
     assert_eq!(body["has_request"], false, "Failed 不应再被派发");
+}
+
+/// gwlinkd 状态通道：环回心跳 → 网关存储 → admin 视图（含 `age_seconds` / `stale`）；环回限定。
+#[tokio::test]
+async fn gateway_linkd_status_heartbeat_round_trips() {
+    use std::net::SocketAddr;
+
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let env = TestEnv::new().await;
+    let app = router(env.config.clone(), env.store_handle.clone());
+    let loopback = || MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    // 1. 从未上报 → has_status=false（页面显示「未检测到 gwlinkd」）：空态也是全字段契约。
+    let view: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/gateway/linkd-status").await).await;
+    assert_eq!(view["has_status"], false);
+    assert_eq!(view["stale"], false, "从未有过 ≠ 失联");
+    assert_eq!(view["age_seconds"], 0);
+
+    // 2. gwlinkd 环回心跳（无密钥载荷）。
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/linkd-status")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "gateway_id": "GX01",
+                "instance_id": "GX01/inst-1",
+                "version": "0.4.0",
+                "center_endpoint": "https://center.example",
+                "state": "Linked",
+                "credential_expires_at": "2026-12-01T00:00:00Z",
+                "last_center_report_at": "2026-10-05T00:00:00Z",
+                "reported_at": "2026-10-05T00:00:00Z",
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(accepted["gateway_id"], "GX01");
+    assert!(
+        accepted["received_at"].is_string(),
+        "受理回执要给网关收讫时刻"
+    );
+
+    // 3. admin 读回：新鲜 → stale=false（失联判定走**网关时钟**的 received_at）。
+    let view: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/gateway/linkd-status").await).await;
+    assert_eq!(view["has_status"], true);
+    assert_eq!(view["state"], "Linked");
+    assert_eq!(view["gateway_id"], "GX01");
+    assert_eq!(view["center_endpoint"], "https://center.example");
+    assert_eq!(view["stale"], false, "刚心跳不算失联");
+    let age = view["age_seconds"].as_i64().expect("i64");
+    assert!((0..=5).contains(&age), "刚写进去，age 应在 [0,5]：{age}");
+
+    // 4. 非环回拒绝（与 link-request / self-state 同口径）。
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/linkd-status")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "gateway_id": "GX01" }).to_string(),
+        ))
+        .expect("request");
+    request
+        .extensions_mut()
+        .insert(MockConnectInfo(SocketAddr::from(([192, 0, 2, 1], 40_001))));
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // 5. admin 面要 bearer：没带 token → 401（状态不可匿名读）。
+    let unauthorized = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/gateway/linkd-status",
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    // 6. **错误**的 bearer 同样 401（不是只认「有没有带」）。
+    let wrong = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/gateway/linkd-status",
+        Some("adm_wrong_token"),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 网关**自身**状态读口（页面）：admin bearer → 200 且全键契约；无 token → 401；
+/// 环回自述面（`/api/v1/gateway/self-state`）非环回仍 403（不被 admin 读口放宽）。
+#[tokio::test]
+async fn admin_reads_gateway_self_state_but_loopback_face_stays_private() {
+    let env = TestEnv::new().await;
+
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/gateway/self-state?gateway_id=gw-1").await,
+    )
+    .await;
+    for key in [
+        "gateway_id",
+        "version",
+        "collected_at",
+        "store_healthy",
+        "agent_count",
+        "uplink_enabled",
+        "last_error",
+    ] {
+        assert!(view.get(key).is_some(), "缺 {key}: {view}");
+    }
+    assert_eq!(view["gateway_id"], "gw-1", "原样回显调用方给的 id");
+    assert_eq!(view["store_healthy"], true, "空库应可查（健康）");
+
+    // 无 token → 401。
+    let unauthorized = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/gateway/self-state",
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    // 环回面：不带环回连接信息的请求仍被拒（admin 读口不影响它的私密性）。
+    let response = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/gateway/self-state?gateway_id=gw-1")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
