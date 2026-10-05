@@ -69,4 +69,13 @@ mod tests {
             );
         }
     }
+
+    /// agent_api 的 v1 + `/enroll` 必须与 seam 标记（模型接口）声明的路由一致 ——
+    /// 防止“表里改了版本/路径，标记没跟上”的漂移。
+    #[test]
+    fn v1_enroll_route_matches_the_seam_marker() {
+        let (method, path) = crate::api::WistAgentdOnlineRegistrationInterface::route();
+        assert_eq!(method, "POST");
+        assert_eq!(path, format!("/api/{}/agent/enroll", VERSIONS[0].version));
+    }
 }
