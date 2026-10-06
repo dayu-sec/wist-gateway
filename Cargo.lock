@@ -2929,6 +2929,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wist-artifact"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea05a606b916e6b042975c8e4e4ad910ddbf0a05fe4c49afb50c5ce2b342f18b"
+dependencies = [
+ "reqwest",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "wist-contracts"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3001,14 +3011,13 @@ dependencies = [
 
 [[package]]
 name = "wist-release"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f216c202ddf7de0cc58293d62de094139e7b280a10c095fc6fbbf0b44592f65"
+checksum = "5f9ef3978bba8a8312d52c4aa56fd2915257cba09a15b836d6b32f7253ba49fd"
 dependencies = [
  "flate2",
- "reqwest",
- "ring",
  "tar",
+ "wist-artifact",
 ]
 
 [[package]]
