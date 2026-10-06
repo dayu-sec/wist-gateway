@@ -3,6 +3,19 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.26-alpha] - 2026-10-06
+
+### 新增
+
+- **gwlinkd 心跳轨迹**：新增 `GET /api/v1/admin/gateway/linkd-status/history?window_seconds=`（admin bearer）。
+  网关收到每拍心跳时顺手落一条**环形记录**（`0026_gateway_linkd_status_history`：同秒去重、写时裁旧、
+  保留 2h），页面据此画「最近一小时稳不稳」（状态条 + 心跳间隔）。窗口缺省 1h，夹到 `[60s, 2h]`。
+  轨迹写失败**不影响**心跳受理——当前态才是页面「在不在跑」的主判据。
+- **网关自身状态轨迹**：新增 `GET /api/v1/admin/gateway/self-state/history?window_seconds=`（admin bearer）。
+  网关**自身 tick** 每 30s 自采自述面（CPU / RSS / load / 在线 agent 数 / 磁盘），落
+  `0027_gateway_self_state_history`（保留 2h）；**量不出的列写 `null`**，不假装 0。
+  采样与请求路径**解耦**：不搭页面轮询、不搭 gwlinkd 回环读。
+
 ## [0.1.25-alpha] - 2026-10-06
 
 ### 变更

@@ -51,6 +51,10 @@ mod rollout_ops;
 // NOTE(hand-added): 网关自述面（环回；CR-003）。对应 jumo 模型 Control.GatewayApp.SelfInterface
 // 的 QuerySelfState（模型 bind 未定、环回鉴权未决），故路由手加。供 host 侧 wist-gwlinkd 消费。
 mod self_state;
+// NOTE(hand-added): 网关（容器）自述状态的**周期自采**（页面「网关（容器）」tab 的趋势）。
+// 与 `work_expiry` / `revocation_gc` 同一模式（自身 tick，不搭在任何请求路径上）。
+// 重新生成控制面代码时需回补本模块与 `main` 里那一行 spawn。
+mod self_state_history;
 // NOTE(hand-added): 网关侧「接入请求」通道（页面发起接入；CR-003）。对应 jumo 模型
 // Control.GatewayApp.LinkRequestInterface（环回），故路由手加。见 api/link_request.rs 与设计
 // `wist-design/doc/design/edge/gateway-onboard-request.md`。重新生成控制面代码时需回补本模块与下方路由。
@@ -106,6 +110,9 @@ pub use work_expiry::{
 // 不搭在任何请求路径上）。重新生成控制面代码时需回补本模块与 `main` 里那一行 spawn。
 pub mod revocation_gc;
 pub use revocation_gc::{REVOCATION_GC_TICK, spawn_revocation_gc_tick};
+
+// NOTE(hand-added): 网关（容器）自述状态的周期自采（趋势用）。同上，需回补本模块与 `main` 的 spawn。
+pub use self_state_history::{SELF_STATE_SAMPLE_TICK, spawn_self_state_sample_tick};
 
 #[derive(Debug, Clone)]
 pub struct ApiState {
@@ -412,11 +419,22 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/admin/gateway/linkd-status",
             get(linkd_status::admin_view_gateway_linkd_status),
         )
+        // NOTE(hand-added): gwlinkd 心跳轨迹（页面「最近 1 小时稳不稳」）。见 api/linkd_status.rs。
+        .route(
+            "/api/v1/admin/gateway/linkd-status/history",
+            get(linkd_status::admin_view_gateway_linkd_history),
+        )
         // NOTE(hand-added): 网关**自身**状态读侧（页面）—— 环回自述面只服务本机 gwlinkd，
         // 浏览器够不到；这是同一份计算的 admin 读口。见 api/self_state.rs。
         .route(
             "/api/v1/admin/gateway/self-state",
             get(self_state::admin_view_gateway_self_state),
+        )
+        // NOTE(hand-added): 网关自身状态的**轨迹**（页面「网关（容器）」tab 趋势）。
+        // 见 api/self_state_history.rs。
+        .route(
+            "/api/v1/admin/gateway/self-state/history",
+            get(self_state_history::admin_view_gateway_self_state_history),
         )
         // NOTE(hand-added): Agent 管理面列表与凭据吊销。已在 jumo 模型
         // WistGatewayManagementInterface（AdminListAgents / AdminRevokeAgentCredential）中声明，

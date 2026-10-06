@@ -1271,6 +1271,111 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn append_gateway_linkd_heartbeat(
+        &self,
+        at_seconds: i64,
+        state: &str,
+        keep_after: i64,
+    ) -> StoreResult<()> {
+        // 同一秒重复心跳落在同一行（主键冲突即忽略）——轨迹是「每拍一条」，不是流水账。
+        sqlx::query(
+            "INSERT INTO gateway_linkd_status_history (at_seconds, state) VALUES (?1, ?2) \
+             ON CONFLICT (at_seconds) DO NOTHING",
+        )
+        .bind(at_seconds)
+        .bind(state)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "append gateway linkd heartbeat"))?;
+        // 顺手裁掉窗口外的旧行（环形记录：保留量恒定，不会无限增长）。
+        sqlx::query("DELETE FROM gateway_linkd_status_history WHERE at_seconds < ?1")
+            .bind(keep_after)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "prune gateway linkd heartbeat"))?;
+        Ok(())
+    }
+
+    async fn list_gateway_linkd_heartbeats(
+        &self,
+        since_seconds: i64,
+    ) -> StoreResult<Vec<StoredGatewayLinkdHeartbeat>> {
+        let rows = sqlx::query(
+            "SELECT at_seconds, state FROM gateway_linkd_status_history \
+             WHERE at_seconds >= ?1 ORDER BY at_seconds ASC",
+        )
+        .bind(since_seconds)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list gateway linkd heartbeats"))?;
+        let mut heartbeats = Vec::with_capacity(rows.len());
+        for row in &rows {
+            heartbeats.push(StoredGatewayLinkdHeartbeat {
+                at_seconds: column!(row, "at_seconds"),
+                state: column!(row, "state"),
+            });
+        }
+        Ok(heartbeats)
+    }
+
+    async fn append_gateway_self_state_sample(
+        &self,
+        sample: &StoredGatewaySelfStateSample,
+        keep_after: i64,
+    ) -> StoreResult<()> {
+        // 同秒重复采样落在同一行（主键冲突即忽略）。
+        sqlx::query(
+            "INSERT INTO gateway_self_state_history \
+             (at_seconds, cpu_percent, memory_bytes, load_1m, online_agents, disk_usage_percent) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (at_seconds) DO NOTHING",
+        )
+        .bind(sample.at_seconds)
+        .bind(sample.cpu_percent)
+        .bind(sample.memory_bytes.map(|bytes| bytes as i64))
+        .bind(sample.load_1m)
+        .bind(sample.online_agents)
+        .bind(sample.disk_usage_percent)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "append gateway self state sample"))?;
+        // 顺手裁掉窗口外的旧行（环形记录：保留量恒定）。
+        sqlx::query("DELETE FROM gateway_self_state_history WHERE at_seconds < ?1")
+            .bind(keep_after)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "prune gateway self state sample"))?;
+        Ok(())
+    }
+
+    async fn list_gateway_self_state_samples(
+        &self,
+        since_seconds: i64,
+    ) -> StoreResult<Vec<StoredGatewaySelfStateSample>> {
+        let rows = sqlx::query(
+            "SELECT at_seconds, cpu_percent, memory_bytes, load_1m, online_agents, \
+             disk_usage_percent FROM gateway_self_state_history \
+             WHERE at_seconds >= ?1 ORDER BY at_seconds ASC",
+        )
+        .bind(since_seconds)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list gateway self state samples"))?;
+        let mut samples = Vec::with_capacity(rows.len());
+        for row in &rows {
+            // SQLite 只有 i64：字节数按 i64 解出来再转回 u64（写入时也是这么下去的）。
+            let memory_bytes: Option<i64> = column!(row, "memory_bytes");
+            samples.push(StoredGatewaySelfStateSample {
+                at_seconds: column!(row, "at_seconds"),
+                cpu_percent: column!(row, "cpu_percent"),
+                memory_bytes: memory_bytes.map(|bytes| bytes as u64),
+                load_1m: column!(row, "load_1m"),
+                online_agents: column!(row, "online_agents"),
+                disk_usage_percent: column!(row, "disk_usage_percent"),
+            });
+        }
+        Ok(samples)
+    }
+
     async fn upsert_agent_certificate_status(
         &self,
         status: &StoredAgentCertificateStatus,
@@ -4322,6 +4427,151 @@ mod tests {
         assert_eq!(loaded.received_at, "2026-10-05T00:01:00+00:00");
     }
 
+    /// 心跳轨迹：追加（同秒去重）、升序读取、写入时裁窗口外的旧行。
+    #[tokio::test]
+    async fn gateway_linkd_heartbeats_append_list_and_prune() {
+        let store = store().await;
+        let base = 1_700_000_000;
+        // 同秒重复心跳应落在同一行（主键去重），不翻倍。
+        store
+            .append_gateway_linkd_heartbeat(base, "Linked", base - 10_000)
+            .await
+            .unwrap();
+        store
+            .append_gateway_linkd_heartbeat(base, "Linked", base - 10_000)
+            .await
+            .unwrap();
+        store
+            .append_gateway_linkd_heartbeat(base + 30, "Degraded", base - 10_000)
+            .await
+            .unwrap();
+
+        let rows = store
+            .list_gateway_linkd_heartbeats(base - 10_000)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "同秒重复应落在同一行");
+        assert_eq!(rows[0].at_seconds, base);
+        assert_eq!(rows[0].state, "Linked");
+        assert_eq!(rows[1].at_seconds, base + 30);
+        assert_eq!(rows[1].state, "Degraded");
+
+        // 读取带下界：更早的行不会被返回。
+        let recent = store
+            .list_gateway_linkd_heartbeats(base + 10)
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].state, "Degraded");
+
+        // 写入时裁旧（环形记录）：晚于保留窗口的旧行被删掉。
+        let newer = base + 10_000; // 距前几拍远大于保留窗口（3600s）
+        store
+            .append_gateway_linkd_heartbeat(newer, "Linked", newer - 3600)
+            .await
+            .unwrap();
+        let rows = store.list_gateway_linkd_heartbeats(0).await.unwrap();
+        assert_eq!(rows.len(), 1, "只应剩窗口内的那一拍：{rows:?}");
+        assert_eq!(rows[0].at_seconds, newer);
+        assert_eq!(rows[0].state, "Linked");
+    }
+
+    /// 网关自述状态采样：追加（同秒去重）、升序读取、写入时裁窗；量不出的列存 NULL。
+    #[tokio::test]
+    async fn gateway_self_state_samples_append_list_and_prune() {
+        let store = store().await;
+        let base = 1_700_000_000;
+        let sample = |at: i64, cpu: Option<f64>, online: i64| StoredGatewaySelfStateSample {
+            at_seconds: at,
+            cpu_percent: cpu,
+            memory_bytes: Some(64 * 1024 * 1024),
+            load_1m: Some(0.5),
+            online_agents: online,
+            disk_usage_percent: None,
+        };
+        store
+            .append_gateway_self_state_sample(&sample(base, Some(1.5), 2), base - 10_000)
+            .await
+            .unwrap();
+        // 同秒重复：忽略后到的那条（先到的快照才算数）。
+        store
+            .append_gateway_self_state_sample(&sample(base, Some(9.9), 99), base - 10_000)
+            .await
+            .unwrap();
+        store
+            .append_gateway_self_state_sample(&sample(base + 30, None, 3), base - 10_000)
+            .await
+            .unwrap();
+
+        let rows = store
+            .list_gateway_self_state_samples(base - 10_000)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "同秒重复应落在同一行");
+        assert_eq!(rows[0].at_seconds, base);
+        assert_eq!(rows[0].cpu_percent, Some(1.5), "同秒后到的不应覆盖先到的");
+        assert_eq!(rows[0].memory_bytes, Some(64 * 1024 * 1024));
+        assert_eq!(
+            rows[0].disk_usage_percent, None,
+            "量不出的列存 NULL，不假装 0"
+        );
+        assert_eq!(rows[1].at_seconds, base + 30);
+        assert_eq!(rows[1].cpu_percent, None);
+        assert_eq!(rows[1].online_agents, 3);
+
+        // 写入时裁旧（环形记录）。
+        let newer = base + 10_000;
+        store
+            .append_gateway_self_state_sample(&sample(newer, Some(2.0), 1), newer - 3600)
+            .await
+            .unwrap();
+        let rows = store.list_gateway_self_state_samples(0).await.unwrap();
+        assert_eq!(rows.len(), 1, "只应剩窗口内的那一拍：{rows:?}");
+        assert_eq!(rows[0].at_seconds, newer);
+    }
+
+    #[tokio::test]
+    async fn migration_adds_gateway_self_state_history_table() {
+        // 迁移 0027 新建一张表（CREATE TABLE IF NOT EXISTS）；直接查 pragma 确认列真存在。
+        let store = store().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('gateway_self_state_history')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        for expected in [
+            "at_seconds",
+            "cpu_percent",
+            "memory_bytes",
+            "load_1m",
+            "online_agents",
+            "disk_usage_percent",
+        ] {
+            assert!(
+                columns.iter().any(|name| name == expected),
+                "missing column {expected}: {columns:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_adds_gateway_linkd_status_history_table() {
+        // 迁移 0026 新建一张表（CREATE TABLE IF NOT EXISTS）；直接查 pragma 确认列真存在。
+        let store = store().await;
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('gateway_linkd_status_history')",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        for expected in ["at_seconds", "state"] {
+            assert!(
+                columns.iter().any(|name| name == expected),
+                "missing column {expected}: {columns:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn migration_adds_agent_uplink_enabled_column_defaulting_to_off() {
         let store = store().await;
@@ -4960,7 +5210,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let renewal = wist_api::agent_status::AgentCredentialRenewal {
+        let renewal = wist_api::status::AgentCredentialRenewal {
             outcome: "renewed".to_string(),
             checked_at: "2026-10-01T00:00:00+00:00".to_string(),
             detail: "credential renewed".to_string(),

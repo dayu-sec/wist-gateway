@@ -10,7 +10,7 @@
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -22,6 +22,11 @@ use super::{ApiState, rate_limit};
 
 /// 失联阈值：心跳约 30s 一拍，超过 3 拍（90s）未见即判失联。
 const STALE_AFTER_SECONDS: i64 = 90;
+
+/// 心跳轨迹保留窗口（2 小时 ≈ 240 拍）：环形记录，写入时裁掉窗口外的旧行。
+const HISTORY_RETENTION_SECONDS: i64 = 2 * 3600;
+/// 页面默认看最近 1 小时（与中心侧「最近 1 小时趋势」口径一致）。
+const DEFAULT_HISTORY_WINDOW_SECONDS: i64 = 3600;
 
 /// gwlinkd 自报状态（心跳；无密钥）。字段 snake_case，与 gwlinkd 的 DTO 同钉一份形状。
 #[derive(Debug, Deserialize)]
@@ -71,6 +76,31 @@ pub struct GatewayLinkdStatusView {
 pub struct GatewayLinkdStatusAccepted {
     pub gateway_id: String,
     pub received_at: String,
+}
+
+/// 页面可见的 gwlinkd 心跳轨迹（最近窗口的环形记录）。
+#[derive(Debug, Serialize)]
+pub struct GatewayLinkdHistoryView {
+    /// 本次返回覆盖的窗口（秒）。
+    pub window_seconds: i64,
+    /// 窗口内的心跳，按时刻升序；断档 = 相邻两点之间 gwlinkd 没在跑。
+    pub samples: Vec<GatewayLinkdHeartbeatView>,
+}
+
+/// 一条心跳（页面画「状态条 / 心跳间隔」用）。
+#[derive(Debug, Serialize)]
+pub struct GatewayLinkdHeartbeatView {
+    /// 网关收到心跳的时刻（unix 秒）。
+    pub at: i64,
+    /// 那一刻 gwlinkd 自报的状态。
+    pub state: String,
+}
+
+/// 轨迹查询参数。
+#[derive(Debug, Deserialize)]
+pub struct LinkdHistoryQuery {
+    #[serde(default)]
+    pub window_seconds: Option<i64>,
 }
 
 fn now_rfc3339() -> String {
@@ -138,6 +168,7 @@ pub async fn report_gateway_linkd_status(
         return (StatusCode::FORBIDDEN, "linkd-status is loopback-only").into_response();
     }
     let received_at = now_rfc3339();
+    let received_at_seconds = chrono::Utc::now().timestamp();
     let status = StoredGatewayLinkdStatus {
         setting_id: DEFAULT_GATEWAY_LINKD_STATUS_SETTING_ID.to_string(),
         gateway_id: input.gateway_id.trim().to_string(),
@@ -166,6 +197,19 @@ pub async fn report_gateway_linkd_status(
         )
             .into_response();
     }
+    // 顺手落一条心跳轨迹（供页面看「最近一小时稳不稳」）。
+    // 轨迹写失败**不影响**心跳本身受理 —— 当前态（上面那行）才是页面「在不在跑」的主判据。
+    if let Err(err) = state
+        .store
+        .append_gateway_linkd_heartbeat(
+            received_at_seconds,
+            &status.state,
+            received_at_seconds - HISTORY_RETENTION_SECONDS,
+        )
+        .await
+    {
+        eprintln!("warn append gateway linkd heartbeat failed: {err}");
+    }
     Json(GatewayLinkdStatusAccepted {
         gateway_id: status.gateway_id,
         received_at,
@@ -189,6 +233,50 @@ pub async fn admin_view_gateway_linkd_status(
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to read linkd status: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 读取 gwlinkd 心跳轨迹（页面用）：
+/// `GET /api/v1/admin/gateway/linkd-status/history?window_seconds=`（admin bearer）。
+///
+/// 窗口缺省 1h，并夹到 `[60s, 保留窗口]` —— 防止页面要一个数据库里根本没有的更大窗口
+/// （那只会白扫一遍）。
+pub async fn admin_view_gateway_linkd_history(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Query(params): Query<LinkdHistoryQuery>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = super::admin_auth::require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let window_seconds = params
+        .window_seconds
+        .unwrap_or(DEFAULT_HISTORY_WINDOW_SECONDS)
+        .clamp(60, HISTORY_RETENTION_SECONDS);
+    let since_seconds = chrono::Utc::now().timestamp() - window_seconds;
+    match state
+        .store
+        .list_gateway_linkd_heartbeats(since_seconds)
+        .await
+    {
+        Ok(heartbeats) => Json(GatewayLinkdHistoryView {
+            window_seconds,
+            samples: heartbeats
+                .into_iter()
+                .map(|heartbeat| GatewayLinkdHeartbeatView {
+                    at: heartbeat.at_seconds,
+                    state: heartbeat.state,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read linkd history: {err}"),
         )
             .into_response(),
     }

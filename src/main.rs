@@ -88,6 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 为什么不在启动扫一次就完：网关可能连续跑数周不重启，那只会在重启时扫。
     wist_gateway::api::spawn_revocation_gc_tick(state.store.clone());
 
+    // 网关（容器）自述状态的周期自采：供「网关状态」页的「网关（容器）」tab 画趋势。
+    // 为什么不用 center 推的 `gateway_*`：那是 center 的 VM，网关这台 VM 里没有它。
+    wist_gateway::api::spawn_self_state_sample_tick(state.clone());
+
     if let Some(ingest_addr) = ingest_addr {
         // 数据面（warp-parse）订阅端的**内部**接入端点：明文 HTTP，默认只绑环回。
         // 为什么不能复用下面的 HTTPS 监听：数据面的 sink 连接器没有 TLS 参数（见 api/ingest.rs）。

@@ -279,6 +279,36 @@ pub struct StoredGatewayLinkdStatus {
     pub received_at: String,
 }
 
+/// gwlinkd 心跳轨迹的**一行**（最近窗口内，供页面画「掉线没有、心跳断没断」）。
+///
+/// 与 [`StoredGatewayLinkdStatus`] 的分工：那条是**当前态**（最近一拍），本行是**历史**（每拍一行）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StoredGatewayLinkdHeartbeat {
+    /// 网关收到该心跳的时刻（unix 秒，**网关时钟**，与失联判定同源）。
+    pub at_seconds: i64,
+    /// 那一刻 gwlinkd 自报的状态（空串 = 未报）。
+    pub state: String,
+}
+
+/// 网关（容器）自述状态轨迹的一行（周期自采；供页面「网关（容器）」tab 画趋势）。
+///
+/// 各量都是**那一刻的快照**；量不出的列是 `None`（趋势里显断线，不假装 0）。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct StoredGatewaySelfStateSample {
+    /// 采样时刻（unix 秒，**网关时钟**）。
+    pub at_seconds: i64,
+    /// 网关进程 CPU 占比（单核口径）。
+    pub cpu_percent: Option<f64>,
+    /// 网关进程常驻内存（字节，RSS）。
+    pub memory_bytes: Option<u64>,
+    /// 主机 1 分钟负载。
+    pub load_1m: Option<f64>,
+    /// 已登记 Agent 中在线的台数。
+    pub online_agents: i64,
+    /// 主盘使用率（0..100）。
+    pub disk_usage_percent: Option<f64>,
+}
+
 /// agent 上报的**客户端证书状态**（最近一次）。
 ///
 /// 为什么要存：证书与到期时间只有本机知道（服务端在握手期就验完了，而过期证书进不来），
@@ -1073,6 +1103,35 @@ pub trait Store: Send + Sync + fmt::Debug {
         &self,
         status: &StoredGatewayLinkdStatus,
     ) -> StoreResult<()>;
+
+    /// 追加一条 gwlinkd 心跳轨迹，并裁掉 `keep_after`（unix 秒）之前的旧行。
+    ///
+    /// `at_seconds` 同秒重复 → 落在同一行（主键去重），不翻倍。
+    async fn append_gateway_linkd_heartbeat(
+        &self,
+        at_seconds: i64,
+        state: &str,
+        keep_after: i64,
+    ) -> StoreResult<()>;
+
+    /// 读取 `since_seconds`（unix 秒）之后的 gwlinkd 心跳轨迹（按时刻升序）。
+    async fn list_gateway_linkd_heartbeats(
+        &self,
+        since_seconds: i64,
+    ) -> StoreResult<Vec<StoredGatewayLinkdHeartbeat>>;
+
+    /// 追加一条网关（容器）自述状态采样，并裁掉 `keep_after`（unix 秒）之前的旧行。
+    async fn append_gateway_self_state_sample(
+        &self,
+        sample: &StoredGatewaySelfStateSample,
+        keep_after: i64,
+    ) -> StoreResult<()>;
+
+    /// 读取 `since_seconds`（unix 秒）之后的网关自述状态采样（按时刻升序）。
+    async fn list_gateway_self_state_samples(
+        &self,
+        since_seconds: i64,
+    ) -> StoreResult<Vec<StoredGatewaySelfStateSample>>;
 
     /// 落 agent 上报的客户端证书状态（最近一次为准）。
     async fn upsert_agent_certificate_status(

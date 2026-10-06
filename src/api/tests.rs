@@ -10343,6 +10343,27 @@ async fn gateway_linkd_status_heartbeat_round_trips() {
     let age = view["age_seconds"].as_i64().expect("i64");
     assert!((0..=5).contains(&age), "刚写进去，age 应在 [0,5]：{age}");
 
+    // 3b. 心跳轨迹（页面「最近 1 小时稳不稳」）：刚那一拍应出现在窗口内。
+    let history: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/gateway/linkd-status/history").await)
+            .await;
+    assert_eq!(history["window_seconds"], 3600, "缺省窗口 = 1h：{history}");
+    let samples = history["samples"].as_array().expect("samples");
+    assert_eq!(samples.len(), 1, "刚报了一拍，轨迹应有一条：{history}");
+    assert_eq!(samples[0]["state"], "Linked");
+    assert!(samples[0]["at"].is_i64(), "时刻是 unix 秒：{history}");
+
+    // 3c. 窗口可调且被夹到 [60, 保留窗口]。
+    let tiny: serde_json::Value = decode_json_response(
+        get_admin(
+            &env,
+            "/api/v1/admin/gateway/linkd-status/history?window_seconds=1",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(tiny["window_seconds"], 60, "过小的窗口应夹到 60s：{tiny}");
+
     // 4. 非环回拒绝（与 link-request / self-state 同口径）。
     let mut request = Request::builder()
         .method("POST")
@@ -10377,6 +10398,16 @@ async fn gateway_linkd_status_heartbeat_round_trips() {
     )
     .await;
     assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    // 7. 轨迹口同样要 bearer（没带 → 401）。
+    let unauthorized_history = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/gateway/linkd-status/history",
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized_history.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// 网关**自身**状态读口（页面）：admin bearer → 200 且全键契约；无 token → 401；
@@ -10425,4 +10456,61 @@ async fn admin_reads_gateway_self_state_but_loopback_face_stays_private() {
         .await
         .expect("route response");
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// 网关自述状态**轨迹**读口：采样落表后能读回（值原样，量不出的是 `null`）；窗口被夹；无 token → 401。
+#[tokio::test]
+async fn admin_reads_gateway_self_state_history() {
+    let env = TestEnv::new().await;
+    let now = chrono::Utc::now().timestamp();
+    env.store_handle
+        .append_gateway_self_state_sample(
+            &crate::infra::StoredGatewaySelfStateSample {
+                at_seconds: now,
+                cpu_percent: Some(1.5),
+                memory_bytes: Some(64 * 1024 * 1024),
+                load_1m: Some(0.42),
+                online_agents: 3,
+                disk_usage_percent: None,
+            },
+            // 写入时裁旧：保留窗口（2h），刚采的这条不会把自己裁掉。
+            now - 7200,
+        )
+        .await
+        .expect("append sample");
+
+    let view: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/gateway/self-state/history").await)
+            .await;
+    assert_eq!(view["window_seconds"], 3600, "缺省窗口 = 1h：{view}");
+    let samples = view["samples"].as_array().expect("samples");
+    assert_eq!(samples.len(), 1, "刚采的一拍应读回：{view}");
+    assert_eq!(samples[0]["cpu_percent"], 1.5);
+    assert_eq!(samples[0]["online_agents"], 3);
+    assert!(
+        samples[0]["disk_usage_percent"].is_null(),
+        "量不出应是 null（不是缺键、也不是 0）：{view}"
+    );
+    assert!(samples[0]["at"].is_i64(), "时刻是 unix 秒：{view}");
+
+    // 窗口可调且被夹到 [60s, 2h]。
+    let tiny: serde_json::Value = decode_json_response(
+        get_admin(
+            &env,
+            "/api/v1/admin/gateway/self-state/history?window_seconds=1",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(tiny["window_seconds"], 60, "过小的窗口应夹到 60s：{tiny}");
+
+    // admin 面要 bearer（状态轨迹不可匿名读）。
+    let unauthorized = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/gateway/self-state/history",
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 }

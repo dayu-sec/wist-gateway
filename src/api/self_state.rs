@@ -114,7 +114,7 @@ pub async fn admin_view_gateway_self_state(
     Json(self_state(&state, gateway_id).await).into_response()
 }
 
-async fn self_state(state: &ApiState, gateway_id: &str) -> GatewaySelfState {
+pub(super) async fn self_state(state: &ApiState, gateway_id: &str) -> GatewaySelfState {
     let mut last_error: Option<String> = None;
 
     // 存储健康 = 「能不能查」；同时一次性拿到机队，供 agent_count / 在线 / 滞后。
