@@ -3,6 +3,16 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.28-alpha] - 2026-10-06
+
+### 变更
+
+- **灰度发布计划的推进口径收进共享 crate `wist-release` 0.3**（`rollout` 模块）：阶段推进闸门的
+  校验、`phase_settled` / `phase_should_advance`、批次节流（`phase_start_targets` /
+  `next_refill_targets`）、条目状态折叠、以及**确定性 work id** 统一由共享 crate 提供 ——
+  与中心算阶段的是同一份口径。本仓 `app/rollout.rs` 只剩「接到网关存储类型上」的适配，
+  外加网关独有的物化（target → `OneShotWork`）。**行为不变**。
+
 ## [0.1.27-alpha] - 2026-10-06
 
 ### 变更
