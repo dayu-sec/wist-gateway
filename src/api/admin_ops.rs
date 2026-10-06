@@ -1924,7 +1924,10 @@ pub async fn set_agent_install_package(
         Err(err) => {
             let status = match &err {
                 PackageFetchError::DigestMismatch(_) => StatusCode::BAD_REQUEST,
-                PackageFetchError::SourceUnavailable(_) => StatusCode::BAD_GATEWAY,
+                // 超限归「来源侧的问题」这一档（与「拿不到」同一回执，不改既有状态码）。
+                PackageFetchError::SourceUnavailable(_) | PackageFetchError::TooLarge(_) => {
+                    StatusCode::BAD_GATEWAY
+                }
             };
             return (status, err.to_string()).into_response();
         }
