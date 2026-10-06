@@ -344,7 +344,7 @@ fn imported_path(path: &Path) -> std::path::PathBuf {
 }
 
 fn serialize_work_state_changes(
-    changes: Option<Vec<wist_api::agent_status::AgentWorkStateChange>>,
+    changes: Option<Vec<wist_api::status::AgentWorkStateChange>>,
 ) -> StoreResult<Option<String>> {
     match changes {
         Some(changes) => serde_json::to_string(&changes)
@@ -410,7 +410,7 @@ fn deserialize_ip_addresses(raw: Option<String>) -> Vec<String> {
 
 /// 最近一次续签判定落一个 TEXT 列（只留最近一份），与 `serialize_uplink_state` 同形。
 fn serialize_renewal_report(
-    value: Option<wist_api::agent_status::AgentCredentialRenewal>,
+    value: Option<wist_api::status::AgentCredentialRenewal>,
 ) -> StoreResult<Option<String>> {
     match value {
         Some(value) => serde_json::to_string(&value)
@@ -423,7 +423,7 @@ fn serialize_renewal_report(
 /// 与 `deserialize_local_work` 同一条取舍：读到坏 JSON 就当「没报过」（`None`）。
 fn deserialize_renewal_report(
     raw: Option<String>,
-) -> Option<wist_api::agent_status::AgentCredentialRenewal> {
+) -> Option<wist_api::status::AgentCredentialRenewal> {
     match raw.as_deref() {
         Some(value) if !value.is_empty() => serde_json::from_str(value).ok(),
         _ => None,
@@ -432,7 +432,7 @@ fn deserialize_renewal_report(
 
 fn deserialize_work_state_changes(
     raw: Option<String>,
-) -> Option<Vec<wist_api::agent_status::AgentWorkStateChange>> {
+) -> Option<Vec<wist_api::status::AgentWorkStateChange>> {
     match raw.as_deref() {
         Some(value) if !value.is_empty() => serde_json::from_str(value).ok(),
         _ => None,

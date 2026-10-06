@@ -28,7 +28,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use wist_api::gateway::ReportAgentFactSummary;
+use wist_api::facts::ReportAgentFactSummary;
 use wist_control::types::DateTime;
 
 use super::ApiState;

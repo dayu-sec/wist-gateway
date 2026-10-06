@@ -12,16 +12,19 @@ use crate::infra::{
     new_secret_token, outstanding_one_shot,
     victoria_metrics::{import_lines, metric_line},
 };
-use wist_api::agent_status::{AgentStatusAck, AgentStatusReport};
-use wist_api::agent_uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND, PollAgentUplink};
+use wist_api::action_result::{ActionResultAck, ReportActionResult};
+use wist_api::discovery_policies::{
+    DiscoveryPoliciesReturned, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
+};
 use wist_api::enrollment::{
     CredentialBundle, CredentialRenewal, CredentialRenewed, RENEW_AGENT_CREDENTIAL_KIND,
 };
-use wist_api::gateway::{
-    ActionResultAck, DiscoveryPoliciesReturned, FactSummaryAccepted, FactSummaryAckStatus,
-    POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies, REPORT_AGENT_FACT_SUMMARY_KIND,
-    ReportActionResult, ReportAgentFactSummary,
+use wist_api::facts::{
+    FactSummaryAccepted, FactSummaryAckStatus, REPORT_AGENT_FACT_SUMMARY_KIND,
+    ReportAgentFactSummary,
 };
+use wist_api::status::{AgentStatusAck, AgentStatusReport};
+use wist_api::uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND, PollAgentUplink};
 use wist_api::work::{
     ACK_WORK_KIND, AckWork, POLL_WORK_KIND, PollWork, REPORT_WORK_RESULT_KIND, ReportWorkResult,
     WorkAccepted, WorkGrant, WorkResultAccepted,

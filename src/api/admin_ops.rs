@@ -303,7 +303,7 @@ pub async fn get_agent_runtime_status(
         }
     };
     let certificate_status = match state.store.get_agent_certificate_status(&agent_id).await {
-        Ok(status) => status.map(|status| wist_api::agent_status::AgentCertificateStatus {
+        Ok(status) => status.map(|status| wist_api::status::AgentCertificateStatus {
             not_after: status.not_after,
             remaining_seconds: status.remaining_seconds,
             state: status.state,
@@ -2420,7 +2420,7 @@ fn runtime_status(
     cpu_cores: Option<u32>,
     admin_latency_ms: Option<u64>,
     uplink_state: Option<wist_contracts::agent_uplink::AgentUplinkState>,
-    certificate_status: Option<wist_api::agent_status::AgentCertificateStatus>,
+    certificate_status: Option<wist_api::status::AgentCertificateStatus>,
     revoked: bool,
 ) -> AgentRuntimeStatusView {
     AgentRuntimeStatusView {
@@ -2495,7 +2495,7 @@ pub struct AgentRuntimeStatusView {
     ///
     /// 为什么要有它：证书快到期 / 已过期需重装这件事，只有本机能判（服务端在握手期就验完了，
     /// 而过期证书根本进不来）。见 `docs/design/agent-identity-mtls.md` §5.5。
-    pub certificate_status: Option<wist_api::agent_status::AgentCertificateStatus>,
+    pub certificate_status: Option<wist_api::status::AgentCertificateStatus>,
     /// 这台 agent 是否在**拒绝名单**内（被吊销，§5.6）。true 时它的任何凭据路径都会被 401
     /// `certificate_revoked`，页面应据此把「被吊销」与「离线」区分开 —— 离线会自己回来，
     /// 被吊销不会。原因 / GC 水位见拒绝名单列表接口。

@@ -3,6 +3,14 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.25-alpha] - 2026-10-06
+
+### 变更
+
+- 依赖 `wist-api` `0.5` → **`0.6`**：该版把杂物袋模块 `gateway` 拆成
+  `action_plan` / `action_result` / `facts` / `discovery_policies`，并把 `agent_status` / `agent_uplink`
+  改名为 `status` / `uplink`（**线上 JSON 不变**）。本仓只改 `use` / 类型路径，**无行为变化**。
+
 ## [0.1.24-alpha] - 2026-10-06
 
 ### 变更

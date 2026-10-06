@@ -14,11 +14,11 @@ use ring::{
     signature::{self, Ed25519KeyPair, KeyPair},
 };
 use tower::ServiceExt;
-use wist_api::agent_status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
 use wist_api::enrollment::{
     AgentIdentityStatus, CredentialRenewal, CredentialRenewed, EnrollmentEnvelope,
     EnrollmentRequest, EnrollmentStatus,
 };
+use wist_api::status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
 
 use crate::app::knowledge::{KnowledgeSource, LoadedKnowledge};
 use crate::infra::{
@@ -29,11 +29,12 @@ use crate::infra::{
     StoredKnowledgePackage, VerifiedAgentIdentity, bytes_sha256_hex,
     load_install_script_public_key_pem, sha256_hex,
 };
-use wist_api::agent_uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND};
-use wist_api::gateway::{
+use wist_api::action_result::{ReportActionResult, ResultAttestation};
+use wist_api::discovery_policies::{
     DiscoveryPoliciesReturned, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
-    ReportActionResult, ReportAgentFactSummary, ResultAttestation,
 };
+use wist_api::facts::ReportAgentFactSummary;
+use wist_api::uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND};
 use wist_api::work::{ACK_WORK_KIND, POLL_WORK_KIND, REPORT_WORK_RESULT_KIND};
 use wist_contracts::action_result::{ActionResult, FinalStatus};
 use wist_contracts::fact_summary::FactContent;
