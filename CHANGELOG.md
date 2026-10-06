@@ -3,6 +3,20 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.27-alpha] - 2026-10-06
+
+### 变更
+
+- **自述面带上网关对外域名**：`GatewaySelfState` 加 `public_base_url`（管理面「对外地址」优先，
+  未设回落 `[server] public_base_url`）—— 网关自己才知道这个值，host 侧 `wist-gwlinkd` 读自述面后
+  随注册 / 状态上报转带给中心。**线上 JSON 加键（向后兼容）**，无行为变化。
+- **安装包内核收进共享 crate `wist-release` 0.2**：包来源读取 / 摘要校验 / 身份解析（含架构名表）/ 
+  内容寻址 id 由共享 crate 提供，中心与网关共用一份；本仓 `api/install_package.rs` 只剩薄转发。
+  **身份解析口径不变**：agent 包仍是「只认包内目录名、且必须切出已知 target-triple」的严格口径。
+- 顺带把三处同类副本收编到同一 crate：`infra::secret::bytes_sha256_hex`（转发 `sha256_hex_bytes`）、
+  知识库包的 `kbp-` id（转发 `content_id`，与安装包 `pkg-` 同一份逻辑）、知识库 `read_source`
+  （**读字节机制**转发，**策略与错误分类**留本仓：16 MiB / 60s / 「来源是目录」提示）。
+
 ## [0.1.26-alpha] - 2026-10-06
 
 ### 新增

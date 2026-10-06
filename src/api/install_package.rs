@@ -14,33 +14,23 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use crate::infra::{AdminConfig, Store, bytes_sha256_hex};
 
-/// 拉取超时：制品可能几十 MB，给足时间，但不能无限等。
-const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
-/// 制品大小上限：防止误填地址把任意大文件灌进网关磁盘。
-const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
+// 安装包内核（来源读取 / 摘要校验 / 身份解析 / 命名）已收进共享 crate `wist-release`，
+// 中心与网关共用一份，不再各写一遍。
+use wist_release::package::read_verified_source;
 
-/// 拉取来源制品时的失败原因；调用方据此区分「管理面填错了摘要」与「来源拿不到」。
-#[derive(Debug)]
-pub enum PackageFetchError {
-    /// 管理面填写的期望摘要与拉取到的内容不符。
-    DigestMismatch(String),
-    /// 来源不可达 / 读取失败 / 超过大小上限。
-    SourceUnavailable(String),
-}
-
-impl std::fmt::Display for PackageFetchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DigestMismatch(message) | Self::SourceUnavailable(message) => {
-                f.write_str(message)
-            }
-        }
-    }
-}
+/// 取包失败：沿用本模块原名（共享 crate 的类型）。
+/// 调用方据此区分「管理面填错了摘要」与「来源拿不到」。
+pub use wist_release::package::PackageError as PackageFetchError;
+/// 内容寻址 id：`pkg-<sha256 前 16 位>`（裸 hex）——转出自共享 crate。
+pub use wist_release::package::package_id_for_sha256;
+/// 二进制包身份：只认包内顶层目录名、且必须切出已知 target-triple（读不出整体留空）。
+/// 与中心托管包的宽松口径（`read_package_identity`，可回落来源文件名）刻意分开 ——
+/// agent 安装包读不出架构时宁可不报，也不把版本错切出来。
+pub use wist_release::package::read_binary_package_identity as read_package_identity;
 
 /// 网关实际分发的安装包来源。
 ///
@@ -150,35 +140,6 @@ pub async fn fetch_into_package_cache(
     })
 }
 
-/// 内容寻址 id：`pkg-<sha256 前 16 位>`（裸 hex）。
-///
-/// 取前 16 位（64 bit）足够区分设备内录入的包，同时保持文件名短、可读。
-pub fn package_id_for_sha256(sha256_hex: &str) -> String {
-    let prefix: String = sha256_hex.chars().take(16).collect();
-    format!("pkg-{prefix}")
-}
-
-/// 读来源 → 校验期望摘要，返回（字节, 裸 hex sha256）。
-async fn read_verified_source(
-    source: &str,
-    expected_sha256: Option<&str>,
-) -> Result<(Vec<u8>, String), PackageFetchError> {
-    let bytes = read_source(source).await?;
-    let actual = bytes_sha256_hex(&bytes);
-    if let Some(expected) = expected_sha256 {
-        let expected_hex = expected
-            .strip_prefix("sha256:")
-            .unwrap_or(expected)
-            .to_ascii_lowercase();
-        if actual != expected_hex {
-            return Err(PackageFetchError::DigestMismatch(format!(
-                "agent package sha256 mismatch: expected {expected_hex} got {actual}"
-            )));
-        }
-    }
-    Ok((bytes, actual))
-}
-
 fn write_cache_to(path: &Path, bytes: &[u8]) -> Result<(), PackageFetchError> {
     let dir = path.parent().ok_or_else(|| {
         PackageFetchError::SourceUnavailable(format!(
@@ -207,53 +168,6 @@ fn write_cache_to(path: &Path, bytes: &[u8]) -> Result<(), PackageFetchError> {
         ))
     })?;
     Ok(())
-}
-
-async fn read_source(source: &str) -> Result<Vec<u8>, PackageFetchError> {
-    // 本机绝对路径：直接读文件（与「https 链接或主机绝对路径」的地址口径对应）。
-    if source.starts_with('/') {
-        return std::fs::read(source).map_err(|err| {
-            PackageFetchError::SourceUnavailable(format!(
-                "failed to read package from {source}: {err}"
-            ))
-        });
-    }
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .build()
-        .map_err(|err| {
-            PackageFetchError::SourceUnavailable(format!("failed to build http client: {err}"))
-        })?;
-    let response = client.get(source).send().await.map_err(|err| {
-        PackageFetchError::SourceUnavailable(format!(
-            "failed to fetch package from {source}: {err}"
-        ))
-    })?;
-    if !response.status().is_success() {
-        return Err(PackageFetchError::SourceUnavailable(format!(
-            "package source {source} returned HTTP {}",
-            response.status()
-        )));
-    }
-    if let Some(len) = response.content_length()
-        && len > MAX_PACKAGE_BYTES
-    {
-        return Err(PackageFetchError::SourceUnavailable(format!(
-            "package at {source} is {len} bytes, over the {MAX_PACKAGE_BYTES} byte limit"
-        )));
-    }
-    let bytes = response.bytes().await.map_err(|err| {
-        PackageFetchError::SourceUnavailable(format!(
-            "failed to read package body from {source}: {err}"
-        ))
-    })?;
-    if bytes.len() as u64 > MAX_PACKAGE_BYTES {
-        return Err(PackageFetchError::SourceUnavailable(format!(
-            "package at {source} is {} bytes, over the {MAX_PACKAGE_BYTES} byte limit",
-            bytes.len()
-        )));
-    }
-    Ok(bytes.to_vec())
 }
 
 /// 文件 sha256（裸 hex）。
@@ -294,70 +208,9 @@ struct PackageHashCacheEntry {
 
 static PACKAGE_HASH_CACHE: Mutex<Option<PackageHashCacheEntry>> = Mutex::new(None);
 
-/// 目标三元组的已知架构前缀（用于把 `wist-agentd-<version>-<triple>` 切两段）。
-const KNOWN_TRIPLE_ARCHES: &[&str] = &[
-    "aarch64",
-    "x86_64",
-    "i686",
-    "i586",
-    "armv7",
-    "armv6",
-    "arm",
-    "riscv64",
-    "powerpc64",
-    "powerpc64le",
-    "s390x",
-    "x86_64h",
-    "loongarch64",
-];
-
-/// 从安装包字节里读出版本与目标三元组，读不出返回 `("", "")`。
-///
-/// 包是 `wist-agentd-<version>-<target-triple>.tar.gz`，顶层一层同名目录，形如
-/// `wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd`。本函数解压 gzip 后取
-/// **第一个 tar 条目**的路径首段，再按前缀 `wist-agentd-` 切出 `<version>` 与 `<triple>`。
-///
-/// 不是标准包（裸二进制、非 gzip、损坏字节）一律返回空串而**不报错**：这些包仍能被
-/// 网关按内容寻址分发，只是历史行里 version/arch 留空；让录入整体失败反而会阻断升级。
-pub fn read_package_identity(bytes: &[u8]) -> (String, String) {
-    let Some(dir) = first_tar_entry_component(bytes) else {
-        return (String::new(), String::new());
-    };
-    parse_agent_package_dir_name(&dir)
-}
-
-/// gzip + tar 解出第一个条目路径的首段（如 `wist-agentd-0.1.9-aarch64-apple-darwin`）。
-/// 任何一步失败都返回 `None`，绝不 panic。
-fn first_tar_entry_component(bytes: &[u8]) -> Option<String> {
-    let decoder = flate2::read::GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(decoder);
-    let mut entries = archive.entries().ok()?;
-    let entry = entries.next()?.ok()?;
-    let path = entry.path().ok()?;
-    // 跳过 `./` / `/` 之类非普通段，取第一个普通目录名。
-    path.components().find_map(|component| match component {
-        std::path::Component::Normal(name) => name.to_str().map(str::to_string),
-        _ => None,
-    })
-}
-
-/// 从顶层目录名 `wist-agentd-<version>-<triple>` 切出 `(version, triple)`。
-///
-/// 版本自身可能带 `-`（预发布，如 `0.2.0-beta.1`），因此不能简单按第一个 `-` 切：
-/// 以「剩余部分以已知架构名开头」的那个 `-` 作为分隔点。切不出时返回 `("", "")`。
-fn parse_agent_package_dir_name(dir: &str) -> (String, String) {
-    let Some(rest) = dir.strip_prefix("wist-agentd-") else {
-        return (String::new(), String::new());
-    };
-    for (index, _) in rest.match_indices('-') {
-        let candidate = &rest[index + 1..];
-        let arch_head = candidate.split('-').next().unwrap_or("");
-        if KNOWN_TRIPLE_ARCHES.contains(&arch_head) {
-            return (rest[..index].to_string(), candidate.to_string());
-        }
-    }
-    (String::new(), String::new())
-}
+// 包身份解析（顶层目录名 → version/arch，且要求已知 target-triple）已收进共享 crate
+// `wist-release`（`read_binary_package_identity`，本模块在上面转出为 `read_package_identity`），
+// 未知三元组表的唯一来源也在那里。
 
 #[cfg(test)]
 mod tests {

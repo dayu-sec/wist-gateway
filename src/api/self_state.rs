@@ -40,6 +40,9 @@ pub struct SelfStateQuery {
 pub struct GatewaySelfState {
     pub gateway_id: String,
     pub version: String,
+    /// 网关**对外基址**（对外域名）：管理面「对外地址」优先，未设回落 `[server] public_base_url`。
+    /// 供 host 侧 gwlinkd 上报中心（中心据此知道该网关对外域名）。
+    pub public_base_url: String,
     pub collected_at: DateTime,
     pub store_healthy: bool,
     pub agent_count: i64,
@@ -153,6 +156,11 @@ pub(super) async fn self_state(state: &ApiState, gateway_id: &str) -> GatewaySel
     let process = process_metrics();
     let host = host_metrics();
 
+    // 网关**对外基址**（对外域名）：本机才知道它（管理面「对外地址」优先，未设回落 `[server] public_base_url`），
+    // 由 host 侧 gwlinkd 读自述面后随注册 / 状态上报转带给中心。
+    let public_base_url =
+        super::install::effective_advertise_base(&state.config, &state.store).await;
+
     // 数据面累计计数（进程内一份）；存储大小取 SQLite 文件大小。
     let store_bytes = store_file_bytes(&state.config);
     let (ingest_accepted_total, ingest_rejected_total, last_ingest_at) = {
@@ -170,6 +178,7 @@ pub(super) async fn self_state(state: &ApiState, gateway_id: &str) -> GatewaySel
     GatewaySelfState {
         gateway_id: gateway_id.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        public_base_url,
         collected_at: now,
         store_healthy,
         agent_count,
@@ -310,6 +319,7 @@ mod tests {
         let state = GatewaySelfState {
             gateway_id: "gw-1".into(),
             version: "0.1.15".into(),
+            public_base_url: "https://gw.example.com".into(),
             collected_at: DateTime::now(),
             store_healthy: true,
             agent_count: 3,
@@ -363,6 +373,7 @@ mod tests {
                 "memory_total_bytes",
                 "offline_agents",
                 "online_agents",
+                "public_base_url",
                 "store_bytes",
                 "store_healthy",
                 "uplink_enabled",

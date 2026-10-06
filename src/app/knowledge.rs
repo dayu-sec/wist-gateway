@@ -300,15 +300,14 @@ pub const PACKAGE_NAME: &str = "wist-knowledge";
 
 /// 内容寻址 id：`kbp-<sha256 前 16 位>`（裸 hex）。
 ///
-/// 与安装包的 `pkg-<…>` 同口径：前 16 位（64 bit）足够区分一台网关里录入过的包，
-/// 同时保持目录名短、可读。
+/// 与安装包的 `pkg-<…>` **同一份取 id 逻辑**（共享 crate 的 `content_id(prefix, sha)`），
+/// 仅前缀不同：`kbp` 是知识库包，`pkg` 是安装包。
 ///
 /// 摘要算的是**来源制品（tarball）的字节**，不是解开后的目录 —— 这样它与发布侧
 /// `wist-knowledge-<版本>.tar.gz.sha256` 是同一个数，运维拿它核对不会两边对不上；
-/// 代价是同一份内容重打包会得到不同的 id（压缩不可复现），但那本就不是"同一个制品"。
+/// 代价是同一份内容重打包会得到不同的 id（压缩不可复现），但那本就不是“同一个制品”。
 pub fn package_id_for_sha256(sha256_hex: &str) -> String {
-    let prefix: String = sha256_hex.chars().take(16).collect();
-    format!("kbp-{prefix}")
+    wist_release::package::content_id("kbp", sha256_hex)
 }
 
 /// 录入失败的原因。分类是为了让管理面能给出**可操作**的错误码（设计 §7）。
@@ -723,64 +722,28 @@ async fn read_signature(source: &str) -> Result<Vec<u8>, KnowledgeRecordError> {
 
 /// 读来源字节：`https://` 走 HTTP，`/absolute/path` 读本机文件（容器内路径）。
 async fn read_source(source: &str) -> Result<Vec<u8>, KnowledgeRecordError> {
-    if source.starts_with('/') {
-        let path = Path::new(source);
-        let metadata = std::fs::metadata(path).map_err(|err| {
-            KnowledgeRecordError::SourceUnavailable(format!("读不到来源 {source}：{err}"))
-        })?;
-        if metadata.is_dir() {
-            return Err(KnowledgeRecordError::SourceInvalid(format!(
-                "来源是目录：知识库包必须是 **tar.gz 制品**（{source}）"
-            )));
-        }
-        if metadata.len() > MAX_PACKAGE_BYTES {
-            return Err(KnowledgeRecordError::SourceUnavailable(format!(
-                "来源 {} 有 {} 字节，超过上限 {MAX_PACKAGE_BYTES}",
-                source,
-                metadata.len()
-            )));
-        }
-        return std::fs::read(path).map_err(|err| {
-            KnowledgeRecordError::SourceUnavailable(format!("读不到来源 {source}：{err}"))
-        });
-    }
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .build()
-        .map_err(|err| {
-            KnowledgeRecordError::SourceUnavailable(format!("构建 http 客户端失败：{err}"))
-        })?;
-    let response = client.get(source).send().await.map_err(|err| {
-        KnowledgeRecordError::SourceUnavailable(format!("拉取 {source} 失败：{err}"))
-    })?;
-    if !response.status().is_success() {
-        return Err(KnowledgeRecordError::SourceUnavailable(format!(
-            "来源 {source} 返回 HTTP {}",
-            response.status()
+    // 知识库特有：来源填成了目录时说清楚「要的是 tar.gz 制品」，比泛泛的「读不到」可操作。
+    if source.starts_with('/') && std::fs::metadata(source).is_ok_and(|meta| meta.is_dir()) {
+        return Err(KnowledgeRecordError::SourceInvalid(format!(
+            "来源是目录：知识库包必须是 **tar.gz 制品**（{source}）"
         )));
     }
-    if let Some(len) = response.content_length()
-        && len > MAX_PACKAGE_BYTES
-    {
-        return Err(KnowledgeRecordError::SourceUnavailable(format!(
-            "来源 {source} 有 {len} 字节，超过上限 {MAX_PACKAGE_BYTES}"
-        )));
-    }
-    let bytes = response.bytes().await.map_err(|err| {
-        KnowledgeRecordError::SourceUnavailable(format!("读 {source} 正文失败：{err}"))
-    })?;
-    if bytes.len() as u64 > MAX_PACKAGE_BYTES {
-        return Err(KnowledgeRecordError::SourceUnavailable(format!(
-            "来源 {source} 有 {} 字节，超过上限 {MAX_PACKAGE_BYTES}",
-            bytes.len()
-        )));
-    }
-    Ok(bytes.to_vec())
+    // 读字节这套**机制**（甄别路径 / URL、读完前拦超限、超时、错误分类）在共享 crate，与安装包
+    // 同一份；本函数只保留知识库的**策略与分类**（见下面的常量）。
+    wist_release::package::read_source_within(source, MAX_PACKAGE_BYTES, FETCH_TIMEOUT)
+        .await
+        .map_err(|err| match err {
+            wist_release::package::PackageError::SourceUnavailable(message) => {
+                KnowledgeRecordError::SourceUnavailable(message)
+            }
+            // 只读来源不会出摘要不符；真出现也归到「拿不到」。
+            other => KnowledgeRecordError::SourceUnavailable(other.to_string()),
+        })
 }
 
-/// 拉取超时：内容包不大（几 KB～几 MB），但不能无限等。
+/// 拉取超时：内容包不大（几 KB～几 MB），但不能无限等 —— 比安装包的 120s 紧。
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-/// 包大小上限：防止误填地址把任意大文件灌进网关磁盘。
+/// 包大小上限：防止误填地址把任意大文件灌进网关磁盘 —— 比安装包的 512 MiB 紧。
 const MAX_PACKAGE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[cfg(test)]
@@ -1233,5 +1196,50 @@ mod tests {
                 "配了公钥且验签通过，就该记下签发者指纹"
             );
         }
+    }
+
+    #[test]
+    fn package_id_is_the_shared_content_id_with_the_kbp_prefix() {
+        // `kbp-` 与安装包的 `pkg-` 是**同一份**取 id 逻辑（共享 crate 的 `content_id`），只是前缀不同。
+        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(package_id_for_sha256(sha), "kbp-0123456789abcdef");
+        assert_eq!(
+            package_id_for_sha256(sha),
+            wist_release::package::content_id("kbp", sha)
+        );
+        assert_eq!(
+            wist_release::package::package_id_for_sha256(sha),
+            wist_release::package::content_id("pkg", sha)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_source_rejects_a_directory_with_a_knowledge_specific_hint() {
+        // 来源填成目录：给一条能操作的提示（要的是 tar.gz 制品），而不是泛泛的「读不到」。
+        let dir = std::env::temp_dir().join("wist-knowledge-src-dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let err = read_source(&dir.to_string_lossy())
+            .await
+            .expect_err("directory must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("来源是目录"), "{message}");
+        assert!(message.contains("tar.gz"), "{message}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn read_source_reads_a_local_file_and_maps_missing_paths() {
+        let file = std::env::temp_dir().join("wist-knowledge-src.bin");
+        std::fs::write(&file, b"payload").expect("write");
+        assert_eq!(
+            read_source(&file.to_string_lossy()).await.expect("read"),
+            b"payload"
+        );
+        // 路径不存在 → 归到「来源拿不到」（错误分类不因收进共享 crate 而变化）。
+        assert!(matches!(
+            read_source("/definitely/not/here.tar.gz").await,
+            Err(KnowledgeRecordError::SourceUnavailable(_))
+        ));
+        let _ = std::fs::remove_file(file);
     }
 }
