@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.1.28" #@gxl:set(version)
+version = "0.1.29" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -42,7 +42,7 @@ x509-parser = "0.16"
 # 证书有效期用 rcgen 的 `OffsetDateTime`（rcgen 不重导出 time）。
 time = { version = "0.3", features = ["std"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 # 安装包内核（来源读取 / 摘要校验 / 身份解析 / 命名）——与中心共用一份。
 wist-release = { version = "0.3" }
 # 解 gzip/tar：知识库制品入库时解开校验（`app/knowledge.rs::unpack_into`）。

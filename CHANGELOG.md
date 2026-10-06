@@ -3,6 +3,17 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.29-alpha] - 2026-10-06
+
+### 变更
+
+- **`reqwest` 0.12 → 0.13**（`features = ["json", "query", "rustls"]`）：本仓是最后一个 0.12 的落单者，
+  而共享 crate `wist-release` 已升到 0.13 —— 不跟就是构建里带**两份 reqwest**。现在四仓（center /
+  gateway / gwlinkd / agentd）与 crate 全在 0.13.5。**行为不变**。
+  - 顺带修了一个潜在断链：`webpki-roots` 不是 reqwest 0.13 的 feature（它只是可选依赖的隐式
+    feature，且 reqwest 源码并不引用），0.13.5 已把它去掉 —— 0.13 里 TLS 根由 `rustls`
+    （系统根）决定。
+
 ## [0.1.28-alpha] - 2026-10-06
 
 ### 变更
