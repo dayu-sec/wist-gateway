@@ -182,7 +182,10 @@ fn append(state: &ApiState, records: &[AgentLogRecord]) -> std::io::Result<()> {
     if records.is_empty() {
         return Ok(());
     }
-    let file = AgentLogFile::new(state.config.agent_log_file());
+    let file = AgentLogFile::with_retention(
+        state.config.agent_log_file(),
+        state.config.agent_log_retention(),
+    );
     // 锁中毒（持锁线程 panic）不该让日志从此写不进去：取回内部值继续用。
     let _guard = APPEND_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     file.append(records)
@@ -230,7 +233,10 @@ pub async fn view_agent_logs(
         .limit
         .unwrap_or(DEFAULT_LOG_QUERY_LIMIT)
         .clamp(1, MAX_LOG_QUERY_LIMIT);
-    let file = AgentLogFile::new(state.config.agent_log_file());
+    let file = AgentLogFile::with_retention(
+        state.config.agent_log_file(),
+        state.config.agent_log_retention(),
+    );
     match file.tail(query.agent_id.as_deref(), query.family.as_deref(), limit) {
         Ok(tail) => Json(AgentLogsResponse {
             logs: tail.records,

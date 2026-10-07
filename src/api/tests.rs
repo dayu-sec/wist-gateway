@@ -6506,6 +6506,9 @@ impl TestEnv {
             knowledge_source_dir: None,
             knowledge_signing_public_key_file: None,
             knowledge_signing_public_key: None,
+            log_max_bytes: crate::infra::LogRetention::default().max_bytes,
+            log_keep_files: crate::infra::LogRetention::default().keep_files,
+            log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
         };
         // A temp-file DB (not `:memory:`) because the router may use several
         // pooled connections; `SqliteStore` is `Clone` and shares the same pool.
@@ -8138,7 +8141,21 @@ async fn work_routes_need_the_admin_token_and_the_right_agent() {
 // 灰度发布计划（Control.Rollout）：创建 → 批准（物化第一阶段）→ 推进 → 完成 + 结果回填
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn create_rollout_plan(env: &TestEnv, phases: serde_json::Value) -> serde_json::Value {
+/// 建计划：只给**目标 + 阶段数**，阶段由服务端按阶梯切（客户端不再自己切）。
+async fn create_rollout_plan(
+    env: &TestEnv,
+    target_ids: &[&str],
+    phase_count: i64,
+) -> serde_json::Value {
+    create_rollout_plan_with_batch(env, target_ids, phase_count, 0).await
+}
+
+async fn create_rollout_plan_with_batch(
+    env: &TestEnv,
+    target_ids: &[&str],
+    phase_count: i64,
+    batch_size: i64,
+) -> serde_json::Value {
     let response = post_json_to_router(
         &env.config,
         &env.store_handle,
@@ -8147,9 +8164,11 @@ async fn create_rollout_plan(env: &TestEnv, phases: serde_json::Value) -> serde_
         &serde_json::json!({
             "action": "upgrade",
             "spec": "{\"target_version\":\"0.1.4\",\"package_url\":\"/tmp/pkg\",\"package_sha256\":\"sha256:abc\"}",
-            "phases": phases,
+            "target_ids": target_ids,
+            "phase_count": phase_count,
             "deadline_at": "2026-10-01T00:00:00Z",
             "timeout_seconds": 600,
+            "batch_size": batch_size,
         }),
     )
     .await;
@@ -8200,7 +8219,7 @@ async fn rollout_plan_routes_require_admin_bearer() {
     let env = TestEnv::new().await;
     let body = serde_json::json!({
         "action": "upgrade", "spec": "x",
-        "phases": [{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }],
+        "target_ids": ["agent-node-a"], "phase_count": 1,
         "deadline_at": "2026-10-01T00:00:00Z", "timeout_seconds": 600,
     });
     assert_eq!(
@@ -8229,38 +8248,49 @@ async fn rollout_plan_routes_require_admin_bearer() {
 }
 
 #[tokio::test]
-async fn creating_a_plan_validates_phases_and_returns_draft() {
+async fn creating_a_plan_validates_targets_and_returns_draft() {
     let env = TestEnv::new().await;
     enroll_fleet(&env).await;
-    let plan = create_rollout_plan(
-        &env,
-        serde_json::json!([
-            { "target_ids": ["agent-node-a"], "advance_rule": "manual" },
-            { "target_ids": ["agent-node-b"], "advance_rule": "all_succeeded" },
-        ]),
-    )
-    .await;
+    // 2 个目标 / 2 阶段 → 阶梯切出 [1, 1]；闸门：首段 manual、其余 all_succeeded。
+    let plan = create_rollout_plan(&env, &["agent-node-a", "agent-node-b"], 2).await;
     assert_eq!(plan["status"], "draft");
     assert_eq!(plan["current_phase"], 0);
     assert_eq!(plan["action"], "upgrade");
     assert_eq!(plan["phases"].as_array().expect("phases").len(), 2);
     assert_eq!(plan["phases"][0]["phase_index"], 1);
     assert_eq!(plan["phases"][0]["status"], "pending");
+    assert_eq!(
+        plan["phases"][0]["advance_rule"], "manual",
+        "首段（金丝雀）人工确认"
+    );
     assert_eq!(plan["phases"][1]["phase_index"], 2);
+    assert_eq!(plan["phases"][1]["advance_rule"], "all_succeeded");
 
-    // 阶段数/闸门/重复 target 都要响，不能当自由文本收下。
-    for (bad, reason) in [
-        (serde_json::json!([]), "at least one phase"),
+    // 目标为空 / 阶段数 < 1 / 阶段数大于目标数 都要响，不能当自由文本收下。
+    for (body, reason) in [
         (
-            serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "auto" }]),
-            "advance_rule",
+            serde_json::json!({
+                "action": "upgrade", "spec": "x", "target_ids": [],
+                "phase_count": 1,
+                "deadline_at": "2026-10-01T00:00:00Z", "timeout_seconds": 600,
+            }),
+            "target_ids",
         ),
         (
-            serde_json::json!([
-                { "target_ids": ["agent-node-a"], "advance_rule": "manual" },
-                { "target_ids": ["agent-node-a"], "advance_rule": "manual" },
-            ]),
-            "more than one phase",
+            serde_json::json!({
+                "action": "upgrade", "spec": "x", "target_ids": ["agent-node-a"],
+                "phase_count": 0,
+                "deadline_at": "2026-10-01T00:00:00Z", "timeout_seconds": 600,
+            }),
+            "phase_count",
+        ),
+        (
+            serde_json::json!({
+                "action": "upgrade", "spec": "x", "target_ids": ["agent-node-a"],
+                "phase_count": 3,
+                "deadline_at": "2026-10-01T00:00:00Z", "timeout_seconds": 600,
+            }),
+            "分不出",
         ),
     ] {
         let response = post_json_to_router(
@@ -8268,10 +8298,7 @@ async fn creating_a_plan_validates_phases_and_returns_draft() {
             &env.store_handle,
             "/api/v1/admin/rollout-plans",
             Some(TEST_ADMIN_API_TOKEN),
-            &serde_json::json!({
-                "action": "upgrade", "spec": "x", "phases": bad,
-                "deadline_at": "2026-10-01T00:00:00Z", "timeout_seconds": 600,
-            }),
+            &body,
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{reason}");
@@ -8291,10 +8318,8 @@ async fn creating_a_plan_rejects_unknown_targets() {
         &serde_json::json!({
             "action": "upgrade",
             "spec": "x",
-            "phases": [{
-                "target_ids": ["agent-node-a", "agent-ghost"],
-                "advance_rule": "manual"
-            }],
+            "target_ids": ["agent-node-a", "agent-ghost"],
+            "phase_count": 1,
             "deadline_at": "2026-10-01T00:00:00Z",
             "timeout_seconds": 600,
         }),
@@ -8308,14 +8333,10 @@ async fn creating_a_plan_rejects_unknown_targets() {
 }
 
 #[tokio::test]
-async fn approving_a_plan_materializes_the_first_phase_and_advancing_completes_it() {
+async fn approving_materializes_the_first_phase_and_the_plan_auto_finishes() {
     let env = TestEnv::new().await;
     let credential = a_classified_macos_agent(&env).await;
-    let plan = create_rollout_plan(
-        &env,
-        serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }]),
-    )
-    .await;
+    let plan = create_rollout_plan(&env, &["agent-node-a"], 1).await;
     let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
 
     // 批准 → 进入第一阶段：物化出的 upgrade 工作应能被 agent 拉到。
@@ -8330,26 +8351,36 @@ async fn approving_a_plan_materializes_the_first_phase_and_advancing_completes_i
     assert_eq!(one_shot[0]["action"], "upgrade");
     assert_eq!(one_shot[0]["agent_id"], "agent-node-a");
 
-    // 推进（单阶段 = 最后阶段）→ 计划收敛为 completed。
-    let completed = advance_plan(&env, &plan_id).await;
-    assert_eq!(completed["status"], "completed");
-    assert_eq!(completed["phases"][0]["status"], "completed");
+    // 闸门：本段还没了结 → 人工推进被拒（推进要求当前阶段全部了结）。
+    let blocked = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/advance",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "plan_id": plan_id }),
+    )
+    .await;
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+
+    // 了结本段（单阶段 = 末阶段）→ 不看闸门、自动收敛为 completed。
+    let work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["status"], "completed");
+    assert_eq!(detail["plan"]["phases"][0]["status"], "completed");
 }
 
 #[tokio::test]
 async fn advancing_materializes_the_next_phase() {
     let env = TestEnv::new().await;
-    enroll_fleet(&env).await;
-    let plan = create_rollout_plan(
-        &env,
-        serde_json::json!([
-            { "target_ids": ["agent-node-a"], "advance_rule": "manual" },
-            { "target_ids": ["agent-node-b"], "advance_rule": "manual" },
-        ]),
-    )
-    .await;
+    let credential = enroll_fleet(&env).await;
+    let plan = create_rollout_plan(&env, &["agent-node-a", "agent-node-b"], 2).await;
     let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
     approve_plan(&env, &plan_id).await;
+
+    // 了结第一阶段（推进闸门要求本段全部了结）。
+    let work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
 
     let advanced = advance_plan(&env, &plan_id).await;
     assert_eq!(advanced["status"], "rolling");
@@ -8373,11 +8404,7 @@ async fn advancing_materializes_the_next_phase() {
 async fn a_work_result_fills_the_rollout_entry() {
     let env = TestEnv::new().await;
     let credential = a_classified_macos_agent(&env).await;
-    let plan = create_rollout_plan(
-        &env,
-        serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }]),
-    )
-    .await;
+    let plan = create_rollout_plan(&env, &["agent-node-a"], 1).await;
     let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
     approve_plan(&env, &plan_id).await;
 
@@ -8411,11 +8438,7 @@ async fn a_work_result_fills_the_rollout_entry() {
 async fn a_failed_work_result_fills_the_entry_with_the_detail() {
     let env = TestEnv::new().await;
     let credential = a_classified_macos_agent(&env).await;
-    let plan = create_rollout_plan(
-        &env,
-        serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }]),
-    )
-    .await;
+    let plan = create_rollout_plan(&env, &["agent-node-a"], 1).await;
     let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
     approve_plan(&env, &plan_id).await;
     let detail = view_plan(&env, &plan_id).await;
@@ -8428,6 +8451,9 @@ async fn a_failed_work_result_fills_the_entry_with_the_detail() {
     let detail = view_plan(&env, &plan_id).await;
     assert_eq!(detail["entries"][0]["status"], "failed");
     assert_eq!(detail["entries"][0]["detail"], "摘要不符");
+    // 末阶段含失败：计划收尾落 `failed`（**不抹成 completed**）。
+    assert_eq!(detail["plan"]["status"], "failed", "{detail}");
+    assert_eq!(detail["plan"]["phases"][0]["status"], "completed");
 }
 
 #[tokio::test]
@@ -8436,11 +8462,7 @@ async fn a_settled_last_phase_finishes_the_plan_without_a_manual_advance() {
     let credential = a_classified_macos_agent(&env).await;
     // 单阶段 + manual：末阶段不需要人工闸门 —— 全部了结就应收敛为 completed，
     // 而不是让计划永远停在 rolling 等人去点那个什么都不启动的「推进」。
-    let plan = create_rollout_plan(
-        &env,
-        serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }]),
-    )
-    .await;
+    let plan = create_rollout_plan(&env, &["agent-node-a"], 1).await;
     let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
     approve_plan(&env, &plan_id).await;
 
@@ -8477,11 +8499,7 @@ async fn a_settled_last_phase_is_reconciled_when_the_plan_is_read() {
     // 模拟「结果回填时网关没接上」留下的 rolling：条目已终态，但计划没收敛。
     let env = TestEnv::new().await;
     let _credential = a_classified_macos_agent(&env).await;
-    let plan = create_rollout_plan(
-        &env,
-        serde_json::json!([{ "target_ids": ["agent-node-a"], "advance_rule": "manual" }]),
-    )
-    .await;
+    let plan = create_rollout_plan(&env, &["agent-node-a"], 1).await;
     let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
     approve_plan(&env, &plan_id).await;
 
@@ -8549,44 +8567,53 @@ async fn enroll_fleet(env: &TestEnv) -> String {
 
 #[tokio::test]
 async fn a_phase_with_all_succeeded_advances_automatically() {
+    // 固定闸门策略：首段（金丝雀）恒 manual，其后恒 all_succeeded。
+    // 所以「自动推进」要过掉金丝雀才看得到（先人工 advance 进第 2 段）。
     let env = TestEnv::new().await;
-    let credential = enroll_fleet(&env).await;
-    let plan = create_rollout_plan(
-        &env,
-        serde_json::json!([
-            { "target_ids": ["agent-node-a"], "advance_rule": "all_succeeded" },
-            { "target_ids": ["agent-node-b"], "advance_rule": "manual" },
-        ]),
-    )
-    .await;
+    let credential_a = enroll_agent_at_node(&env, "node-a").await;
+    let credential_b = enroll_agent_at_node(&env, "node-b").await;
+    enroll_agent_at_node(&env, "node-c").await;
+    let plan =
+        create_rollout_plan(&env, &["agent-node-a", "agent-node-b", "agent-node-c"], 3).await;
     let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
     approve_plan(&env, &plan_id).await;
 
+    // 第 1 段（manual）：a 成功也不自动推进，要人工确认。
     let detail = view_plan(&env, &plan_id).await;
     let work_id = entry_work_id(&detail, "agent-node-a");
-    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+    submit_work_result(&env, Some(&credential_a), &work_id, "succeeded", "").await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["current_phase"], 1, "金丝雀段要人工确认");
 
-    // 阶段 1 全部成功 → 自动推进到阶段 2。
+    // 人工进第 2 段（all_succeeded）。
+    advance_plan(&env, &plan_id).await;
+    let detail = view_plan(&env, &plan_id).await;
+    let work_id = entry_work_id(&detail, "agent-node-b");
+    submit_work_result_as(
+        &env,
+        Some(&credential_b),
+        "agent-node-b",
+        "node-b",
+        &work_id,
+        "succeeded",
+        "",
+    )
+    .await;
+
+    // 第 2 段全部成功 → 自动推进到第 3 段。
     let detail = view_plan(&env, &plan_id).await;
     assert_eq!(detail["plan"]["status"], "rolling");
-    assert_eq!(detail["plan"]["current_phase"], 2);
-    assert_eq!(detail["plan"]["phases"][0]["status"], "completed");
-    assert_eq!(detail["plan"]["phases"][1]["status"], "rolling");
-    assert_eq!(entry_status(&detail, "agent-node-b"), "dispatched");
+    assert_eq!(detail["plan"]["current_phase"], 3);
+    assert_eq!(detail["plan"]["phases"][1]["status"], "completed");
+    assert_eq!(detail["plan"]["phases"][2]["status"], "rolling");
+    assert_eq!(entry_status(&detail, "agent-node-c"), "dispatched");
 }
 
 #[tokio::test]
 async fn a_manual_phase_never_auto_advances() {
     let env = TestEnv::new().await;
     let credential = enroll_fleet(&env).await;
-    let plan = create_rollout_plan(
-        &env,
-        serde_json::json!([
-            { "target_ids": ["agent-node-a"], "advance_rule": "manual" },
-            { "target_ids": ["agent-node-b"], "advance_rule": "manual" },
-        ]),
-    )
-    .await;
+    let plan = create_rollout_plan(&env, &["agent-node-a", "agent-node-b"], 2).await;
     let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
     approve_plan(&env, &plan_id).await;
 
@@ -8608,26 +8635,14 @@ async fn a_manual_phase_never_auto_advances() {
 async fn batch_size_throttles_materialization_and_refills_on_terminal_results() {
     let env = TestEnv::new().await;
     let credential = enroll_fleet(&env).await;
-    let response = post_json_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/admin/rollout-plans",
-        Some(TEST_ADMIN_API_TOKEN),
-        &serde_json::json!({
-            "action": "upgrade",
-            "spec": "{\"target_version\":\"0.1.4\"}",
-            "phases": [{
-                "target_ids": ["agent-node-a", "agent-node-b", "agent-node-c"],
-                "advance_rule": "manual"
-            }],
-            "deadline_at": "2026-10-01T00:00:00Z",
-            "timeout_seconds": 600,
-            "batch_size": 2,
-        }),
+    // 单阶段 + batch_size=2：阶段由服务端切（3 目标 / 1 阶段 = 一段装 3 台）。
+    let plan = create_rollout_plan_with_batch(
+        &env,
+        &["agent-node-a", "agent-node-b", "agent-node-c"],
+        1,
+        2,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let plan: serde_json::Value = decode_json_response(response).await;
     let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
     approve_plan(&env, &plan_id).await;
 

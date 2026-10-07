@@ -92,6 +92,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 为什么不用 center 推的 `gateway_*`：那是 center 的 VM，网关这台 VM 里没有它。
     wist_gateway::api::spawn_self_state_sample_tick(state.clone());
 
+    // 采集日志历史分卷的周期清理：轮转只在**写入**时发生，网关空闲（没有新日志）时也要清。
+    wist_gateway::api::spawn_agent_log_prune_tick(
+        state.config.agent_log_file(),
+        state.config.agent_log_retention(),
+    );
+
     if let Some(ingest_addr) = ingest_addr {
         // 数据面（warp-parse）订阅端的**内部**接入端点：明文 HTTP，默认只绑环回。
         // 为什么不能复用下面的 HTTPS 监听：数据面的 sink 连接器没有 TLS 参数（见 api/ingest.rs）。

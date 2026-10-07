@@ -3,6 +3,18 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha] - 2026-10-07
+
+### 新增
+
+- **代理日志采集与裁剪**：网关接收 Agent 上报日志并落盘（`state/logs/agent-logs.ndjson`），按大小轮转、
+  按份数/时长裁剪（`[logs] max_bytes / keep_files / max_age_seconds`），管理面可看最近日志。
+
+### 变更
+
+- **灰度推进闸门收紧**：`advance` 要求当前阶段**已全部了结**（含失败）才放行；末阶段有失败落 `failed`、
+  否则 `completed`（不再把失败抹成「完成」）。口径在共享 crate `wist-release::rollout`。
+
 ## [0.1.29-alpha] - 2026-10-06
 
 ### 变更

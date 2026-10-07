@@ -114,6 +114,11 @@ pub use revocation_gc::{REVOCATION_GC_TICK, spawn_revocation_gc_tick};
 // NOTE(hand-added): 网关（容器）自述状态的周期自采（趋势用）。同上，需回补本模块与 `main` 的 spawn。
 pub use self_state_history::{SELF_STATE_SAMPLE_TICK, spawn_self_state_sample_tick};
 
+// NOTE(hand-added): 采集日志历史分卷的周期清理（空闲时也要清）。同上，需回补本模块与 `main`
+// 的 spawn。
+pub mod log_prune;
+pub use log_prune::{AGENT_LOG_PRUNE_TICK, spawn_agent_log_prune_tick};
+
 #[derive(Debug, Clone)]
 pub struct ApiState {
     pub config: AdminConfig,

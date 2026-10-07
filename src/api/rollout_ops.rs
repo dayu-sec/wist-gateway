@@ -25,17 +25,13 @@ use crate::infra::{
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct RolloutPhaseRequest {
-    #[serde(default)]
-    pub target_ids: Vec<String>,
-    pub advance_rule: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct CreateRolloutPlanRequest {
     pub action: String,
     pub spec: String,
-    pub phases: Vec<RolloutPhaseRequest>,
+    /// 计划要铺到的目标（网关是 agent_id）；阶段由**服务端**按阶梯切分。
+    pub target_ids: Vec<String>,
+    /// 灰度阶段数（1 个金丝雀 → 10% → 30% → 70% → 全量）。
+    pub phase_count: i64,
     pub deadline_at: String,
     pub timeout_seconds: i64,
     #[serde(default)]
@@ -131,7 +127,10 @@ fn rollout_plan_id(now: &str) -> String {
     format!("plan-{}", &sha256_hex(now)[..12])
 }
 
-/// 把请求折算成落库的计划与全量 target 清单（按阶段顺序去重）。
+/// 把请求折算成落库的计划与全量 target 清单。
+///
+/// **阶段由服务端按阶梯切分**（共享口径 `wist_release::rollout::plan_phases`）：客户端只给
+/// 目标与阶段数，不再自己切 —— 中心与网关同一套，也免得客户端的 target 清单不可信。
 #[allow(clippy::result_large_err)]
 fn build_plan(
     input: &CreateRolloutPlanRequest,
@@ -159,44 +158,53 @@ fn build_plan(
         )
             .into_response());
     }
-    if input.phases.is_empty() {
+    // 目标：去掉空白与重复（保序）。
+    let mut target_ids: Vec<String> = Vec::with_capacity(input.target_ids.len());
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        for target in &input.target_ids {
+            let target = target.trim();
+            if target.is_empty() || !seen.insert(target.to_string()) {
+                continue;
+            }
+            target_ids.push(target.to_string());
+        }
+    }
+    if target_ids.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "phases must name at least one phase",
+            "target_ids must name at least one target",
         )
             .into_response());
     }
-    let mut phases = Vec::with_capacity(input.phases.len());
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut all_targets = Vec::new();
-    for (index, phase) in input.phases.iter().enumerate() {
-        if phase.target_ids.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("phase {} must name at least one target", index + 1),
-            )
-                .into_response());
-        }
-        if let Err(err) = rules::validate_advance_rule(&phase.advance_rule) {
-            return Err((StatusCode::BAD_REQUEST, err).into_response());
-        }
-        for target in &phase.target_ids {
-            if !seen.insert(target.clone()) {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!("target {target} appears in more than one phase"),
-                )
-                    .into_response());
-            }
-            all_targets.push(target.clone());
-        }
-        phases.push(StoredRolloutPhase {
-            phase_index: (index + 1) as i64,
-            target_ids: phase.target_ids.clone(),
-            advance_rule: phase.advance_rule.trim().to_string(),
-            status: "pending".to_string(),
-        });
+    if input.phase_count < 1 {
+        return Err((StatusCode::BAD_REQUEST, "phase_count must be at least 1").into_response());
     }
+    let planned = match wist_release::rollout::plan_phases(&target_ids, input.phase_count as usize)
+    {
+        Ok(phases) => phases,
+        Err(err) => return Err((StatusCode::BAD_REQUEST, err).into_response()),
+    };
+    let phases: Vec<StoredRolloutPhase> = planned
+        .into_iter()
+        .map(|phase| StoredRolloutPhase {
+            phase_index: phase.index as i64,
+            target_ids: phase.target_ids,
+            // 固定闸门策略：金丝雀（首段）人工确认；其后「本段全部成功」自动推进
+            // （末阶段没有下一段，不看闸门）。
+            advance_rule: if phase.index == 1 {
+                rules::ADVANCE_RULE_MANUAL
+            } else {
+                rules::ADVANCE_RULE_ALL_SUCCEEDED
+            }
+            .to_string(),
+            status: "pending".to_string(),
+        })
+        .collect();
+    let all_targets: Vec<String> = phases
+        .iter()
+        .flat_map(|phase| phase.target_ids.iter().cloned())
+        .collect();
     let now = chrono::Utc::now().to_rfc3339();
     let plan = StoredRolloutPlan {
         plan_id: rollout_plan_id(&now),
@@ -296,14 +304,31 @@ async fn refill_phase(
     materialize_targets(state, plan, &targets, now).await
 }
 
-/// 把一份 `rolling` 计划推进一个阶段（标记当前阶段 completed，物化下一阶段，或收敛为 completed）。
+/// 把一份 `rolling` 计划推进一个阶段（标记当前阶段 completed，物化下一阶段，或**收尾**）。
+///
+/// 收尾（末阶段）时看本段结果：**有失败就落 `failed`**，否则 `completed` —— 不把失败抹成
+/// 「完成」（曾因此让界面把一次失败报成成功）。
 #[allow(clippy::result_large_err)]
 async fn advance_plan(state: &ApiState, plan: &mut StoredRolloutPlan) -> Result<(), Response> {
     let idx = plan.current_phase as usize;
     let now = chrono::Utc::now().to_rfc3339();
     plan.phases[idx - 1].status = "completed".to_string();
     if idx == plan.phases.len() {
-        plan.status = "completed".to_string();
+        let entries = match state.store.list_rollout_plan_entries(&plan.plan_id).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to list rollout plan entries: {err}"),
+                )
+                    .into_response());
+            }
+        };
+        let target_ids = &plan.phases[idx - 1].target_ids;
+        let had_failure = entries
+            .iter()
+            .any(|entry| target_ids.contains(&entry.target_id) && entry.status == "failed");
+        plan.status = if had_failure { "failed" } else { "completed" }.to_string();
     } else {
         let next_phase = plan.phases[idx].clone();
         materialize_phase_start(state, plan, &next_phase, &now).await?;
@@ -620,6 +645,33 @@ pub async fn advance_rollout_plan(
         )
             .into_response();
     }
+    // 人工闸门：当前阶段须**已全部了结**（含失败）—— 「金丝雀确认无问题再推下一批」。
+    // 与中心侧 `advance_gate_blocker` 同一口径（两边都收紧）。
+    let entries = match state.store.list_rollout_plan_entries(&plan_id).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to list rollout plan entries: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let phase = &plan.phases[idx - 1];
+    let phase_entries: Vec<StoredRolloutPlanEntry> = entries
+        .into_iter()
+        .filter(|entry| phase.target_ids.contains(&entry.target_id))
+        .collect();
+    if !rules::phase_settled(&phase_entries) {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "rollout plan {plan_id} phase {} is not settled yet",
+                phase.phase_index
+            ),
+        )
+            .into_response();
+    }
     // 推进：当前阶段划 completed，物化下一阶段（受 batch_size 节流）或收敛为 completed。
     if let Err(response) = advance_plan(&state, &mut plan).await {
         return response;
@@ -694,7 +746,8 @@ pub(crate) async fn reconcile_rollout_result(
     };
     let plan_id = entry.plan_id.clone();
     let mut updated = entry;
-    updated.status = rules::entry_status_for(status).to_string();
+    let entry_status = rules::entry_status_for(status);
+    updated.status = entry_status.to_string();
     updated.detail = detail.to_string();
     updated.updated_at = chrono::Utc::now().to_rfc3339();
     store
@@ -702,8 +755,8 @@ pub(crate) async fn reconcile_rollout_result(
         .await
         .map_err(|err| err.to_string())?;
 
-    // running 只是进度，不释放一个在飞槽位，也不谈推进。
-    if !matches!(status, "succeeded" | "failed") {
+    // 「在飞」只是进度，不释放一个在飞槽位，也不谈推进。
+    if !matches!(entry_status, "succeeded" | "failed") {
         return Ok(());
     }
     progress_phase_after_terminal_result(state, &plan_id).await

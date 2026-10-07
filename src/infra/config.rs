@@ -19,6 +19,12 @@ const ENV_DATABASE_URL: &str = "WIST_GATEWAY_DATABASE_URL";
 // entropy check in require_non_weak_admin_token (>= 8 alphanumeric chars).
 const MIN_ADMIN_API_TOKEN_BYTES: usize = 8;
 const MAX_BOOTSTRAP_TOKEN_TTL_SECONDS: i64 = 60 * 60;
+/// 采集日志单文件上限的下限。
+///
+/// 必须**大于单次 append 的字节数**（内部接入端点 body 上限 4 MiB）：否则一批就能把文件顶到上限
+/// 之上，下一批会把它当成「遗留超大文件」丢掉 —— 丢数据。取回看窗口（8 MiB）作为下限，
+/// 比窗口还小的文件，按窗口回看本身也没意义。
+const MIN_AGENT_LOG_BYTES: u64 = crate::infra::TAIL_WINDOW_BYTES;
 /// Well-known weak values that must never be used as the admin API token.
 const WEAK_ADMIN_API_TOKENS: &[&str] = &[
     "admin",
@@ -79,6 +85,12 @@ pub struct AdminConfig {
     pub knowledge_signing_public_key_file: Option<PathBuf>,
     /// 上面那个文件解析出的**裸公钥**（32 字节）。验签用它，省得每次重解 PEM。
     pub knowledge_signing_public_key: Option<Vec<u8>>,
+    /// 采集日志落盘的**单文件上限**（字节）：写满就轮转（见 [`crate::infra::LogRetention`]）。
+    pub log_max_bytes: u64,
+    /// 采集日志保留的历史分卷个数（`<file>.1` … `<file>.N`）。
+    pub log_keep_files: usize,
+    /// 采集日志历史分卷的保留时长（秒）；`0` = 不按时间清。
+    pub log_max_age_seconds: i64,
 }
 
 pub use wist_error::ConfigError;
@@ -111,6 +123,8 @@ struct RawAdminConfig {
     ingest: RawIngestConfig,
     #[serde(default)]
     knowledge: RawKnowledgeConfig,
+    #[serde(default)]
+    logs: RawLogsConfig,
 }
 
 /// `[knowledge]` 段：知识库内容包的**信任配置**（设计 §9）。
@@ -187,6 +201,30 @@ struct RawStoreConfig {
     /// 留空 → 使用 `agent.store_file` 同目录下的 `wist-gateway.db`。
     #[serde(default)]
     database_url: Option<String>,
+}
+
+/// `[logs]` 段：采集日志落盘的保留 / 轮转。缺省时用下面的默认值（不设上界就会无限长）。
+#[derive(Debug, Deserialize)]
+struct RawLogsConfig {
+    /// 单文件上限（字节）：写满就轮转。默认 64 MiB。
+    #[serde(default = "default_log_max_bytes")]
+    max_bytes: u64,
+    /// 保留的历史分卷个数。默认 4。
+    #[serde(default = "default_log_keep_files")]
+    keep_files: usize,
+    /// 历史分卷保留时长（秒）；`0` = 不按时间清。默认 7 天。
+    #[serde(default = "default_log_max_age_seconds")]
+    max_age_seconds: i64,
+}
+
+impl Default for RawLogsConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_log_max_bytes(),
+            keep_files: default_log_keep_files(),
+            max_age_seconds: default_log_max_age_seconds(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,6 +442,9 @@ impl AdminConfig {
             knowledge_source_dir,
             knowledge_signing_public_key_file,
             knowledge_signing_public_key,
+            log_max_bytes: raw.logs.max_bytes,
+            log_keep_files: raw.logs.keep_files,
+            log_max_age_seconds: raw.logs.max_age_seconds,
         })
     }
 
@@ -459,6 +500,7 @@ impl AdminConfig {
         require_non_empty("agent.tenant_id", &self.tenant_id)?;
         require_non_empty("agent.environment_id", &self.environment_id)?;
         require_non_empty("server.victoria_metrics_url", &self.victoria_metrics_url)?;
+        require_min_bytes("logs.max_bytes", self.log_max_bytes, MIN_AGENT_LOG_BYTES)?;
         if let Some(rules_file) = self.purpose_rules_file.as_deref() {
             require_existing_file("purpose.rules_file", rules_file)?;
             // 用**真实的装载器**做结构化校验（不只是 TOML 语法）：规则表写错必须在启动时
@@ -624,11 +666,21 @@ impl AdminConfig {
     /// 采集日志（数据面转发的 `LOGRAW:` 记录）的本地落盘文件。
     ///
     /// 与安装包缓存同一约定：放在 SQLite 库同目录（`state/`）下，随 `state/` 一起备份或清理。
-    /// 为什么先落文件而不是入库：日志是无界的观测流，保留期与索引键尚未定档 ——
-    /// 先落 NDJSON（可以 `tail`、可以 `grep`），等保留策略定了再考虑入库。
+    /// 为什么先落文件而不是入库：日志是无界的观测流，索引键尚未定档 —— 先落 NDJSON
+    /// （可以 `tail`、可以 `grep`）；**保留 / 轮转**已由 [`Self::agent_log_retention`] 给定
+    /// （写满即轮转，历史按数量与时长清理）。
     pub fn agent_log_file(&self) -> PathBuf {
         let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
         state_dir.join("logs").join("agent-logs.ndjson")
+    }
+
+    /// 采集日志落盘的保留 / 轮转策略（由 `[logs]` 段决定，缺省见 [`crate::infra::LogRetention`]）。
+    pub fn agent_log_retention(&self) -> crate::infra::LogRetention {
+        crate::infra::LogRetention {
+            max_bytes: self.log_max_bytes,
+            keep_files: self.log_keep_files,
+            max_age_seconds: self.log_max_age_seconds,
+        }
     }
 }
 
@@ -650,6 +702,18 @@ fn default_victoria_metrics_url() -> String {
 
 fn default_store_file() -> String {
     "state/wist-gateway-store.json".to_string()
+}
+
+fn default_log_max_bytes() -> u64 {
+    crate::infra::LogRetention::default().max_bytes
+}
+
+fn default_log_keep_files() -> usize {
+    crate::infra::LogRetention::default().keep_files
+}
+
+fn default_log_max_age_seconds() -> i64 {
+    crate::infra::LogRetention::default().max_age_seconds
 }
 
 /// 未配置 `database_url` 时的默认 SQLite 库：与旧存储文件同目录。
@@ -842,6 +906,15 @@ fn require_seconds_at_most(field: &str, value: i64, max: i64) -> Result<(), Conf
     )))
 }
 
+fn require_min_bytes(field: &str, value: u64, min: u64) -> Result<(), ConfigError> {
+    if value < min {
+        return Err(config_validation(format!(
+            "{field} must be at least {min} bytes, got {value}"
+        )));
+    }
+    Ok(())
+}
+
 fn require_min_secret_length(field: &str, value: &str, min: usize) -> Result<(), ConfigError> {
     if value.len() >= min {
         return Ok(());
@@ -960,6 +1033,9 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         knowledge_source_dir: None,
         knowledge_signing_public_key_file: None,
         knowledge_signing_public_key: None,
+        log_max_bytes: crate::infra::LogRetention::default().max_bytes,
+        log_keep_files: crate::infra::LogRetention::default().keep_files,
+        log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
     }
 }
 
@@ -1374,6 +1450,54 @@ environment_id = "env-default"
                 .contains("agent.bootstrap_token_ttl_seconds")
         );
         assert!(err.to_string().contains("less than or equal to 3600"));
+        let _ = fs::remove_file(path);
+    }
+
+    /// 缺席 `[logs]` 段 = 用默认保留策略（64 MiB / 4 卷 / 7 天）。
+    #[test]
+    fn agent_log_retention_defaults_when_the_logs_section_is_absent() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[agent]
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(
+            config.agent_log_retention(),
+            crate::infra::LogRetention::default()
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// 单文件上限太小（每次追加都轮转 = 等于不留日志）→ 启动就拒。
+    #[test]
+    fn rejects_a_tiny_log_max_bytes() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[logs]
+max_bytes = 1024
+
+[agent]
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+        let err = AdminConfig::load_from_path(&path).expect_err("tiny max_bytes rejected");
+        assert!(err.to_string().contains("logs.max_bytes"), "{err}");
         let _ = fs::remove_file(path);
     }
 
