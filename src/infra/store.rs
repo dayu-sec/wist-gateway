@@ -176,6 +176,18 @@ pub struct StoredAgentRegistration {
     pub uplink_state: Option<wist_contracts::agent_uplink::AgentUplinkState>,
 }
 
+/// Agent 的**机器身份**读投影：只含「这是哪台机器」需要的列，不读 `local_work` / `uplink_state`
+/// 等重字段。指标端点这类只要身份、不要完整注册的读路径用它，避免把整个注册行拉进来。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredAgentIdentity {
+    pub agent_id: String,
+    pub node_id: String,
+    pub hostname: String,
+    /// 机器级「最近一次已知网卡地址」（形如 `en0 192.168.1.5/24`）；空表 = 还没报过。
+    pub ip_addresses: Vec<String>,
+}
+
 /// 历史实例记录（一个 Agent 可有多个）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -1041,6 +1053,10 @@ pub trait Store: Send + Sync + fmt::Debug {
     async fn agent_exists(&self, agent_id: &str) -> StoreResult<bool>;
 
     async fn list_agents(&self, query: &AgentQuery) -> StoreResult<Vec<StoredAgentRegistration>>;
+
+    /// 轻量机器身份投影：只取 `agent_id` / `node_id` / `hostname` / `ip_addresses` 四列，
+    /// 全表读、无过滤。供「只要身份、不要完整注册」的读路径用（如主机指标端点 join）。
+    async fn list_agent_identities(&self) -> StoreResult<Vec<StoredAgentIdentity>>;
 
     /// 删除一台 Agent：注册、实例、凭据，以及**所有**以它为主键的派生态行（一个事务）。
     ///

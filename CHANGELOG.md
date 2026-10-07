@@ -3,6 +3,21 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0-alpha] - 2026-10-07
+
+### 新增
+
+- **主机指标带上机器身份**：`GET /api/v1/admin/agents/{agent_id}/host-metrics` 与
+  `GET /api/v1/admin/agents/host-metrics`（列表）的响应新增 `node_id` / `hostname` /
+  `ip_addresses` —— 指标本身只有 `agent` 标签，主机身份由网关 **join 注册表**补齐
+  （不往指标标签里塞，避免重复与过期）。列表用轻量身份投影读注册表，不拉整个注册行。
+
+### 变更
+
+- **Agent 安装包 / 知识库包的摘要改为必填**：`POST /api/v1/admin/agent/install-package`（`package_sha256`）
+  与 `POST /api/v1/admin/knowledge/packages`（`sha256`）缺字段即 422、空串即 400 ——不再「不给就跳过校验」；
+  `scripts/import-package.sh` 同步带上摘要（`import-knowledge.sh` 本已带）。
+
 ## [0.2.0-alpha] - 2026-10-07
 
 ### 新增

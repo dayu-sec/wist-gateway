@@ -124,7 +124,10 @@ pub struct AgentRevocationLiftedResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SetAgentInstallPackageRequest {
     pub package_url: String,
-    pub package_sha256: Option<String>,
+    /// 期望摘要（sha256，可带 `sha256:` 前缀）。
+    ///
+    /// **必填**：包的 sha256 是内容身份，网关拿块字节核对、不符即拒；缺了就没有可校验的事实来源。
+    pub package_sha256: String,
     pub requested_by: Option<String>,
 }
 
@@ -1906,32 +1909,29 @@ pub async fn set_agent_install_package(
         return response;
     }
     let (package_url, expected_sha256) =
-        match validate_package_address(input.package_url.trim(), input.package_sha256.as_deref()) {
+        match validate_package_address(input.package_url.trim(), &input.package_sha256) {
             Ok(value) => value,
             Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
         };
     // 先把制品拉到网关本地：之后所有安装都从这份缓存分发，
     // 校验摘要因此与真正服务出去的内容天然同源。
     // 同时会把制品**另存一份按条副本**并解析包身份（升级按条目取包要用）。
-    let cached = match fetch_into_package_cache(
-        &state.config,
-        package_url,
-        expected_sha256.as_deref(),
-    )
-    .await
-    {
-        Ok(cached) => cached,
-        Err(err) => {
-            let status = match &err {
-                PackageFetchError::DigestMismatch(_) => StatusCode::BAD_REQUEST,
-                // 超限归「来源侧的问题」这一档（与「拿不到」同一回执，不改既有状态码）。
-                PackageFetchError::SourceUnavailable(_) | PackageFetchError::TooLarge(_) => {
-                    StatusCode::BAD_GATEWAY
-                }
-            };
-            return (status, err.to_string()).into_response();
-        }
-    };
+    let cached =
+        match fetch_into_package_cache(&state.config, package_url, Some(expected_sha256.as_str()))
+            .await
+        {
+            Ok(cached) => cached,
+            Err(err) => {
+                let status = match &err {
+                    PackageFetchError::DigestMismatch(_) => StatusCode::BAD_REQUEST,
+                    // 超限归「来源侧的问题」这一档（与「拿不到」同一回执，不改既有状态码）。
+                    PackageFetchError::SourceUnavailable(_) | PackageFetchError::TooLarge(_) => {
+                        StatusCode::BAD_GATEWAY
+                    }
+                };
+                return (status, err.to_string()).into_response();
+            }
+        };
     let requested_by = input
         .requested_by
         .unwrap_or_else(|| "platform-maintenance-engineer".to_string());
@@ -2352,10 +2352,11 @@ fn validate_advertise_url(value: &str) -> Result<&str, String> {
 ///
 /// 安装包是 Agent 的启动来源，因此地址只接受 https URL 或本机绝对路径：
 /// 不允许明文 http 分发（与 `server.public_base_url` 必须 https 的口径一致）。
+/// 摘要**必填**（64 hex，可带 `sha256:` 前缀）；空 / 形态不对一律 400。
 fn validate_package_address<'a>(
     package_url: &'a str,
-    package_sha256: Option<&str>,
-) -> Result<(&'a str, Option<String>), String> {
+    package_sha256: &str,
+) -> Result<(&'a str, String), String> {
     if package_url.is_empty() {
         return Err("package_url must not be empty".to_string());
     }
@@ -2370,14 +2371,7 @@ fn validate_package_address<'a>(
     if !package_url.starts_with("https://") && !package_url.starts_with('/') {
         return Err("package_url must be an https:// URL or an absolute path".to_string());
     }
-    let digest = match package_sha256
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(value) => Some(normalize_sha256(value)?),
-        None => None,
-    };
-    Ok((package_url, digest))
+    Ok((package_url, normalize_sha256(package_sha256.trim())?))
 }
 
 fn normalize_sha256(value: &str) -> Result<String, String> {

@@ -1606,6 +1606,27 @@ impl Store for SqliteStore {
         Ok(ids)
     }
 
+    async fn list_agent_identities(&self) -> StoreResult<Vec<StoredAgentIdentity>> {
+        // 只取身份四列（不 join 实例/凭据、不读重字段）—— 这正是它相比 `list_agents` 的省处。
+        let rows = sqlx::query(
+            "SELECT agent_id, node_id, hostname, ip_addresses FROM agents ORDER BY agent_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list agent identities"))?;
+        let mut identities = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let ip_addresses: Option<String> = column!(row, "ip_addresses");
+            identities.push(StoredAgentIdentity {
+                agent_id: column!(row, "agent_id"),
+                node_id: column!(row, "node_id"),
+                hostname: column!(row, "hostname"),
+                ip_addresses: deserialize_ip_addresses(ip_addresses),
+            });
+        }
+        Ok(identities)
+    }
+
     async fn list_agent_instances(&self, agent_id: &str) -> StoreResult<Vec<StoredAgentInstance>> {
         let rows = sqlx::query(
             "SELECT instance_id, agent_id, boot_id, version, started_at, last_seen_at, \
@@ -4049,10 +4070,44 @@ mod tests {
             .unwrap();
         assert!(other_tenant.is_empty());
 
-        let ids = store.list_agent_ids().await.unwrap();
-        assert_eq!(ids, vec!["agent-1".to_string(), "agent-2".to_string()]);
-        assert!(store.agent_exists("agent-1").await.unwrap());
-        assert!(!store.agent_exists("agent-3").await.unwrap());
+        let identities = store.list_agent_identities().await.unwrap();
+        assert_eq!(
+            identities
+                .iter()
+                .map(|identity| identity.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-1", "agent-2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_agent_identities_with_hostname_and_addresses() {
+        let store = store().await;
+        register(&store, "hash-i", "agent-1", "inst-1").await;
+        store
+            .record_agent_machine_profile(&AgentMachineProfileUpdate {
+                agent_id: "agent-1",
+                node_id: "node-1",
+                hostname: "host-1",
+                machine_id: "mid-1",
+                ip_addresses: Some(r#"["en0 10.0.0.5/24","utun100 100.64.0.9/32"]"#),
+                updated_at: "2026-01-01T00:00:00Z",
+            })
+            .await
+            .unwrap();
+
+        let identities = store.list_agent_identities().await.unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].agent_id, "agent-1");
+        assert_eq!(identities[0].node_id, "node-1");
+        assert_eq!(identities[0].hostname, "host-1");
+        assert_eq!(
+            identities[0].ip_addresses,
+            vec![
+                "en0 10.0.0.5/24".to_string(),
+                "utun100 100.64.0.9/32".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

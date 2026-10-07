@@ -1,12 +1,21 @@
+// NOTE(hand-added): 主机资源指标（管理面代理查询 VictoriaMetrics，并按 `agent_id` join 注册表
+// 机器画像 —— 主机名 / `node_id` / 网卡地址）。对应 jumo 模型 `Control.Agent.HostMetrics`
+// （binding：`AdminShowAgentHostMetrics` / `AdminListAgentHostMetrics`），响应字段与模型结构体
+// `AgentHostMetrics` / `AgentHostMetricsSummary` 一致。本模块与这两条路由已声明在模型里，
+// 但代码仍属手加（同 `api/mod.rs` 顶部的 hand-added 说明）：重新生成控制面代码时需回补。
+
 use axum::{
     Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use std::collections::HashMap;
+
 use serde::Serialize;
 
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
+use crate::infra::StoredAgentIdentity;
 use crate::infra::victoria_metrics::query_json;
 
 /// 趋势图时间窗口（秒）与采样步长（秒）。
@@ -19,6 +28,11 @@ const HISTORY_STEP_SECONDS: i64 = 30;
 #[serde(rename_all = "camelCase")]
 pub struct AgentHostMetrics {
     pub agent_id: String,
+    /// 机器身份（主机名 / node_id / 网卡地址）：来自注册表 join —— 数据面 VM 里没有这些标签。
+    /// 空串 / 空表 = 注册表里没有这台机器的画像（老数据或被手工删过）。
+    pub node_id: String,
+    pub hostname: String,
+    pub ip_addresses: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_average_1m: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,6 +78,10 @@ pub struct AgentHostMetricsHistory {
 #[serde(rename_all = "camelCase")]
 pub struct AgentHostMetricsSummary {
     pub agent_id: String,
+    /// 机器身份，口径与 [`AgentHostMetrics`] 一致：注册表 join 而来，缺画像时为空。
+    pub node_id: String,
+    pub hostname: String,
+    pub ip_addresses: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_average_1m: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,9 +102,9 @@ pub async fn get_agent_host_metrics(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    match state.store.agent_exists(&agent_id).await {
-        Ok(true) => {}
-        Ok(false) => {
+    let agent = match state.store.get_agent(&agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
             return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
         }
         Err(err) => {
@@ -96,10 +114,16 @@ pub async fn get_agent_host_metrics(
             )
                 .into_response();
         }
-    }
+    };
 
     match query_host_metrics(&state.config.victoria_metrics_url, &agent_id).await {
-        Ok(metrics) => Json(metrics).into_response(),
+        Ok(mut metrics) => {
+            // 指标端点自己不带主机名/IP —— 身份只能从注册表拿，这里把它 join 回去。
+            metrics.node_id = agent.node_id.clone();
+            metrics.hostname = agent.hostname.clone();
+            metrics.ip_addresses = agent.ip_addresses.clone();
+            Json(metrics).into_response()
+        }
         Err(err) => (
             StatusCode::BAD_GATEWAY,
             format!("failed to query metrics: {err}"),
@@ -117,8 +141,11 @@ pub async fn get_all_agents_host_metrics(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    let agent_ids = match state.store.list_agent_ids().await {
-        Ok(agent_ids) => agent_ids,
+    // 一次性取回注册表里的机器身份（node_id / hostname / ip_addresses），再按 agent_id join 到
+    // 指标上。用轻量投影 `list_agent_identities`（只读身份四列、全表、无过滤）—— 不需要为拿
+    // 身份把整个注册行（含 local_work / uplink_state）拉进来。
+    let identities_list = match state.store.list_agent_identities().await {
+        Ok(identities) => identities,
         Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -127,8 +154,12 @@ pub async fn get_all_agents_host_metrics(
                 .into_response();
         }
     };
+    let identities: HashMap<String, StoredAgentIdentity> = identities_list
+        .into_iter()
+        .map(|identity| (identity.agent_id.clone(), identity))
+        .collect();
 
-    match query_all_host_metrics(&state.config.victoria_metrics_url, &agent_ids).await {
+    match query_all_host_metrics(&state.config.victoria_metrics_url, &identities).await {
         Ok(summaries) => Json(summaries).into_response(),
         Err(err) => (
             StatusCode::BAD_GATEWAY,
@@ -138,11 +169,12 @@ pub async fn get_all_agents_host_metrics(
     }
 }
 
+/// 拉一次所有主机的 `system.*` 指标，按 `agent` 标签分组，并给注册表里认识的机器 join 上身份。
 async fn query_all_host_metrics(
     vm_url: &str,
-    agent_ids: &[String],
+    identities: &HashMap<String, StoredAgentIdentity>,
 ) -> Result<Vec<AgentHostMetricsSummary>, String> {
-    if agent_ids.is_empty() {
+    if identities.is_empty() {
         return Ok(Vec::new());
     }
     // 一次拉取所有主机的 system.* 指标，再按 `agent` 标签分组。
@@ -159,15 +191,19 @@ async fn query_all_host_metrics(
         .unwrap_or_default()
     {
         let agent = item["metric"]["agent"].as_str().unwrap_or("").to_string();
-        if agent.is_empty() || !agent_ids.iter().any(|id| id == &agent) {
+        // 只保留注册表里认识的 agent：`/hosts` 的语义是「有指标上报的已注册机器」。
+        let Some(identity) = identities.get(&agent) else {
             continue;
-        }
+        };
         let name = item["metric"]["__name__"].as_str().unwrap_or("");
         let value = scalar_value(&item);
         let entry = map
             .entry(agent.clone())
             .or_insert_with(|| AgentHostMetricsSummary {
-                agent_id: agent,
+                agent_id: agent.clone(),
+                node_id: identity.node_id.clone(),
+                hostname: identity.hostname.clone(),
+                ip_addresses: identity.ip_addresses.clone(),
                 load_average_1m: None,
                 memory_total_kb: None,
                 memory_available_kb: None,
@@ -220,6 +256,10 @@ fn build_metrics(
 ) -> AgentHostMetrics {
     let mut metrics = AgentHostMetrics {
         agent_id: agent_id.to_string(),
+        // 身份由 handler 从注册表 join 后写入（`build_metrics` 只关心指标本身）。
+        node_id: String::new(),
+        hostname: String::new(),
+        ip_addresses: Vec::new(),
         load_average_1m: None,
         load_average_5m: None,
         load_average_15m: None,

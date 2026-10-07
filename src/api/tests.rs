@@ -82,7 +82,11 @@ async fn set_install_package_source(env: &TestEnv, name: &str, bytes: &[u8]) -> 
         &env.store_handle,
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
-        &serde_json::json!({ "package_url": source }),
+        &serde_json::json!({
+            "package_url": source,
+            // 摘要必填：这里交真实字节的 sha256（与网关拉到的内容同源）。
+            "package_sha256": format!("sha256:{}", bytes_sha256_hex(bytes)),
+        }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3308,6 +3312,233 @@ async fn a_status_report_with_a_machine_profile_backfills_the_registry() {
     );
 }
 
+/// 注册 `agent-node-a` 并上报一次带机器画像的状态：注册表里就有 hostname / node_id / ip_addresses。
+async fn enroll_agent_with_machine_profile(env: &TestEnv, ip_addresses: Vec<String>) {
+    let credential = enroll_agent_credential(env).await;
+    let report = AgentStatusReport {
+        machine_profile: Some(wist_contracts::enrollment::HostProfile {
+            node_id: "node-1".to_string(),
+            hostname: "host-1".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            machine_id: "mid-1".to_string(),
+            cloud_instance_id: None,
+            k8s_node_uid: None,
+            ip_addresses,
+        }),
+        agent_id: "agent-node-a".to_string(),
+        instance_id: "node-a".to_string(),
+        version: "v0.3.0".to_string(),
+        memory_bytes: None,
+        cpu_percent: None,
+        cpu_cores: None,
+        admin_latency_ms: None,
+        discovery_policy_version: None,
+        work_state_changes: None,
+        local_work: None,
+        uplink_state: None,
+        certificate_status: None,
+    };
+    let status = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &report,
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+}
+
+/// 主机指标端点：指标本身来自数据面 VictoriaMetrics，主机名 / `node_id` / IP 由网关
+/// join **注册表**补齐。数据面用一个本地桩顶替（`query` / `query_range` 返回固定 JSON）。
+#[tokio::test]
+async fn host_metrics_routes_join_registry_identity_onto_data_plane_metrics() {
+    let mut env = TestEnv::new().await;
+    enroll_agent_with_machine_profile(
+        &env,
+        vec![
+            "en0 10.0.0.5/24".to_string(),
+            "utun100 100.64.0.9/32".to_string(),
+        ],
+    )
+    .await;
+
+    // 把管理面的 VM 地址指向本地桩（随机端口）。
+    env.config.victoria_metrics_url = spawn_victoria_metrics_stub("agent-node-a", 1.5).await;
+
+    // 详情：指标值来自数据面桩，身份 join 自注册表（多地址原样带出）。
+    let detail = get_admin(&env, "/api/v1/admin/agents/agent-node-a/host-metrics").await;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(detail).await;
+    assert_eq!(view["agentId"], "agent-node-a");
+    assert_eq!(view["hostname"], "host-1", "主机名必须 join 自注册表");
+    assert_eq!(view["nodeId"], "node-1");
+    assert_eq!(
+        view["ipAddresses"],
+        serde_json::json!(["en0 10.0.0.5/24", "utun100 100.64.0.9/32"])
+    );
+    assert_eq!(view["loadAverage1m"], 1.5);
+    assert_eq!(view["memoryTotalKb"], 1024);
+
+    // 列表：一行一台有指标上报的主机，同样带身份。
+    let list = get_admin(&env, "/api/v1/admin/agents/host-metrics").await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let rows: serde_json::Value = decode_json_response(list).await;
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 1, "只保留注册表里认识、且真有指标的机器");
+    assert_eq!(rows[0]["agentId"], "agent-node-a");
+    assert_eq!(rows[0]["hostname"], "host-1");
+    assert_eq!(rows[0]["nodeId"], "node-1");
+    assert_eq!(
+        rows[0]["ipAddresses"],
+        serde_json::json!(["en0 10.0.0.5/24", "utun100 100.64.0.9/32"])
+    );
+    assert_eq!(rows[0]["memoryAvailableKb"], 512);
+
+    // 未知 agent：404（存在性走注册表，与指标无关）。
+    let missing = get_admin(&env, "/api/v1/admin/agents/agent-missing/host-metrics").await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+/// 数据面有指标、但**注册表不认识**的 agent：列表必须丢掉它（`/hosts` 只说「已注册且有指标」）。
+#[tokio::test]
+async fn host_metrics_list_drops_metrics_from_agents_outside_the_registry() {
+    let mut env = TestEnv::new().await;
+    enroll_agent_with_machine_profile(&env, vec!["en0 10.0.0.5/24".to_string()]).await;
+
+    let instant = serde_json::json!({
+        "status": "success",
+        "data": {
+            "resultType": "vector",
+            "result": [
+                {
+                    "metric": { "__name__": "system.load_average.1m", "agent": "agent-node-a" },
+                    "value": [1_700_000_000, "1.5"],
+                },
+                {
+                    "metric": { "__name__": "system.load_average.1m", "agent": "ghost-agent" },
+                    "value": [1_700_000_000, "9.9"],
+                },
+            ],
+        },
+    });
+    let range = serde_json::json!({
+        "status": "success",
+        "data": { "resultType": "matrix", "result": [] },
+    });
+    env.config.victoria_metrics_url = spawn_victoria_metrics_stub_bodies(instant, range).await;
+
+    let list = get_admin(&env, "/api/v1/admin/agents/host-metrics").await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let rows: serde_json::Value = decode_json_response(list).await;
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 1, "注册表不认识的 agent 不该出现：{rows:?}");
+    assert_eq!(rows[0]["agentId"], "agent-node-a");
+}
+
+/// 数据面**没有**这台机器的指标：详情仍要带上注册表里的身份 —— 「没数据」不等于「不知道是谁」。
+#[tokio::test]
+async fn host_metrics_detail_keeps_registry_identity_when_data_plane_is_empty() {
+    let mut env = TestEnv::new().await;
+    enroll_agent_with_machine_profile(&env, vec!["en0 10.0.0.5/24".to_string()]).await;
+
+    let empty = serde_json::json!({
+        "status": "success",
+        "data": { "resultType": "vector", "result": [] },
+    });
+    let empty_range = serde_json::json!({
+        "status": "success",
+        "data": { "resultType": "matrix", "result": [] },
+    });
+    env.config.victoria_metrics_url = spawn_victoria_metrics_stub_bodies(empty, empty_range).await;
+
+    let detail = get_admin(&env, "/api/v1/admin/agents/agent-node-a/host-metrics").await;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(detail).await;
+    assert_eq!(view["hostname"], "host-1");
+    assert_eq!(view["nodeId"], "node-1");
+    assert_eq!(view["ipAddresses"], serde_json::json!(["en0 10.0.0.5/24"]));
+    // 没有指标就不要编一个值：缺失字段被 skip，`loadAverage1m` 不该出现。
+    assert!(
+        view.get("loadAverage1m").is_none(),
+        "无数据时不该伪造负载读数：{view:?}"
+    );
+}
+
+/// 一个最小的 VictoriaMetrics 桩：`/api/v1/query`（即时）与 `/api/v1/query_range`（区间）返回
+/// 给定的 JSON 体。绑随机端口，返回 base URL。仅测试用。
+async fn spawn_victoria_metrics_stub_bodies(
+    instant: serde_json::Value,
+    range: serde_json::Value,
+) -> String {
+    let app = axum::Router::new()
+        .route(
+            "/api/v1/query",
+            axum::routing::get(move || {
+                let body = instant.clone();
+                async move { Json(body) }
+            }),
+        )
+        .route(
+            "/api/v1/query_range",
+            axum::routing::get(move || {
+                let body = range.clone();
+                async move { Json(body) }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind victoria metrics stub");
+    let addr = listener.local_addr().expect("stub addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// 单台主机的固定读数桩：负载 1m + 内存总量/可用量（即时），负载趋势（区间）。
+async fn spawn_victoria_metrics_stub(agent_id: &str, load_1m: f64) -> String {
+    let agent = agent_id.to_string();
+    let instant = serde_json::json!({
+        "status": "success",
+        "data": {
+            "resultType": "vector",
+            "result": [
+                {
+                    "metric": { "__name__": "system.load_average.1m", "agent": agent },
+                    "value": [1_700_000_000, load_1m.to_string()],
+                },
+                {
+                    "metric": { "__name__": "system.memory.total", "agent": agent },
+                    "value": [1_700_000_000, "1024"],
+                },
+                {
+                    "metric": { "__name__": "system.memory.available", "agent": agent },
+                    "value": [1_700_000_000, "512"],
+                },
+            ],
+        },
+    });
+    let range = serde_json::json!({
+        "status": "success",
+        "data": {
+            "resultType": "matrix",
+            "result": [
+                {
+                    "metric": { "__name__": "system.load_average.1m", "agent": agent },
+                    "values": [
+                        [1_700_000_000, load_1m.to_string()],
+                        [1_700_000_030, load_1m.to_string()],
+                    ],
+                },
+            ],
+        },
+    });
+    spawn_victoria_metrics_stub_bodies(instant, range).await
+}
+
 #[tokio::test]
 async fn credential_renewal_issues_a_new_certificate_and_rotates_the_stored_credential() {
     let mut env = TestEnv::new().await;
@@ -5069,7 +5300,10 @@ async fn install_package_set_rejects_bad_input() {
         &env.store_handle,
         uri,
         Some(TEST_ADMIN_API_TOKEN),
-        &serde_json::json!({ "package_url": "http://example.com/agentd.tar.gz" }),
+        &serde_json::json!({
+            "package_url": "http://example.com/agentd.tar.gz",
+            "package_sha256": "a".repeat(64),
+        }),
     )
     .await;
     assert_eq!(insecure.status(), StatusCode::BAD_REQUEST);
@@ -5099,7 +5333,10 @@ async fn install_package_set_rejects_unfetchable_source() {
         &env.store_handle,
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
-        &serde_json::json!({ "package_url": missing }),
+        &serde_json::json!({
+            "package_url": missing,
+            "package_sha256": "a".repeat(64),
+        }),
     )
     .await;
 
@@ -5112,6 +5349,42 @@ async fn install_package_set_rejects_unfetchable_source() {
             .is_none(),
         "a failed set must not persist"
     );
+}
+
+#[tokio::test]
+async fn install_package_set_requires_a_digest() {
+    // 摘要必填：缺字段 → 请求体不合契约（422），**不是**默默放行。
+    let env = TestEnv::new_without_package().await;
+    let source = write_source_package(&env, "require-digest", b"x");
+
+    let missing = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "package_url": source }),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        env.store
+            .get_agent_install_package()
+            .await
+            .unwrap()
+            .is_none(),
+        "a request without a digest must not persist"
+    );
+
+    // 空串 → 400（当成「没给」就跳过了校验，所以必须拒）。
+    let empty = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "package_url": source, "package_sha256": "  " }),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -5880,7 +6153,10 @@ async fn install_package_history_absent_when_source_unreadable() {
         &env.store_handle,
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
-        &serde_json::json!({ "package_url": missing }),
+        &serde_json::json!({
+            "package_url": missing,
+            "package_sha256": "a".repeat(64),
+        }),
     )
     .await;
 
@@ -6196,7 +6472,10 @@ async fn install_package_set_heals_history_after_a_history_write_failure() {
         &env.store_handle,
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
-        &serde_json::json!({ "package_url": source }),
+        &serde_json::json!({
+            "package_url": source,
+            "package_sha256": format!("sha256:{digest}"),
+        }),
     )
     .await;
     assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -6226,7 +6505,10 @@ async fn install_package_set_heals_history_after_a_history_write_failure() {
         &env.store_handle,
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
-        &serde_json::json!({ "package_url": source }),
+        &serde_json::json!({
+            "package_url": source,
+            "package_sha256": format!("sha256:{digest}"),
+        }),
     )
     .await;
     assert_eq!(retried.status(), StatusCode::OK);
@@ -6246,7 +6528,10 @@ async fn install_package_set_rejects_unreachable_url() {
         &env.store_handle,
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
-        &serde_json::json!({ "package_url": "https://" }),
+        &serde_json::json!({
+            "package_url": "https://",
+            "package_sha256": "a".repeat(64),
+        }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -9872,7 +10157,13 @@ async fn knowledge_endpoints_record_then_activate_without_a_restart() {
     let response = post_to_state(
         &state,
         "/api/v1/admin/knowledge/packages",
-        &serde_json::json!({ "source": tarball.to_string_lossy() }),
+        &serde_json::json!({
+            "source": tarball.to_string_lossy(),
+            // 摘要必填：交真实 tarball 的 sha256。
+            "sha256": crate::infra::bytes_sha256_hex(
+                &std::fs::read(&tarball).expect("read tarball")
+            ),
+        }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -9956,6 +10247,7 @@ async fn knowledge_record_can_activate_in_one_shot() {
     let tarball = crate::test_support::knowledge_package_tarball(&root, false);
     let body = serde_json::json!({
         "source": tarball.to_string_lossy(),
+        "sha256": crate::infra::bytes_sha256_hex(&std::fs::read(&tarball).expect("read tarball")),
         "activate": true,
         "requested_by": "tester",
     });
@@ -10013,7 +10305,7 @@ async fn knowledge_endpoints_report_actionable_error_codes() {
     let response = post_to_state(
         &state,
         "/api/v1/admin/knowledge/packages",
-        &serde_json::json!({ "source": "relative/path.tar.gz" }),
+        &serde_json::json!({ "source": "relative/path.tar.gz", "sha256": "a".repeat(64) }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);

@@ -35,9 +35,10 @@ const DEFAULT_ACTOR: &str = "platform-maintenance-engineer";
 pub struct RecordKnowledgeRequest {
     /// `https://…` 链接，或**容器内**绝对路径（宿主路径容器里看不见）。
     pub source: String,
-    /// 可选的期望摘要（发布侧 `*.sha256` 里那串），与来源字节核对。
-    #[serde(default)]
-    pub sha256: Option<String>,
+    /// 期望摘要（发布侧 `*.sha256` 里那串），与来源字节核对。
+    ///
+    /// **必填**：包的 sha256 是内容身份，网关拿块字节核对、不符即拒；缺了就没有可校验的事实来源。
+    pub sha256: String,
     /// 录入成功后是否立即激活。缺省 `false`：**录入 ≠ 生效**。
     #[serde(default)]
     pub activate: bool,
@@ -300,12 +301,21 @@ pub async fn record_knowledge_package(
         .requested_by
         .clone()
         .unwrap_or_else(|| DEFAULT_ACTOR.to_string());
+    // 摘要是**必填**：空串也拒（否则会被当成「未给」而跳过校验）。
+    let expected_sha256 = input.sha256.trim();
+    if expected_sha256.is_empty() {
+        return knowledge_error(
+            StatusCode::BAD_REQUEST,
+            "sha256_required",
+            "期望摘要 sha256 必填（填发布侧 *.sha256 里那串）".to_string(),
+        );
+    }
     let recorded_at = chrono::Utc::now().to_rfc3339();
     let recorded = match record_package(
         &state.config,
         &state.store,
         &input.source,
-        input.sha256.as_deref(),
+        Some(expected_sha256),
         &actor,
         &recorded_at,
     )

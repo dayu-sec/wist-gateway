@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::rollout as rules;
 use crate::infra::{
-    StoredOneShotWork, StoredRolloutPhase, StoredRolloutPlan, StoredRolloutPlanEntry, sha256_hex,
+    StoredOneShotWork, StoredRolloutPhase, StoredRolloutPlan, StoredRolloutPlanEntry,
 };
 
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
@@ -122,9 +122,9 @@ fn entry_view(entry: &StoredRolloutPlanEntry) -> RolloutPlanEntryView {
     }
 }
 
-/// 计划 id：创建时间戳的摘要。同一纳秒内建两份相同计划才可能撞（可接受）。
-fn rollout_plan_id(now: &str) -> String {
-    format!("plan-{}", &sha256_hex(now)[..12])
+/// 计划 id：`plan-<action>-<yyyyMMdd-HHmmss>-<short>`（口径在共享 crate `wist_release::rollout`）。
+fn rollout_plan_id(action: &str, now: &str) -> String {
+    wist_release::rollout::plan_id(action, now)
 }
 
 /// 把请求折算成落库的计划与全量 target 清单。
@@ -207,7 +207,7 @@ fn build_plan(
         .collect();
     let now = chrono::Utc::now().to_rfc3339();
     let plan = StoredRolloutPlan {
-        plan_id: rollout_plan_id(&now),
+        plan_id: rollout_plan_id(action, &now),
         action: action.to_string(),
         spec: spec.to_string(),
         deadline_at: deadline_at.to_string(),
