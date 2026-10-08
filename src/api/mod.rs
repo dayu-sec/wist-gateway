@@ -97,7 +97,7 @@ use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
 use pipeline::get_pipeline_topology;
 use rollout_ops::{
     advance_rollout_plan, approve_rollout_plan, create_rollout_plan, list_rollout_plans,
-    view_rollout_plan,
+    retry_rollout_plan, view_rollout_plan,
 };
 use software_ops::{view_agent_software, view_software_holdings};
 
@@ -484,6 +484,10 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/rollout-plans/advance",
             post(advance_rollout_plan),
+        )
+        .route(
+            "/api/v1/admin/rollout-plans/retry",
+            post(retry_rollout_plan),
         )
         .route(
             "/api/v1/admin/rollout-plans/{plan_id}",

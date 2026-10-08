@@ -3,6 +3,22 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0-alpha] - 2026-10-08
+
+### 新增
+
+- **失败的升级目标可以重试**：`POST /api/v1/admin/rollout-plans/retry`
+  （body `{plan_id, target_ids?}`；`target_ids` 不传 = 该计划全部失败项）。为每个失败目标派一件
+  **新工作**（新的 `work_id` —— agentd 只对没跑过的 id 才重跑），并把计划 / 阶段重开为「进行中」，
+  接着走推进闸门；逐台或一次全部都可。草稿计划与没有失败项的计划会被拒。
+
+### 变更
+
+- **升级计划可按「版本」下发（不必再手选制品）**：新建 Agent 升级计划时只给 agentd 版本，
+  网关在派活时按**每个目标 Agent 的平台**（macOS-ARM / Linux x86_64·ARM64）自动挑对应平台的
+  安装包下发。建计划时即校验「每个目标平台都有该版本的包」——缺任一平台当场 **400** 并列出缺的
+  目标与平台，不再等到逐台派活才失败。显式制品（`package_url`）的老计划行为不变。
+
 ## [0.5.0-alpha] - 2026-10-08
 
 ### 新增

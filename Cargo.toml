@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.5.0" #@gxl:set(version)
+version = "0.6.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -43,8 +43,9 @@ time = { version = "0.3", features = ["std"] }
 serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 # 安装包内核（来源读取 / 摘要校验 / 身份解析 / 命名）——与中心共用一份。
-wist-release = "0.4.0"
-#wist-release = { version = "0.4", path = "../wist-release" }
+wist-release = "0.5.0"
+# 本地联调：按 rust-gx 约定切下面这行用 path 指向本地 `wist-release`；发版时切回上面的 registry。
+#wist-release = { version = "0.5", path = "../wist-release" }
 # 解 gzip/tar：知识库制品入库时解开校验（`app/knowledge.rs::unpack_into`）。
 # flate2 默认走纯 Rust 后端（miniz_oxide），不引入 C 依赖。
 flate2 = "1"

@@ -50,13 +50,34 @@ pub fn next_refill_targets(
     wist_release::rollout::next_refill_targets(&phase.target_ids, &states, batch_size)
 }
 
-/// 把计划里的一个目标物化成一件一次性工作：`spec` 原样带上，`scheduled_at` 取当下。
-pub fn build_one_shot_work(plan: &StoredRolloutPlan, target_id: &str, now: &str) -> OneShotWork {
+/// 把计划里的一个目标物化成一件一次性工作（`work_id` 用确定性 id）。
+///
+/// `spec` 是该目标**已解析**的动作参数，由调用方给出：按版本选择的计划里，网关要先按
+/// 目标 agent 的平台把制品（`package_url` / `package_sha256`）补进 spec（见
+/// `api::rollout_ops::dispatch_spec_for`）；显式制品的旧计划则原样透传。`scheduled_at` 取当下。
+pub fn build_one_shot_work(
+    plan: &StoredRolloutPlan,
+    target_id: &str,
+    spec: &str,
+    now: &str,
+) -> OneShotWork {
+    let work_id = rollout_work_id(&plan.plan_id, target_id);
+    build_one_shot_work_with_id(plan, target_id, work_id, spec, now)
+}
+
+/// 同 [`build_one_shot_work`]，但 `work_id` 由调用方给出（**重试**要用新 id，见 [`retry_work_id`]）。
+pub fn build_one_shot_work_with_id(
+    plan: &StoredRolloutPlan,
+    target_id: &str,
+    work_id: String,
+    spec: &str,
+    now: &str,
+) -> OneShotWork {
     OneShotWork {
-        work_id: rollout_work_id(&plan.plan_id, target_id),
+        work_id,
         agent_id: target_id.to_string(),
         action: plan.action.clone(),
-        spec: plan.spec.clone(),
+        spec: spec.to_string(),
         scheduled_at: now.to_string(),
         deadline_at: plan.deadline_at.clone(),
         timeout_seconds: plan.timeout_seconds,
@@ -74,10 +95,54 @@ pub fn build_one_shot_work(plan: &StoredRolloutPlan, target_id: &str, now: &str)
     }
 }
 
+/// **重试**用的**新**工作 id（口径在共享 crate `wist_release::plan`）。
+///
+/// 必须换个 id：agentd 只对「本机未执行过」的 `work_id` 起升级器（`AppliedWorkGrant::apply`）——
+/// 重发同一个 id，agentd 会保留旧执行状态、**不再跑**，那是假重试。
+pub use wist_release::plan::retry_work_id;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::infra::StoredRolloutPhase;
+
+    #[test]
+    fn build_one_shot_work_with_id_carries_the_given_id_and_spec() {
+        let plan = StoredRolloutPlan {
+            plan_id: "plan-1".to_string(),
+            action: "upgrade".to_string(),
+            spec: "ignored".to_string(),
+            deadline_at: "2026-10-01T00:00:00Z".to_string(),
+            timeout_seconds: 600,
+            phases: vec![StoredRolloutPhase {
+                phase_index: 1,
+                target_ids: vec!["agent-a".to_string()],
+                advance_rule: "manual".to_string(),
+                status: "rolling".to_string(),
+            }],
+            batch_size: 0,
+            current_phase: 1,
+            status: "rolling".to_string(),
+            created_by: "admin".to_string(),
+            created_at: "2026-09-25T00:00:00Z".to_string(),
+            approved_by: None,
+            approved_at: None,
+        };
+        let work = build_one_shot_work_with_id(
+            &plan,
+            "agent-a",
+            "work-plan-1-rdeadbe".to_string(),
+            "{\"package_url\":\"/x\",\"package_sha256\":\"y\"}",
+            "2026-09-25T01:00:00Z",
+        );
+        assert_eq!(work.work_id, "work-plan-1-rdeadbe");
+        assert_eq!(
+            work.spec,
+            "{\"package_url\":\"/x\",\"package_sha256\":\"y\"}"
+        );
+        assert_eq!(work.issued_by, "rollout:plan-1");
+        assert_eq!(work.status, "dispatched");
+    }
 
     fn entry(target: &str, status: &str) -> StoredRolloutPlanEntry {
         StoredRolloutPlanEntry {
@@ -148,7 +213,13 @@ mod tests {
             approved_by: None,
             approved_at: None,
         };
-        let work = build_one_shot_work(&plan, "agent-a", "2026-09-25T01:00:00Z");
+        // 动作 spec 由调用方给出（按版本时会先按目标平台补上制品）。
+        let work = build_one_shot_work(
+            &plan,
+            "agent-a",
+            "{\"target_version\":\"0.1.4\"}",
+            "2026-09-25T01:00:00Z",
+        );
         assert_eq!(work.work_id, rollout_work_id("plan-1", "agent-a"));
         assert_eq!(work.agent_id, "agent-a");
         assert_eq!(work.action, "upgrade");

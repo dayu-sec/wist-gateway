@@ -1169,6 +1169,33 @@ fn fact_report(processes: &[&str]) -> ReportAgentFactSummary {
     report
 }
 
+/// 指定 agent / 平台的「声明正确」事实报文（多平台机队用例用）。
+fn fact_report_for(
+    agent_id: &str,
+    node_id: &str,
+    os: &str,
+    arch: &str,
+    processes: &[&str],
+) -> ReportAgentFactSummary {
+    let mut report = ReportAgentFactSummary::new_agent_facts(
+        "report-1".to_string(),
+        agent_id.to_string(),
+        node_id.to_string(),
+        String::new(),
+        7,
+        "2026-09-22T00:00:00Z".to_string(),
+        os.to_string(),
+        arch.to_string(),
+        processes.len() as i64,
+        processes.iter().map(|value| value.to_string()).collect(),
+        Vec::new(),
+        Vec::new(),
+        "2026-09-22T00:00:01Z".to_string(),
+    );
+    report.content_digest = digest_of(&report);
+    report
+}
+
 /// 一份「声明被写错」的报文：用来验证判重不看声明。
 fn fact_report_declaring(processes: &[&str], declared: &str) -> ReportAgentFactSummary {
     let mut report = raw_fact_report(processes);
@@ -8531,6 +8558,75 @@ async fn create_rollout_plan_with_batch(
     decode_json_response(response).await
 }
 
+/// 按**原始 spec** 建计划：给需要自定 spec 的用例用。
+async fn create_rollout_plan_with_spec(
+    env: &TestEnv,
+    target_ids: &[&str],
+    spec: &str,
+    batch_size: i64,
+) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "action": "upgrade",
+            "spec": spec,
+            "target_ids": target_ids,
+            "phase_count": 1,
+            "deadline_at": "2026-10-01T00:00:00Z",
+            "timeout_seconds": 600,
+            "batch_size": batch_size,
+        }),
+    )
+    .await
+}
+
+/// 按**版本**建计划（不选制品）：spec 只写 `target_version`，制品由网关按目标平台解析。
+async fn create_version_rollout_plan(
+    env: &TestEnv,
+    target_ids: &[&str],
+    version: &str,
+) -> Response {
+    create_rollout_plan_with_spec(
+        env,
+        target_ids,
+        &serde_json::json!({ "target_version": version }).to_string(),
+        0,
+    )
+    .await
+}
+
+/// 一条安装包录入历史（版本 + 平台）。摘要从 id 的 hex 后缀派生，让不同包的摘要不同 ——
+/// 测试要能分辨「实际派了哪一份」。
+fn agent_package_history(package_id: &str, version: &str, arch: &str) -> StoredAgentInstallPackage {
+    let hex = package_id.trim_start_matches("pkg-");
+    let digest = hex.repeat(64 / hex.len().max(1));
+    StoredAgentInstallPackage {
+        package_id: package_id.to_string(),
+        source: format!("/packages/agentd-{version}-{arch}.tar.gz"),
+        package_sha256: format!("sha256:{digest}"),
+        version: version.to_string(),
+        arch: arch.to_string(),
+        cached_path: format!("/state/agentd-{version}-{arch}"),
+        created_by: "eng".to_string(),
+        created_at: "2026-01-01T00:00:00+00:00".to_string(),
+    }
+}
+
+/// 读某个计划目标的**已解析**工作 spec。
+async fn resolved_work_spec(env: &TestEnv, plan_id: &str, agent_id: &str) -> serde_json::Value {
+    let work_id = crate::app::rollout::rollout_work_id(plan_id, agent_id);
+    let work = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .expect("load work")
+        .expect("work exists");
+    serde_json::from_str(&work.work.spec).expect("spec json")
+}
+
 async fn approve_plan(env: &TestEnv, plan_id: &str) -> serde_json::Value {
     let response = post_json_to_router(
         &env.config,
@@ -8753,6 +8849,651 @@ async fn advancing_materializes_the_next_phase() {
         .expect("work exists");
     assert_eq!(work.work.agent_id, "agent-node-b");
     assert_eq!(work.work.issued_by, format!("rollout:{plan_id}"));
+}
+
+#[tokio::test]
+async fn version_based_upgrade_resolves_the_artifact_for_the_target_platform() {
+    let env = TestEnv::new().await;
+    // agent-node-a 报的是 macos / arm64 → 发布平台 aarch64-apple-darwin。
+    a_classified_macos_agent(&env).await;
+    let package = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    env.store
+        .upsert_agent_install_package_by_id(&package)
+        .await
+        .unwrap();
+
+    // 只选版本（不选制品）→ 建计划成功（该平台该版本有包）。
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    // 计划本身只记版本（制品不在计划里）。
+    assert_eq!(plan["spec"], "{\"target_version\":\"0.1.9\"}");
+
+    // 批准 → 物化：派给该 agent 的 spec 由网关按平台补好制品。
+    approve_plan(&env, &plan_id).await;
+    let work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    let work = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .expect("load work")
+        .expect("work exists");
+    let spec: serde_json::Value = serde_json::from_str(&work.work.spec).expect("spec json");
+    let expected_url = format!(
+        "{}/api/v1/agent/packages/{}",
+        env.config.public_base_url.trim_end_matches('/'),
+        package.package_id
+    );
+    assert_eq!(spec["package_url"], serde_json::json!(expected_url));
+    assert_eq!(
+        spec["package_sha256"],
+        serde_json::json!(package.package_sha256)
+    );
+    // 核对：不写 target_version —— agentd 要求它与包内自报版本逐字一致，而计划里存的是发布版本。
+    assert!(spec.get("target_version").is_none(), "{spec}");
+}
+
+#[tokio::test]
+async fn version_based_upgrade_rejects_a_version_without_a_package_for_the_target_platform() {
+    let env = TestEnv::new().await;
+    // agent-node-a 需要 aarch64-apple-darwin 的包（macos / arm64）。
+    a_classified_macos_agent(&env).await;
+    // 只录了**别的平台**的同版本包 → 建计划就必须拒（不把失败推迟到派活逐台暴露）。
+    let package =
+        agent_package_history("pkg-00000000000000bb", "0.1.9", "x86_64-unknown-linux-musl");
+    env.store
+        .upsert_agent_install_package_by_id(&package)
+        .await
+        .unwrap();
+
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    // 报错要能直接指出缺哪个版本、哪个平台（否则运维只能翻代码猜）。
+    assert!(text.contains("0.1.9"), "{text}");
+    assert!(text.contains("aarch64-apple-darwin"), "{text}");
+}
+
+#[tokio::test]
+async fn version_based_upgrade_resolves_each_target_platform_independently() {
+    let env = TestEnv::new().await;
+    // agent-node-a: macos/arm64；agent-node-b: linux/x86_64。
+    a_classified_macos_agent(&env).await;
+    enroll_agent_at_node(&env, "node-b").await;
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-b", "node-b", "linux", "x86_64", &["sshd"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let mac = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    let lin = agent_package_history("pkg-00000000000000bb", "0.1.9", "x86_64-unknown-linux-musl");
+    env.store
+        .upsert_agent_install_package_by_id(&mac)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&lin)
+        .await
+        .unwrap();
+
+    let response =
+        create_version_rollout_plan(&env, &["agent-node-a", "agent-node-b"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // 每台拿到的是**自己平台**那一份，不是「第一份」。
+    let mac_spec = resolved_work_spec(&env, &plan_id, "agent-node-a").await;
+    assert_eq!(
+        mac_spec["package_sha256"],
+        serde_json::json!(mac.package_sha256)
+    );
+    assert!(
+        mac_spec["package_url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/{}", mac.package_id)),
+        "{mac_spec}"
+    );
+
+    let lin_spec = resolved_work_spec(&env, &plan_id, "agent-node-b").await;
+    assert_eq!(
+        lin_spec["package_sha256"],
+        serde_json::json!(lin.package_sha256)
+    );
+    assert!(
+        lin_spec["package_url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/{}", lin.package_id)),
+        "{lin_spec}"
+    );
+}
+
+#[tokio::test]
+async fn version_based_upgrade_reports_every_uncovered_target_platform() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await; // macos 有包
+    enroll_agent_at_node(&env, "node-b").await; // linux 没包
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-b", "node-b", "linux", "x86_64", &["sshd"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let mac = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    env.store
+        .upsert_agent_install_package_by_id(&mac)
+        .await
+        .unwrap();
+
+    let response =
+        create_version_rollout_plan(&env, &["agent-node-a", "agent-node-b"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(text.contains("agent-node-b"), "{text}");
+    assert!(text.contains("x86_64-unknown-linux-musl"), "{text}");
+    // 有包的那台不该被误报。
+    assert!(!text.contains("agent-node-a"), "{text}");
+}
+
+#[tokio::test]
+async fn version_based_upgrade_rejects_a_target_without_a_reported_platform() {
+    let env = TestEnv::new().await;
+    // 只注册、不上报事实 → 平台未知。
+    enroll_agent_credential(&env).await;
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(text.contains("has not reported a platform"), "{text}");
+}
+
+#[tokio::test]
+async fn version_based_upgrade_rejects_an_agent_platform_without_agentd_artifacts() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    // macOS-Intel：真实的 os/arch 组合，但 agentd **没有**该平台制品。
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-a", "node-a", "macos", "x86_64", &["xcodebuild"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(
+        text.contains("not a known agentd release platform"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn version_based_upgrade_ships_the_newest_package_for_a_duplicated_version() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    // 同一 (version, arch) 两份、created_at 不同：派活应取**最新录入**的那份。
+    let older = StoredAgentInstallPackage {
+        created_at: "2026-01-01T00:00:00+00:00".to_string(),
+        ..agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin")
+    };
+    let newer = StoredAgentInstallPackage {
+        created_at: "2026-02-01T00:00:00+00:00".to_string(),
+        ..agent_package_history("pkg-00000000000000bb", "0.1.9", "aarch64-apple-darwin")
+    };
+    assert_ne!(newer.package_sha256, older.package_sha256);
+    env.store
+        .upsert_agent_install_package_by_id(&older)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&newer)
+        .await
+        .unwrap();
+
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let spec = resolved_work_spec(&env, &plan_id, "agent-node-a").await;
+    assert_eq!(
+        spec["package_sha256"],
+        serde_json::json!(newer.package_sha256)
+    );
+}
+
+#[tokio::test]
+async fn version_based_upgrade_forwards_allow_downgrade() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    let package = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    env.store
+        .upsert_agent_install_package_by_id(&package)
+        .await
+        .unwrap();
+
+    let raw = serde_json::json!({ "target_version": "0.1.9", "allow_downgrade": true }).to_string();
+    let response = create_rollout_plan_with_spec(&env, &["agent-node-a"], &raw, 0).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let resolved = resolved_work_spec(&env, &plan_id, "agent-node-a").await;
+    // 计划里带的 allow_downgrade 要透到派活的 spec（重新拼 spec 也不能吞掉它）。
+    assert_eq!(resolved["allow_downgrade"], serde_json::json!(true));
+    assert!(resolved.get("target_version").is_none(), "{resolved}");
+}
+
+#[tokio::test]
+async fn create_rejects_a_version_spec_with_an_empty_target_version() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    // 空版本 + 无制品：坏 spec，不能当「显式制品」把空壳透传给 agentd。
+    let response =
+        create_rollout_plan_with_spec(&env, &["agent-node-a"], r#"{"target_version":"   "}"#, 0)
+            .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(text.contains("target_version"), "{text}");
+
+    // `null` 版本（键在但取不出可用值）同样拒。
+    let null_response =
+        create_rollout_plan_with_spec(&env, &["agent-node-a"], r#"{"target_version":null}"#, 0)
+            .await;
+    assert_eq!(null_response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn explicit_artifact_plan_passes_through_verbatim_without_a_platform_lookup() {
+    let env = TestEnv::new().await;
+    // 注册但**不上报事实**：显式制品不需要平台，建计划与派活都不该因此失败。
+    enroll_agent_credential(&env).await;
+    let raw = r#"{"package_url":"/srv/wist/agentd.tar.gz","package_sha256":"sha256:abc"}"#;
+    let response = create_rollout_plan_with_spec(&env, &["agent-node-a"], raw, 0).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    let work = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(work.work.spec.as_str(), raw, "显式制品的 spec 应原样透传");
+}
+
+#[tokio::test]
+async fn version_based_upgrade_resolves_the_artifact_on_the_refill_path() {
+    let env = TestEnv::new().await;
+    let credential_a = a_classified_macos_agent(&env).await;
+    let credential_b = enroll_agent_at_node(&env, "node-b").await;
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-b", "node-b", "linux", "x86_64", &["sshd"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let mac = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    let lin = agent_package_history("pkg-00000000000000bb", "0.1.9", "x86_64-unknown-linux-musl");
+    env.store
+        .upsert_agent_install_package_by_id(&mac)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&lin)
+        .await
+        .unwrap();
+
+    let raw = serde_json::json!({ "target_version": "0.1.9" }).to_string();
+    let response =
+        create_rollout_plan_with_spec(&env, &["agent-node-a", "agent-node-b"], &raw, 1).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // batch_size=1：只物化了 1 台。找出它是谁，了结它 → 触发 refill。
+    let detail = view_plan(&env, &plan_id).await;
+    let entries = detail["entries"].as_array().expect("entries");
+    let dispatched = entries
+        .iter()
+        .find(|entry| entry["status"] == "dispatched")
+        .expect("one dispatched");
+    let first = dispatched["target_id"].as_str().unwrap().to_string();
+    let second = if first == "agent-node-a" {
+        "agent-node-b"
+    } else {
+        "agent-node-a"
+    };
+    let credential = if first == "agent-node-a" {
+        credential_a.clone()
+    } else {
+        credential_b.clone()
+    };
+    let work_id = dispatched["work_id"].as_str().unwrap().to_string();
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+
+    // refill 后第二台也被物化，且 spec 已按**它的**平台解析好。
+    let resolved = resolved_work_spec(&env, &plan_id, second).await;
+    let expected = if second == "agent-node-a" { &mac } else { &lin };
+    assert_eq!(
+        resolved["package_sha256"],
+        serde_json::json!(expected.package_sha256)
+    );
+}
+
+#[tokio::test]
+async fn dispatch_refuses_an_upgrade_spec_that_is_missing_package_url() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    // 直接落一份「既无 version 也无 package_url」的 upgrade 计划（绕过建计划校验，模拟历史/
+    // 版本错配留下的坏 spec）——agentd 对缺 `package_url` 只会以 spec_invalid 拒绝，网关应先在
+    // 自己这侧挡住，而不是把空壳发出去。
+    let plan = crate::infra::StoredRolloutPlan {
+        plan_id: "plan-bad-spec".to_string(),
+        action: "upgrade".to_string(),
+        spec: r#"{"foo":1}"#.to_string(),
+        deadline_at: "2026-10-01T00:00:00Z".to_string(),
+        timeout_seconds: 600,
+        phases: vec![crate::infra::StoredRolloutPhase {
+            phase_index: 1,
+            target_ids: vec!["agent-node-a".to_string()],
+            advance_rule: "manual".to_string(),
+            status: "pending".to_string(),
+        }],
+        batch_size: 0,
+        current_phase: 0,
+        status: "draft".to_string(),
+        created_by: "admin".to_string(),
+        created_at: "2026-10-01T00:00:00+00:00".to_string(),
+        approved_by: None,
+        approved_at: None,
+    };
+    env.store.save_rollout_plan(&plan).await.unwrap();
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/approve",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "plan_id": "plan-bad-spec" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(text.contains("package_url"), "{text}");
+
+    // 没有物化任何工作：拦住的是「半截 spec 出站」，不是别的。
+    assert!(
+        env.store_handle
+            .get_one_shot_work(&crate::app::rollout::rollout_work_id(
+                "plan-bad-spec",
+                "agent-node-a"
+            ))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+async fn retry_plan(env: &TestEnv, body: serde_json::Value) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/retry",
+        Some(TEST_ADMIN_API_TOKEN),
+        &body,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn retry_requeues_a_failed_target_with_a_new_work_id() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let package = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    env.store
+        .upsert_agent_install_package_by_id(&package)
+        .await
+        .unwrap();
+
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // 让该目标失败。
+    let original_work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    submit_work_result(&env, Some(&credential), &original_work_id, "failed", "boom").await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["entries"][0]["status"], "failed", "{detail}");
+
+    // 重试：计划重开为 rolling，条目回 dispatched。
+    let retried: serde_json::Value =
+        decode_json_response(retry_plan(&env, serde_json::json!({ "plan_id": plan_id })).await)
+            .await;
+    assert_eq!(retried["status"], "rolling", "{retried}");
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["entries"][0]["status"], "dispatched", "{detail}");
+    let new_work_id = detail["entries"][0]["work_id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    // 换了**新** work_id（否则 agentd 不会重跑）。
+    assert_ne!(new_work_id, original_work_id, "{detail}");
+
+    // 新工作的 spec 仍按平台解析好（package_url 指向该包的网关分发地址）。
+    let work = env
+        .store_handle
+        .get_one_shot_work(&new_work_id)
+        .await
+        .unwrap()
+        .expect("retry work exists");
+    let spec: serde_json::Value = serde_json::from_str(&work.work.spec).expect("spec json");
+    assert!(
+        spec["package_url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/{}", package.package_id)),
+        "{spec}"
+    );
+}
+
+#[tokio::test]
+async fn retry_can_target_a_single_failed_subset() {
+    let env = TestEnv::new().await;
+    let credential_a = a_classified_macos_agent(&env).await;
+    let credential_b = enroll_agent_at_node(&env, "node-b").await;
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-b", "node-b", "linux", "x86_64", &["sshd"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let mac = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    let lin = agent_package_history("pkg-00000000000000bb", "0.1.9", "x86_64-unknown-linux-musl");
+    env.store
+        .upsert_agent_install_package_by_id(&mac)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&lin)
+        .await
+        .unwrap();
+
+    let response =
+        create_version_rollout_plan(&env, &["agent-node-a", "agent-node-b"], "0.1.9").await;
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // 两台都失败。
+    let wa = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    let wb = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-b");
+    submit_work_result(&env, Some(&credential_a), &wa, "failed", "a-boom").await;
+    // 注意：结果要**以该 agent 自己的身份**上报（`submit_work_result` 固定用 agent-node-a）。
+    submit_work_result_as(
+        &env,
+        Some(&credential_b),
+        "agent-node-b",
+        "node-b",
+        &wb,
+        "failed",
+        "b-boom",
+    )
+    .await;
+
+    // 只重试 agent-node-a。
+    retry_plan(
+        &env,
+        serde_json::json!({ "plan_id": plan_id, "target_ids": ["agent-node-a"] }),
+    )
+    .await;
+
+    let detail = view_plan(&env, &plan_id).await;
+    let entries = detail["entries"].as_array().expect("entries");
+    let find = |target: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["target_id"] == target)
+            .expect("entry")
+    };
+    assert_eq!(find("agent-node-a")["status"], "dispatched", "{detail}");
+    assert_ne!(
+        find("agent-node-a")["work_id"].as_str().unwrap(),
+        wa,
+        "{detail}"
+    );
+    // 没被点到的目标保持 failed。
+    assert_eq!(find("agent-node-b")["status"], "failed", "{detail}");
+}
+
+#[tokio::test]
+async fn retrying_a_failed_target_rolls_the_plan_back_to_its_phase() {
+    let env = TestEnv::new().await;
+    let credential_a = a_classified_macos_agent(&env).await; // agent-node-a：macos/arm64
+    let _b = enroll_agent_at_node(&env, "node-b").await;
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-b", "node-b", "linux", "x86_64", &["sshd"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let mac = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    let lin = agent_package_history("pkg-00000000000000bb", "0.1.9", "x86_64-unknown-linux-musl");
+    env.store
+        .upsert_agent_install_package_by_id(&mac)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&lin)
+        .await
+        .unwrap();
+
+    // 两阶段：phase1 = 金丝雀（agent-node-a），phase2 = 余下（agent-node-b）。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "action": "upgrade",
+            "spec": "{\"target_version\":\"0.1.9\"}",
+            "target_ids": ["agent-node-a", "agent-node-b"],
+            "phase_count": 2,
+            "deadline_at": "2026-10-01T00:00:00Z",
+            "timeout_seconds": 600,
+            "batch_size": 0,
+        }),
+    )
+    .await;
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    assert_eq!(plan["phases"][0]["target_ids"][0], "agent-node-a", "{plan}");
+
+    approve_plan(&env, &plan_id).await;
+    // 金丝雀失败，但仍人工推进（闸门允许带失败推进）—— 计划来到第二阶段。
+    let wa = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    submit_work_result(&env, Some(&credential_a), &wa, "failed", "canary-boom").await;
+    let advanced = advance_plan(&env, &plan_id).await;
+    assert_eq!(advanced["current_phase"], 2, "{advanced}");
+    assert_eq!(advanced["phases"][0]["status"], "completed", "{advanced}");
+
+    // 重试第一阶段那个失败目标 → 计划与阶段都**重开**，current_phase 指回它所在的第 1 段。
+    let retried: serde_json::Value =
+        decode_json_response(retry_plan(&env, serde_json::json!({ "plan_id": plan_id })).await)
+            .await;
+    assert_eq!(retried["status"], "rolling", "{retried}");
+    assert_eq!(retried["current_phase"], 1, "{retried}");
+    assert_eq!(retried["phases"][0]["status"], "rolling", "{retried}");
+
+    // 重开的条目换了新 work_id、回 dispatched；未涉及的第二阶段条目不动。
+    let detail = view_plan(&env, &plan_id).await;
+    let find = |target: &str| {
+        detail["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .find(|entry| entry["target_id"] == target)
+            .expect("entry")
+    };
+    assert_eq!(find("agent-node-a")["status"], "dispatched", "{detail}");
+    assert_ne!(
+        find("agent-node-a")["work_id"].as_str().unwrap(),
+        wa,
+        "{detail}"
+    );
+    assert_eq!(find("agent-node-b")["status"], "dispatched", "{detail}");
+}
+
+#[tokio::test]
+async fn retry_refuses_a_draft_plan_and_a_plan_without_failures() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    let package = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    env.store
+        .upsert_agent_install_package_by_id(&package)
+        .await
+        .unwrap();
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+
+    // 草稿态：还没派过活 → 409。
+    let draft = retry_plan(&env, serde_json::json!({ "plan_id": plan_id })).await;
+    assert_eq!(draft.status(), StatusCode::CONFLICT);
+
+    // 批准后没有任何失败项 → 400。
+    approve_plan(&env, &plan_id).await;
+    let none = retry_plan(&env, serde_json::json!({ "plan_id": plan_id })).await;
+    assert_eq!(none.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
