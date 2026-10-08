@@ -1067,12 +1067,18 @@ pub trait Store: Send + Sync + fmt::Debug {
     /// 返回是否确实删掉了一台（`false` = 本来就不存在）。
     async fn delete_agent(&self, agent_id: &str) -> StoreResult<bool>;
 
-    /// 读取 wist-agentd 安装包地址设置；未设置过返回 `None`（调用方回落到内置默认地址）。
+    /// 读取某**平台**（target-triple）的 wist-agentd 安装包地址设置；未设置过返回 `None`。
     async fn get_agent_install_package(
         &self,
+        platform: &str,
     ) -> StoreResult<Option<StoredAgentInstallPackageAddress>>;
 
-    /// 写入/覆盖 wist-agentd 安装包地址设置。
+    /// 列出**已录入**的全部平台安装包设置（每平台一行）。
+    async fn list_agent_install_package_addresses(
+        &self,
+    ) -> StoreResult<Vec<StoredAgentInstallPackageAddress>>;
+
+    /// 写入/覆盖某平台的 wist-agentd 安装包地址设置（按 `address_id` = 平台幂等）。
     async fn upsert_agent_install_package(
         &self,
         setting: &StoredAgentInstallPackageAddress,

@@ -582,27 +582,35 @@ impl AdminConfig {
     ///
     /// **运行期分发不要用这个**：基址应取「网关对外地址」（管理面设置，未设置时回落
     /// 配置值），见 [`Self::install_script_url_at`]。
-    pub fn install_script_url(&self, arch: &str) -> String {
-        self.install_script_url_at(&self.public_base_url, arch)
+    pub fn install_script_url(&self, platform: &str) -> String {
+        self.install_script_url_at(&self.public_base_url, platform)
     }
 
     /// 同 [`Self::install_script_url`]，但基址由调用方给出（网关对外地址）。
-    pub fn install_script_url_at(&self, base: &str, arch: &str) -> String {
+    ///
+    /// 脚本按**平台（target-triple）**寻址：`/api/v1/agent/install/{platform}/install.sh`。
+    /// 每个平台的脚本内嵌对应平台的托管包与摘要（agentd 是平台专用制品）。
+    pub fn install_script_url_at(&self, base: &str, platform: &str) -> String {
         format!(
-            "{}/api/v1/agent/install/{arch}/install.sh",
+            "{}/api/v1/agent/install/{platform}/install.sh",
             trim_base_url(base)
         )
     }
 
     /// 安装包分发地址（基址取配置里的 `server.public_base_url`）；运行期见
     /// [`Self::agent_package_url_at`]。
-    pub fn agent_package_url(&self) -> String {
-        self.agent_package_url_at(&self.public_base_url)
+    pub fn agent_package_url(&self, platform: &str) -> String {
+        self.agent_package_url_at(&self.public_base_url, platform)
     }
 
     /// 同 [`Self::agent_package_url`]，但基址由调用方给出。
-    pub fn agent_package_url_at(&self, base: &str) -> String {
-        format!("{}/api/v1/agent/packages/current", trim_base_url(base))
+    ///
+    /// `?platform=` 标注目标平台：同一网关上不同平台的 agent 各取到自己那份包。
+    pub fn agent_package_url_at(&self, base: &str, platform: &str) -> String {
+        format!(
+            "{}/api/v1/agent/packages/current?platform={platform}",
+            trim_base_url(base)
+        )
     }
 
     /// 某个内容寻址 id 的安装包下载地址（基址由调用方给出，通常取
@@ -625,13 +633,16 @@ impl AdminConfig {
         format!("{}/api/v1/agent/initial-config", trim_base_url(base))
     }
 
-    /// 管理面设置的安装包**本地缓存**路径（单例）。
+    /// 管理面设置的安装包**本地缓存**路径（**按平台**一份）。
     ///
-    /// 设置来源地址时网关会把制品拉到这里，之后所有安装都从这份缓存分发；
+    /// 设置来源地址时网关会把制品拉到这里，之后该平台的安装都从这份缓存分发；
     /// 放在 SQLite 库同目录（`state/`）下，便于随 `state/` 一起备份或清理。
-    pub fn install_package_cache_path(&self) -> PathBuf {
+    pub fn install_package_cache_path(&self, platform: &str) -> PathBuf {
         let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
-        state_dir.join("install-package").join("agent-package")
+        state_dir
+            .join("install-package")
+            .join("current")
+            .join(platform)
     }
 
     /// 内容寻址的安装包**按条副本**路径：每个录入过的包单独存一份（升级要按条目取包）。
@@ -1116,12 +1127,12 @@ environment_id = "env-default"
         assert_eq!(config.admin_api_token_hash, sha256_hex("test-admin-token"));
         assert_eq!(config.public_base_url, "https://127.0.0.1:3000");
         assert_eq!(
-            config.install_script_url("x86"),
-            "https://127.0.0.1:3000/api/v1/agent/install/x86/install.sh"
+            config.install_script_url("x86_64-unknown-linux-musl"),
+            "https://127.0.0.1:3000/api/v1/agent/install/x86_64-unknown-linux-musl/install.sh"
         );
         assert_eq!(
-            config.agent_package_url(),
-            "https://127.0.0.1:3000/api/v1/agent/packages/current"
+            config.agent_package_url("x86_64-unknown-linux-musl"),
+            "https://127.0.0.1:3000/api/v1/agent/packages/current?platform=x86_64-unknown-linux-musl"
         );
         assert!(config.install_script_signing_private_key_file.is_absolute());
         assert!(

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -17,10 +17,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use ring::digest::{SHA256, digest};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use webpki::EndEntityCert;
-use wist_control::types::{AgentBootstrapBundle, AgentInstallCode, DateTime};
+use wist_control::types::{AgentBootstrapBundle, AgentInstallCode, AgentPlatformPackage, DateTime};
 
 use super::ApiState;
-use super::install_package::{AgentPackageSource, effective_package_path, resolve_agent_package};
+use super::install_package::{
+    AgentPackageSource, PLATFORM_LINUX_ARM, PLATFORM_LINUX_X86, PLATFORM_MACOS_ARM,
+    effective_package_path, resolve_agent_package, resolve_agent_platform_packages,
+};
 use super::{admin_auth::require_admin_bearer, rate_limit};
 
 const INSTALL_SCRIPT_TEMPLATE: &str = include_str!("install.sh");
@@ -57,16 +60,17 @@ pub async fn get_agent_install_code(
 
 pub async fn get_agent_install_script(
     State(state): State<ApiState>,
-    Path(arch): Path<String>,
+    Path(platform): Path<String>,
 ) -> Response {
-    let Ok(arch) = supported_agent_arch(&arch) else {
-        return unknown_arch_response();
+    let Ok(platform) = supported_agent_platform(&platform) else {
+        return unknown_platform_response();
     };
     let base = effective_advertise_base(&state.config, &state.store).await;
-    match resolve_agent_package(&state.config, &state.store, &base).await {
+    match resolve_agent_package(&state.config, &state.store, &base, platform).await {
         Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to resolve agent package: {err}"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CACHE_CONTROL, NO_STORE)],
+            format!("agent package for platform {platform} is not available: {err}"),
         )
             .into_response(),
         Ok(package) => (
@@ -74,7 +78,7 @@ pub async fn get_agent_install_script(
                 (header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8"),
                 (header::CACHE_CONTROL, NO_STORE),
             ],
-            install_script(&state.config, arch, &package, &base),
+            install_script(&state.config, platform, &package, &base),
         )
             .into_response(),
     }
@@ -82,23 +86,24 @@ pub async fn get_agent_install_script(
 
 pub async fn get_agent_install_script_signature(
     State(state): State<ApiState>,
-    Path(arch): Path<String>,
+    Path(platform): Path<String>,
 ) -> Response {
-    let Ok(arch) = supported_agent_arch(&arch) else {
-        return unknown_arch_response();
+    let Ok(platform) = supported_agent_platform(&platform) else {
+        return unknown_platform_response();
     };
     let base = effective_advertise_base(&state.config, &state.store).await;
-    let package = match resolve_agent_package(&state.config, &state.store, &base).await {
+    let package = match resolve_agent_package(&state.config, &state.store, &base, platform).await {
         Ok(package) => package,
         Err(err) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to resolve agent package: {err}"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CACHE_CONTROL, NO_STORE)],
+                format!("agent package for platform {platform} is not available: {err}"),
             )
                 .into_response();
         }
     };
-    match install_script_signature(&state.config, arch, &package, &base) {
+    match install_script_signature(&state.config, platform, &package, &base) {
         Ok(signature) => (
             [
                 (header::CONTENT_TYPE, "application/octet-stream"),
@@ -115,19 +120,23 @@ pub async fn get_agent_install_script_signature(
     }
 }
 
-fn supported_agent_arch(arch: &str) -> Result<&'static str, ()> {
-    match arch {
-        "x86" => Ok("x86"),
-        "arm" => Ok("arm"),
+/// 安装脚本路径里的**平台**（target-triple）：只认 agentd 发布的三个平台。
+/// 其余一律 404（安装面是固定的：macOS-ARM + Linux x86_64/ARM64）；
+/// 具体某个平台是否有包，另由 `resolve_agent_package` 判定（无则 503）。
+fn supported_agent_platform(platform: &str) -> Result<&'static str, ()> {
+    match platform.trim() {
+        p if p == PLATFORM_LINUX_X86 => Ok(PLATFORM_LINUX_X86),
+        p if p == PLATFORM_LINUX_ARM => Ok(PLATFORM_LINUX_ARM),
+        p if p == PLATFORM_MACOS_ARM => Ok(PLATFORM_MACOS_ARM),
         _ => Err(()),
     }
 }
 
-fn unknown_arch_response() -> Response {
+fn unknown_platform_response() -> Response {
     (
         StatusCode::NOT_FOUND,
         [(header::CACHE_CONTROL, NO_STORE)],
-        "unknown agent architecture",
+        "unknown agent platform",
     )
         .into_response()
 }
@@ -182,11 +191,19 @@ pub async fn get_agent_initial_config_with_token(
     }
 }
 
+/// 安装包当前分发端点上的目标平台（`?platform=<target-triple>`）。
+#[derive(serde::Deserialize)]
+pub struct AgentPackageQuery {
+    #[serde(default)]
+    pub platform: Option<String>,
+}
+
 pub async fn download_agent_package(
     State(state): State<ApiState>,
     client_identity: Option<Extension<VerifiedAgentIdentity>>,
     headers: HeaderMap,
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Query(params): Query<AgentPackageQuery>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = authorize_package_download(
@@ -199,11 +216,25 @@ pub async fn download_agent_package(
     {
         return response;
     }
-    let Some(package_path) = effective_package_path(&state.config, &state.store).await else {
+    let Some(platform) = params
+        .platform
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CACHE_CONTROL, NO_STORE)],
+            "missing platform query parameter",
+        )
+            .into_response();
+    };
+    let Some(package_path) = effective_package_path(&state.config, &state.store, platform).await
+    else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::CACHE_CONTROL, NO_STORE)],
-            "agent package is not configured on this gateway",
+            "agent package for this platform is not configured on this gateway",
         )
             .into_response();
     };
@@ -392,8 +423,14 @@ pub async fn issue_agent_install_code(
     // 基址取「网关对外地址」：安装命令、脚本与安装包的分发地址、以及 Agent 的控制面
     // endpoint 全部由它派生，必须同源。
     let base = effective_advertise_base(config, store).await;
-    let package = resolve_agent_package(config, store, &base).await?;
-    agent_install_code(config, &token, expires_at, &package, &base)
+    let packages = resolve_agent_platform_packages(config, store, &base).await?;
+    if packages.is_empty() {
+        return Err(
+            "没有可用的 agent 安装包：管理面未录入任何平台（或副本已不在）—— 到「安装包」页按平台录入"
+                .to_string(),
+        );
+    }
+    agent_install_code(config, &token, expires_at, &packages, &base)
 }
 
 /// 生效的对外基址：管理面设置过就用它（去掉尾斜杠），否则回落 `server.public_base_url`。
@@ -478,12 +515,22 @@ pub fn agent_install_code(
     config: &AdminConfig,
     token: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
-    package: &AgentPackageSource,
+    packages: &[(String, AgentPackageSource)],
     base: &str,
 ) -> Result<AgentInstallCode, String> {
-    let x86_install_script_url = config.install_script_url_at(base, "x86");
-    let arm_install_script_url = config.install_script_url_at(base, "arm");
+    let x86_install_script_url = config.install_script_url_at(base, PLATFORM_LINUX_X86);
+    let arm_install_script_url = config.install_script_url_at(base, PLATFORM_LINUX_ARM);
     let macos_install_code = macos_install_command(config, base)?;
+    // 每平台一份：安装脚本地址（平台限定）+ 网关托管包地址/摘要。
+    let platforms: Vec<AgentPlatformPackage> = packages
+        .iter()
+        .map(|(platform, source)| AgentPlatformPackage {
+            platform: platform.clone(),
+            install_script_url: config.install_script_url_at(base, platform),
+            agent_package_url: source.url.clone(),
+            agent_package_sha256: source.sha256.clone(),
+        })
+        .collect();
     Ok(AgentInstallCode {
         x86_linux_install_code: install_command(config, &x86_install_script_url),
         bootstrap_enrollment_token: token.to_string(),
@@ -491,15 +538,13 @@ pub fn agent_install_code(
         macos_install_code,
         bootstrap_bundle: AgentBootstrapBundle {
             bundle_id: format!("agent-bootstrap-{}", short_token_id(token)),
-            install_script_url: x86_install_script_url,
-            agent_package_url: package.url.clone(),
-            agent_package_sha256: package.sha256.clone(),
             control_endpoint: base.to_string(),
             trust_bundle: config.trust_bundle.clone(),
             tenant_id: config.tenant_id.clone(),
             environment_id: config.environment_id.clone(),
             expires_at: DateTime::from_rfc3339(&expires_at.to_rfc3339())
                 .unwrap_or_else(DateTime::now),
+            platforms,
         },
     })
 }
@@ -510,12 +555,12 @@ pub fn agent_install_code(
 /// 否则客户端下载到的脚本与其签名会不一致。
 pub fn install_script(
     config: &AdminConfig,
-    arch: &str,
+    platform: &str,
     package: &AgentPackageSource,
     base: &str,
 ) -> String {
     INSTALL_SCRIPT_TEMPLATE
-        .replace("{{ARCH}}", arch)
+        .replace("{{ARCH}}", platform)
         .replace("{{AGENT_PACKAGE_URL}}", &package.url)
         .replace(
             "{{AGENT_INITIAL_CONFIG_URL}}",
@@ -565,19 +610,18 @@ fn server_tls_spki_pin(config: &AdminConfig) -> Result<String, String> {
 
 /// macOS install command: the built-in curl authenticates the TLS channel by
 /// pinning the gateway's serving certificate, so the target host needs no
-/// external OpenSSL 3 / Ed25519 CLI support. The host architecture is picked
-/// at runtime (arm64 -> arm, everything else -> x86).
+/// external OpenSSL 3 / Ed25519 CLI support. 只发布 macOS-ARM（`aarch64-apple-darwin`），
+/// 脚本按**平台**寻址（`/api/v1/agent/install/<triple>/install.sh`）。
 fn macos_install_command(config: &AdminConfig, base: &str) -> Result<String, String> {
     let pin = server_tls_spki_pin(config)?;
-    let install_base = format!("{}/api/v1/agent/install", base.trim_end_matches('/'));
+    let script_url = config.install_script_url_at(base, PLATFORM_MACOS_ARM);
     Ok(format!(
         r#"set -eu; D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT INT TERM
 if [ "$(uname -s)" != "Darwin" ]; then echo "this install command is for macOS only" >&2; exit 2; fi
-case "$(uname -m)" in arm64) ARCH=arm ;; *) ARCH=x86 ;; esac
-curl -fsSLk --pinnedpubkey "sha256//{pin}" "{install_base}/$ARCH/install.sh" -o "$D/s"
+curl -fsSLk --pinnedpubkey "sha256//{pin}" "{script_url}" -o "$D/s"
 sh "$D/s""#,
         pin = pin,
-        install_base = install_base,
+        script_url = script_url,
     ))
 }
 
@@ -587,11 +631,11 @@ fn install_script_signature_url(script_url: &str) -> String {
 
 pub(crate) fn install_script_signature(
     config: &AdminConfig,
-    arch: &str,
+    platform: &str,
     package: &AgentPackageSource,
     base: &str,
 ) -> Result<Vec<u8>, String> {
-    let script = install_script(config, arch, package, base);
+    let script = install_script(config, platform, package, base);
     sign_install_script(
         &config.install_script_signing_private_key_file,
         script.as_bytes(),

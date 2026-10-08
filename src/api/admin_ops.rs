@@ -14,11 +14,11 @@ use crate::app::work as work_rules;
 use crate::app::work::WorkRejection;
 use crate::infra::{
     AgentQuery, DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID, DEFAULT_AGENT_UPLINK_PORT,
-    DEFAULT_AGENT_UPLINK_SETTING_ID, DEFAULT_INSTALL_PACKAGE_SETTING_ID, StoredAgentAdvertiseUrl,
-    StoredAgentClassification, StoredAgentFactSummary, StoredAgentInstallPackage,
-    StoredAgentInstallPackageAddress, StoredAgentRevocation, StoredAgentUplinkAddress,
-    StoredOneShotWork, StoredPurposeSuggestion, StoredWorkAck, StoredWorkResult,
-    contains_shell_metacharacters, effective_standing, outstanding_one_shot,
+    DEFAULT_AGENT_UPLINK_SETTING_ID, StoredAgentAdvertiseUrl, StoredAgentClassification,
+    StoredAgentFactSummary, StoredAgentInstallPackage, StoredAgentInstallPackageAddress,
+    StoredAgentRevocation, StoredAgentUplinkAddress, StoredOneShotWork, StoredPurposeSuggestion,
+    StoredWorkAck, StoredWorkResult, contains_shell_metacharacters, effective_standing,
+    outstanding_one_shot,
 };
 use wist_contracts::work::{OneShotWork, StandingWork, WorkKind, WorkReceipt};
 
@@ -120,25 +120,40 @@ pub struct AgentRevocationLiftedResponse {
     pub status: String,
 }
 
-/// 设置安装包地址的请求体。
+/// 设置安装包地址的请求体：**按平台**一次一套（多平台 agentd，缺任一整体拒绝）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct SetAgentInstallPackageRequest {
+    pub artifacts: Vec<SetAgentInstallPackageArtifact>,
+    pub requested_by: Option<String>,
+}
+
+/// 请求体里的一个平台制品。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetAgentInstallPackageArtifact {
+    /// 目标平台（target-triple），如 `aarch64-apple-darwin` / `x86_64-unknown-linux-musl`。
+    pub platform: String,
     pub package_url: String,
     /// 期望摘要（sha256，可带 `sha256:` 前缀）。
     ///
     /// **必填**：包的 sha256 是内容身份，网关拿块字节核对、不符即拒；缺了就没有可校验的事实来源。
     pub package_sha256: String,
-    pub requested_by: Option<String>,
 }
 
-/// 安装包地址响应（对应模型 `AgentInstallPackageAddress`）。
+/// 安装包来源响应：**按平台**列出已录入的一份。
 #[derive(Debug, Serialize)]
 pub struct AgentInstallPackageResponse {
-    pub address_id: String,
+    pub packages: Vec<AgentInstallPackagePlatform>,
+}
+
+/// 一个平台的当前安装包来源（对应模型 `AgentInstallPackageAddress`，`address_id` = 平台）。
+#[derive(Debug, Serialize)]
+pub struct AgentInstallPackagePlatform {
+    /// 目标平台（target-triple）。
+    pub platform: String,
     pub package_url: String,
     pub package_sha256: Option<String>,
     pub updated_by: String,
-    /// 未设置过（当前用内置默认分发地址）时为 null。
+    /// 未设置过时为 null。
     pub updated_at: Option<DateTime>,
 }
 
@@ -1872,19 +1887,8 @@ pub async fn view_agent_install_package(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    match state.store.get_agent_install_package().await {
-        Ok(Some(setting)) => Json(install_package_response(&setting)).into_response(),
-        // 未录入过来源：没有「来源地址」可报（安装包也没有其它来路 —— 已删的内置包不是回落）。
-        // 这里回空串而不回填分发端点 —— 回填会让操作者以为可以把这个地址当来源保存，
-        // 而那样网关会去请求自己（且没有 bootstrap token）。
-        Ok(None) => Json(AgentInstallPackageResponse {
-            address_id: DEFAULT_INSTALL_PACKAGE_SETTING_ID.to_string(),
-            package_url: String::new(),
-            package_sha256: None,
-            updated_by: String::new(),
-            updated_at: None,
-        })
-        .into_response(),
+    match state.store.list_agent_install_package_addresses().await {
+        Ok(settings) => Json(install_package_response(&settings)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to load agent install package address: {err}"),
@@ -1893,10 +1897,10 @@ pub async fn view_agent_install_package(
     }
 }
 
-/// 设置 wist-agentd 安装包的**来源地址**（管理面）。
+/// 设置 wist-agentd 安装包的**来源地址**（管理面，**按平台**）。
 ///
-/// 网关会立即把该地址的制品拉到本地缓存，后续安装统一从网关自身分发；
-/// 拉取失败或摘要不匹配则整次操作失败，既不落库也不覆盖已有缓存。
+/// 网关会立即把每个平台的制品拉到本地缓存，后续安装从网关自身分发；
+/// 任一平台的拉取/校验失败则整次操作失败，既不落库也不覆盖已有缓存。
 /// 变更只影响之后新签发的安装代码与 install.sh，已签发的安装代码不变。
 pub async fn set_agent_install_package(
     State(state): State<ApiState>,
@@ -1908,17 +1912,50 @@ pub async fn set_agent_install_package(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    let (package_url, expected_sha256) =
-        match validate_package_address(input.package_url.trim(), &input.package_sha256) {
-            Ok(value) => value,
-            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-        };
-    // 先把制品拉到网关本地：之后所有安装都从这份缓存分发，
-    // 校验摘要因此与真正服务出去的内容天然同源。
-    // 同时会把制品**另存一份按条副本**并解析包身份（升级按条目取包要用）。
-    let cached =
-        match fetch_into_package_cache(&state.config, package_url, Some(expected_sha256.as_str()))
-            .await
+    if input.artifacts.is_empty() {
+        return (StatusCode::BAD_REQUEST, "artifacts must not be empty").into_response();
+    }
+    // 第一阶段：平台去重 + 逐项校验来源地址；任一不合格整体拒绝（不写任何东西）。
+    let mut seen = std::collections::BTreeSet::new();
+    let mut prepared: Vec<(String, String, String)> = Vec::with_capacity(input.artifacts.len());
+    for artifact in &input.artifacts {
+        let platform = artifact.platform.trim();
+        if platform.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "artifact.platform must not be empty",
+            )
+                .into_response();
+        }
+        if !seen.insert(platform.to_string()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("duplicate platform `{platform}`"),
+            )
+                .into_response();
+        }
+        let (package_url, expected_sha256) =
+            match validate_package_address(artifact.package_url.trim(), &artifact.package_sha256) {
+                Ok(value) => value,
+                Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+            };
+        prepared.push((
+            platform.to_string(),
+            package_url.to_string(),
+            expected_sha256,
+        ));
+    }
+    // 第二阶段：全部拉到网关本地（拉取/校验失败整次不生效，不覆盖已有缓存）。
+    // 同时核「声明的平台」与「包内读出的 triple」：不符即拒，免得把错平台的包挂到某槽。
+    let mut fetched = Vec::with_capacity(prepared.len());
+    for (platform, package_url, expected_sha256) in &prepared {
+        let cached = match fetch_into_package_cache(
+            &state.config,
+            platform,
+            package_url,
+            Some(expected_sha256.as_str()),
+        )
+        .await
         {
             Ok(cached) => cached,
             Err(err) => {
@@ -1932,47 +1969,70 @@ pub async fn set_agent_install_package(
                 return (status, err.to_string()).into_response();
             }
         };
+        if !cached.arch.is_empty() && cached.arch != *platform {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "artifact platform `{platform}` does not match the package triple `{}`",
+                    cached.arch
+                ),
+            )
+                .into_response();
+        }
+        fetched.push((platform.clone(), package_url.clone(), cached));
+    }
     let requested_by = input
         .requested_by
         .unwrap_or_else(|| "platform-maintenance-engineer".to_string());
     let recorded_at = chrono::Utc::now().to_rfc3339();
-    let package_sha256 = format!("sha256:{}", cached.sha256);
-    let setting = StoredAgentInstallPackageAddress {
-        address_id: DEFAULT_INSTALL_PACKAGE_SETTING_ID.to_string(),
-        package_url: package_url.to_string(),
-        // 摘要由网关拉取后计算/校验再落库：保证它与本地缓存内容永远一致
-        // （手填摘要与本地的包对不上，正是安装端 sha256 mismatch 的成因）。
-        package_sha256: Some(package_sha256.clone()),
-        updated_by: requested_by.clone(),
-        updated_at: recorded_at.clone(),
-    };
-    if let Err(err) = state.store.upsert_agent_install_package(&setting).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store agent install package address: {err}"),
-        )
-            .into_response();
+    // 第三阶段：落库（每平台一份设置 + 一条内容寻址历史）。
+    for (platform, package_url, cached) in fetched {
+        let package_sha256 = format!("sha256:{}", cached.sha256);
+        let setting = StoredAgentInstallPackageAddress {
+            address_id: platform.clone(),
+            package_url: package_url.clone(),
+            // 摘要由网关拉取后计算/校验再落库：保证它与本地缓存内容永远一致
+            // （手填摘要与本地的包对不上，正是安装端 sha256 mismatch 的成因）。
+            package_sha256: Some(package_sha256.clone()),
+            updated_by: requested_by.clone(),
+            updated_at: recorded_at.clone(),
+        };
+        if let Err(err) = state.store.upsert_agent_install_package(&setting).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to store agent install package address: {err}"),
+            )
+                .into_response();
+        }
+        // 追加录入历史：内容寻址（package_id）幂等，同一个包重复录入覆盖同一行。
+        let history = StoredAgentInstallPackage {
+            package_id: cached.package_id.clone(),
+            source: package_url,
+            package_sha256,
+            version: cached.version.clone(),
+            arch: cached.arch.clone(),
+            cached_path: cached.cached_path.to_string_lossy().to_string(),
+            created_by: requested_by.clone(),
+            created_at: recorded_at.clone(),
+        };
+        if let Err(err) = state
+            .store
+            .upsert_agent_install_package_by_id(&history)
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to store agent install package history: {err}"),
+            )
+                .into_response();
+        }
     }
-    // 追加录入历史：内容寻址（package_id）幂等，同一个包重复录入覆盖同一行。
-    let history = StoredAgentInstallPackage {
-        package_id: cached.package_id.clone(),
-        source: package_url.to_string(),
-        package_sha256,
-        version: cached.version.clone(),
-        arch: cached.arch.clone(),
-        cached_path: cached.cached_path.to_string_lossy().to_string(),
-        created_by: requested_by,
-        created_at: recorded_at,
-    };
-    match state
-        .store
-        .upsert_agent_install_package_by_id(&history)
-        .await
-    {
-        Ok(()) => Json(install_package_response(&setting)).into_response(),
+    // 回读一遍给回执（已按平台列出）。
+    match state.store.list_agent_install_package_addresses().await {
+        Ok(settings) => Json(install_package_response(&settings)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store agent install package history: {err}"),
+            format!("failed to load agent install package address: {err}"),
         )
             .into_response(),
     }
@@ -2021,14 +2081,19 @@ pub async fn list_agent_install_packages(
 }
 
 fn install_package_response(
-    setting: &StoredAgentInstallPackageAddress,
+    settings: &[StoredAgentInstallPackageAddress],
 ) -> AgentInstallPackageResponse {
     AgentInstallPackageResponse {
-        address_id: setting.address_id.clone(),
-        package_url: setting.package_url.clone(),
-        package_sha256: setting.package_sha256.clone(),
-        updated_by: setting.updated_by.clone(),
-        updated_at: DateTime::from_rfc3339(&setting.updated_at),
+        packages: settings
+            .iter()
+            .map(|setting| AgentInstallPackagePlatform {
+                platform: setting.address_id.clone(),
+                package_url: setting.package_url.clone(),
+                package_sha256: setting.package_sha256.clone(),
+                updated_by: setting.updated_by.clone(),
+                updated_at: DateTime::from_rfc3339(&setting.updated_at),
+            })
+            .collect(),
     }
 }
 

@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.3.0" #@gxl:set(version)
+version = "0.4.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -27,10 +27,9 @@ wist-contracts = { version = "0.3" }
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可改用下面注释的 path 行。
 wist-api = { version = "0.6" }
 #wist-api = { version = "0.6", path = "../wist-api" }
-wist-control = { version = "0.6" }
+wist-control = { version = "0.11" }
+#wist-control = { version = "0.11", path = "../wist-control" }
 wist-error = { version = "0.1" }
-
-#wist-control = { version = "0.1.1", path = "../wist-control" }
 orion-error = { version = "0.8", features = ["derive", "serde_json"] }
 ring = "0.17"
 # agent 客户端证书（mTLS）签发/解析：见 docs/design/agent-identity-mtls.md §4。

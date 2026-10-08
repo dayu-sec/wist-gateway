@@ -23,11 +23,10 @@ use wist_api::status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
 use crate::app::knowledge::{KnowledgeSource, LoadedKnowledge};
 use crate::infra::{
     AdminConfig, AgentStatusUpdate, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
-    DEFAULT_INSTALL_PACKAGE_SETTING_ID, KnowledgeActivation, SqliteStore, Store,
-    StoredAgentInstallPackage, StoredAgentInstallPackageAddress, StoredAgentRevocation,
-    StoredAgentUplinkAddress, StoredCredentialStatus, StoredEnrollmentTokenStatus,
-    StoredKnowledgePackage, VerifiedAgentIdentity, bytes_sha256_hex,
-    load_install_script_public_key_pem, sha256_hex,
+    KnowledgeActivation, SqliteStore, Store, StoredAgentInstallPackage,
+    StoredAgentInstallPackageAddress, StoredAgentRevocation, StoredAgentUplinkAddress,
+    StoredCredentialStatus, StoredEnrollmentTokenStatus, StoredKnowledgePackage,
+    VerifiedAgentIdentity, bytes_sha256_hex, load_install_script_public_key_pem, sha256_hex,
 };
 use wist_api::action_result::{ReportActionResult, ResultAttestation};
 use wist_api::discovery_policies::{
@@ -56,12 +55,16 @@ use super::{
 };
 
 const TEST_ADMIN_API_TOKEN: &str = "test-admin-token";
+/// 测试用固定平台（target-triple）：`TestEnv` 的制品是裸文件（读不出 triple），
+/// 因此平台在调用处显式给。
+const TEST_PLATFORM: &str = "aarch64-apple-darwin";
 
 /// 测试用的本地制品来源（直接从文件构造 `AgentPackageSource`，不经过库）。
 fn local_package(env: &TestEnv) -> AgentPackageSource {
     AgentPackageSource::from_local_file(
         &env.config,
         &env.config.public_base_url,
+        TEST_PLATFORM,
         env.package_file.clone(),
     )
     .expect("local package source")
@@ -75,17 +78,28 @@ fn write_source_package(env: &TestEnv, name: &str, bytes: &[u8]) -> String {
 }
 
 /// 把一份来源制品设置进管理面（走真实 POST），返回（来源路径, 制品摘要）。
+///
+/// 平台从制品自身读（包内目录名的 target-triple）；裸字节读不出时回落 [`TEST_PLATFORM`]。
 async fn set_install_package_source(env: &TestEnv, name: &str, bytes: &[u8]) -> (String, String) {
     let source = write_source_package(env, name, bytes);
+    let (_, arch) = read_package_identity(bytes);
+    let platform = if arch.is_empty() {
+        TEST_PLATFORM
+    } else {
+        arch.as_str()
+    };
     let response = post_json_to_router(
         &env.config,
         &env.store_handle,
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
         &serde_json::json!({
-            "package_url": source,
-            // 摘要必填：这里交真实字节的 sha256（与网关拉到的内容同源）。
-            "package_sha256": format!("sha256:{}", bytes_sha256_hex(bytes)),
+            "artifacts": [{
+                "platform": platform,
+                "package_url": source,
+                // 摘要必填：这里交真实字节的 sha256（与网关拉到的内容同源）。
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(bytes)),
+            }],
         }),
     )
     .await;
@@ -106,7 +120,7 @@ async fn local_package_install_code(env: &TestEnv) -> wist_control::types::Agent
         &env.config,
         "token-a",
         expires_at,
-        &local_package(env),
+        &[(TEST_PLATFORM.to_string(), local_package(env))],
         &env.config.public_base_url,
     )
     .expect("install code")
@@ -117,16 +131,14 @@ async fn install_code_bundle_targets_gateway_package() {
     let env = TestEnv::new().await;
     let install_code = local_package_install_code(&env).await;
 
+    let bundle = &install_code.bootstrap_bundle;
+    assert_eq!(bundle.platforms.len(), 1);
+    assert_eq!(bundle.platforms[0].platform, TEST_PLATFORM);
     assert_eq!(
-        install_code.bootstrap_bundle.agent_package_url,
-        "https://127.0.0.1:3000/api/v1/agent/packages/current"
+        bundle.platforms[0].agent_package_url,
+        format!("https://127.0.0.1:3000/api/v1/agent/packages/current?platform={TEST_PLATFORM}")
     );
-    assert!(
-        !install_code
-            .bootstrap_bundle
-            .agent_package_sha256
-            .is_empty()
-    );
+    assert!(!bundle.platforms[0].agent_package_sha256.is_empty());
 }
 
 #[tokio::test]
@@ -136,17 +148,17 @@ async fn linux_install_code_verifies_signed_script() {
     let command = &install_code.x86_linux_install_code;
 
     assert!(install_code.arm_linux_install_code.contains(
-        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/arm/install.sh\" -o \"$D/s\""
+        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/aarch64-unknown-linux-musl/install.sh\" -o \"$D/s\""
     ));
     assert!(command.contains(
-        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/x86/install.sh\" -o \"$D/s\""
+        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/x86_64-unknown-linux-musl/install.sh\" -o \"$D/s\""
     ));
     assert!(command.contains("mktemp -d"));
     // 引导命令只报「在做什么」，不把临时工作目录这种实现细节吐给运维（安装脚本自己有进度输出）。
     assert!(!command.contains("working dir"));
     assert!(command.contains("echo \"==> 校验安装脚本签名\""));
     assert!(command.contains(
-        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/x86/install.sh.sig\" -o \"$D/sig\""
+        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/x86_64-unknown-linux-musl/install.sh.sig\" -o \"$D/sig\""
     ));
     assert!(command.contains("-----BEGIN PUBLIC KEY-----"));
     assert!(command.contains(&env.config.install_script_signing_public_key_pem));
@@ -165,9 +177,8 @@ async fn macos_install_code_pins_gateway_certificate() {
     let macos = &install_code.macos_install_code;
 
     assert!(macos.contains("\"$(uname -s)\" != \"Darwin\""));
-    assert!(macos.contains("arm64) ARCH=arm ;; *) ARCH=x86"));
     assert!(macos.contains(&format!(
-        "curl -fsSLk --pinnedpubkey \"sha256//{TEST_TLS_CERT_PIN}\" \"https://127.0.0.1:3000/api/v1/agent/install/$ARCH/install.sh\""
+        "curl -fsSLk --pinnedpubkey \"sha256//{TEST_TLS_CERT_PIN}\" \"https://127.0.0.1:3000/api/v1/agent/install/aarch64-apple-darwin/install.sh\""
     )));
     assert!(macos.contains("sh \"$D/s\""));
     assert!(!macos.contains("working dir"));
@@ -192,18 +203,10 @@ async fn install_code_leaks_no_enrollment_token() {
         assert!(!command.contains("?token="));
         assert!(!command.contains("WIST_ENROLLMENT_TOKEN="));
     }
-    assert!(
-        !install_code
-            .bootstrap_bundle
-            .install_script_url
-            .contains("?token=")
-    );
-    assert!(
-        !install_code
-            .bootstrap_bundle
-            .agent_package_url
-            .contains("?token=")
-    );
+    for platform in &install_code.bootstrap_bundle.platforms {
+        assert!(!platform.install_script_url.contains("?token="));
+        assert!(!platform.agent_package_url.contains("?token="));
+    }
 }
 
 #[tokio::test]
@@ -238,7 +241,7 @@ async fn issue_install_code_persists_one_time_token() {
 fn rendered_install_script(env: &TestEnv) -> String {
     super::install::install_script(
         &env.config,
-        "x86",
+        TEST_PLATFORM,
         &local_package(env),
         &env.config.public_base_url,
     )
@@ -250,7 +253,7 @@ async fn install_script_verifies_package_digest() {
     let script = rendered_install_script(&env);
     let sha256 = local_package(&env).sha256;
 
-    assert!(script.contains("ARCH=\"x86\""));
+    assert!(script.contains(&format!("ARCH=\"{TEST_PLATFORM}\"")));
     assert!(script.contains("AGENT_PACKAGE_SHA256=\""));
     assert!(script.contains(&sha256));
     assert!(script.contains("sha256sum"));
@@ -284,7 +287,9 @@ async fn install_script_scopes_initial_config_to_token() {
     assert!(script.contains("Enrollment token:"));
     assert!(script.contains("</dev/tty"));
     assert!(script.contains("-H \"authorization: Bearer $WIST_ENROLLMENT_TOKEN\""));
-    assert!(script.contains("\"https://127.0.0.1:3000/api/v1/agent/packages/current\""));
+    assert!(script.contains(&format!(
+        "\"https://127.0.0.1:3000/api/v1/agent/packages/current?platform={TEST_PLATFORM}\""
+    )));
     assert!(script.contains("\"https://127.0.0.1:3000/api/v1/agent/initial-config\""));
     assert!(!script.contains("?token="));
     assert!(script.contains("wist-agentd --config-dir"));
@@ -411,9 +416,13 @@ async fn local_package_requires_readable_file() {
 
     // 从本地文件构造来源需要读制品算摘要；制品不在就必须显式失败，
     // 而不是把空摘要发下去（那会让安装端跳过校验）。
-    let err =
-        AgentPackageSource::from_local_file(&env.config, &env.config.public_base_url, package_path)
-            .expect_err("unreadable package");
+    let err = AgentPackageSource::from_local_file(
+        &env.config,
+        &env.config.public_base_url,
+        TEST_PLATFORM,
+        package_path,
+    )
+    .expect_err("unreadable package");
 
     assert!(!err.is_empty());
 }
@@ -3744,7 +3753,7 @@ async fn install_script_signature_route_matches_script() {
     let script_response = get_to_router(
         &env.config,
         &env.store_handle,
-        "/api/v1/agent/install/x86/install.sh",
+        &format!("/api/v1/agent/install/{TEST_PLATFORM}/install.sh"),
         None,
     )
     .await;
@@ -3755,7 +3764,7 @@ async fn install_script_signature_route_matches_script() {
     let signature_response = get_to_router(
         &env.config,
         &env.store_handle,
-        "/api/v1/agent/install/x86/install.sh.sig",
+        &format!("/api/v1/agent/install/{TEST_PLATFORM}/install.sh.sig"),
         None,
     )
     .await;
@@ -4131,7 +4140,7 @@ async fn agent_package_route_requires_valid_token() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/v1/agent/packages/current")
+                .uri("/api/v1/agent/packages/current?platform=aarch64-apple-darwin")
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .expect("request"),
@@ -4158,7 +4167,7 @@ async fn agent_package_route_requires_valid_token() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/v1/agent/packages/current")
+                .uri("/api/v1/agent/packages/current?platform=aarch64-apple-darwin")
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -5201,8 +5210,9 @@ async fn advertise_url_drives_install_code_and_initial_config() {
     assert!(
         before
             .bootstrap_bundle
-            .agent_package_url
-            .starts_with(&env.config.public_base_url)
+            .platforms
+            .iter()
+            .all(|p| p.agent_package_url.starts_with(&env.config.public_base_url))
     );
 
     let ok = post_json_to_router(
@@ -5224,23 +5234,22 @@ async fn advertise_url_drives_install_code_and_initial_config() {
         after.bootstrap_bundle.control_endpoint,
         "https://gw.example.com"
     );
-    assert!(
-        after
-            .bootstrap_bundle
-            .install_script_url
+    assert!(after.bootstrap_bundle.platforms.iter().all(|p| {
+        p.install_script_url
             .starts_with("https://gw.example.com/api/v1/agent/install/")
-    );
+    }));
     assert!(
         after
             .bootstrap_bundle
-            .agent_package_url
-            .starts_with("https://gw.example.com/api/v1/agent/packages/current")
+            .platforms
+            .iter()
+            .all(|p| p.agent_package_url.starts_with(
+                "https://gw.example.com/api/v1/agent/packages/current?platform=aarch64-apple-darwin"
+            ))
     );
-    assert!(
-        after
-            .x86_linux_install_code
-            .contains("https://gw.example.com/api/v1/agent/install/x86/install.sh")
-    );
+    assert!(after.x86_linux_install_code.contains(
+        "https://gw.example.com/api/v1/agent/install/x86_64-unknown-linux-musl/install.sh"
+    ));
     assert!(
         after
             .macos_install_code
@@ -5283,10 +5292,7 @@ async fn install_package_view_starts_unset() {
     .await;
     assert_eq!(view.status(), StatusCode::OK);
     let body: serde_json::Value = decode_json_response(view).await;
-    assert_eq!(body["package_url"], "");
-    assert_eq!(body["package_sha256"], serde_json::Value::Null);
-    assert_eq!(body["updated_by"], "");
-    assert_eq!(body["updated_at"], serde_json::Value::Null);
+    assert_eq!(body["packages"], serde_json::json!([]));
 }
 
 #[tokio::test]
@@ -5301,8 +5307,11 @@ async fn install_package_set_rejects_bad_input() {
         uri,
         Some(TEST_ADMIN_API_TOKEN),
         &serde_json::json!({
-            "package_url": "http://example.com/agentd.tar.gz",
-            "package_sha256": "a".repeat(64),
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": "http://example.com/agentd.tar.gz",
+                "package_sha256": "a".repeat(64),
+            }],
         }),
     )
     .await;
@@ -5314,8 +5323,11 @@ async fn install_package_set_rejects_bad_input() {
         uri,
         Some(TEST_ADMIN_API_TOKEN),
         &serde_json::json!({
-            "package_url": "https://example.com/agentd.tar.gz",
-            "package_sha256": "not-a-digest",
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": "https://example.com/agentd.tar.gz",
+                "package_sha256": "not-a-digest",
+            }],
         }),
     )
     .await;
@@ -5334,8 +5346,11 @@ async fn install_package_set_rejects_unfetchable_source() {
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
         &serde_json::json!({
-            "package_url": missing,
-            "package_sha256": "a".repeat(64),
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": missing,
+                "package_sha256": "a".repeat(64),
+            }],
         }),
     )
     .await;
@@ -5343,7 +5358,7 @@ async fn install_package_set_rejects_unfetchable_source() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert!(
         env.store
-            .get_agent_install_package()
+            .get_agent_install_package(TEST_PLATFORM)
             .await
             .unwrap()
             .is_none(),
@@ -5362,13 +5377,15 @@ async fn install_package_set_requires_a_digest() {
         &env.store_handle,
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
-        &serde_json::json!({ "package_url": source }),
+        &serde_json::json!({
+            "artifacts": [{ "platform": TEST_PLATFORM, "package_url": source }],
+        }),
     )
     .await;
     assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert!(
         env.store
-            .get_agent_install_package()
+            .get_agent_install_package(TEST_PLATFORM)
             .await
             .unwrap()
             .is_none(),
@@ -5381,7 +5398,9 @@ async fn install_package_set_requires_a_digest() {
         &env.store_handle,
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
-        &serde_json::json!({ "package_url": source, "package_sha256": "  " }),
+        &serde_json::json!({
+            "artifacts": [{ "platform": TEST_PLATFORM, "package_url": source, "package_sha256": "  " }],
+        }),
     )
     .await;
     assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
@@ -5398,8 +5417,11 @@ async fn install_package_set_rejects_mismatched_digest() {
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
         &serde_json::json!({
-            "package_url": source,
-            "package_sha256": "b".repeat(64),
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": source,
+                "package_sha256": "b".repeat(64),
+            }],
         }),
     )
     .await;
@@ -5407,7 +5429,7 @@ async fn install_package_set_rejects_mismatched_digest() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(
         env.store
-            .get_agent_install_package()
+            .get_agent_install_package(TEST_PLATFORM)
             .await
             .unwrap()
             .is_none(),
@@ -5430,18 +5452,25 @@ async fn install_package_set_stores_computed_digest() {
         uri,
         Some(TEST_ADMIN_API_TOKEN),
         &serde_json::json!({
-            "package_url": source,
-            "package_sha256": format!("sha256:{}", digest.to_uppercase()),
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", digest.to_uppercase()),
+            }],
             "requested_by": "platform-eng",
         }),
     )
     .await;
     assert_eq!(set.status(), StatusCode::OK);
     let body: serde_json::Value = decode_json_response(set).await;
-    assert_eq!(body["package_url"], source);
-    assert_eq!(body["package_sha256"], format!("sha256:{digest}"));
-    assert_eq!(body["updated_by"], "platform-eng");
-    assert!(body["updated_at"].is_string());
+    assert_eq!(body["packages"][0]["platform"], TEST_PLATFORM);
+    assert_eq!(body["packages"][0]["package_url"], source);
+    assert_eq!(
+        body["packages"][0]["package_sha256"],
+        format!("sha256:{digest}")
+    );
+    assert_eq!(body["packages"][0]["updated_by"], "platform-eng");
+    assert!(body["packages"][0]["updated_at"].is_string());
 
     let view = get_to_router(
         &env.config,
@@ -5451,8 +5480,8 @@ async fn install_package_set_stores_computed_digest() {
     )
     .await;
     let body: serde_json::Value = decode_json_response(view).await;
-    assert_eq!(body["package_url"], source);
-    assert_eq!(body["updated_by"], "platform-eng");
+    assert_eq!(body["packages"][0]["package_url"], source);
+    assert_eq!(body["packages"][0]["updated_by"], "platform-eng");
 }
 
 #[tokio::test]
@@ -5461,7 +5490,7 @@ async fn install_package_set_caches_artifact_locally() {
     let bytes = b"cached-package-bytes-v2";
     set_install_package_source(&env, "mirror", bytes).await;
 
-    let cached = env.config.install_package_cache_path();
+    let cached = env.config.install_package_cache_path(TEST_PLATFORM);
     assert!(cached.is_file(), "artifact should be cached locally");
     assert_eq!(std::fs::read(&cached).expect("read cache"), bytes.to_vec());
 }
@@ -5477,11 +5506,13 @@ async fn install_code_distributes_gateway_endpoint() {
         .expect("install code");
 
     // 分发地址恒为网关端点，摘要取自本地缓存：两者同源，安装端不会 mismatch。
+    let platform = &install_code.bootstrap_bundle.platforms[0];
+    assert_eq!(platform.platform, TEST_PLATFORM);
     assert_eq!(
-        install_code.bootstrap_bundle.agent_package_url,
-        env.config.agent_package_url()
+        platform.agent_package_url,
+        env.config.agent_package_url(TEST_PLATFORM)
     );
-    assert_eq!(install_code.bootstrap_bundle.agent_package_sha256, digest);
+    assert_eq!(platform.agent_package_sha256, digest);
 }
 
 #[tokio::test]
@@ -5493,14 +5524,14 @@ async fn install_script_hides_source_address() {
     let response = get_to_router(
         &env.config,
         &env.store_handle,
-        "/api/v1/agent/install/x86/install.sh",
+        &format!("/api/v1/agent/install/{TEST_PLATFORM}/install.sh"),
         None,
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let script = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8 script");
 
-    assert!(script.contains(&env.config.agent_package_url()));
+    assert!(script.contains(&env.config.agent_package_url(TEST_PLATFORM)));
     assert!(script.contains(&digest));
     assert!(
         !script.contains(&source),
@@ -5519,7 +5550,7 @@ async fn package_download_serves_cached_artifact() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/v1/agent/packages/current")
+                .uri("/api/v1/agent/packages/current?platform=aarch64-apple-darwin")
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .expect("request"),
@@ -5718,7 +5749,12 @@ async fn current_package_download_accepts_a_client_certificate() {
     set_install_package_source(&env, "current", bytes).await;
     let agent_id = enroll_agent_credential(&env).await;
 
-    let response = get_agent_package(&env, "/api/v1/agent/packages/current", Some(&agent_id)).await;
+    let response = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&agent_id),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_bytes(response).await.to_vec(), bytes.to_vec());
 }
@@ -5804,7 +5840,12 @@ async fn package_download_rejects_a_revoked_agent() {
     set_install_package_source(&env, "revoked-agent", b"revoked-agent-bytes").await;
     let agent_id = enroll_agent_credential(&env).await;
 
-    let before = get_agent_package(&env, "/api/v1/agent/packages/current", Some(&agent_id)).await;
+    let before = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&agent_id),
+    )
+    .await;
     assert_eq!(before.status(), StatusCode::OK);
 
     assert_eq!(
@@ -5814,7 +5855,12 @@ async fn package_download_rejects_a_revoked_agent() {
         StatusCode::OK
     );
 
-    let after = get_agent_package(&env, "/api/v1/agent/packages/current", Some(&agent_id)).await;
+    let after = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&agent_id),
+    )
+    .await;
     assert_auth_rejected(after, "invalid agent client certificate").await;
 }
 
@@ -5926,7 +5972,7 @@ async fn package_get_with_bearer(app: &axum::Router, token: &str) -> axum::respo
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/v1/agent/packages/current")
+                .uri("/api/v1/agent/packages/current?platform=aarch64-apple-darwin")
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .expect("request"),
@@ -5959,10 +6005,15 @@ async fn recorded_package_with_a_missing_copy_is_unavailable() {
     let env = TestEnv::new().await;
     let credential = enroll_agent_credential(&env).await;
     // 录入过，但网关那份副本丢了：没有可用包（不会回落到别的来源）。
-    std::fs::remove_file(env.config.install_package_cache_path()).expect("remove cached copy");
+    std::fs::remove_file(env.config.install_package_cache_path(TEST_PLATFORM))
+        .expect("remove cached copy");
 
-    let current =
-        get_agent_package(&env, "/api/v1/agent/packages/current", Some(&credential)).await;
+    let current = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&credential),
+    )
+    .await;
     assert_eq!(current.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_no_store(&current);
 
@@ -5970,11 +6021,11 @@ async fn recorded_package_with_a_missing_copy_is_unavailable() {
     let script = get_to_router(
         &env.config,
         &env.store_handle,
-        "/api/v1/agent/install/x86/install.sh",
+        "/api/v1/agent/install/x86_64-unknown-linux-musl/install.sh",
         None,
     )
     .await;
-    assert_eq!(script.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(script.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = decode_text_response(script).await;
     assert!(body.contains("没有可用的 agent 安装包"), "{body}");
 }
@@ -6015,8 +6066,12 @@ async fn package_download_without_a_recorded_package_is_no_store() {
         .execute(env.store.pool())
         .await
         .expect("clear recorded package");
-    let current =
-        get_agent_package(&env, "/api/v1/agent/packages/current", Some(&credential)).await;
+    let current = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&credential),
+    )
+    .await;
     assert_eq!(current.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_no_store(&current);
     let body = decode_text_response(current).await;
@@ -6048,7 +6103,7 @@ async fn current_package_download_still_enforces_one_time_bootstrap_tokens() {
     let first = get_to_router(
         &env.config,
         &env.store_handle,
-        "/api/v1/agent/packages/current",
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
         Some(&token),
     )
     .await;
@@ -6065,7 +6120,7 @@ async fn current_package_download_still_enforces_one_time_bootstrap_tokens() {
     let replay = get_to_router(
         &env.config,
         &env.store_handle,
-        "/api/v1/agent/packages/current",
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
         Some(&token),
     )
     .await;
@@ -6082,7 +6137,7 @@ async fn current_package_download_still_enforces_one_time_bootstrap_tokens() {
     let after = get_to_router(
         &env.config,
         &env.store_handle,
-        "/api/v1/agent/packages/current",
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
         Some(&expired),
     )
     .await;
@@ -6154,8 +6209,11 @@ async fn install_package_history_absent_when_source_unreadable() {
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
         &serde_json::json!({
-            "package_url": missing,
-            "package_sha256": "a".repeat(64),
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": missing,
+                "package_sha256": "a".repeat(64),
+            }],
         }),
     )
     .await;
@@ -6200,7 +6258,7 @@ async fn install_package_set_records_setting_and_history_together() {
     // 成功录入：单行设置（当前生效来源）与历史行**都在**，且摘要同源。
     let setting = env
         .store
-        .get_agent_install_package()
+        .get_agent_install_package("x86_64-unknown-linux-gnu")
         .await
         .unwrap()
         .expect("setting");
@@ -6266,8 +6324,11 @@ async fn install_package_failed_set_keeps_previous_setting_and_history() {
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
         &serde_json::json!({
-            "package_url": bad_source,
-            "package_sha256": "c".repeat(64),
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": bad_source,
+                "package_sha256": "c".repeat(64),
+            }],
         }),
     )
     .await;
@@ -6275,7 +6336,7 @@ async fn install_package_failed_set_keeps_previous_setting_and_history() {
 
     let setting = env
         .store
-        .get_agent_install_package()
+        .get_agent_install_package("x86_64-unknown-linux-gnu")
         .await
         .unwrap()
         .expect("setting");
@@ -6473,15 +6534,18 @@ async fn install_package_set_heals_history_after_a_history_write_failure() {
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
         &serde_json::json!({
-            "package_url": source,
-            "package_sha256": format!("sha256:{digest}"),
+            "artifacts": [{
+                "platform": "x86_64-unknown-linux-gnu",
+                "package_url": source,
+                "package_sha256": format!("sha256:{digest}"),
+            }],
         }),
     )
     .await;
     assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let setting = env
         .store
-        .get_agent_install_package()
+        .get_agent_install_package("x86_64-unknown-linux-gnu")
         .await
         .unwrap()
         .expect("setting stored despite failed history write");
@@ -6506,8 +6570,11 @@ async fn install_package_set_heals_history_after_a_history_write_failure() {
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
         &serde_json::json!({
-            "package_url": source,
-            "package_sha256": format!("sha256:{digest}"),
+            "artifacts": [{
+                "platform": "x86_64-unknown-linux-gnu",
+                "package_url": source,
+                "package_sha256": format!("sha256:{digest}"),
+            }],
         }),
     )
     .await;
@@ -6529,8 +6596,11 @@ async fn install_package_set_rejects_unreachable_url() {
         "/api/v1/admin/agent/install-package",
         Some(TEST_ADMIN_API_TOKEN),
         &serde_json::json!({
-            "package_url": "https://",
-            "package_sha256": "a".repeat(64),
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": "https://",
+                "package_sha256": "a".repeat(64),
+            }],
         }),
     )
     .await;
@@ -6804,12 +6874,12 @@ impl TestEnv {
         // 安装包只有「管理面录入」一个来源（`agent.package_file` 已删）：默认给测试环境录一份本地
         // 制品，等价于真实部署里先在「安装包」页录入 —— 否则签发安装代码/分发端点会直接 503。
         if record_package {
-            let cached = config.install_package_cache_path();
+            let cached = config.install_package_cache_path(TEST_PLATFORM);
             std::fs::create_dir_all(cached.parent().expect("cache dir")).expect("create cache dir");
             std::fs::copy(&package_file, &cached).expect("seed package cache");
             store_handle
                 .upsert_agent_install_package(&StoredAgentInstallPackageAddress {
-                    address_id: DEFAULT_INSTALL_PACKAGE_SETTING_ID.to_string(),
+                    address_id: TEST_PLATFORM.to_string(),
                     package_url: package_file.to_string_lossy().to_string(),
                     package_sha256: None,
                     updated_by: "test-ops".to_string(),
@@ -9230,13 +9300,22 @@ async fn package_download_rejects_a_certificate_for_an_unknown_agent() {
     let env = TestEnv::new().await;
     set_install_package_source(&env, "unknown-agent", b"unknown-agent-bytes").await;
 
-    let rejected =
-        get_agent_package(&env, "/api/v1/agent/packages/current", Some("agent-ghost")).await;
+    let rejected = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some("agent-ghost"),
+    )
+    .await;
     assert_auth_rejected(rejected, "invalid agent client certificate").await;
 
     // 登记一台后放行（证明拒绝来自「未知」，不是端点坏了）。
     let agent_id = enroll_agent_credential(&env).await;
-    let ok = get_agent_package(&env, "/api/v1/agent/packages/current", Some(&agent_id)).await;
+    let ok = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&agent_id),
+    )
+    .await;
     assert_eq!(ok.status(), StatusCode::OK);
 }
 

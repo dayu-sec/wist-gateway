@@ -273,11 +273,11 @@ pub fn router_with_state(state: ApiState) -> Router {
             post(linkd_status::report_gateway_linkd_status),
         )
         .route(
-            "/api/v1/agent/install/{arch}/install.sh",
+            "/api/v1/agent/install/{platform}/install.sh",
             get(get_agent_install_script),
         )
         .route(
-            "/api/v1/agent/install/{arch}/install.sh.sig",
+            "/api/v1/agent/install/{platform}/install.sh.sig",
             get(get_agent_install_script_signature),
         )
         .route(

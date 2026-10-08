@@ -3,6 +3,22 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0-alpha] - 2026-10-08
+
+### 变更（不兼容）
+
+- **Agent 安装包改为按平台托管（多平台）**：`wist-agentd` 和 galaxy-ops 一样是三平台制品
+  （macOS-ARM + Linux x86_64/ARM64），而网关此前只能托管**一份**当前包 —— 换平台的机器装到的是错包。
+  现在按平台（target-triple）各托管一份：
+  - `POST /api/v1/admin/agent/install-package` 请求体改为 `{artifacts: [{platform, package_url, package_sha256}], requested_by?}`；
+    一次提交多平台，任一拉取/校验失败整次不生效（不落库、不覆盖缓存）；平台与包内 triple 不符即拒。
+  - `GET /api/v1/admin/agent/install-package` 响应改为 `{packages: [{platform, package_url, package_sha256, updated_by, updated_at}]}`（**去掉**单值 `address_id` / 顶层 `package_url`）。
+  - 安装脚本路由改为**平台化**：`/api/v1/agent/install/{platform}/install.sh`（+ `.sig`）；
+    包下发 `GET /api/v1/agent/packages/current?platform=<triple>`（缺 `platform` 回 400）。
+  - 缓存在 `state/install-package/current/<platform>`；存储 `agent_install_package` 复用 `address_id` 列作平台键（无 schema 改动，旧的 `default` 行需重录）。
+  - 安装代码/引导包：`AgentBootstrapBundle.platforms`（`wist-control` 0.11）列出各平台的脚本地址 + 包地址/摘要；三条安装命令各指向自己平台的脚本。
+  - 已签发的安装命令会失效（脚本 URL 变了），需重发。
+
 ## [0.3.0-alpha] - 2026-10-07
 
 ### 新增

@@ -32,6 +32,12 @@ pub use wist_release::package::package_id_for_sha256;
 /// agent 安装包读不出架构时宁可不报，也不把版本错切出来。
 pub use wist_release::package::read_binary_package_identity as read_package_identity;
 
+/// agentd 的已知发布平台（target-triple），与 `wist-agentd` 发布矩阵一致。
+/// 网关按平台分别托管安装包（macOS-ARM + Linux x86_64/ARM64）。
+pub const PLATFORM_LINUX_X86: &str = "x86_64-unknown-linux-musl";
+pub const PLATFORM_LINUX_ARM: &str = "aarch64-unknown-linux-musl";
+pub const PLATFORM_MACOS_ARM: &str = "aarch64-apple-darwin";
+
 /// 网关实际分发的安装包来源。
 ///
 /// `url` 恒为网关自身的分发端点（目标主机只连网关）；`sha256` 是裸 hex，
@@ -51,10 +57,11 @@ impl AgentPackageSource {
     pub fn from_local_file(
         config: &AdminConfig,
         base: &str,
+        platform: &str,
         path: PathBuf,
     ) -> Result<Self, String> {
         Ok(Self {
-            url: config.agent_package_url_at(base),
+            url: config.agent_package_url_at(base, platform),
             sha256: file_sha256_hex(&path)?,
         })
     }
@@ -73,9 +80,10 @@ impl AgentPackageSource {
 pub async fn effective_package_path(
     config: &AdminConfig,
     store: &Arc<dyn Store>,
+    platform: &str,
 ) -> Option<PathBuf> {
-    let cached = config.install_package_cache_path();
-    match store.get_agent_install_package().await {
+    let cached = config.install_package_cache_path(platform);
+    match store.get_agent_install_package(platform).await {
         Ok(Some(_)) if cached.is_file() => Some(cached),
         Ok(_) => None,
         Err(err) => {
@@ -92,14 +100,45 @@ pub async fn resolve_agent_package(
     config: &AdminConfig,
     store: &Arc<dyn Store>,
     base: &str,
+    platform: &str,
 ) -> Result<AgentPackageSource, String> {
-    let Some(path) = effective_package_path(config, store).await else {
-        return Err(
-            "没有可用的 agent 安装包：管理面未录入来源，或录入的副本已不在 —— 到「安装包」页看一眼（重新录入会重新拉取）"
-                .to_string(),
-        );
+    let Some(path) = effective_package_path(config, store, platform).await else {
+        return Err(format!(
+            "平台 {platform} 没有可用的 agent 安装包：管理面未录入来源，或录入的副本已不在 —— 到「安装包」页看一眼（重新录入会重新拉取）"
+        ));
     };
-    AgentPackageSource::from_local_file(config, base, path)
+    AgentPackageSource::from_local_file(config, base, platform, path)
+}
+
+/// 解析**全部已录入平台**的安装包来源（签发安装代码时组多平台 bundle 用）。
+///
+/// 只列「记录在案且缓存副本仍在」的平台；某个平台的副本丢了就跳过（只记告警），
+/// 不让一个坏平台把整份安装代码弄成不可用。
+pub async fn resolve_agent_platform_packages(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    base: &str,
+) -> Result<Vec<(String, AgentPackageSource)>, String> {
+    let settings = store
+        .list_agent_install_package_addresses()
+        .await
+        .map_err(|err| format!("failed to list agent install packages: {err}"))?;
+    let mut resolved = Vec::new();
+    for setting in settings {
+        let platform = setting.address_id;
+        match effective_package_path(config, store, &platform).await {
+            Some(path) => {
+                resolved.push((
+                    platform.clone(),
+                    AgentPackageSource::from_local_file(config, base, &platform, path)?,
+                ));
+            }
+            None => eprintln!(
+                "warning: recorded agent install package for platform {platform} has no cached copy; skipped"
+            ),
+        }
+    }
+    Ok(resolved)
 }
 
 /// 一次录入的完整产物：单例缓存与按条副本都已落盘，并已解析出包身份。
@@ -121,12 +160,13 @@ pub struct CachedInstallPackage {
 /// 来源只读一次：读到的字节同时用于写两份缓存与解析包身份，避免重复拉取几十 MB 的制品。
 pub async fn fetch_into_package_cache(
     config: &AdminConfig,
+    platform: &str,
     source: &str,
     expected_sha256: Option<&str>,
 ) -> Result<CachedInstallPackage, PackageFetchError> {
     let (bytes, sha256) = read_verified_source(source, expected_sha256).await?;
-    // 单例缓存照旧写：安装路径 /api/v1/agent/packages/current 仍从它分发。
-    write_cache_to(&config.install_package_cache_path(), &bytes)?;
+    // 按平台的当前缓存：安装路径 /api/v1/agent/packages/current?platform= 从它分发。
+    write_cache_to(&config.install_package_cache_path(platform), &bytes)?;
     let package_id = package_id_for_sha256(&sha256);
     let cached_path = config.install_package_history_path(&package_id);
     write_cache_to(&cached_path, &bytes)?;

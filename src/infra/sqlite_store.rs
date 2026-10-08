@@ -552,6 +552,18 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
     })
 }
 
+fn agent_install_package_address_from_row(
+    row: &SqliteRow,
+) -> StoreResult<StoredAgentInstallPackageAddress> {
+    Ok(StoredAgentInstallPackageAddress {
+        address_id: column!(row, "address_id"),
+        package_url: column!(row, "package_url"),
+        package_sha256: column!(row, "package_sha256"),
+        updated_by: column!(row, "updated_by"),
+        updated_at: column!(row, "updated_at"),
+    })
+}
+
 fn agent_install_package_from_row(row: &SqliteRow) -> StoreResult<StoredAgentInstallPackage> {
     Ok(StoredAgentInstallPackage {
         package_id: column!(row, "package_id"),
@@ -999,25 +1011,35 @@ impl Store for SqliteStore {
 
     async fn get_agent_install_package(
         &self,
+        platform: &str,
     ) -> StoreResult<Option<StoredAgentInstallPackageAddress>> {
         let row = sqlx::query(
             "SELECT address_id, package_url, package_sha256, updated_by, updated_at \
              FROM agent_install_package WHERE address_id = ?1",
         )
-        .bind(DEFAULT_INSTALL_PACKAGE_SETTING_ID)
+        .bind(platform)
         .fetch_optional(&self.pool)
         .await
         .map_err(|err| sql_error(err, "select agent install package"))?;
         match row {
-            Some(row) => Ok(Some(StoredAgentInstallPackageAddress {
-                address_id: column!(row, "address_id"),
-                package_url: column!(row, "package_url"),
-                package_sha256: column!(row, "package_sha256"),
-                updated_by: column!(row, "updated_by"),
-                updated_at: column!(row, "updated_at"),
-            })),
+            Some(row) => Ok(Some(agent_install_package_address_from_row(&row)?)),
             None => Ok(None),
         }
+    }
+
+    async fn list_agent_install_package_addresses(
+        &self,
+    ) -> StoreResult<Vec<StoredAgentInstallPackageAddress>> {
+        let rows = sqlx::query(
+            "SELECT address_id, package_url, package_sha256, updated_by, updated_at \
+             FROM agent_install_package ORDER BY address_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list agent install package addresses"))?;
+        rows.iter()
+            .map(agent_install_package_address_from_row)
+            .collect()
     }
 
     async fn list_agent_install_packages(&self) -> StoreResult<Vec<StoredAgentInstallPackage>> {
@@ -1086,7 +1108,7 @@ impl Store for SqliteStore {
              package_sha256 = excluded.package_sha256, updated_by = excluded.updated_by, \
              updated_at = excluded.updated_at",
         )
-        .bind(DEFAULT_INSTALL_PACKAGE_SETTING_ID)
+        .bind(&setting.address_id)
         .bind(&setting.package_url)
         .bind(&setting.package_sha256)
         .bind(&setting.updated_by)
@@ -4237,11 +4259,18 @@ mod tests {
     #[tokio::test]
     async fn stores_agent_install_package_address() {
         let store = store().await;
-        // 未设置过时为 None（调用方回落到内置默认地址）。
-        assert!(store.get_agent_install_package().await.unwrap().is_none());
+        let platform = "aarch64-apple-darwin";
+        // 未设置过时为 None。
+        assert!(
+            store
+                .get_agent_install_package(platform)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let setting = StoredAgentInstallPackageAddress {
-            address_id: DEFAULT_INSTALL_PACKAGE_SETTING_ID.to_string(),
+            address_id: platform.to_string(),
             package_url: "https://mirror.example.com/agentd.tar.gz".to_string(),
             package_sha256: Some("sha256:abc".to_string()),
             updated_by: "platform-eng".to_string(),
@@ -4250,7 +4279,7 @@ mod tests {
         store.upsert_agent_install_package(&setting).await.unwrap();
 
         let loaded = store
-            .get_agent_install_package()
+            .get_agent_install_package(platform)
             .await
             .unwrap()
             .expect("setting");
@@ -4258,19 +4287,28 @@ mod tests {
         assert_eq!(loaded.package_sha256, setting.package_sha256);
         assert_eq!(loaded.updated_by, "platform-eng");
 
-        // 单例覆盖写入。
+        // 按平台覆盖写入。
         let updated = StoredAgentInstallPackageAddress {
             package_url: "https://other.example.com/agentd.tar.gz".to_string(),
             ..setting.clone()
         };
         store.upsert_agent_install_package(&updated).await.unwrap();
         let loaded = store
-            .get_agent_install_package()
+            .get_agent_install_package(platform)
             .await
             .unwrap()
             .expect("setting");
         assert_eq!(
             loaded.package_url,
+            "https://other.example.com/agentd.tar.gz"
+        );
+
+        // 列出：每平台一行（本用例只有一行）。
+        let all = store.list_agent_install_package_addresses().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].address_id, platform);
+        assert_eq!(
+            all[0].package_url,
             "https://other.example.com/agentd.tar.gz"
         );
     }
