@@ -7,6 +7,8 @@ pub mod agent_logs;
 pub use agent_logs::*;
 pub mod config;
 pub use config::*;
+pub mod github;
+pub use github::*;
 pub mod install_signing;
 pub use install_signing::*;
 pub mod secret;

@@ -3,6 +3,16 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0-alpha] - 2026-10-08
+
+### 新增
+
+- **解析 GitHub Release（安装包页一键填充）**：`POST /api/v1/admin/github-release/resolve`
+  （body `{release_url}`）—— 从 release 页面地址拉出 tag 与各平台资产
+  （`{version, assets: [{name, artifact_url, sha256, platform}]}`，`platform` = 从文件名读出的
+  target-triple）。供「安装包」页按平台自动填址+摘要（对齐 gops 的录入范式）。
+  与中心 `wist-center` 同款口径；公开仓匿名即可，私有仓可设 `WIST_GATEWAY_GITHUB_TOKEN` / `GITHUB_TOKEN`。
+
 ## [0.4.0-alpha] - 2026-10-08
 
 ### 变更（不兼容）

@@ -74,10 +74,10 @@ pub mod wist_agentd_online_registration_interface;
 pub use wist_agentd_online_registration_interface::WistAgentdOnlineRegistrationInterface;
 
 use admin_ops::{
-    classify_agent, delete_agent, get_agent_runtime_status, grant_work, lift_agent_revocation,
-    list_agent_install_packages, list_agent_revocations, list_agents, pause_work, resume_work,
-    revoke_agent, revoke_agent_credential, revoke_work, set_agent_advertise_url,
-    set_agent_install_package, set_agent_uplink, view_agent_advertise_url,
+    admin_resolve_github_release, classify_agent, delete_agent, get_agent_runtime_status,
+    grant_work, lift_agent_revocation, list_agent_install_packages, list_agent_revocations,
+    list_agents, pause_work, resume_work, revoke_agent, revoke_agent_credential, revoke_work,
+    set_agent_advertise_url, set_agent_install_package, set_agent_uplink, view_agent_advertise_url,
     view_agent_install_package, view_agent_purpose, view_agent_uplink, view_agent_work,
     view_discovery_policies, view_purpose_coverage,
 };
@@ -397,6 +397,11 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agent/install-packages",
             get(list_agent_install_packages),
+        )
+        // 管理面：解析 GitHub Release（拉 tag + 多平台制品地址，供安装包页一键填充）
+        .route(
+            "/api/v1/admin/github-release/resolve",
+            post(admin_resolve_github_release),
         )
         // NOTE(hand-added): Agent 数据面上送地址的读取/设置。它是 `uplink:poll` 现算上送
         // 授权时的目标来源；未设置时授权只能是待命（没有目标，Agent 不采集日志也不上送数据面）。

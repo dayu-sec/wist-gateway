@@ -2038,6 +2038,41 @@ pub async fn set_agent_install_package(
     }
 }
 
+/// 解析 GitHub Release 的请求体（安装包页「一键填充」用）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveGitHubReleaseRequest {
+    pub release_url: String,
+}
+
+/// 解析 GitHub Release：拉 tag 与各平台制品地址/摘要（管理面，供安装包页按平台一键填充）。
+///
+/// 输入 `https://github.com/<owner>/<repo>/releases/tag/<tag>`；返回各资产的文件名、
+/// 下载地址、sha256（有则给）与从文件名读出的 target-triple。公开仓匿名即可；私有仓
+/// 可设 `WIST_GATEWAY_GITHUB_TOKEN` / `GITHUB_TOKEN`。
+pub async fn admin_resolve_github_release(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Json(request): Json<ResolveGitHubReleaseRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let release_url = request.release_url.trim();
+    if release_url.is_empty() {
+        return (StatusCode::BAD_REQUEST, "release_url must not be empty").into_response();
+    }
+    // 可选 token：私有仓 / 提高匿名限流。优先专用名，其次通用名。
+    let token = std::env::var("WIST_GATEWAY_GITHUB_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok());
+    match crate::infra::resolve_github_release(release_url, token.as_deref()).await {
+        Ok(resolved) => Json(resolved).into_response(),
+        Err(err) => (StatusCode::BAD_GATEWAY, err).into_response(),
+    }
+}
+
 /// 列出 wist-agentd 安装包的**录入历史**（管理面）。
 ///
 /// 按录入时间倒序返回；每条带内容寻址 id（可用于 `GET /api/v1/agent/packages/{package_id}`
