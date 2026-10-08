@@ -58,7 +58,7 @@ mod self_state_history;
 // NOTE(hand-added): 网关侧「接入请求」通道（页面发起接入；CR-003）。对应 jumo 模型
 // Control.GatewayApp.LinkRequestInterface（环回），故路由手加。见 api/link_request.rs 与设计
 // `wist-design/doc/design/edge/gateway-onboard-request.md`。重新生成控制面代码时需回补本模块与下方路由。
-mod link_request;
+pub mod link_request;
 // NOTE(hand-added): gwlinkd 状态心跳（环回；CR-003）。gwlinkd 纯出站、页面拉不到它，故它每拍
 // 把自身状态推到网关。见 api/linkd_status.rs 与设计 `wist-design/doc/design/edge/gateway-linkd-status.md`。
 mod linkd_status;
@@ -139,6 +139,11 @@ pub struct ApiState {
     /// 启动时装载一次（配置错了 `AdminConfig::validate` 就已经拒绝启动）。它的根**只留服务端**
     /// 当 client 验证信任锚，**不下发**给 agent（见 `docs/design/agent-identity-mtls.md` §4.1）。
     pub agent_ca: Option<Arc<AgentCa>>,
+    /// 页面提交、等 gwlinkd 环回拉取的**接入待办**（单例）。`None` = 无待办。
+    ///
+    /// **只挂进程内存、不落 DB**：待办是**一次性**的过路（gwlinkd 拉到即消费，并把它写进自己的
+    /// `gwlinkd.toml` 作为持久记录），网关重启即丢 —— 丢了重提即可，无需持久化。
+    pub link_request: Arc<Mutex<Option<link_request::LinkRequest>>>,
 }
 
 impl ApiState {
@@ -212,6 +217,7 @@ pub fn build_state_with_knowledge(
         rate_limits: Arc::new(Mutex::new(rate_limit::RateLimitState::default())),
         knowledge: Arc::new(RwLock::new(Arc::new(knowledge))),
         agent_ca,
+        link_request: Arc::new(Mutex::new(None)),
     }
 }
 

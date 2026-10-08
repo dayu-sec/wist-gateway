@@ -10,6 +10,10 @@
 // - **环回（gwlinkd）**：`GET /api/v1/gateway/link-request` + `POST /api/v1/gateway/link-result`
 //   （loopback-only）。host 侧常驻拉取待办、完成接入后回报结果。
 //
+// **待办只挂进程内存**（[`ApiState::link_request`]），**不落 DB**：链接关系的持久记录由 gwlinkd
+// 在接入那一步写进它自己的 `gwlinkd.toml`（见 `wist-gwlinkd`），网关这里只是「取一次」的过路。
+// 网关重启即丢 —— 那是预期的：待办是**一次性**的，丢了重提即可，不必持久化。
+//
 // 字段 snake_case（环回面与 gwlinkd DTO 一致；admin 面沿用网关既有 snake_case 约定）。
 // 一次性接入券**明文**只经环回面交付 gwlinkd；admin 视图**不返回**券与 CA。
 
@@ -21,14 +25,32 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::infra::{DEFAULT_GATEWAY_LINK_REQUEST_SETTING_ID, StoredGatewayLinkRequest};
-
 use super::{ApiState, rate_limit};
 
 const STATUS_PENDING: &str = "Pending";
 const STATUS_CONNECTING: &str = "Connecting";
 const STATUS_CONNECTED: &str = "Connected";
 const STATUS_FAILED: &str = "Failed";
+
+/// 接入待办（进程内存单例；`None` = 无待办）。
+///
+/// **不落 DB**：这是「取一次」的过路。gwlinkd 拉到后在本机把它写进 `gwlinkd.toml`（持久记录）。
+#[derive(Debug, Clone)]
+pub struct LinkRequest {
+    pub gateway_id: String,
+    pub center_endpoint: String,
+    /// 一次性接入券明文：仅经环回面交付 gwlinkd；被消费（`Connected`）后清空。
+    pub link_token: String,
+    /// CA-S 信任锚（中心服务器证书信任根，PEM 内容）。
+    pub trust_bundle_pem: String,
+    /// `Pending` / `Connecting` / `Connected` / `Failed`。
+    pub status: String,
+    /// 失败原因（供页面显示）。
+    pub result_detail: String,
+    pub requested_by: String,
+    pub requested_at: String,
+    pub updated_at: String,
+}
 
 /// 提交接入请求（admin）。接入物来自 Center 页「连接 Gateway」。
 #[derive(Debug, Deserialize)]
@@ -89,7 +111,7 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn view(request: &StoredGatewayLinkRequest) -> GatewayLinkRequestView {
+fn view(request: &LinkRequest) -> GatewayLinkRequestView {
     GatewayLinkRequestView {
         has_request: true,
         gateway_id: request.gateway_id.clone(),
@@ -113,7 +135,7 @@ fn empty_view() -> GatewayLinkRequestView {
     }
 }
 
-fn fulfillment(request: &StoredGatewayLinkRequest) -> GatewayLinkRequestFulfillment {
+fn fulfillment(request: &LinkRequest) -> GatewayLinkRequestFulfillment {
     GatewayLinkRequestFulfillment {
         has_request: true,
         gateway_id: request.gateway_id.clone(),
@@ -136,6 +158,8 @@ fn empty_fulfillment() -> GatewayLinkRequestFulfillment {
 }
 
 /// 提交接入请求：`POST /api/v1/admin/gateway/link-request`（admin bearer）。
+///
+/// 只覆盖**进程内存**里的待办（不落 DB）；gwlinkd 环回拉取后会把接入物写进它自己的配置文件。
 pub async fn admin_set_gateway_link_request(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -166,8 +190,7 @@ pub async fn admin_set_gateway_link_request(
             .into_response();
     }
     let now = now_rfc3339();
-    let request = StoredGatewayLinkRequest {
-        setting_id: DEFAULT_GATEWAY_LINK_REQUEST_SETTING_ID.to_string(),
+    let request = LinkRequest {
         gateway_id: input.gateway_id.trim().to_string(),
         center_endpoint: center_endpoint.to_string(),
         link_token: link_token.to_string(),
@@ -178,13 +201,10 @@ pub async fn admin_set_gateway_link_request(
         requested_at: now.clone(),
         updated_at: now,
     };
-    if let Err(err) = state.store.upsert_gateway_link_request(&request).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store link request: {err}"),
-        )
-            .into_response();
-    }
+    *state
+        .link_request
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = Some(request.clone());
     Json(view(&request)).into_response()
 }
 
@@ -198,14 +218,13 @@ pub async fn admin_view_gateway_link_request(
     if let Err(response) = super::admin_auth::require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    match state.store.get_gateway_link_request().await {
-        Ok(Some(request)) => Json(view(&request)).into_response(),
-        Ok(None) => Json(empty_view()).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read link request: {err}"),
-        )
-            .into_response(),
+    let guard = state
+        .link_request
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    match guard.as_ref() {
+        Some(request) => Json(view(request)).into_response(),
+        None => Json(empty_view()).into_response(),
     }
 }
 
@@ -220,23 +239,21 @@ pub async fn query_gateway_link_request(
     if !client.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
         return (StatusCode::FORBIDDEN, "link-request is loopback-only").into_response();
     }
-    match state.store.get_gateway_link_request().await {
+    let mut guard = state
+        .link_request
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    match guard.as_mut() {
         // 只派发**未终态**的请求：`Pending`（推进到 `Connecting`）/ `Connecting`。
         // `Failed` 不再派发 —— 同一张（多半已被消费的）券重试只会反复失败；让操作者在页面重提。
-        Ok(Some(mut request)) if is_serveable(&request.status) => {
+        Some(request) if is_serveable(&request.status) => {
             if request.status == STATUS_PENDING {
                 request.status = STATUS_CONNECTING.to_string();
                 request.updated_at = now_rfc3339();
-                let _ = state.store.upsert_gateway_link_request(&request).await;
             }
-            Json(fulfillment(&request)).into_response()
+            Json(fulfillment(request)).into_response()
         }
-        Ok(_) => Json(empty_fulfillment()).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read link request: {err}"),
-        )
-            .into_response(),
+        _ => Json(empty_fulfillment()).into_response(),
     }
 }
 
@@ -267,8 +284,12 @@ pub async fn report_gateway_link_result(
                 .into_response();
         }
     };
-    match state.store.get_gateway_link_request().await {
-        Ok(Some(mut request)) => {
+    let mut guard = state
+        .link_request
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    match guard.as_mut() {
+        Some(request) => {
             request.status = status.to_string();
             request.result_detail = input.detail.trim().to_string();
             request.updated_at = now_rfc3339();
@@ -282,24 +303,12 @@ pub async fn report_gateway_link_result(
             } else {
                 input.gateway_id.trim().to_string()
             };
-            if let Err(err) = state.store.upsert_gateway_link_request(&request).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to store link result: {err}"),
-                )
-                    .into_response();
-            }
             Json(GatewayLinkResultAccepted {
                 gateway_id,
                 accepted_at: now_rfc3339(),
             })
             .into_response()
         }
-        Ok(None) => (StatusCode::NOT_FOUND, "no link request").into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read link request: {err}"),
-        )
-            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no link request").into_response(),
     }
 }

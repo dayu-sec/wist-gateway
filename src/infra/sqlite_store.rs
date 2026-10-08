@@ -1165,72 +1165,6 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    async fn get_gateway_link_request(&self) -> StoreResult<Option<StoredGatewayLinkRequest>> {
-        let row = sqlx::query(
-            "SELECT setting_id, gateway_id, center_endpoint, link_token, trust_bundle_pem, \
-             status, result_detail, requested_by, requested_at, updated_at \
-             FROM gateway_link_request WHERE setting_id = ?1",
-        )
-        .bind(DEFAULT_GATEWAY_LINK_REQUEST_SETTING_ID)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| sql_error(err, "select gateway link request"))?;
-        match row {
-            Some(row) => Ok(Some(StoredGatewayLinkRequest {
-                setting_id: column!(row, "setting_id"),
-                gateway_id: column!(row, "gateway_id"),
-                center_endpoint: column!(row, "center_endpoint"),
-                link_token: column!(row, "link_token"),
-                trust_bundle_pem: column!(row, "trust_bundle_pem"),
-                status: column!(row, "status"),
-                result_detail: column!(row, "result_detail"),
-                requested_by: column!(row, "requested_by"),
-                requested_at: column!(row, "requested_at"),
-                updated_at: column!(row, "updated_at"),
-            })),
-            None => Ok(None),
-        }
-    }
-
-    async fn upsert_gateway_link_request(
-        &self,
-        request: &StoredGatewayLinkRequest,
-    ) -> StoreResult<()> {
-        sqlx::query(
-            "INSERT INTO gateway_link_request (setting_id, gateway_id, center_endpoint, link_token, \
-             trust_bundle_pem, status, result_detail, requested_by, requested_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-             ON CONFLICT (setting_id) DO UPDATE SET gateway_id = excluded.gateway_id, \
-             center_endpoint = excluded.center_endpoint, link_token = excluded.link_token, \
-             trust_bundle_pem = excluded.trust_bundle_pem, status = excluded.status, \
-             result_detail = excluded.result_detail, requested_by = excluded.requested_by, \
-             requested_at = excluded.requested_at, updated_at = excluded.updated_at",
-        )
-        .bind(DEFAULT_GATEWAY_LINK_REQUEST_SETTING_ID)
-        .bind(&request.gateway_id)
-        .bind(&request.center_endpoint)
-        .bind(&request.link_token)
-        .bind(&request.trust_bundle_pem)
-        .bind(&request.status)
-        .bind(&request.result_detail)
-        .bind(&request.requested_by)
-        .bind(&request.requested_at)
-        .bind(&request.updated_at)
-        .execute(&self.pool)
-        .await
-        .map_err(|err| sql_error(err, "upsert gateway link request"))?;
-        Ok(())
-    }
-
-    async fn clear_gateway_link_request(&self) -> StoreResult<()> {
-        sqlx::query("DELETE FROM gateway_link_request WHERE setting_id = ?1")
-            .bind(DEFAULT_GATEWAY_LINK_REQUEST_SETTING_ID)
-            .execute(&self.pool)
-            .await
-            .map_err(|err| sql_error(err, "clear gateway link request"))?;
-        Ok(())
-    }
-
     async fn get_gateway_linkd_status(&self) -> StoreResult<Option<StoredGatewayLinkdStatus>> {
         let row = sqlx::query(
             "SELECT setting_id, gateway_id, instance_id, version, center_endpoint, state, \
@@ -4423,55 +4357,6 @@ mod tests {
         assert_eq!(loaded.host, "10.0.2.10");
         assert_eq!(loaded.port, 9100);
         assert!(loaded.enabled, "开关必须能往返（true 要读回 true）");
-    }
-
-    /// 迁移 0022 加的启用开关：列必须真在，而且**不写它时按 0（关）落库**。
-    ///
-    /// 后者是关键：旧库升上来的行走的就是这条路径（它们的存在早于这一列），
-    /// 默认读成「开」等于把一次升级变成「全队开始上送」。
-    #[tokio::test]
-    async fn stores_gateway_link_request() {
-        let store = store().await;
-        // 未提交过时为 None（调用方按「无待办」处理）。
-        assert!(store.get_gateway_link_request().await.unwrap().is_none());
-
-        let request = StoredGatewayLinkRequest {
-            setting_id: DEFAULT_GATEWAY_LINK_REQUEST_SETTING_ID.to_string(),
-            gateway_id: "gw-1".to_string(),
-            center_endpoint: "https://center.example".to_string(),
-            link_token: "link_abc".to_string(),
-            trust_bundle_pem: "-----BEGIN CERTIFICATE-----\n".to_string(),
-            status: "Pending".to_string(),
-            result_detail: String::new(),
-            requested_by: "admin".to_string(),
-            requested_at: "2026-10-05T00:00:00+00:00".to_string(),
-            updated_at: "2026-10-05T00:00:00+00:00".to_string(),
-        };
-        store.upsert_gateway_link_request(&request).await.unwrap();
-
-        let loaded = store
-            .get_gateway_link_request()
-            .await
-            .unwrap()
-            .expect("request");
-        assert_eq!(loaded.gateway_id, "gw-1");
-        assert_eq!(loaded.link_token, "link_abc");
-
-        // 单例覆盖写入。
-        let mut updated = request.clone();
-        updated.status = "Connected".to_string();
-        updated.link_token.clear();
-        store.upsert_gateway_link_request(&updated).await.unwrap();
-        let loaded = store
-            .get_gateway_link_request()
-            .await
-            .unwrap()
-            .expect("request");
-        assert_eq!(loaded.status, "Connected");
-        assert!(loaded.link_token.is_empty());
-
-        store.clear_gateway_link_request().await.unwrap();
-        assert!(store.get_gateway_link_request().await.unwrap().is_none());
     }
 
     #[tokio::test]

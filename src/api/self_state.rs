@@ -46,7 +46,6 @@ pub struct GatewaySelfState {
     pub collected_at: DateTime,
     pub store_healthy: bool,
     pub agent_count: i64,
-    pub uplink_enabled: bool,
     pub last_error: Option<String>,
     /// 网关**进程**已运行秒数（`sysinfo::Process::run_time`）。
     pub uptime_seconds: i64,
@@ -142,17 +141,6 @@ pub(super) async fn self_state(state: &ApiState, gateway_id: &str) -> GatewaySel
         .max()
         .unwrap_or(0);
 
-    // 上送启用 = 是否设置了 agent 数据面上送地址（无目标即不采集、不上送）。
-    let uplink_enabled = match state.store.get_agent_uplink().await {
-        Ok(setting) => setting.is_some(),
-        Err(err) => {
-            if last_error.is_none() {
-                last_error = Some(err.to_string());
-            }
-            false
-        }
-    };
-
     let process = process_metrics();
     let host = host_metrics();
 
@@ -182,7 +170,6 @@ pub(super) async fn self_state(state: &ApiState, gateway_id: &str) -> GatewaySel
         collected_at: now,
         store_healthy,
         agent_count,
-        uplink_enabled,
         last_error,
         uptime_seconds: process.uptime_seconds,
         cpu_percent: process.cpu_percent,
@@ -323,7 +310,6 @@ mod tests {
             collected_at: DateTime::now(),
             store_healthy: true,
             agent_count: 3,
-            uplink_enabled: true,
             last_error: None,
             uptime_seconds: 3600,
             cpu_percent: Some(1.5),
@@ -376,7 +362,6 @@ mod tests {
                 "public_base_url",
                 "store_bytes",
                 "store_healthy",
-                "uplink_enabled",
                 "uptime_seconds",
                 "version"
             ]

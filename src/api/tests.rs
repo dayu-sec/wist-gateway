@@ -6943,6 +6943,7 @@ async fn test_state() -> ApiState {
         runtime: Arc::new(Mutex::new(AdminRuntimeState::default())),
         rate_limits: Arc::new(Mutex::new(super::rate_limit::RateLimitState::default())),
         knowledge: Arc::new(RwLock::new(Arc::new(knowledge))),
+        link_request: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -11200,7 +11201,9 @@ async fn gateway_link_request_flow_round_trips() {
     use axum::extract::connect_info::MockConnectInfo;
 
     let env = TestEnv::new().await;
-    let app = router(env.config.clone(), env.store_handle.clone());
+    // 接入待办只挂进程内存：留一份 `ApiState` 句柄直接读它。
+    let state = super::build_state(env.config.clone(), env.store_handle.clone());
+    let app = super::router_with_state(state.clone());
     let loopback = || MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
 
     // 1. admin 提交（含地址 + 券 + CA）。
@@ -11285,17 +11288,24 @@ async fn gateway_link_request_flow_round_trips() {
     let body: serde_json::Value = decode_json_response(response).await;
     assert_eq!(body["has_request"], false);
 
-    let stored = env
-        .store_handle
-        .get_gateway_link_request()
-        .await
-        .expect("read")
-        .expect("request");
+    let stored = state.link_request.lock().unwrap().clone().expect("request");
     assert_eq!(stored.status, "Connected");
     assert!(stored.link_token.is_empty(), "消费后必须清掉明文券");
 
-    let view: serde_json::Value =
-        decode_json_response(get_admin(&env, "/api/v1/admin/gateway/link-request").await).await;
+    // admin 视图走**同一张 app**（同一份内存态）——接入待办不落库，另起 router 会读不到。
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/gateway/link-request")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    let view: serde_json::Value = decode_json_response(response).await;
     assert_eq!(view["status"], "Connected");
 }
 
@@ -11355,24 +11365,21 @@ async fn gateway_link_request_failed_is_not_reserved() {
     use axum::extract::connect_info::MockConnectInfo;
 
     let env = TestEnv::new().await;
-    // 直接落一条 Pending 请求（绕过 admin 面，聚焦状态机）。
-    env.store_handle
-        .upsert_gateway_link_request(&crate::infra::StoredGatewayLinkRequest {
-            setting_id: crate::infra::DEFAULT_GATEWAY_LINK_REQUEST_SETTING_ID.to_string(),
-            gateway_id: "gw-1".to_string(),
-            center_endpoint: "https://center.example".to_string(),
-            link_token: "link_abc".to_string(),
-            trust_bundle_pem: "CA".to_string(),
-            status: "Pending".to_string(),
-            result_detail: String::new(),
-            requested_by: "admin".to_string(),
-            requested_at: "t".to_string(),
-            updated_at: "t".to_string(),
-        })
-        .await
-        .expect("seed");
+    // 直接种一条 Pending 待办到进程内存（绕过 admin 面，聚焦状态机）。
+    let state = super::build_state(env.config.clone(), env.store_handle.clone());
+    *state.link_request.lock().unwrap() = Some(super::link_request::LinkRequest {
+        gateway_id: "gw-1".to_string(),
+        center_endpoint: "https://center.example".to_string(),
+        link_token: "link_abc".to_string(),
+        trust_bundle_pem: "CA".to_string(),
+        status: "Pending".to_string(),
+        result_detail: String::new(),
+        requested_by: "admin".to_string(),
+        requested_at: "t".to_string(),
+        updated_at: "t".to_string(),
+    });
 
-    let app = router(env.config.clone(), env.store_handle.clone());
+    let app = super::router_with_state(state.clone());
     let loopback = || MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
 
     // gwlinkd 拉一次 → Connecting。
@@ -11410,6 +11417,87 @@ async fn gateway_link_request_failed_is_not_reserved() {
     let body: serde_json::Value =
         decode_json_response(app.clone().oneshot(request).await.expect("route response")).await;
     assert_eq!(body["has_request"], false, "Failed 不应再被派发");
+}
+
+/// 重提覆盖（单例）：admin 再次提交 → 状态回到 Pending、券被替换；未知 result status → 400。
+#[tokio::test]
+async fn gateway_link_request_admin_overwrite_and_bad_result_status() {
+    use std::net::SocketAddr;
+
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), env.store_handle.clone());
+    let app = super::router_with_state(state.clone());
+    let loopback = || MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    async fn post_admin(app: axum::Router, body: serde_json::Value) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/gateway/link-request")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+        .status()
+    }
+
+    let first = post_admin(
+        app.clone(),
+        serde_json::json!({
+            "gateway_id": "gw-1",
+            "center_endpoint": "https://center.example",
+            "link_token": "link_first",
+            "trust_bundle_pem": "CA",
+        }),
+    )
+    .await;
+    assert_eq!(first, StatusCode::OK);
+
+    // gwlinkd 拉一次 → Connecting（证明再提交前确实有非 Pending 的旧待办）。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let _ = app.clone().oneshot(request).await.expect("route response");
+
+    // 重提（新券）→ 覆盖，状态回 Pending。
+    let second = post_admin(
+        app.clone(),
+        serde_json::json!({
+            "gateway_id": "gw-1",
+            "center_endpoint": "https://center.example",
+            "link_token": "link_second",
+            "trust_bundle_pem": "CA",
+        }),
+    )
+    .await;
+    assert_eq!(second, StatusCode::OK);
+    {
+        let guard = state.link_request.lock().unwrap();
+        let stored = guard.as_ref().expect("request");
+        assert_eq!(stored.link_token, "link_second", "重提应替换券");
+        assert_eq!(stored.status, "Pending", "重提应回到 Pending");
+    }
+
+    // 未知 result status → 400。
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/link-result")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "gateway_id": "gw-1", "status": "Bogus" }).to_string(),
+        ))
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 /// gwlinkd 状态通道：环回心跳 → 网关存储 → admin 视图（含 `age_seconds` / `stale`）；环回限定。
@@ -11553,7 +11641,6 @@ async fn admin_reads_gateway_self_state_but_loopback_face_stays_private() {
         "collected_at",
         "store_healthy",
         "agent_count",
-        "uplink_enabled",
         "last_error",
     ] {
         assert!(view.get(key).is_some(), "缺 {key}: {view}");

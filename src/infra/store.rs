@@ -215,9 +215,6 @@ pub const DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID: &str = "default";
 /// 知识库生效指针的单例 id（`knowledge_active.setting_id`）。
 pub const DEFAULT_KNOWLEDGE_SETTING_ID: &str = "default";
 
-/// 单例设置行 id：网关接入请求只有一个生效值。
-pub const DEFAULT_GATEWAY_LINK_REQUEST_SETTING_ID: &str = "default";
-
 /// 单例设置行 id：gwlinkd 状态（心跳）只有一个生效值。
 pub const DEFAULT_GATEWAY_LINKD_STATUS_SETTING_ID: &str = "default";
 
@@ -239,28 +236,6 @@ pub struct StoredAgentUplinkAddress {
     #[serde(default)]
     pub enabled: bool,
     pub updated_by: String,
-    pub updated_at: String,
-}
-
-/// 网关侧一次性「接入请求」：运维在页面提交、host 侧 gwlinkd 环回拉取执行。
-///
-/// 载荷是 Center 页「连接 Gateway」给的一整套接入物（地址 + 券 + CA）。接入券明文被
-/// gwlinkd 消费后由网关清空；`status` 供页面显示生命周期。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct StoredGatewayLinkRequest {
-    pub setting_id: String,
-    pub gateway_id: String,
-    pub center_endpoint: String,
-    /// 一次性接入券**明文**：仅随本请求一次性交给 gwlinkd；被消费后清空。
-    pub link_token: String,
-    /// CA-S 信任锚（中心服务器证书信任根，PEM 内容）。
-    pub trust_bundle_pem: String,
-    /// `Pending` / `Connecting` / `Connected` / `Failed`。
-    pub status: String,
-    /// 失败原因（供页面显示）。
-    pub result_detail: String,
-    pub requested_by: String,
-    pub requested_at: String,
     pub updated_at: String,
 }
 
@@ -1104,18 +1079,6 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 写入/覆盖 Agent 数据面上送地址设置。
     async fn upsert_agent_uplink(&self, setting: &StoredAgentUplinkAddress) -> StoreResult<()>;
-
-    /// 读取网关接入请求；未提交过返回 `None`（调用方按「无待办」处理）。
-    async fn get_gateway_link_request(&self) -> StoreResult<Option<StoredGatewayLinkRequest>>;
-
-    /// 写入/覆盖网关接入请求（单例）。
-    async fn upsert_gateway_link_request(
-        &self,
-        request: &StoredGatewayLinkRequest,
-    ) -> StoreResult<()>;
-
-    /// 清空网关接入请求（消费 / 完成接入后移除待办）。
-    async fn clear_gateway_link_request(&self) -> StoreResult<()>;
 
     /// 读取 gwlinkd 状态（最近一次心跳）；从未上报过返回 `None`。
     async fn get_gateway_linkd_status(&self) -> StoreResult<Option<StoredGatewayLinkdStatus>>;
