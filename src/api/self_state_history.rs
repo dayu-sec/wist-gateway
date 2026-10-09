@@ -54,7 +54,7 @@ pub fn spawn_self_state_sample_tick(state: ApiState) {
                 .append_gateway_self_state_sample(&sample, at_seconds - HISTORY_RETENTION_SECONDS)
                 .await
             {
-                eprintln!("warn append gateway self state sample failed: {err}");
+                log::warn!("warn append gateway self state sample failed: {err}");
             }
         }
     });

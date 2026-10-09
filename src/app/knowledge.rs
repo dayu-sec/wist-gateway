@@ -123,7 +123,7 @@ impl LoadedKnowledge {
                 match crate::app::content::load_content(catalog, packs, templates) {
                     Ok(set) => Some(Arc::new(set)),
                     Err(err) => {
-                        eprintln!("warning: failed to load collection content: {err}");
+                        log::warn!("warning: failed to load collection content: {err}");
                         None
                     }
                 }
@@ -134,7 +134,7 @@ impl LoadedKnowledge {
             Some(path) => match crate::app::purpose::load_rule_table(path) {
                 Ok(table) => Some(Arc::new(table)),
                 Err(err) => {
-                    eprintln!(
+                    log::warn!(
                         "warning: failed to load purpose rule table {}: {err}",
                         path.display()
                     );
@@ -147,7 +147,7 @@ impl LoadedKnowledge {
             Some(path) => match crate::app::discovery_policy::load_policy_table(path) {
                 Ok(set) => Some(Arc::new(set)),
                 Err(err) => {
-                    eprintln!(
+                    log::warn!(
                         "warning: failed to load discovery aspect policy table {}: {err}",
                         path.display()
                     );
@@ -201,7 +201,7 @@ impl LoadedKnowledge {
                     return Ok(loaded);
                 }
                 // 目录悬空 / 内容损坏都回落 —— 见方法头注释。
-                Err(err) => eprintln!(
+                Err(err) => log::warn!(
                     "warning: 生效知识包不可用，按后续来源回落（package_id={}）: {err}",
                     active.package_id
                 ),
@@ -216,7 +216,7 @@ impl LoadedKnowledge {
                     return Ok(loaded);
                 }
                 Err(err) => {
-                    eprintln!("warning: 启动期知识源不可用，继续按配置/空载回落: {err}")
+                    log::warn!("warning: 启动期知识源不可用，继续按配置/空载回落: {err}")
                 }
             }
         }
@@ -511,7 +511,7 @@ pub async fn record_package(
     store
         .upsert_knowledge_package(&row)
         .await
-        .map_err(|err| KnowledgeRecordError::Store(format!("落库失败：{err}")))?;
+        .map_err(|err| KnowledgeRecordError::Store(format!("落库失败：{}", err.display_chain())))?;
 
     // `load_package_dir` 装出来的这一份 `source` 还是默认的 `None`，而 `activate: true` 的
     // 一次性路径会把 `loaded` **直接**交给 `activate_loaded`，它只认 `KnowledgeSource::Package`。

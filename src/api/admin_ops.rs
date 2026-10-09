@@ -1,3 +1,4 @@
+use super::codes;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -23,7 +24,7 @@ use crate::infra::{
 use wist_contracts::work::{OneShotWork, StandingWork, WorkKind, WorkReceipt};
 
 use super::install_package::{PackageFetchError, fetch_into_package_cache};
-use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
+use super::{ApiState, admin_auth::require_admin_bearer, error::ApiError, rate_limit};
 
 /// 列表默认/最大分页大小（防止一次拉全表）。
 const DEFAULT_AGENT_PAGE_LIMIT: u64 = 100;
@@ -137,6 +138,10 @@ pub struct SetAgentInstallPackageArtifact {
     ///
     /// **必填**：包的 sha256 是内容身份，网关拿块字节核对、不符即拒；缺了就没有可校验的事实来源。
     pub package_sha256: String,
+    /// 中心镜像地址（**provenance/留痕**）：发布 ② 由 gwlinkd 交付时带上；网关**不**据此取包
+    /// （它取 `package_url`），只记进历史当作「这个包从哪来」。人填来源（admin 端点）不填。
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 /// 安装包来源响应：**按平台**列出已录入的一份。
@@ -310,14 +315,19 @@ pub async fn get_agent_runtime_status(
     let agent = match state.store.get_agent(&agent_id).await {
         Ok(Some(agent)) => agent,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
+            return ApiError::not_found(
+                codes::AGENT_NOT_FOUND,
+                format!("unknown agent {agent_id}"),
+            )
+            .into_response();
         }
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let certificate_status = match state.store.get_agent_certificate_status(&agent_id).await {
@@ -330,7 +340,7 @@ pub async fn get_agent_runtime_status(
         Err(err) => {
             // 这是 agent 自报的**可观测性**字段（§5.5），非安全关键：读不出来就降级成
             // 「未上报」并记一行，不要把整个运行态接口（它还有 revoked 等关键信息）打成 500。
-            eprintln!(
+            log::warn!(
                 "event=AgentCertificateStatusReadFailed agent_id={agent_id} detail=\"{err}\""
             );
             None
@@ -339,11 +349,12 @@ pub async fn get_agent_runtime_status(
     let revoked = match state.store.is_agent_revoked(&agent_id).await {
         Ok(revoked) => revoked,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent revocation: {err}"),
+            return ApiError::internal(
+                codes::AGENT_REVOCATION_UNAVAILABLE,
+                "failed to load agent revocation",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     Json(runtime_status(
@@ -390,22 +401,27 @@ pub async fn delete_agent(
     let agent = match state.store.get_agent(&agent_id).await {
         Ok(Some(agent)) => agent,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
+            return ApiError::not_found(
+                codes::AGENT_NOT_FOUND,
+                format!("unknown agent {agent_id}"),
+            )
+            .into_response();
         }
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     if super::overview::agent_is_online(&agent.last_seen_at, &DateTime::now()) {
-        return (
-            StatusCode::CONFLICT,
+        return ApiError::conflict(
+            codes::AGENT_ONLINE,
             format!("agent {agent_id} is online; only offline agents can be deleted"),
         )
-            .into_response();
+        .into_response();
     }
     match state.store.delete_agent(&agent_id).await {
         Ok(true) => Json(AgentDeletionResult {
@@ -413,11 +429,11 @@ pub async fn delete_agent(
             deleted_at: DateTime::now(),
         })
         .into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to delete agent: {err}"),
-        )
+        Ok(false) => {
+            ApiError::not_found(codes::AGENT_NOT_FOUND, format!("unknown agent {agent_id}"))
+                .into_response()
+        }
+        Err(err) => ApiError::internal(codes::AGENT_DELETE_FAILED, "failed to delete agent", err)
             .into_response(),
     }
 }
@@ -451,45 +467,53 @@ pub async fn view_agent_purpose(
     match state.store.get_agent(&agent_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
+            return ApiError::not_found(
+                codes::AGENT_NOT_FOUND,
+                format!("unknown agent {agent_id}"),
+            )
+            .into_response();
         }
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let fact_summary = match state.store.get_agent_fact_summary(&agent_id).await {
         Ok(summary) => summary,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent fact summary: {err}"),
+            return ApiError::internal(
+                codes::AGENT_FACT_SUMMARY_UNAVAILABLE,
+                "failed to load agent fact summary",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let suggestion = match state.store.get_purpose_suggestion(&agent_id).await {
         Ok(suggestion) => suggestion,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load purpose suggestion: {err}"),
+            return ApiError::internal(
+                codes::PURPOSE_SUGGESTION_UNAVAILABLE,
+                "failed to load purpose suggestion",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let suggestion = refresh_suggestion_for_read(&state, fact_summary.as_ref(), suggestion).await;
     let classification = match state.store.get_agent_classification(&agent_id).await {
         Ok(classification) => classification,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent classification: {err}"),
+            return ApiError::internal(
+                codes::AGENT_CLASSIFICATION_UNAVAILABLE,
+                "failed to load agent classification",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     Json(AgentPurposeResponse {
@@ -532,40 +556,41 @@ pub async fn classify_agent(
     }
     let machine_class = input.machine_class.trim();
     if !MACHINE_CLASSES.contains(&machine_class) {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::UNKNOWN_MACHINE_CLASS,
             format!("unknown machine_class {machine_class:?}"),
         )
-            .into_response();
+        .into_response();
     }
     let expected_platform =
         platform_for_machine_class(machine_class).expect("validated machine class has a platform");
     let summary = match state.store.get_agent_fact_summary(&agent_id).await {
         Ok(summary) => summary,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent fact summary: {err}"),
+            return ApiError::internal(
+                codes::AGENT_FACT_SUMMARY_UNAVAILABLE,
+                "failed to load agent fact summary",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let Some(summary) = summary else {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::CLASSIFICATION_REQUIRES_FACT_SUMMARY,
             format!("cannot classify {agent_id}: no observed platform yet (no fact summary)"),
         )
-            .into_response();
+        .into_response();
     };
     if summary.os != expected_platform {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::MACHINE_CLASS_PLATFORM_MISMATCH,
             format!(
                 "machine_class {machine_class} belongs to {expected_platform}, but the agent platform is {}",
                 summary.os
             ),
         )
-            .into_response();
+        .into_response();
     }
     let classification = StoredAgentClassification {
         agent_id: agent_id.clone(),
@@ -581,11 +606,12 @@ pub async fn classify_agent(
         .upsert_agent_classification(&classification)
         .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store agent classification: {err}"),
+        return ApiError::internal(
+            codes::AGENT_CLASSIFICATION_STORE_FAILED,
+            "failed to store agent classification",
+            err,
         )
-            .into_response();
+        .into_response();
     }
     Json(classification).into_response()
 }
@@ -613,12 +639,13 @@ struct PurposeCoverageResponse {
 ///     它是「现在不行」，人该做的是等采集就绪或换个动作，而不是改请求；
 ///   * `NotFound` —— 目标不存在。
 fn rejection_response(rejection: WorkRejection) -> Response {
-    let status = match &rejection {
-        WorkRejection::NotFound(_) => StatusCode::NOT_FOUND,
-        WorkRejection::BadRequest(_) => StatusCode::BAD_REQUEST,
-        WorkRejection::Conflict(_) => StatusCode::CONFLICT,
-    };
-    (status, rejection.message().to_string()).into_response()
+    let message = rejection.message().to_string();
+    match &rejection {
+        WorkRejection::NotFound(_) => ApiError::not_found(codes::WORK_NOT_FOUND, message),
+        WorkRejection::BadRequest(_) => ApiError::bad_request(codes::WORK_BAD_REQUEST, message),
+        WorkRejection::Conflict(_) => ApiError::conflict(codes::WORK_CONFLICT, message),
+    }
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -666,11 +693,11 @@ pub async fn grant_work(
     match input.work_kind.trim() {
         "Standing" => grant_standing_work(&state, &agent_id, &input).await,
         "OneShot" => grant_one_shot_work(&state, &agent_id, &input).await,
-        other => (
-            StatusCode::BAD_REQUEST,
+        other => ApiError::bad_request(
+            codes::UNKNOWN_WORK_KIND,
             format!("unknown work_kind {other:?} (Standing | OneShot)"),
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -685,50 +712,51 @@ async fn grant_standing_work(
 ) -> Response {
     let knowledge = state.knowledge();
     let Some(content) = knowledge.content.as_deref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
+        return ApiError::unavailable(
+            codes::COLLECTION_CONTENT_UNAVAILABLE,
             "collection content is not loaded: 配置 [content] 三件套后重启网关",
         )
-            .into_response();
+        .into_response();
     };
     let family = match input.family.as_deref().map(str::trim) {
         Some(family) if !family.is_empty() => family,
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
+            return ApiError::bad_request(
+                codes::WORK_FAMILY_REQUIRED,
                 "family is required for work_kind = Standing",
             )
-                .into_response();
+            .into_response();
         }
     };
     let classification = match state.store.get_agent_classification(agent_id).await {
         Ok(classification) => classification,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent classification: {err}"),
+            return ApiError::internal(
+                codes::AGENT_CLASSIFICATION_UNAVAILABLE,
+                "failed to load agent classification",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let Some(classification) = classification else {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::WORK_AGENT_UNCLASSIFIED,
             format!(
                 "cannot grant work to {agent_id}: 先归档用途判定（AgentClassification）—— 它决定取哪份模板"
             ),
         )
-            .into_response();
+        .into_response();
     };
     let Some(platform) = platform_for_machine_class(&classification.machine_class) else {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::MACHINE_CLASS_NO_PLATFORM,
             format!(
                 "machine class {:?} maps to no platform",
                 classification.machine_class
             ),
         )
-            .into_response();
+        .into_response();
     };
     if let Err(rejection) = work_rules::check_family_grantable(content, family, platform) {
         return rejection_response(rejection);
@@ -736,11 +764,12 @@ async fn grant_standing_work(
     let existing = match state.store.list_standing_work(agent_id).await {
         Ok(works) => works.into_iter().find(|work| work.family == family),
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load standing work: {err}"),
+            return ApiError::internal(
+                codes::STANDING_WORK_UNAVAILABLE,
+                "failed to load standing work",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let requested_spec = input.spec.trim();
@@ -748,21 +777,22 @@ async fn grant_standing_work(
         let facts = match state.store.get_agent_fact_summary(agent_id).await {
             Ok(facts) => facts,
             Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to load agent fact summary: {err}"),
+                return ApiError::internal(
+                    codes::AGENT_FACT_SUMMARY_UNAVAILABLE,
+                    "failed to load agent fact summary",
+                    err,
                 )
-                    .into_response();
+                .into_response();
             }
         };
         let Some(facts) = facts else {
-            return (
-                StatusCode::BAD_REQUEST,
+            return ApiError::bad_request(
+                codes::WORK_SPEC_UNDERIVABLE,
                 format!(
                     "cannot derive the work spec for {agent_id}: 还没有事实摘要（无事实就无从裁剪）"
                 ),
             )
-                .into_response();
+            .into_response();
         };
         work_rules::derive_spec(
             content,
@@ -803,11 +833,12 @@ async fn grant_standing_work(
         updated_at: now.clone(),
     };
     if let Err(err) = state.store.save_standing_work(&work).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store standing work: {err}"),
+        return ApiError::internal(
+            codes::STANDING_WORK_STORE_FAILED,
+            "failed to store standing work",
+            err,
         )
-            .into_response();
+        .into_response();
     }
     finish_work_mutation(
         state,
@@ -833,19 +864,19 @@ async fn grant_one_shot_work(
     let action = match input.action.as_deref().map(str::trim) {
         Some(action) if !action.is_empty() => action,
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
+            return ApiError::bad_request(
+                codes::WORK_ACTION_REQUIRED,
                 "action is required for work_kind = OneShot",
             )
-                .into_response();
+            .into_response();
         }
     };
     if input.spec.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::WORK_SPEC_REQUIRED,
             "spec is required for work_kind = OneShot",
         )
-            .into_response();
+        .into_response();
     }
     // 绝对截止是必填：没有截止的「一次性工作」与常驻工作无从分辨，
     // 而两者的暂停、恢复、结算语义完全不同。
@@ -855,27 +886,27 @@ async fn grant_one_shot_work(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::WORK_DEADLINE_REQUIRED,
             "deadline_at is required for work_kind = OneShot",
         )
-            .into_response();
+        .into_response();
     };
     if chrono::DateTime::parse_from_rfc3339(deadline_at).is_err() {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::WORK_DEADLINE_INVALID,
             format!("deadline_at must be RFC3339, got {deadline_at:?}"),
         )
-            .into_response();
+        .into_response();
     }
     let timeout_seconds = match input.timeout_seconds {
         Some(value) if value > 0 => value,
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
+            return ApiError::bad_request(
+                codes::WORK_TIMEOUT_INVALID,
                 "timeout_seconds must be a positive number of seconds",
             )
-                .into_response();
+            .into_response();
         }
     };
     let now = chrono::Utc::now().to_rfc3339();
@@ -887,11 +918,11 @@ async fn grant_one_shot_work(
         .unwrap_or(&now)
         .to_string();
     if chrono::DateTime::parse_from_rfc3339(&scheduled_at).is_err() {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::WORK_SCHEDULED_AT_INVALID,
             format!("scheduled_at must be RFC3339, got {scheduled_at:?}"),
         )
-            .into_response();
+        .into_response();
     }
     // `interruptible` 不在请求体里（模型消息也没这个字段）：一件活能不能中途暂停是
     // **动作目录的属性**，不该由每次派发的人各自声明 —— 否则同一种动作会因为两次派发
@@ -924,11 +955,12 @@ async fn grant_one_shot_work(
         })
         .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store one-shot work: {err}"),
+        return ApiError::internal(
+            codes::ONE_SHOT_WORK_STORE_FAILED,
+            "failed to store one-shot work",
+            err,
         )
-            .into_response();
+        .into_response();
     }
     finish_work_mutation(
         state,
@@ -976,11 +1008,11 @@ pub async fn revoke_work(
         Err(response) => *response,
         Ok(LoadedWork::Standing(work)) => {
             if work.status == "revoked" {
-                return (
-                    StatusCode::CONFLICT,
+                return ApiError::conflict(
+                    codes::WORK_ALREADY_REVOKED,
                     format!("standing work {work_id} is already revoked"),
                 )
-                    .into_response();
+                .into_response();
             }
             let revoked = StandingWork {
                 status: "revoked".to_string(),
@@ -988,11 +1020,12 @@ pub async fn revoke_work(
                 ..work
             };
             if let Err(err) = state.store.save_standing_work(&revoked).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to store standing work: {err}"),
+                return ApiError::internal(
+                    codes::STANDING_WORK_STORE_FAILED,
+                    "failed to store standing work",
+                    err,
                 )
-                    .into_response();
+                .into_response();
             }
             // `reason_code` 收下但暂不落库：审计事件（WorkRevoked）还没建。
             // 宁可在回执里如实回报，也不凭一个没人读的列假装留了痕。
@@ -1013,25 +1046,26 @@ pub async fn revoke_work(
         }
         Ok(LoadedWork::OneShot(stored)) => {
             if !stored.work.is_outstanding() {
-                return (
-                    StatusCode::CONFLICT,
+                return ApiError::conflict(
+                    codes::WORK_ALREADY_TERMINAL,
                     format!(
                         "one-shot work {work_id} is already {} (terminal)",
                         stored.work.status
                     ),
                 )
-                    .into_response();
+                .into_response();
             }
             let mut canceled = stored;
             canceled.work.status = "canceled".to_string();
             canceled.work.paused_at = None;
             canceled.pre_pause_status = None;
             if let Err(err) = state.store.save_one_shot_work(&canceled).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to store one-shot work: {err}"),
+                return ApiError::internal(
+                    codes::ONE_SHOT_WORK_STORE_FAILED,
+                    "failed to store one-shot work",
+                    err,
                 )
-                    .into_response();
+                .into_response();
             }
             finish_work_mutation(
                 &state,
@@ -1068,14 +1102,14 @@ pub async fn pause_work(
         Err(response) => *response,
         Ok(LoadedWork::Standing(work)) => {
             if work.status != "active" {
-                return (
-                    StatusCode::CONFLICT,
+                return ApiError::conflict(
+                    codes::WORK_NOT_ACTIVE,
                     format!(
                         "standing work {work_id} is {}; only active work can be paused",
                         work.status
                     ),
                 )
-                    .into_response();
+                .into_response();
             }
             let paused = StandingWork {
                 status: "paused".to_string(),
@@ -1084,11 +1118,12 @@ pub async fn pause_work(
                 ..work
             };
             if let Err(err) = state.store.save_standing_work(&paused).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to store standing work: {err}"),
+                return ApiError::internal(
+                    codes::STANDING_WORK_STORE_FAILED,
+                    "failed to store standing work",
+                    err,
                 )
-                    .into_response();
+                .into_response();
             }
             finish_work_mutation(
                 &state,
@@ -1110,11 +1145,12 @@ pub async fn pause_work(
                 Err(rejection) => return rejection_response(rejection),
             };
             if let Err(err) = state.store.save_one_shot_work(&paused).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to store one-shot work: {err}"),
+                return ApiError::internal(
+                    codes::ONE_SHOT_WORK_STORE_FAILED,
+                    "failed to store one-shot work",
+                    err,
                 )
-                    .into_response();
+                .into_response();
             }
             finish_work_mutation(
                 &state,
@@ -1152,14 +1188,14 @@ pub async fn resume_work(
         Err(response) => *response,
         Ok(LoadedWork::Standing(work)) => {
             if work.status != "paused" {
-                return (
-                    StatusCode::CONFLICT,
+                return ApiError::conflict(
+                    codes::WORK_NOT_PAUSED,
                     format!(
                         "standing work {work_id} is {}; only paused work can be resumed",
                         work.status
                     ),
                 )
-                    .into_response();
+                .into_response();
             }
             // 恢复**不重新审定**：仍用暂停前的同一版本（`plan_version` 不动）。
             let resumed = StandingWork {
@@ -1169,11 +1205,12 @@ pub async fn resume_work(
                 ..work
             };
             if let Err(err) = state.store.save_standing_work(&resumed).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to store standing work: {err}"),
+                return ApiError::internal(
+                    codes::STANDING_WORK_STORE_FAILED,
+                    "failed to store standing work",
+                    err,
                 )
-                    .into_response();
+                .into_response();
             }
             finish_work_mutation(
                 &state,
@@ -1195,11 +1232,12 @@ pub async fn resume_work(
                 Err(rejection) => return rejection_response(rejection),
             };
             if let Err(err) = state.store.save_one_shot_work(&resumed).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to store one-shot work: {err}"),
+                return ApiError::internal(
+                    codes::ONE_SHOT_WORK_STORE_FAILED,
+                    "failed to store one-shot work",
+                    err,
                 )
-                    .into_response();
+                .into_response();
             }
             let receipt = WorkReceipt {
                 work_id: resumed.work.work_id.clone(),
@@ -1237,11 +1275,12 @@ async fn load_work(
         .await
         .map_err(|err| {
             Box::new(
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to load standing work: {err}"),
+                ApiError::internal(
+                    codes::STANDING_WORK_UNAVAILABLE,
+                    "failed to load standing work",
+                    err,
                 )
-                    .into_response(),
+                .into_response(),
             )
         })?;
     if let Some(work) = standing {
@@ -1256,11 +1295,12 @@ async fn load_work(
         .await
         .map_err(|err| {
             Box::new(
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to load one-shot work: {err}"),
+                ApiError::internal(
+                    codes::ONE_SHOT_WORK_UNAVAILABLE,
+                    "failed to load one-shot work",
+                    err,
                 )
-                    .into_response(),
+                .into_response(),
             )
         })?;
     match one_shot {
@@ -1270,11 +1310,11 @@ async fn load_work(
 }
 
 fn not_found_work(agent_id: &str, work_id: &str) -> Response {
-    (
-        StatusCode::NOT_FOUND,
+    ApiError::not_found(
+        codes::WORK_NOT_FOUND,
         format!("unknown work {work_id} on agent {agent_id}"),
     )
-        .into_response()
+    .into_response()
 }
 
 /// 改完工作后统一收尾：推进授权序号并把回执交给调用方。
@@ -1287,11 +1327,12 @@ async fn finish_work_mutation(state: &ApiState, agent_id: &str, receipt: WorkRec
         .next_work_sequence(agent_id, &receipt.created_at)
         .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to bump work sequence: {err}"),
+        return ApiError::internal(
+            codes::WORK_SEQUENCE_BUMP_FAILED,
+            "failed to bump work sequence",
+            err,
         )
-            .into_response();
+        .into_response();
     }
     Json(receipt).into_response()
 }
@@ -1376,21 +1417,23 @@ pub async fn view_agent_work(
     let standing = match state.store.list_standing_work(&agent_id).await {
         Ok(works) => works,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load standing work: {err}"),
+            return ApiError::internal(
+                codes::STANDING_WORK_UNAVAILABLE,
+                "failed to load standing work",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let one_shot = match state.store.list_one_shot_work(&agent_id).await {
         Ok(works) => works,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load one-shot work: {err}"),
+            return ApiError::internal(
+                codes::ONE_SHOT_WORK_UNAVAILABLE,
+                "failed to load one-shot work",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let mut standing_views = Vec::new();
@@ -1439,11 +1482,12 @@ pub async fn view_agent_work(
     let sequence = match state.store.work_sequence(&agent_id).await {
         Ok(sequence) => sequence,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load work sequence: {err}"),
+            return ApiError::internal(
+                codes::WORK_SEQUENCE_UNAVAILABLE,
+                "failed to load work sequence",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     // 本机工作视图：agent 上报的「我真的在干什么」。读不到就是没报过（`None`），
@@ -1451,11 +1495,12 @@ pub async fn view_agent_work(
     let local = match state.store.get_agent(&agent_id).await {
         Ok(agent) => agent.and_then(|agent| agent.local_work),
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     Json(AgentWorkView {
@@ -1474,10 +1519,7 @@ pub async fn view_agent_work(
 async fn load_ack(state: &ApiState, work_id: &str) -> Result<Option<StoredWorkAck>, Box<Response>> {
     state.store.get_work_ack(work_id).await.map_err(|err| {
         Box::new(
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load work ack: {err}"),
-            )
+            ApiError::internal(codes::WORK_ACK_UNAVAILABLE, "failed to load work ack", err)
                 .into_response(),
         )
     })
@@ -1491,11 +1533,12 @@ async fn load_work_result(
 ) -> Result<Option<StoredWorkResult>, Box<Response>> {
     state.store.get_work_result(work_id).await.map_err(|err| {
         Box::new(
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load work result: {err}"),
+            ApiError::internal(
+                codes::WORK_RESULT_UNAVAILABLE,
+                "failed to load work result",
+                err,
             )
-                .into_response(),
+            .into_response(),
         )
     })
 }
@@ -1516,11 +1559,12 @@ pub async fn view_purpose_coverage(
     let counts = match state.store.purpose_coverage().await {
         Ok(counts) => counts,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load purpose coverage: {err}"),
+            return ApiError::internal(
+                codes::PURPOSE_COVERAGE_UNAVAILABLE,
+                "failed to load purpose coverage",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     // 未归类 = 总数 − 已判定；用 max(0) 防脏数据把负数漏到页面上。
@@ -1571,7 +1615,7 @@ async fn refresh_suggestion_for_read(
     {
         Ok(suggestion) => suggestion,
         Err(detail) => {
-            eprintln!(
+            log::warn!(
                 "warn purpose suggestion refresh failed agent_id={}: {detail}",
                 summary.agent_id
             );
@@ -1609,21 +1653,23 @@ pub async fn list_agents(
     let agents = match state.store.list_agents(&store_query).await {
         Ok(agents) => agents,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let total = match state.store.count_agents(&store_query).await {
         Ok(total) => total,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
 
@@ -1670,19 +1716,20 @@ pub async fn revoke_agent_credential(
             revoked_at: DateTime::now(),
         })
         .into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
+        Ok(false) => ApiError::not_found(
+            codes::AGENT_CREDENTIAL_NOT_FOUND,
             format!(
                 "unknown or already revoked credential {} for agent {agent_id}",
                 input.credential_id
             ),
         )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to revoke agent credential: {err}"),
+        .into_response(),
+        Err(err) => ApiError::internal(
+            codes::AGENT_CREDENTIAL_REVOKE_FAILED,
+            "failed to revoke agent credential",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -1710,14 +1757,19 @@ pub async fn revoke_agent(
     let agent = match state.store.get_agent(&agent_id).await {
         Ok(Some(agent)) => agent,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
+            return ApiError::not_found(
+                codes::AGENT_NOT_FOUND,
+                format!("unknown agent {agent_id}"),
+            )
+            .into_response();
         }
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let now = chrono::Utc::now();
@@ -1736,15 +1788,14 @@ pub async fn revoke_agent(
         .to_rfc3339(),
     };
     if let Err(err) = state.store.revoke_agent(&entry).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to revoke agent: {err}"),
-        )
+        return ApiError::internal(codes::AGENT_REVOKE_FAILED, "failed to revoke agent", err)
             .into_response();
     }
-    eprintln!(
+    log::info!(
         "audit agent_revoked agent_id={} retain_until={} reason_code={}",
-        entry.agent_id, entry.retain_until, entry.reason_code
+        entry.agent_id,
+        entry.retain_until,
+        entry.reason_code
     );
     Json(entry).into_response()
 }
@@ -1762,23 +1813,24 @@ pub async fn lift_agent_revocation(
     }
     match state.store.lift_agent_revocation(&agent_id).await {
         Ok(true) => {
-            eprintln!("audit agent_revocation_lifted agent_id={agent_id}");
+            log::info!("audit agent_revocation_lifted agent_id={agent_id}");
             Json(AgentRevocationLiftedResponse {
                 agent_id,
                 status: "lifted".to_string(),
             })
             .into_response()
         }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
+        Ok(false) => ApiError::not_found(
+            codes::AGENT_REVOCATION_NOT_FOUND,
             format!("agent {agent_id} is not in the revocation list"),
         )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to lift agent revocation: {err}"),
+        .into_response(),
+        Err(err) => ApiError::internal(
+            codes::AGENT_REVOCATION_LIFT_FAILED,
+            "failed to lift agent revocation",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -1798,11 +1850,12 @@ pub async fn list_agent_revocations(
             generated_at: DateTime::now(),
         })
         .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to list agent revocations: {err}"),
+        Err(err) => ApiError::internal(
+            codes::AGENT_REVOCATION_LIST_FAILED,
+            "failed to list agent revocations",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -1889,11 +1942,12 @@ pub async fn view_agent_install_package(
     }
     match state.store.list_agent_install_package_addresses().await {
         Ok(settings) => Json(install_package_response(&settings)).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load agent install package address: {err}"),
+        Err(err) => ApiError::internal(
+            codes::INSTALL_PACKAGE_ADDRESS_UNAVAILABLE,
+            "failed to load agent install package address",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -1912,43 +1966,85 @@ pub async fn set_agent_install_package(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
+    apply_agent_install_package(&state, input).await
+}
+
+/// 安装包来源设置的**内核**：admin 端点（人工录入，见上 `set_agent_install_package`）与环回端点
+/// （中心下发，见 `super::agent_package::receive_agent_package`）**共用这一份**，防止两处漂移。
+///
+/// 鉴权口径由调用方负责（admin bearer / loopback-only）；语义来源不同（人工录入 / 中心推送），
+/// 但「把来源落到网关包管理」这件事只有这一份实现：
+/// 校验 → 逐平台拉取到本地（失败整次不生效）→ 落库每平台设置 + 内容寻址历史 → 回读。
+pub(crate) async fn apply_agent_install_package(
+    state: &ApiState,
+    input: SetAgentInstallPackageRequest,
+) -> Response {
     if input.artifacts.is_empty() {
-        return (StatusCode::BAD_REQUEST, "artifacts must not be empty").into_response();
+        return ApiError::bad_request(
+            codes::INSTALL_PACKAGE_ARTIFACTS_EMPTY,
+            "artifacts must not be empty",
+        )
+        .into_response();
     }
     // 第一阶段：平台去重 + 逐项校验来源地址；任一不合格整体拒绝（不写任何东西）。
     let mut seen = std::collections::BTreeSet::new();
-    let mut prepared: Vec<(String, String, String)> = Vec::with_capacity(input.artifacts.len());
+    let mut prepared: Vec<(String, String, String, Option<String>)> =
+        Vec::with_capacity(input.artifacts.len());
     for artifact in &input.artifacts {
         let platform = artifact.platform.trim();
         if platform.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
+            return ApiError::bad_request(
+                codes::INSTALL_PACKAGE_PLATFORM_REQUIRED,
                 "artifact.platform must not be empty",
             )
-                .into_response();
+            .into_response();
         }
         if !seen.insert(platform.to_string()) {
-            return (
-                StatusCode::BAD_REQUEST,
+            return ApiError::bad_request(
+                codes::INSTALL_PACKAGE_PLATFORM_DUPLICATE,
                 format!("duplicate platform `{platform}`"),
             )
-                .into_response();
+            .into_response();
         }
         let (package_url, expected_sha256) =
             match validate_package_address(artifact.package_url.trim(), &artifact.package_sha256) {
                 Ok(value) => value,
-                Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+                Err(message) => {
+                    return ApiError::bad_request(codes::INSTALL_PACKAGE_ADDRESS_INVALID, message)
+                        .into_response();
+                }
             };
+        // provenance：中心地址（② 由 gwlinkd 带，仅留痕）；人填来源为 None。
+        // 它**不是**取包指令，但仍做长度/控制字符校验 —— 不应无界膨胀或把控制字符落进历史。
+        let origin = match artifact
+            .origin
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => {
+                if value.len() > MAX_PACKAGE_URL_LEN || value.chars().any(char::is_control) {
+                    return ApiError::bad_request(
+                        codes::INSTALL_PACKAGE_ORIGIN_INVALID,
+                        "artifact.origin must be at most 2048 bytes and free of control characters",
+                    )
+                    .into_response();
+                }
+                Some(value.to_string())
+            }
+            None => None,
+        };
         prepared.push((
             platform.to_string(),
             package_url.to_string(),
             expected_sha256,
+            origin,
         ));
     }
     // 第二阶段：全部拉到网关本地（拉取/校验失败整次不生效，不覆盖已有缓存）。
     // 同时核「声明的平台」与「包内读出的 triple」：不符即拒，免得把错平台的包挂到某槽。
     let mut fetched = Vec::with_capacity(prepared.len());
-    for (platform, package_url, expected_sha256) in &prepared {
+    for (platform, package_url, expected_sha256, origin) in &prepared {
         let cached = match fetch_into_package_cache(
             &state.config,
             platform,
@@ -1959,35 +2055,48 @@ pub async fn set_agent_install_package(
         {
             Ok(cached) => cached,
             Err(err) => {
-                let status = match &err {
-                    PackageFetchError::DigestMismatch(_) => StatusCode::BAD_REQUEST,
+                let (status, code, message) = match &err {
+                    PackageFetchError::DigestMismatch(_) => (
+                        StatusCode::BAD_REQUEST,
+                        codes::INSTALL_PACKAGE_DIGEST_MISMATCH,
+                        "package digest does not match the declared sha256",
+                    ),
                     // 超限归「来源侧的问题」这一档（与「拿不到」同一回执，不改既有状态码）。
-                    PackageFetchError::SourceUnavailable(_) | PackageFetchError::TooLarge(_) => {
-                        StatusCode::BAD_GATEWAY
-                    }
+                    PackageFetchError::SourceUnavailable(_) | PackageFetchError::TooLarge(_) => (
+                        StatusCode::BAD_GATEWAY,
+                        codes::INSTALL_PACKAGE_SOURCE_UNAVAILABLE,
+                        "failed to fetch agent install package from source",
+                    ),
                 };
-                return (status, err.to_string()).into_response();
+                return ApiError::internal_with(status, code, message, err).into_response();
             }
         };
         if !cached.arch.is_empty() && cached.arch != *platform {
-            return (
-                StatusCode::BAD_REQUEST,
+            return ApiError::bad_request(
+                codes::INSTALL_PACKAGE_PLATFORM_MISMATCH,
                 format!(
                     "artifact platform `{platform}` does not match the package triple `{}`",
                     cached.arch
                 ),
             )
-                .into_response();
+            .into_response();
         }
-        fetched.push((platform.clone(), package_url.clone(), cached));
+        fetched.push((
+            platform.clone(),
+            package_url.clone(),
+            cached,
+            origin.clone(),
+        ));
     }
     let requested_by = input
         .requested_by
         .unwrap_or_else(|| "platform-maintenance-engineer".to_string());
     let recorded_at = chrono::Utc::now().to_rfc3339();
     // 第三阶段：落库（每平台一份设置 + 一条内容寻址历史）。
-    for (platform, package_url, cached) in fetched {
+    for (platform, package_url, cached, origin) in fetched {
         let package_sha256 = format!("sha256:{}", cached.sha256);
+        // 「历史里的 source」= **provenance**：② 记中心地址（origin）；人填来源同 `package_url`。
+        let source = origin.unwrap_or_else(|| package_url.clone());
         let setting = StoredAgentInstallPackageAddress {
             address_id: platform.clone(),
             package_url: package_url.clone(),
@@ -1998,16 +2107,17 @@ pub async fn set_agent_install_package(
             updated_at: recorded_at.clone(),
         };
         if let Err(err) = state.store.upsert_agent_install_package(&setting).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to store agent install package address: {err}"),
+            return ApiError::internal(
+                codes::INSTALL_PACKAGE_ADDRESS_STORE_FAILED,
+                "failed to store agent install package address",
+                err,
             )
-                .into_response();
+            .into_response();
         }
         // 追加录入历史：内容寻址（package_id）幂等，同一个包重复录入覆盖同一行。
         let history = StoredAgentInstallPackage {
             package_id: cached.package_id.clone(),
-            source: package_url,
+            source,
             package_sha256,
             version: cached.version.clone(),
             arch: cached.arch.clone(),
@@ -2020,21 +2130,23 @@ pub async fn set_agent_install_package(
             .upsert_agent_install_package_by_id(&history)
             .await
         {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to store agent install package history: {err}"),
+            return ApiError::internal(
+                codes::INSTALL_PACKAGE_HISTORY_STORE_FAILED,
+                "failed to store agent install package history",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     }
     // 回读一遍给回执（已按平台列出）。
     match state.store.list_agent_install_package_addresses().await {
         Ok(settings) => Json(install_package_response(&settings)).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load agent install package address: {err}"),
+        Err(err) => ApiError::internal(
+            codes::INSTALL_PACKAGE_ADDRESS_UNAVAILABLE,
+            "failed to load agent install package address",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -2061,15 +2173,27 @@ pub async fn admin_resolve_github_release(
     }
     let release_url = request.release_url.trim();
     if release_url.is_empty() {
-        return (StatusCode::BAD_REQUEST, "release_url must not be empty").into_response();
+        return ApiError::bad_request(codes::RELEASE_URL_REQUIRED, "release_url must not be empty")
+            .into_response();
     }
     // 可选 token：私有仓 / 提高匿名限流。优先专用名，其次通用名。
     let token = std::env::var("WIST_GATEWAY_GITHUB_TOKEN")
         .ok()
         .or_else(|| std::env::var("GITHUB_TOKEN").ok());
-    match crate::infra::resolve_github_release(release_url, token.as_deref()).await {
+    match crate::error::logged_op(
+        module_path!(),
+        "resolve github release",
+        &[("release_url", release_url.to_string())],
+        crate::infra::resolve_github_release(release_url, token.as_deref()).await,
+    ) {
         Ok(resolved) => Json(resolved).into_response(),
-        Err(err) => (StatusCode::BAD_GATEWAY, err).into_response(),
+        // 失败已由 logged_op 记（含链路）；这里只投影，不重复记。
+        Err(_) => ApiError::handled(
+            StatusCode::BAD_GATEWAY,
+            codes::GITHUB_RELEASE_RESOLVE_FAILED,
+            "failed to resolve GitHub release",
+        )
+        .into_response(),
     }
 }
 
@@ -2107,11 +2231,12 @@ pub async fn list_agent_install_packages(
                 .collect();
             Json(AgentInstallPackageHistoryResponse { packages }).into_response()
         }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load agent install package history: {err}"),
+        Err(err) => ApiError::internal(
+            codes::INSTALL_PACKAGE_HISTORY_UNAVAILABLE,
+            "failed to load agent install package history",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -2150,11 +2275,12 @@ pub async fn view_discovery_policies(
     let agents = match state.store.list_agents(&AgentQuery::default()).await {
         Ok(agents) => agents,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let mut agents: Vec<AgentAppliedDiscoveryPolicy> = agents
@@ -2225,11 +2351,12 @@ pub async fn view_agent_uplink(
             enabled_configured: false,
         })
         .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load agent uplink address: {err}"),
+        Err(err) => ApiError::internal(
+            codes::AGENT_UPLINK_UNAVAILABLE,
+            "failed to load agent uplink address",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -2259,7 +2386,9 @@ pub async fn set_agent_uplink(
     }
     let (host, port) = match validate_uplink_address(&input.host, input.port) {
         Ok(value) => value,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(message) => {
+            return ApiError::bad_request(codes::AGENT_UPLINK_INVALID, message).into_response();
+        }
     };
     // 缺省 = 保持已存值（见 `SetAgentUplinkRequest::enabled`）。读不到已存值就 500，
     // 不把「读库失败」伪装成「关掉」——那会静默掐掉全队的上送。
@@ -2268,11 +2397,12 @@ pub async fn set_agent_uplink(
         None => match state.store.get_agent_uplink().await {
             Ok(stored) => stored.map(|setting| setting.enabled).unwrap_or(false),
             Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to load agent uplink address: {err}"),
+                return ApiError::internal(
+                    codes::AGENT_UPLINK_UNAVAILABLE,
+                    "failed to load agent uplink address",
+                    err,
                 )
-                    .into_response();
+                .into_response();
             }
         },
     };
@@ -2288,11 +2418,12 @@ pub async fn set_agent_uplink(
     };
     match state.store.upsert_agent_uplink(&setting).await {
         Ok(()) => Json(uplink_response(&setting)).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store agent uplink address: {err}"),
+        Err(err) => ApiError::internal(
+            codes::AGENT_UPLINK_STORE_FAILED,
+            "failed to store agent uplink address",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -2356,11 +2487,12 @@ pub async fn view_agent_advertise_url(
             &state.config.public_base_url,
         ))
         .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load gateway advertise url: {err}"),
+        Err(err) => ApiError::internal(
+            codes::ADVERTISE_URL_UNAVAILABLE,
+            "failed to load gateway advertise url",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -2381,7 +2513,9 @@ pub async fn set_agent_advertise_url(
     }
     let url = match validate_advertise_url(&input.url) {
         Ok(value) => value,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(message) => {
+            return ApiError::bad_request(codes::ADVERTISE_URL_INVALID, message).into_response();
+        }
     };
     let setting = StoredAgentAdvertiseUrl {
         setting_id: DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID.to_string(),
@@ -2397,11 +2531,12 @@ pub async fn set_agent_advertise_url(
             &state.config.public_base_url,
         ))
         .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store gateway advertise url: {err}"),
+        Err(err) => ApiError::internal(
+            codes::ADVERTISE_URL_STORE_FAILED,
+            "failed to store gateway advertise url",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -2488,15 +2623,17 @@ fn normalize_sha256(value: &str) -> Result<String, String> {
 async fn agent_not_found_response(state: &ApiState, agent_id: &str) -> Option<Response> {
     match state.store.agent_exists(agent_id).await {
         Ok(true) => None,
-        Ok(false) => {
-            Some((StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response())
-        }
-        Err(err) => Some(
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
-            )
+        Ok(false) => Some(
+            ApiError::not_found(codes::AGENT_NOT_FOUND, format!("unknown agent {agent_id}"))
                 .into_response(),
+        ),
+        Err(err) => Some(
+            ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
+            )
+            .into_response(),
         ),
     }
 }

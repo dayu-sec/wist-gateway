@@ -17,14 +17,16 @@
 // 字段 snake_case（环回面与 gwlinkd DTO 一致；admin 面沿用网关既有 snake_case 约定）。
 // 一次性接入券**明文**只经环回面交付 gwlinkd；admin 视图**不返回**券与 CA。
 
+use super::codes;
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 
+use super::error::ApiError;
 use super::{ApiState, rate_limit};
 
 const STATUS_PENDING: &str = "Pending";
@@ -174,20 +176,20 @@ pub async fn admin_set_gateway_link_request(
     let link_token = input.link_token.trim();
     let trust_bundle_pem = input.trust_bundle_pem.trim();
     if center_endpoint.is_empty() || link_token.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::LINK_REQUEST_INVALID,
             "center_endpoint / link_token must not be empty",
         )
-            .into_response();
+        .into_response();
     }
     // CA 信任锚仅对 **https** 中心必需：明文 http 无 TLS 可校，允许为空；
     // 而 https 无 CA 则拒绝 —— 否则 gwlinkd 会静默回落到系统根（信任被悄悄放宽）。
     if center_endpoint.starts_with("https://") && trust_bundle_pem.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::LINK_REQUEST_MISSING_TRUST_ANCHOR,
             "https center requires trust_bundle_pem (CA trust anchor)",
         )
-            .into_response();
+        .into_response();
     }
     let now = now_rfc3339();
     let request = LinkRequest {
@@ -237,7 +239,11 @@ pub async fn query_gateway_link_request(
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
     if !client.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
-        return (StatusCode::FORBIDDEN, "link-request is loopback-only").into_response();
+        return ApiError::forbidden(
+            codes::LINK_REQUEST_LOOPBACK_ONLY,
+            "link-request is loopback-only",
+        )
+        .into_response();
     }
     let mut guard = state
         .link_request
@@ -271,17 +277,21 @@ pub async fn report_gateway_link_result(
     Json(input): Json<ReportGatewayLinkResultRequest>,
 ) -> Response {
     if !client.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
-        return (StatusCode::FORBIDDEN, "link-result is loopback-only").into_response();
+        return ApiError::forbidden(
+            codes::LINK_RESULT_LOOPBACK_ONLY,
+            "link-result is loopback-only",
+        )
+        .into_response();
     }
     let status = match input.status.trim() {
         "Connected" => STATUS_CONNECTED,
         "Failed" => STATUS_FAILED,
         other => {
-            return (
-                StatusCode::BAD_REQUEST,
+            return ApiError::bad_request(
+                codes::LINK_RESULT_INVALID_STATUS,
                 format!("status must be Connected|Failed, got {other:?}"),
             )
-                .into_response();
+            .into_response();
         }
     };
     let mut guard = state
@@ -309,6 +319,8 @@ pub async fn report_gateway_link_result(
             })
             .into_response()
         }
-        None => (StatusCode::NOT_FOUND, "no link request").into_response(),
+        None => {
+            ApiError::not_found(codes::LINK_REQUEST_NOT_FOUND, "no link request").into_response()
+        }
     }
 }

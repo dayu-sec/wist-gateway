@@ -4,6 +4,7 @@
 // `AgentHostMetrics` / `AgentHostMetricsSummary` 一致。本模块与这两条路由已声明在模型里，
 // 但代码仍属手加（同 `api/mod.rs` 顶部的 hand-added 说明）：重新生成控制面代码时需回补。
 
+use super::codes;
 use axum::{
     Json,
     extract::{Path, State},
@@ -14,6 +15,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
+use super::error::ApiError;
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 use crate::infra::StoredAgentIdentity;
 use crate::infra::victoria_metrics::query_json;
@@ -105,14 +107,19 @@ pub async fn get_agent_host_metrics(
     let agent = match state.store.get_agent(&agent_id).await {
         Ok(Some(agent)) => agent,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
+            return ApiError::not_found(
+                codes::AGENT_NOT_FOUND,
+                format!("unknown agent {agent_id}"),
+            )
+            .into_response();
         }
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
 
@@ -124,11 +131,13 @@ pub async fn get_agent_host_metrics(
             metrics.ip_addresses = agent.ip_addresses.clone();
             Json(metrics).into_response()
         }
-        Err(err) => (
+        Err(err) => ApiError::internal_with(
             StatusCode::BAD_GATEWAY,
-            format!("failed to query metrics: {err}"),
+            codes::HOST_METRICS_UNAVAILABLE,
+            "failed to query metrics",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -147,11 +156,12 @@ pub async fn get_all_agents_host_metrics(
     let identities_list = match state.store.list_agent_identities().await {
         Ok(identities) => identities,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let identities: HashMap<String, StoredAgentIdentity> = identities_list
@@ -161,11 +171,13 @@ pub async fn get_all_agents_host_metrics(
 
     match query_all_host_metrics(&state.config.victoria_metrics_url, &identities).await {
         Ok(summaries) => Json(summaries).into_response(),
-        Err(err) => (
+        Err(err) => ApiError::internal_with(
             StatusCode::BAD_GATEWAY,
-            format!("failed to query metrics: {err}"),
+            codes::HOST_METRICS_UNAVAILABLE,
+            "failed to query metrics",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 

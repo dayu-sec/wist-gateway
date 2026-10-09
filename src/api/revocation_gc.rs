@@ -29,8 +29,8 @@ pub fn spawn_revocation_gc_tick(store: Arc<dyn Store>) {
             ticker.tick().await;
             match store.purge_expired_agent_revocations().await {
                 Ok(0) => {}
-                Ok(removed) => eprintln!("audit agent_revocation_gc removed={removed}"),
-                Err(err) => eprintln!("agent revocation gc failed: {err}"),
+                Ok(removed) => log::info!("audit agent_revocation_gc removed={removed}"),
+                Err(err) => log::warn!("agent revocation gc failed: {err}"),
             }
         }
     });

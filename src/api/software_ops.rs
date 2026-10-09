@@ -1,11 +1,13 @@
+use super::codes;
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 
+use super::error::ApiError;
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -80,35 +82,42 @@ pub async fn view_agent_software(
     match state.store.get_agent(&agent_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("unknown agent {agent_id}")).into_response();
+            return ApiError::not_found(
+                codes::SOFTWARE_AGENT_NOT_FOUND,
+                format!("unknown agent {agent_id}"),
+            )
+            .into_response();
         }
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent store: {err}"),
+            return ApiError::internal(
+                codes::SOFTWARE_AGENT_STORE_FAILED,
+                "failed to load agent store",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
 
     let entries = match state.store.list_agent_software(&agent_id).await {
         Ok(entries) => entries,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load software inventory: {err}"),
+            return ApiError::internal(
+                codes::SOFTWARE_INVENTORY_LOAD_FAILED,
+                "failed to load software inventory",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let summary = match state.store.summarize_agent_software(&agent_id).await {
         Ok(summary) => summary,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to summarize software inventory: {err}"),
+            return ApiError::internal(
+                codes::SOFTWARE_SUMMARY_FAILED,
+                "failed to summarize software inventory",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
 
@@ -149,21 +158,23 @@ pub async fn view_software_holdings(
     let holdings = match state.store.list_software_holdings(limit).await {
         Ok(holdings) => holdings,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load software holdings: {err}"),
+            return ApiError::internal(
+                codes::SOFTWARE_HOLDINGS_LOAD_FAILED,
+                "failed to load software holdings",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let total_keys = match state.store.count_software_keys().await {
         Ok(total) => total,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to count software keys: {err}"),
+            return ApiError::internal(
+                codes::SOFTWARE_KEYS_COUNT_FAILED,
+                "failed to count software keys",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
 

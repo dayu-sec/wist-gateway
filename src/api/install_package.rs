@@ -87,7 +87,7 @@ pub async fn effective_package_path(
         Ok(Some(_)) if cached.is_file() => Some(cached),
         Ok(_) => None,
         Err(err) => {
-            eprintln!("warning: failed to read agent install package address: {err}");
+            log::warn!("warning: failed to read agent install package address: {err}");
             None
         }
     }
@@ -133,7 +133,7 @@ pub async fn resolve_agent_platform_packages(
                     AgentPackageSource::from_local_file(config, base, &platform, path)?,
                 ));
             }
-            None => eprintln!(
+            None => log::warn!(
                 "warning: recorded agent install package for platform {platform} has no cached copy; skipped"
             ),
         }

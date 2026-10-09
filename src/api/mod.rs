@@ -15,7 +15,11 @@ use crate::infra::{AdminConfig, AgentCa, Store};
 mod admin_auth;
 mod admin_ops;
 mod agent_ops;
+// NOTE(hand-added): 管理面错误码的稳定词表（`code` 的唯一来源）。重新生成控制面代码时需回补本模块。
+pub mod codes;
 mod enrollment;
+pub mod error;
+pub use error::{ApiError, ProtocolError, ProtocolErrorEnvelope, Severity};
 mod host_metrics;
 mod ingest;
 mod install;
@@ -62,6 +66,11 @@ pub mod link_request;
 // NOTE(hand-added): gwlinkd 状态心跳（环回；CR-003）。gwlinkd 纯出站、页面拉不到它，故它每拍
 // 把自身状态推到网关。见 api/linkd_status.rs 与设计 `wist-design/doc/design/edge/gateway-linkd-status.md`。
 mod linkd_status;
+// NOTE(hand-added): 「Agent 包下发」通道（环回写入；发布 ②）。中心把 agentd 包推进网关包管理的
+// 意图由 host 侧 wist-gwlinkd 拉取后环回 POST 到本端点；与 admin 端点 install-package 同内核
+// （`admin_ops::apply_agent_install_package`）。见 api/agent_package.rs 与设计
+// `wist-design/doc/design/edge/agent-package-push-to-gateways.md`。重新生成控制面代码时需回补本模块与下方路由。
+mod agent_package;
 // NOTE(hand-added): agent 面（edge seam B：gateway ↔ agentd）的路由按 API 版本集中到
 // `api/agent_api/`（版本并存约定见 design/foundation/api-seam-inventory.md §7）。
 // 加 v2 = 新增版本子模块 + 往 `VERSIONS` 加一行。重新生成控制面代码时需回补本模块。
@@ -230,7 +239,7 @@ fn load_agent_ca(config: &AdminConfig) -> Option<Arc<AgentCa>> {
     match AgentCa::load(cert_file, key_file) {
         Ok(ca) => Some(Arc::new(ca)),
         Err(err) => {
-            eprintln!(
+            log::warn!(
                 "warning: agent CA is configured but unusable; mTLS issuance disabled: {err}"
             );
             None
@@ -277,6 +286,11 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/gateway/linkd-status",
             post(linkd_status::report_gateway_linkd_status),
+        )
+        // NOTE(hand-added): 中心下发 agentd 包（环回写入；发布 ②）。见 api/agent_package.rs 说明。
+        .route(
+            "/api/v1/gateway/agent-package",
+            post(agent_package::receive_agent_package),
         )
         .route(
             "/api/v1/agent/install/{platform}/install.sh",

@@ -28,8 +28,8 @@ pub fn spawn_one_shot_expiry_tick(store: Arc<dyn Store>) {
             ticker.tick().await;
             match expire_overdue_one_shot_works(store.as_ref(), now_ms()).await {
                 Ok(0) => {}
-                Ok(terminated) => eprintln!("event=OneShotExpirySweep terminated={terminated}"),
-                Err(err) => eprintln!("one-shot expiry sweep failed: {err}"),
+                Ok(terminated) => log::info!("event=OneShotExpirySweep terminated={terminated}"),
+                Err(err) => log::warn!("one-shot expiry sweep failed: {err}"),
             }
         }
     });
@@ -61,7 +61,7 @@ pub async fn expire_overdue_one_shot_works(
             Ok(true) => {
                 // 只记行日志，不落事件表：到期判定是**状态收敛**，不是「谁下了指令」那种要留审的动作；
                 // 而成品（页面上那条终态）本身就可查。
-                eprintln!(
+                log::info!(
                     "event=OneShotWorkOverdue work_id={work_id} agent_id={agent_id} status={status}"
                 );
                 terminated += 1;
@@ -70,7 +70,7 @@ pub async fn expire_overdue_one_shot_works(
             Ok(false) => {}
             Err(err) => {
                 // 单件失败不中断整轮：一件坏数据不该让别的活一直卡在「执行中」。
-                eprintln!("event=OneShotExpirySaveFailed work_id={work_id} detail=\"{err}\"");
+                log::warn!("event=OneShotExpirySaveFailed work_id={work_id} detail=\"{err}\"");
             }
         }
     }

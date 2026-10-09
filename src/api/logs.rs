@@ -19,6 +19,7 @@
 //! 与事实那条同一个理由：warp-parse 的 http sink 对非 2xx 会重试并最终落 rescue 文件 ——
 //! 那是**可见的**。反过来，若这里对永久性错误回 202，记录会静默消失。
 
+use super::codes;
 use std::sync::Mutex;
 
 use axum::{
@@ -32,6 +33,7 @@ use serde_json::{Value, json};
 
 use crate::infra::{AgentLogFile, AgentLogRecord};
 
+use super::error::ApiError;
 use super::ingest::preview;
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 
@@ -91,14 +93,15 @@ pub async fn ingest_agent_logs(
         other => vec![other],
     };
     if records.len() > MAX_LOG_RECORDS_PER_REQUEST {
-        return (
+        return ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
+            codes::INGEST_LOGS_TOO_MANY_RECORDS,
             format!(
                 "too many records in one request: {} (limit {MAX_LOG_RECORDS_PER_REQUEST})",
                 records.len()
             ),
         )
-            .into_response();
+        .into_response();
     }
 
     let received_at = chrono::Utc::now().to_rfc3339();
@@ -117,11 +120,12 @@ pub async fn ingest_agent_logs(
         match append(&state, &accepted) {
             Ok(()) => accepted.len(),
             Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to append agent logs: {err}"),
+                return ApiError::internal(
+                    codes::LOG_INGEST_APPEND_FAILED,
+                    "failed to append agent logs",
+                    err,
                 )
-                    .into_response();
+                .into_response();
             }
         }
     } else {
@@ -136,6 +140,8 @@ pub async fn ingest_agent_logs(
     if failures.is_empty() {
         (StatusCode::ACCEPTED, Json(body)).into_response()
     } else {
+        // 非 2xx 是故意的：让数据面重试并最终落 rescue（可见），而不是静默丢。
+        // 这个 body 是**领域响应**（逐条失败明细），不是通用错误信封 —— 保留 `{ingested,rejected,failures}`。
         (StatusCode::BAD_REQUEST, Json(body)).into_response()
     }
 }
@@ -245,10 +251,7 @@ pub async fn view_agent_logs(
             file: file.path().display().to_string(),
         })
         .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read agent logs: {err}"),
-        )
+        Err(err) => ApiError::internal(codes::LOGS_READ_FAILED, "failed to read agent logs", err)
             .into_response(),
     }
 }

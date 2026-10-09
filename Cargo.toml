@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.6.0" #@gxl:set(version)
+version = "0.7.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -23,14 +23,23 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rustls-pki-types = "1"
 rustls-webpki = "0.103"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-wist-contracts = { version = "0.3" }
+wist-contracts = { version = "0.7" }
+#wist-contracts = { version = "0.7", path = "../wist-contracts" }
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可改用下面注释的 path 行。
-wist-api = { version = "0.6" }
-#wist-api = { version = "0.6", path = "../wist-api" }
-wist-control = { version = "0.11" }
-#wist-control = { version = "0.11", path = "../wist-control" }
-wist-error = { version = "0.1" }
-orion-error = { version = "0.8", features = ["derive", "serde_json"] }
+wist-api = { version = "0.7" }
+#wist-api = { version = "0.7", path = "../wist-api" }
+wist-control = { version = "0.14" }
+#wist-control = { version = "0.14", path = "../wist-control" }
+wist-error = { version = "0.2" }
+#wist-error = { version = "0.2", path = "../wist-error" }
+# 跨进程错误投影 wire 类型（`ProtocolError` / `Severity`），见 `api/error.rs`。
+wist-shared = { version = "0.2" }
+#wist-shared = { version = "0.2", path = "../wist-shared" }
+orion-error = { version = "0.9", features = ["derive", "serde_json"] }
+# 运行日志：`env_logger` 走 `log` facade（与 `orion-error` 默认 `log` feature 同一入口），
+# `RUST_LOG` 控级别，落 stderr（systemd/journald 收）。
+log = "0.4"
+env_logger = "0.11"
 ring = "0.17"
 # agent 客户端证书（mTLS）签发/解析：见 docs/design/agent-identity-mtls.md §4。
 # rcgen 负责「CSR → 客户端证书」的签发（签发时忽略 CSR 主体，主体由网关填）；

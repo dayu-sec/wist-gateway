@@ -91,6 +91,8 @@ pub struct AdminConfig {
     pub log_keep_files: usize,
     /// 采集日志历史分卷的保留时长（秒）；`0` = 不按时间清。
     pub log_max_age_seconds: i64,
+    /// `[log]` 段：本进程运行日志（级别 / 格式 / 落点 / 轮转）。与 `[logs]`（被采集 agent 日志）不同。
+    pub log: crate::logging::LogSection,
 }
 
 pub use wist_error::ConfigError;
@@ -125,6 +127,9 @@ struct RawAdminConfig {
     knowledge: RawKnowledgeConfig,
     #[serde(default)]
     logs: RawLogsConfig,
+    /// `[log]` 段：**本网关进程自己**的运行日志（与上面 `[logs]` 的“被采集 agent 日志落盘保留”不同）。
+    #[serde(default)]
+    log: RawLogConfig,
 }
 
 /// `[knowledge]` 段：知识库内容包的**信任配置**（设计 §9）。
@@ -225,6 +230,29 @@ impl Default for RawLogsConfig {
             max_age_seconds: default_log_max_age_seconds(),
         }
     }
+}
+
+/// `[log]` 段：本网关进程自己的运行日志（级别 / 格式 / 落点）。
+#[derive(Debug, Default, Deserialize)]
+struct RawLogConfig {
+    /// 过滤器指令（`info`，或 `wist_gateway=debug,hyper=warn`）。缺省 `info`。
+    #[serde(default)]
+    level: Option<String>,
+    /// 输出格式（`text` | `json`）。缺省 `text`。
+    #[serde(default)]
+    format: crate::logging::LogFormat,
+    /// 写文件（追加；相对 config 目录解析；自动建父目录；写满轮转）。缺省写 stderr。
+    #[serde(default)]
+    file: Option<String>,
+    /// 单文件上限（字节）；缺省 64 MiB。
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    /// 保留的历史分卷个数；缺省 4。
+    #[serde(default)]
+    keep_files: Option<usize>,
+    /// 历史分卷保留时长（秒）；缺省 7 天。
+    #[serde(default)]
+    max_age_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -445,6 +473,15 @@ impl AdminConfig {
             log_max_bytes: raw.logs.max_bytes,
             log_keep_files: raw.logs.keep_files,
             log_max_age_seconds: raw.logs.max_age_seconds,
+            log: crate::logging::LogSection {
+                level: normalize_optional(raw.log.level.as_deref().map(expand_env).transpose()?),
+                format: raw.log.format,
+                file: normalize_optional(raw.log.file.as_deref().map(expand_env).transpose()?)
+                    .map(|value| absolutize_path(config_dir, Path::new(&value))),
+                max_bytes: raw.log.max_bytes,
+                keep_files: raw.log.keep_files,
+                max_age_seconds: raw.log.max_age_seconds,
+            },
         })
     }
 
@@ -683,6 +720,11 @@ impl AdminConfig {
     pub fn agent_log_file(&self) -> PathBuf {
         let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
         state_dir.join("logs").join("agent-logs.ndjson")
+    }
+
+    /// 运行日志的 `[log]` 段（供 [`crate::logging::init`] 用）。
+    pub fn log_section(&self) -> crate::logging::LogSection {
+        self.log.clone()
     }
 
     /// 采集日志落盘的保留 / 轮转策略（由 `[logs]` 段决定，缺省见 [`crate::infra::LogRetention`]）。
@@ -1047,6 +1089,7 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         log_max_bytes: crate::infra::LogRetention::default().max_bytes,
         log_keep_files: crate::infra::LogRetention::default().keep_files,
         log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
+        log: crate::logging::LogSection::default(),
     }
 }
 
@@ -1773,6 +1816,31 @@ environment_id = "env-default"
         let path = write_temp_config(&body);
         let err = AdminConfig::load_from_path(&path).expect_err("invalid content must be rejected");
         assert!(err.to_string().contains("content"), "{err}");
+    }
+
+    #[test]
+    fn log_section_parses_and_absolutizes_file() {
+        let path = write_temp_config(
+            "[log]\nlevel = \"warn\"\nformat = \"json\"\nfile = \"logs/gateway.log\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        );
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(config.log.level.as_deref(), Some("warn"));
+        assert_eq!(config.log.format, crate::logging::LogFormat::Json);
+        let file = config.log.file.expect("log file resolved");
+        assert!(
+            file.is_absolute(),
+            "log file should be absolutized: {file:?}"
+        );
+        assert!(file.ends_with("logs/gateway.log"), "{file:?}");
+    }
+
+    #[test]
+    fn log_section_defaults_when_absent() {
+        let path = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(config.log.level, None);
+        assert_eq!(config.log.format, crate::logging::LogFormat::Text);
+        assert_eq!(config.log.file, None);
     }
 
     fn write_temp_config(content: &str) -> PathBuf {

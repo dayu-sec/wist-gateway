@@ -2,11 +2,13 @@
 // @jumo hash=46ea6f5515c8cd4b
 
 use std::{
-    error::Error,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+use orion_error::{conversion::ToStructError, prelude::*};
+use wist_error::AppReason;
 
 use axum::{
     Router,
@@ -24,13 +26,33 @@ use tokio_rustls::TlsAcceptor;
 use wist_gateway::infra::VerifiedAgentIdentity;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> std::process::ExitCode {
+    match run_main().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            // 打印完整因果链（含 source）：配置 / 库 / TLS 的具体原因都在链上。
+            // 日志在**读到配置之后**才初始化；配置本身读不了时它还没起来 —— 退到 stderr，
+            // 别让启动失败静默。
+            let chain = err.display_chain();
+            if log::log_enabled!(log::Level::Error) {
+                log::error!("wist-gateway failed: {chain}");
+            } else {
+                eprintln!("wist-gateway failed: {chain}");
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// 进程主体：`init-config` 子命令 + 网关服务。错误统一在 [`main`] 打印因果链后退非零。
+async fn run_main() -> Result<(), wist_gateway::AppError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("init-config") {
         return init_config_command(args.get(1).map(String::as_str));
     }
-    let config =
-        wist_gateway::infra::AdminConfig::load_from_env().map_err(|err| err.into_boxed_std())?;
+    let config = wist_gateway::infra::AdminConfig::load_from_env().conv_err()?;
+    // 运行日志在**读到配置之后**初始化：级别 / 格式 / 落点由 `[log]` 段决定（`RUST_LOG` 优先）。
+    wist_gateway::logging::init(&config.log_section());
 
     // 单实例闸门：**一个操作系统上只允许一个网关**。放在打开库之前 —— 真正的破坏是两个实例
     // 同时写一份 SQLite，而不是端口被占（端口可以配成不同的）。
@@ -40,11 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(err) => {
             // 拒绝启动是给**运维**看的一句话：不要让它套上 `Error: "…"` 那层 Debug 引号与转义，
             // 原文打出来再退。（这里还没开库、没占端口，没有要清理的东西。）
-            eprintln!("wist-gateway 拒绝启动：{err}");
+            log::error!("wist-gateway 拒绝启动：{err}");
             std::process::exit(1);
         }
     };
-    println!(
+    log::info!(
         "wist-gateway single-instance lock: {}",
         instance_lock.path().display()
     );
@@ -55,19 +77,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 配了 agent CA = 启用 mTLS（客户端证书验证）。双轨期没配就保持原来的「只要服务端证书」。
     let mtls_enabled = config.agent_ca_files().is_some();
     let tls_config = if let Some((agent_ca_file, _)) = config.agent_ca_files() {
-        let agent_ca_pem = std::fs::read_to_string(agent_ca_file).map_err(|err| {
-            format!(
-                "failed to read agent CA certificate {}: {err}",
-                agent_ca_file.display()
-            )
-        })?;
+        let agent_ca_pem = std::fs::read_to_string(agent_ca_file).source_err(
+            AppReason::system_error(),
+            format!("read agent CA certificate {}", agent_ca_file.display()),
+        )?;
         wist_gateway::infra::load_agent_mtls_server_config(
             &config.tls_cert_file,
             &config.tls_key_file,
             &agent_ca_pem,
-        )?
+        )
+        .map_err(|err| AppReason::system_error().to_err().with_detail(err))?
     } else {
-        wist_gateway::infra::load_admin_tls_config(&config)?
+        wist_gateway::infra::load_admin_tls_config(&config)
+            .map_err(|err| AppReason::system_error().to_err().with_detail(err))?
     };
     // 两个监听共用一份状态：知识库内容、会话运行态与限流器都只能有一份。
     //
@@ -76,8 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 拒启会把处置入口（管理面）一起关掉；而“空载”由下面这行 source 日志兜住，不再静默。
     let knowledge = wist_gateway::app::knowledge::LoadedKnowledge::resolve(&config, &store)
         .await
-        .map_err(|err| format!("load knowledge content: {err}"))?;
-    println!("knowledge source = {}", knowledge.source.describe());
+        .source_raw_err(AppReason::system_error(), "load knowledge content")?;
+    log::info!("knowledge source = {}", knowledge.source.describe());
     let state = wist_gateway::api::build_state_with_knowledge(config, store, knowledge);
 
     // 一次性工作的到期判定：过了截止的标 expired、预算尽的标 timed_out。
@@ -101,21 +123,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(ingest_addr) = ingest_addr {
         // 数据面（warp-parse）订阅端的**内部**接入端点：明文 HTTP，默认只绑环回。
         // 为什么不能复用下面的 HTTPS 监听：数据面的 sink 连接器没有 TLS 参数（见 api/ingest.rs）。
-        let ingest_listener = TcpListener::bind(&ingest_addr).await?;
-        println!("wist-gateway ingest listening on http://{ingest_addr} (data plane only)");
+        let ingest_listener = TcpListener::bind(&ingest_addr)
+            .await
+            .source_err(AppReason::system_error(), "bind ingest listen address")?;
+        log::info!("wist-gateway ingest listening on http://{ingest_addr} (data plane only)");
         let ingest_app = wist_gateway::api::ingest_router(state.clone());
         tokio::spawn(async move {
             if let Err(err) = axum::serve(ingest_listener, ingest_app).await {
                 // 内部端点挂了不让整个网关跟着退：控制面还能用，只是不再订阅数据面。
-                eprintln!("ingest listener stopped: {err}");
+                log::error!("ingest listener stopped: {err}");
             }
         });
     } else {
-        println!("wist-gateway ingest endpoint disabled ([ingest] listen_addr is empty)");
+        log::info!("wist-gateway ingest endpoint disabled ([ingest] listen_addr is empty)");
     }
 
-    let listener = TcpListener::bind(&addr).await?;
-    println!("wist-gateway listening on https://{addr}");
+    let listener = TcpListener::bind(&addr)
+        .await
+        .source_err(AppReason::system_error(), "bind listen address")?;
+    log::info!("wist-gateway listening on https://{addr}");
     serve_tls(
         listener,
         wist_gateway::api::router_with_state(state),
@@ -129,24 +155,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// 打开持久化后端（当前实现：SQLite），并在库为空时一次性导入旧版 JSON 存储。
 async fn build_store(
     config: &wist_gateway::infra::AdminConfig,
-) -> Result<Arc<dyn wist_gateway::infra::Store>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Arc<dyn wist_gateway::infra::Store>, wist_gateway::AppError> {
     let store = match config.database_url.as_deref() {
         Some(database_url) => wist_gateway::infra::SqliteStore::connect(database_url)
             .await
-            .map_err(|err| err.into_boxed_std())?,
+            .conv_err()?,
         None => wist_gateway::infra::SqliteStore::connect_path(&config.sqlite_path)
             .await
-            .map_err(|err| err.into_boxed_std())?,
+            .conv_err()?,
     };
     match store.import_legacy_json(&config.store_file).await {
-        Ok(true) => println!(
+        Ok(true) => log::info!(
             "imported legacy store {} into the database",
             config.store_file.display()
         ),
         Ok(false) => {}
         // 导入失败不阻断启动：库本身可用，旧注册表可由 Agent 重新注册恢复。
-        Err(err) => eprintln!(
-            "warning: failed to import legacy store {}: {err}",
+        Err(err) => log::warn!(
+            "failed to import legacy store {}: {err}",
             config.store_file.display()
         ),
     }
@@ -156,11 +182,12 @@ async fn build_store(
 /// Generate a wist-gateway.toml with a freshly random admin API token
 /// (and the install-script signing key it references), so a newly initialized
 /// admin never runs with a predictable or shared default token.
-fn init_config_command(
-    out_arg: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let token = wist_gateway::infra::new_admin_token()
-        .map_err(|err| format!("failed to generate admin api token: {err}"))?;
+fn init_config_command(out_arg: Option<&str>) -> Result<(), wist_gateway::AppError> {
+    let token = wist_gateway::infra::new_admin_token().map_err(|err| {
+        AppReason::system_error()
+            .to_err()
+            .with_detail(format!("failed to generate admin api token: {err}"))
+    })?;
     let out_path = out_arg
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(wist_gateway::infra::default_config_path()));
@@ -171,11 +198,23 @@ fn init_config_command(
     let state_dir = parent.join("state");
     let key_path = state_dir.join("install-script-signing-ed25519.pkcs8.pem");
     if !key_path.exists() {
-        std::fs::create_dir_all(&state_dir)?;
-        wist_gateway::infra::generate_install_script_signing_key(&key_path)?;
+        std::fs::create_dir_all(&state_dir).source_err(
+            AppReason::system_error(),
+            format!("create state dir {}", state_dir.display()),
+        )?;
+        wist_gateway::infra::generate_install_script_signing_key(&key_path)
+            .map_err(|err| AppReason::system_error().to_err().with_detail(err))?;
     }
-    std::fs::write(&out_path, wist_gateway::infra::default_config_text(&token))?;
-    println!("generated admin config: {}", out_path.display());
+    let existed = out_path.exists();
+    std::fs::write(&out_path, wist_gateway::infra::default_config_text(&token)).source_err(
+        AppReason::system_error(),
+        format!("write config {}", out_path.display()),
+    )?;
+    if existed {
+        println!("overwrote existing config: {}", out_path.display());
+    } else {
+        println!("generated admin config: {}", out_path.display());
+    }
     println!("admin api token: {}", token);
     println!("install script signing key: {}", key_path.display());
     println!(
@@ -191,17 +230,20 @@ async fn serve_tls(
     app: Router,
     tls_config: rustls::ServerConfig,
     mtls_enabled: bool,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<(), wist_gateway::AppError> {
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
+        let (stream, peer_addr) = listener
+            .accept()
+            .await
+            .source_err(AppReason::system_error(), "accept TLS connection")?;
         let acceptor = acceptor.clone();
         let service = app.clone();
         tokio::spawn(async move {
             let tls_stream = match acceptor.accept(stream).await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    eprintln!("failed TLS handshake from {peer_addr}: {err}");
+                    log::warn!("failed TLS handshake from {peer_addr}: {err}");
                     return;
                 }
             };
@@ -213,7 +255,7 @@ async fn serve_tls(
                     Some(der) => match VerifiedAgentIdentity::from_certificate_der(&der) {
                         Ok(identity) => Some(identity),
                         Err(err) => {
-                            eprintln!(
+                            log::warn!(
                                 "mTLS client certificate from {peer_addr} has no usable agent identity: {err}"
                             );
                             None
@@ -235,7 +277,7 @@ async fn serve_tls(
             let service = TowerToHyperService::new(service);
             let builder = Builder::new(TokioExecutor::new());
             if let Err(err) = builder.serve_connection(io, service).await {
-                eprintln!("failed to serve HTTPS connection from {peer_addr}: {err}");
+                log::warn!("failed to serve HTTPS connection from {peer_addr}: {err}");
             }
         });
     }
@@ -263,4 +305,69 @@ async fn inject_connection_context(
         request.extensions_mut().insert(identity);
     }
     next.run(request).await
+}
+
+// NOTE(hand-added): 本文件为 `// @jumo generated`，重新生成控制面代码时需回补本测试模块。
+// 为什么不放在 `api/tests.rs`：环回护栏（`client.ip().is_loopback()`）赖以判定的 `ConnectInfo`
+// 在**生产**里由本文件的 `inject_connection_context` 注入（自定义 hyper 服务路径），而 lib 侧的
+// 真 socket 测试走的是 axum 内建的 `into_make_service_with_connect_info` —— 二者是不同的注入机制。
+// 这里钉住生产那一份：一旦注入被漏掉，护栏会 fail-closed，把全部环回写口（含发布 ② 的
+// `POST /api/v1/gateway/agent-package`）静默变成 403。
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        extract::connect_info::ConnectInfo,
+        http::{Request, StatusCode},
+        middleware::from_fn_with_state,
+        routing::get,
+    };
+    use tower::ServiceExt;
+
+    use super::{ConnectionContext, inject_connection_context};
+
+    /// 探针：读的就是环回护栏赖以判定的 `ConnectInfo`（取不到就 500，等于护栏 fail-closed 失效）。
+    async fn peer_kind(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> &'static str {
+        if peer.ip().is_loopback() {
+            "loopback"
+        } else {
+            "remote"
+        }
+    }
+
+    async fn probe_verdict(peer: &str) -> String {
+        let app = Router::new()
+            .route("/probe", get(peer_kind))
+            .layer(from_fn_with_state(
+                ConnectionContext {
+                    peer: peer.parse().expect("peer addr"),
+                    client_identity: None,
+                },
+                inject_connection_context,
+            ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        String::from_utf8(bytes.to_vec()).expect("utf8")
+    }
+
+    /// 生产注入层必须把**真实对端**喂给环回护栏：环回放行、远端拒绝。
+    #[tokio::test]
+    async fn inject_connection_context_feeds_the_loopback_guard() {
+        assert_eq!(probe_verdict("127.0.0.1:4000").await, "loopback");
+        assert_eq!(probe_verdict("192.0.2.1:4001").await, "remote");
+    }
 }

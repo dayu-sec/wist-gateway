@@ -1,3 +1,4 @@
+use super::codes;
 use std::sync::Arc;
 
 use axum::{
@@ -20,6 +21,7 @@ use webpki::EndEntityCert;
 use wist_control::types::{AgentBootstrapBundle, AgentInstallCode, AgentPlatformPackage, DateTime};
 
 use super::ApiState;
+use super::error::ApiError;
 use super::install_package::{
     AgentPackageSource, PLATFORM_LINUX_ARM, PLATFORM_LINUX_X86, PLATFORM_MACOS_ARM,
     effective_package_path, resolve_agent_package, resolve_agent_platform_packages,
@@ -42,7 +44,7 @@ pub async fn get_agent_install_code(
     }
     match issue_agent_install_code(&state.config, &state.store).await {
         Ok(install_code) => {
-            eprintln!(
+            log::info!(
                 "audit install_code_issued tenant={} environment={} bundle={}",
                 state.config.tenant_id,
                 state.config.environment_id,
@@ -50,11 +52,12 @@ pub async fn get_agent_install_code(
             );
             ([(header::CACHE_CONTROL, NO_STORE)], Json(install_code)).into_response()
         }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to issue install code: {err}"),
+        Err(err) => ApiError::internal(
+            codes::INSTALL_CODE_ISSUE_FAILED,
+            "failed to issue install code",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -66,13 +69,20 @@ pub async fn get_agent_install_script(
         return unknown_platform_response();
     };
     let base = effective_advertise_base(&state.config, &state.store).await;
-    match resolve_agent_package(&state.config, &state.store, &base, platform).await {
-        Err(err) => (
+    match crate::error::logged_op(
+        module_path!(),
+        "resolve agent package",
+        &[("platform", platform.to_string())],
+        resolve_agent_package(&state.config, &state.store, &base, platform).await,
+    ) {
+        // 失败已由 logged_op 记（含链路）；这里只投影，不重复记。
+        Err(_) => ApiError::handled(
             StatusCode::SERVICE_UNAVAILABLE,
-            [(header::CACHE_CONTROL, NO_STORE)],
-            format!("agent package for platform {platform} is not available: {err}"),
+            codes::INSTALL_PACKAGE_UNAVAILABLE,
+            format!("agent package for platform {platform} is not available"),
         )
-            .into_response(),
+        .with_no_store()
+        .into_response(),
         Ok(package) => (
             [
                 (header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8"),
@@ -92,15 +102,22 @@ pub async fn get_agent_install_script_signature(
         return unknown_platform_response();
     };
     let base = effective_advertise_base(&state.config, &state.store).await;
-    let package = match resolve_agent_package(&state.config, &state.store, &base, platform).await {
+    let package = match crate::error::logged_op(
+        module_path!(),
+        "resolve agent package",
+        &[("platform", platform.to_string())],
+        resolve_agent_package(&state.config, &state.store, &base, platform).await,
+    ) {
         Ok(package) => package,
-        Err(err) => {
-            return (
+        // 失败已由 logged_op 记（含链路）；这里只投影，不重复记。
+        Err(_) => {
+            return ApiError::handled(
                 StatusCode::SERVICE_UNAVAILABLE,
-                [(header::CACHE_CONTROL, NO_STORE)],
-                format!("agent package for platform {platform} is not available: {err}"),
+                codes::INSTALL_PACKAGE_UNAVAILABLE,
+                format!("agent package for platform {platform} is not available"),
             )
-                .into_response();
+            .with_no_store()
+            .into_response();
         }
     };
     match install_script_signature(&state.config, platform, &package, &base) {
@@ -112,11 +129,12 @@ pub async fn get_agent_install_script_signature(
             signature,
         )
             .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to sign install script: {err}"),
+        Err(err) => ApiError::internal(
+            codes::INSTALL_SCRIPT_SIGN_FAILED,
+            "failed to sign install script",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -133,11 +151,8 @@ fn supported_agent_platform(platform: &str) -> Result<&'static str, ()> {
 }
 
 fn unknown_platform_response() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        [(header::CACHE_CONTROL, NO_STORE)],
-        "unknown agent platform",
-    )
+    ApiError::not_found(codes::UNKNOWN_PLATFORM, "unknown agent platform")
+        .with_no_store()
         .into_response()
 }
 
@@ -153,7 +168,10 @@ pub async fn get_agent_initial_config_with_token(
     }
     let Some(token) = bootstrap_bearer_token(&headers) else {
         rate_limit::record_auth_failure(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
-        return unauthorized_no_store("agent initial config requires a bootstrap bearer token");
+        return unauthorized_no_store(
+            codes::BOOTSTRAP_TOKEN_REQUIRED,
+            "agent initial config requires a bootstrap bearer token",
+        );
     };
 
     match validate_bootstrap_token_for_config(&state.config, &state.store, token).await {
@@ -167,7 +185,7 @@ pub async fn get_agent_initial_config_with_token(
             let uplink = match effective_agent_uplink(&state.config, &state.store).await {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("warning: failed to read agent uplink address: {err}");
+                    log::warn!("warning: failed to read agent uplink address: {err}");
                     derived_agent_uplink(&state.config, &state.store).await
                 }
             };
@@ -185,8 +203,11 @@ pub async fn get_agent_initial_config_with_token(
             // 对外只回一句不可区分的口径：不暴露「token 存在但过期/已消费」这类可枚举细节
             // （与安装包分发端点、enroll 路径的对外口径一致）。具体原因只进服务端审计日志，
             // 保留运维可诊断性。
-            eprintln!("audit bootstrap_token_rejected endpoint=initial-config reason={reason}");
-            unauthorized_no_store("invalid bootstrap bearer token")
+            log::warn!("audit bootstrap_token_rejected endpoint=initial-config reason={reason}");
+            unauthorized_no_store(
+                codes::BOOTSTRAP_TOKEN_INVALID,
+                "invalid bootstrap bearer token",
+            )
         }
     }
 }
@@ -222,21 +243,18 @@ pub async fn download_agent_package(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return (
-            StatusCode::BAD_REQUEST,
-            [(header::CACHE_CONTROL, NO_STORE)],
-            "missing platform query parameter",
-        )
+        return ApiError::bad_request(codes::MISSING_PLATFORM, "missing platform query parameter")
+            .with_no_store()
             .into_response();
     };
     let Some(package_path) = effective_package_path(&state.config, &state.store, platform).await
     else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::CACHE_CONTROL, NO_STORE)],
+        return ApiError::unavailable(
+            codes::AGENT_PACKAGE_NOT_CONFIGURED,
             "agent package for this platform is not configured on this gateway",
         )
-            .into_response();
+        .with_no_store()
+        .into_response();
     };
     match std::fs::read(&package_path) {
         Ok(bytes) => (
@@ -251,12 +269,13 @@ pub async fn download_agent_package(
             bytes,
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [(header::CACHE_CONTROL, NO_STORE)],
+        Err(err) => ApiError::internal(
+            codes::AGENT_PACKAGE_READ_FAILED,
             "failed to read agent package",
+            err,
         )
-            .into_response(),
+        .with_no_store()
+        .into_response(),
     }
 }
 
@@ -289,20 +308,18 @@ pub async fn download_agent_package_by_id(
     {
         Ok(Some(entry)) => entry,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                [(header::CACHE_CONTROL, NO_STORE)],
-                "unknown agent package",
-            )
+            return ApiError::not_found(codes::AGENT_PACKAGE_NOT_FOUND, "unknown agent package")
+                .with_no_store()
                 .into_response();
         }
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(header::CACHE_CONTROL, NO_STORE)],
-                format!("failed to load agent package history: {err}"),
+            return ApiError::internal(
+                codes::AGENT_PACKAGE_HISTORY_LOAD_FAILED,
+                "failed to load agent package history",
+                err,
             )
-                .into_response();
+            .with_no_store()
+            .into_response();
         }
     };
     match std::fs::read(&entry.cached_path) {
@@ -315,12 +332,12 @@ pub async fn download_agent_package_by_id(
         )
             .into_response(),
         // 行在但副本丢了（磁盘被清/被移）：按不存在处理，别把 500 当作“网关挂了”。
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            [(header::CACHE_CONTROL, NO_STORE)],
+        Err(_) => ApiError::not_found(
+            codes::AGENT_PACKAGE_COPY_MISSING,
             "agent package copy is missing",
         )
-            .into_response(),
+        .with_no_store()
+        .into_response(),
     }
 }
 
@@ -353,18 +370,22 @@ async fn authorize_package_download(
             }
             Err(reason) => {
                 rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
-                eprintln!(
+                log::warn!(
                     "audit package_download_rejected reason=invalid_certificate detail={reason}"
                 );
-                Err(unauthorized_no_store("invalid agent client certificate"))
+                Err(unauthorized_no_store(
+                    codes::AGENT_CERTIFICATE_INVALID,
+                    "invalid agent client certificate",
+                ))
             }
         };
     }
     let Some(token) = bootstrap_bearer_token(headers) else {
         rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
         // 对外仍是一句不可区分的口径；具体原因只进服务端审计日志（**不记 token 本身**）。
-        eprintln!("audit package_download_rejected reason=missing_credential");
+        log::warn!("audit package_download_rejected reason=missing_credential");
         return Err(unauthorized_no_store(
+            codes::CREDENTIAL_REQUIRED,
             "agent package download requires a bootstrap token or a client certificate",
         ));
     };
@@ -375,20 +396,20 @@ async fn authorize_package_download(
         }
         Err(reason) => {
             rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
-            eprintln!(
+            log::warn!(
                 "audit package_download_rejected reason=invalid_bootstrap_token detail={reason}"
             );
-            Err(unauthorized_no_store("invalid bootstrap token"))
+            Err(unauthorized_no_store(
+                codes::BOOTSTRAP_TOKEN_INVALID,
+                "invalid bootstrap token",
+            ))
         }
     }
 }
 
-fn unauthorized_no_store(message: impl Into<String>) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::CACHE_CONTROL, NO_STORE)],
-        message.into(),
-    )
+fn unauthorized_no_store(code: &str, message: impl Into<String>) -> Response {
+    ApiError::unauthorized(code, message)
+        .with_no_store()
         .into_response()
 }
 
@@ -442,7 +463,7 @@ pub async fn effective_advertise_base(config: &AdminConfig, store: &Arc<dyn Stor
         Ok(Some(setting)) => setting.url.trim_end_matches('/').to_string(),
         Ok(None) => config.public_base_url.clone(),
         Err(err) => {
-            eprintln!("warning: failed to read gateway advertise url: {err}");
+            log::warn!("warning: failed to read gateway advertise url: {err}");
             config.public_base_url.clone()
         }
     }

@@ -1,3 +1,4 @@
+use super::codes;
 use axum::{
     Json,
     extract::{Extension, State},
@@ -36,6 +37,7 @@ use wist_control::types::DateTime;
 use wist_control::{AgentControlCommandsReturned, PollControlCommands};
 
 use super::ApiState;
+use super::error::ApiError;
 
 pub async fn submit_agent_status(
     State(state): State<ApiState>,
@@ -83,18 +85,19 @@ pub async fn submit_agent_status(
                 Ok(false) => {
                     // 未知 agent 的状态上报不再静默成功：旧实现会丢弃该次上报，
                     // 这里显式返回 404，让上报方感知身份/凭据不一致。
-                    return (
-                        StatusCode::NOT_FOUND,
+                    return ApiError::not_found(
+                        codes::AGENT_NOT_FOUND,
                         format!("unknown agent {}", input.agent_id),
                     )
-                        .into_response();
+                    .into_response();
                 }
                 Err(err) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to update agent status: {err}"),
+                    return ApiError::internal(
+                        codes::AGENT_STATUS_UPDATE_FAILED,
+                        "failed to update agent status",
+                        err,
                     )
-                        .into_response();
+                    .into_response();
                 }
             }
             // 机器画像回填（机器名 / node_id / 网卡地址）：凭证书首触重建登记时是空的，靠这里补齐。
@@ -113,7 +116,7 @@ pub async fn submit_agent_status(
                     })
                     .await
                 {
-                    eprintln!(
+                    log::warn!(
                         "event=AgentMachineProfileStoreFailed agent_id={} detail=\"{err}\"",
                         agent.agent_id
                     );
@@ -134,7 +137,7 @@ pub async fn submit_agent_status(
                     })
                     .await
             {
-                eprintln!(
+                log::warn!(
                     "event=AgentCertificateStatusStoreFailed agent_id={} detail=\"{err}\"",
                     agent.agent_id
                 );
@@ -152,9 +155,10 @@ pub async fn submit_agent_status(
             if !lines.is_empty()
                 && let Err(err) = import_lines(&state.config.victoria_metrics_url, &lines).await
             {
-                eprintln!(
+                log::warn!(
                     "warn agent metrics import failed agent_id={} instance_id={}: {err}",
-                    agent.agent_id, agent.instance_id
+                    agent.agent_id,
+                    agent.instance_id
                 );
             }
             (
@@ -283,7 +287,11 @@ pub async fn poll_discovery_policies(
     Json(input): Json<PollDiscoveryPolicies>,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != POLL_DISCOVERY_POLICIES_KIND {
-        return (StatusCode::BAD_REQUEST, "invalid discovery policies poll").into_response();
+        return ApiError::bad_request(
+            codes::INVALID_DISCOVERY_POLICIES_POLL,
+            "invalid discovery policies poll",
+        )
+        .into_response();
     }
     if let Err(response) = authenticate_agent(
         &state,
@@ -305,11 +313,11 @@ pub async fn poll_discovery_policies(
             )),
         )
             .into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
+        None => ApiError::unavailable(
+            codes::DISCOVERY_POLICY_TABLE_UNCONFIGURED,
             "discovery policy table is not configured",
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -323,7 +331,8 @@ pub async fn poll_work(
     Json(input): Json<PollWork>,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != POLL_WORK_KIND {
-        return (StatusCode::BAD_REQUEST, "invalid work poll").into_response();
+        return ApiError::bad_request(codes::INVALID_WORK_POLL, "invalid work poll")
+            .into_response();
     }
     if let Err(response) = authenticate_agent(
         &state,
@@ -337,11 +346,12 @@ pub async fn poll_work(
     }
     match build_work_grant(&state, &input.agent_id).await {
         Ok(grant) => Json(grant).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to build work grant: {err}"),
+        Err(err) => ApiError::internal(
+            codes::WORK_GRANT_BUILD_FAILED,
+            "failed to build work grant",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -366,7 +376,8 @@ pub async fn poll_agent_uplink(
     Json(input): Json<PollAgentUplink>,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != POLL_AGENT_UPLINK_KIND {
-        return (StatusCode::BAD_REQUEST, "invalid uplink poll").into_response();
+        return ApiError::bad_request(codes::INVALID_UPLINK_POLL, "invalid uplink poll")
+            .into_response();
     }
     if let Err(response) = authenticate_agent(
         &state,
@@ -380,11 +391,12 @@ pub async fn poll_agent_uplink(
     }
     match build_agent_uplink_grant(&state, &input.agent_id).await {
         Ok(grant) => Json(grant).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to build agent uplink grant: {err}"),
+        Err(err) => ApiError::internal(
+            codes::AGENT_UPLINK_GRANT_BUILD_FAILED,
+            "failed to build agent uplink grant",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -459,7 +471,7 @@ pub async fn ack_work(
     Json(input): Json<AckWork>,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != ACK_WORK_KIND {
-        return (StatusCode::BAD_REQUEST, "invalid work ack").into_response();
+        return ApiError::bad_request(codes::INVALID_WORK_ACK, "invalid work ack").into_response();
     }
     if let Err(response) = authenticate_agent(
         &state,
@@ -474,11 +486,12 @@ pub async fn ack_work(
     let now = chrono::Utc::now().to_rfc3339();
     let (status, work_kind) = match state.store.get_standing_work(&input.work_id).await {
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load standing work: {err}"),
+            return ApiError::internal(
+                codes::STANDING_WORK_LOAD_FAILED,
+                "failed to load standing work",
+                err,
             )
-                .into_response();
+            .into_response();
         }
         Ok(Some(work)) if work.agent_id == input.agent_id => {
             let status = if work.plan_version == input.plan_version {
@@ -491,11 +504,12 @@ pub async fn ack_work(
         }
         Ok(_) => match state.store.get_one_shot_work(&input.work_id).await {
             Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to load one-shot work: {err}"),
+                return ApiError::internal(
+                    codes::ONE_SHOT_WORK_LOAD_FAILED,
+                    "failed to load one-shot work",
+                    err,
                 )
-                    .into_response();
+                .into_response();
             }
             Ok(Some(stored)) if stored.work.agent_id == input.agent_id => {
                 if stored.work.status == "dispatched" {
@@ -503,11 +517,12 @@ pub async fn ack_work(
                     accepted.work.status = "accepted".to_string();
                     accepted.work.attempt += 1;
                     if let Err(err) = state.store.save_one_shot_work(&accepted).await {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("failed to store one-shot work: {err}"),
+                        return ApiError::internal(
+                            codes::ONE_SHOT_WORK_STORE_FAILED,
+                            "failed to store one-shot work",
+                            err,
                         )
-                            .into_response();
+                        .into_response();
                     }
                 }
                 // 一次性工作不按 `plan_version` 比：它是命令式的，版本由网关自己推，
@@ -526,11 +541,12 @@ pub async fn ack_work(
             acknowledged_at: now.clone(),
         };
         if let Err(err) = state.store.upsert_work_ack(&ack).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to store work ack: {err}"),
+            return ApiError::internal(
+                codes::WORK_ACK_STORE_FAILED,
+                "failed to store work ack",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     }
     Json(WorkAccepted {
@@ -558,7 +574,8 @@ pub async fn submit_work_result(
     Json(input): Json<ReportWorkResult>,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != REPORT_WORK_RESULT_KIND {
-        return (StatusCode::BAD_REQUEST, "invalid work result").into_response();
+        return ApiError::bad_request(codes::INVALID_WORK_RESULT, "invalid work result")
+            .into_response();
     }
     if let Err(response) = authenticate_agent(
         &state,
@@ -571,14 +588,14 @@ pub async fn submit_work_result(
         return response;
     }
     if !AGENT_REPORTABLE_WORK_STATUSES.contains(&input.status.as_str()) {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::INVALID_WORK_RESULT_STATUS,
             format!(
                 "status {:?} is not agent-reportable (one of {:?})",
                 input.status, AGENT_REPORTABLE_WORK_STATUSES
             ),
         )
-            .into_response();
+        .into_response();
     }
     let now = chrono::Utc::now().to_rfc3339();
     let stored = match state.store.get_one_shot_work(&input.work_id).await {
@@ -592,11 +609,12 @@ pub async fn submit_work_result(
             .into_response();
         }
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load one-shot work: {err}"),
+            return ApiError::internal(
+                codes::ONE_SHOT_WORK_LOAD_FAILED,
+                "failed to load one-shot work",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
 
@@ -604,11 +622,12 @@ pub async fn submit_work_result(
         let mut updated = stored;
         updated.work.status = input.status.clone();
         if let Err(err) = state.store.save_one_shot_work(&updated).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to store one-shot work: {err}"),
+            return ApiError::internal(
+                codes::ONE_SHOT_WORK_STORE_FAILED,
+                "failed to store one-shot work",
+                err,
             )
-                .into_response();
+            .into_response();
         }
         "accepted"
     } else {
@@ -626,11 +645,12 @@ pub async fn submit_work_result(
         })
         .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store work result: {err}"),
+        return ApiError::internal(
+            codes::WORK_RESULT_STORE_FAILED,
+            "failed to store work result",
+            err,
         )
-            .into_response();
+        .into_response();
     }
 
     // 若这份工作是某份灰度发布计划物化出来的，把结果回填到计划条目；终态结果还会触发
@@ -647,7 +667,7 @@ pub async fn submit_work_result(
         )
         .await
     {
-        eprintln!(
+        log::warn!(
             "event=RolloutEntryReconcileFailed work_id={} detail=\"{err}\"",
             input.work_id
         );
@@ -672,11 +692,11 @@ pub async fn renew_agent_credential(
     Json(input): Json<CredentialRenewal>,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != RENEW_AGENT_CREDENTIAL_KIND {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::INVALID_CREDENTIAL_RENEWAL_REQUEST,
             "invalid credential renewal request",
         )
-            .into_response();
+        .into_response();
     }
     // 先验凭据（证书是唯一路径），再谈请求体内容 —— 不向未认证调用者泄露「你只是报文体写错了」。
     let agent = match authenticate_agent(
@@ -692,27 +712,27 @@ pub async fn renew_agent_credential(
     };
     // 证书是唯一路径：续期也要重新交 CSR，不签 token。
     if input.credential_request != "csr" {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::UNSUPPORTED_CREDENTIAL_REQUEST,
             "unsupported credential request: only csr",
         )
-            .into_response();
+        .into_response();
     }
     let Some(ca) = state.agent_ca.as_deref() else {
         // 没配 agent CA = 这台网关没开 mTLS；证书是唯一凭据路径，续期无从谈起。
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
+        return ApiError::unavailable(
+            codes::AGENT_CERTIFICATE_AUTHORITY_UNCONFIGURED,
             "agent certificate authority is not configured",
         )
-            .into_response();
+        .into_response();
     };
     let csr = input.certificate_signing_request.trim();
     if csr.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::MISSING_CERTIFICATE_SIGNING_REQUEST,
             "missing_certificate_signing_request",
         )
-            .into_response();
+        .into_response();
     }
     let identity = crate::infra::AgentCertificateIdentity::new(
         state.config.tenant_id.clone(),
@@ -723,16 +743,25 @@ pub async fn renew_agent_credential(
         match ca.issue_client_certificate(csr, &identity, state.config.client_cert_ttl_seconds) {
             Ok(issued) => issued,
             Err(reason) => {
-                return (
+                return ApiError::internal_with(
                     StatusCode::BAD_REQUEST,
-                    format!("invalid_certificate_signing_request: {reason}"),
+                    codes::INVALID_CERTIFICATE_SIGNING_REQUEST,
+                    "invalid_certificate_signing_request",
+                    reason,
                 )
-                    .into_response();
+                .into_response();
             }
         };
     let credential_id = match new_secret_token("cred") {
         Ok(id) => id,
-        Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
+        Err(reason) => {
+            return ApiError::internal(
+                codes::CREDENTIAL_ID_GENERATION_FAILED,
+                "failed to generate credential id",
+                reason,
+            )
+            .into_response();
+        }
     };
     let bundle = CredentialBundle {
         credential_id: credential_id.clone(),
@@ -762,9 +791,10 @@ pub async fn renew_agent_credential(
         .await;
     match update_result {
         Ok(true) => {
-            eprintln!(
+            log::info!(
                 "audit credential_renewed agent_id={} instance_id={} scheme=certificate",
-                agent.agent_id, agent.instance_id,
+                agent.agent_id,
+                agent.instance_id,
             );
             (
                 StatusCode::OK,
@@ -774,12 +804,16 @@ pub async fn renew_agent_credential(
             )
                 .into_response()
         }
-        Ok(false) => (StatusCode::UNAUTHORIZED, "invalid agent credential").into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to renew agent credential: {err}"),
+        Ok(false) => {
+            ApiError::unauthorized(codes::INVALID_AGENT_CREDENTIAL, "invalid agent credential")
+                .into_response()
+        }
+        Err(err) => ApiError::internal(
+            codes::CREDENTIAL_RENEWAL_FAILED,
+            "failed to renew agent credential",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -836,11 +870,15 @@ pub(super) async fn ingest_fact_summary(
     input: ReportAgentFactSummary,
 ) -> Response {
     if input.api_version != API_VERSION_V1 || input.kind != REPORT_AGENT_FACT_SUMMARY_KIND {
-        return (StatusCode::BAD_REQUEST, "invalid agent fact summary report").into_response();
+        return ApiError::bad_request(
+            codes::INVALID_FACT_SUMMARY_REPORT,
+            "invalid agent fact summary report",
+        )
+        .into_response();
     }
     // 上限由网关自己封顶，不能指望 agent 守规矩。
     if let Err(detail) = validate_fact_summary(&input) {
-        return (StatusCode::BAD_REQUEST, detail).into_response();
+        return ApiError::bad_request(codes::INVALID_FACT_SUMMARY, detail).into_response();
     }
     let received_at = chrono::Utc::now().to_rfc3339();
 
@@ -848,9 +886,11 @@ pub(super) async fn ingest_fact_summary(
     if digest != input.content_digest {
         // 只作告警：不一致更可能是版本偏差（比如两侧实现不同源），不是非法输入。
         // 自己的这份才是判重依据，所以不一致时仍用 `digest` 走下去。
-        eprintln!(
+        log::warn!(
             "event=FactDigestMismatch agent_id={} agent={} gateway={}",
-            agent.agent_id, input.content_digest, digest
+            agent.agent_id,
+            input.content_digest,
+            digest
         );
     }
 
@@ -881,12 +921,12 @@ pub(super) async fn ingest_fact_summary(
                 Ok(true) => {}
                 // 行在判重与刷新之间消失了（并发删除）：下次上报会走覆盖写补回来，
                 // 不值得为这个竞争把 agent 卡在 500 上。
-                Ok(false) => eprintln!(
+                Ok(false) => log::warn!(
                     "warn agent fact summary vanished during dedupe agent_id={}",
                     agent.agent_id
                 ),
                 // 留痕刷不动不该让 agent 收到 500（它会一直重试）：内容确实没变，照回 duplicate。
-                Err(err) => eprintln!(
+                Err(err) => log::warn!(
                     "warn failed to refresh agent fact marks agent_id={}: {err}",
                     agent.agent_id
                 ),
@@ -904,12 +944,12 @@ pub(super) async fn ingest_fact_summary(
                     Ok(Some(current)) => refresh_software_inventory(state, &current).await,
                     // 摘要行在判重与自愈之间消失了：下次上报会走覆盖写补回，不值得卡住 agent。
                     Ok(None) => {}
-                    Err(err) => eprintln!(
+                    Err(err) => log::warn!(
                         "warn failed to reload fact summary for inventory repair agent_id={}: {err}",
                         agent.agent_id
                     ),
                 },
-                Err(err) => eprintln!(
+                Err(err) => log::warn!(
                     "warn failed to check software inventory agent_id={}: {err}",
                     agent.agent_id
                 ),
@@ -918,7 +958,7 @@ pub(super) async fn ingest_fact_summary(
                 Ok(suggestion) => suggestion.map(|suggestion| suggestion.suggestion_id),
                 Err(err) => {
                     // 建议读不出来不该让 agent 收到 500（它会一直重试）：当作“这次没建议”。
-                    eprintln!(
+                    log::warn!(
                         "warn failed to load purpose suggestion agent_id={}: {err}",
                         agent.agent_id
                     );
@@ -940,11 +980,12 @@ pub(super) async fn ingest_fact_summary(
         }
         Ok(_) => {}
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load agent fact summary: {err}"),
+            return ApiError::internal(
+                codes::AGENT_FACT_SUMMARY_LOAD_FAILED,
+                "failed to load agent fact summary",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     }
 
@@ -966,11 +1007,12 @@ pub(super) async fn ingest_fact_summary(
     };
     // 先落事实再算建议：规则表坏了不该连带把 Agent 报上来的事实丢掉。
     if let Err(err) = state.store.upsert_agent_fact_summary(&summary).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store agent fact summary: {err}"),
+        return ApiError::internal(
+            codes::AGENT_FACT_SUMMARY_STORE_FAILED,
+            "failed to store agent fact summary",
+            err,
         )
-            .into_response();
+        .into_response();
     }
 
     // 事实变了 → 重建 L1a 清单（内容变才重建，与判重同一道门）。
@@ -979,7 +1021,7 @@ pub(super) async fn ingest_fact_summary(
     let suggestion_id = match ensure_fresh_suggestion(state, &summary, None, &received_at).await {
         Ok(suggestion) => suggestion.map(|suggestion| suggestion.suggestion_id),
         Err(detail) => {
-            eprintln!(
+            log::warn!(
                 "warn purpose inference failed agent_id={}: {detail}",
                 summary.agent_id
             );
@@ -1024,11 +1066,11 @@ async fn refresh_software_inventory(state: &ApiState, summary: &StoredAgentFactS
         Ok(written) if written == expected => {}
         // 行数不符理论上不会发生（同一事务内 delete+insert）。真发生了要看得见，
         // 因为它是「清单与摘要不一致」的唯一信号。
-        Ok(written) => eprintln!(
+        Ok(written) => log::warn!(
             "warn software inventory row count mismatch agent_id={}: wrote {written}, expected {expected}",
             summary.agent_id
         ),
-        Err(err) => eprintln!(
+        Err(err) => log::warn!(
             "warn failed to rebuild software inventory agent_id={}: {err}",
             summary.agent_id
         ),
@@ -1202,9 +1244,9 @@ async fn authenticate_agent(
         Some(identity) => certificate_authenticate(state, identity, agent_id, instance_id).await,
         None => Err(unauthorized_code(
             if state.config.agent_ca_files().is_some() {
-                "certificate_required"
+                codes::CERTIFICATE_REQUIRED
             } else {
-                "missing_credential"
+                codes::MISSING_CREDENTIAL
             },
         )),
     }
@@ -1223,12 +1265,12 @@ async fn certificate_authenticate(
         || identity.tenant_id != state.config.tenant_id
         || identity.environment_id != state.config.environment_id
     {
-        return Err(unauthorized_code("certificate_mismatch"));
+        return Err(unauthorized_code(codes::CERTIFICATE_MISMATCH));
     }
     // 证书在握手期已验过、身份也已对齐：此时才判拒绝名单，且**在查库 / 首触重建之前** ——
     // 被吊销的 agent 不能靠「库丢了 → 首触重建」把自己登记回来。
     if agent_is_revoked(state, agent_id).await? {
-        return Err(unauthorized_code("certificate_revoked"));
+        return Err(unauthorized_code(codes::CERTIFICATE_REVOKED));
     }
     if let Some(agent) = state
         .store
@@ -1245,11 +1287,12 @@ async fn certificate_authenticate(
         .await
         .map_err(store_unavailable)?
         .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::internal(
+                codes::AGENT_REGISTRATION_MISSING_AFTER_REBUILD,
+                "agent registration missing right after rebuild",
                 "agent registration missing right after rebuild",
             )
-                .into_response()
+            .into_response()
         })
 }
 
@@ -1287,9 +1330,10 @@ async fn rebuild_agent_registration(
         .await
         .map_err(store_unavailable)?;
     if created {
-        eprintln!(
+        log::info!(
             "audit agent_rebuilt_from_certificate agent_id={} fingerprint={}",
-            identity.agent_id, identity.fingerprint_sha256
+            identity.agent_id,
+            identity.fingerprint_sha256
         );
     }
     Ok(())
@@ -1297,19 +1341,16 @@ async fn rebuild_agent_registration(
 
 /// 401 的正文里带一个稳定的 `code`，agentd 按它决定要不要自愈（§5.4）。
 fn unauthorized_code(code: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        format!("agent identity rejected: {code}"),
-    )
-        .into_response()
+    ApiError::unauthorized(code, format!("agent identity rejected: {code}")).into_response()
 }
 
 fn store_unavailable(err: impl std::fmt::Display) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("failed to load agent credential store: {err}"),
+    ApiError::internal(
+        codes::AGENT_STORE_UNAVAILABLE,
+        "failed to load agent credential store",
+        err,
     )
-        .into_response()
+    .into_response()
 }
 
 /// 命中拒绝名单就 `Err`（401 `certificate_revoked`），否则 `Ok(false)`；调用方当 `?` 用。

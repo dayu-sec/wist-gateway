@@ -9,6 +9,7 @@
 //! NOTE(hand-added): 本模块的端点不在 jumo 静态模型 `binding.mju` 里（与 content / host_metrics
 //! / pipeline 同一模式）。重新生成控制面代码时需回补本模块与 `api/mod.rs` 里的路由。
 
+use super::codes;
 use axum::{
     Json,
     extract::State,
@@ -22,7 +23,7 @@ use crate::app::knowledge::{
 };
 use crate::infra::{KnowledgeActivation, StoredKnowledgePackage, bytes_sha256_hex};
 
-use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
+use super::{ApiState, admin_auth::require_admin_bearer, error::ApiError, rate_limit};
 
 /// 激活留痕一次最多返这么多：管理面展示"最近换过什么"，不做分页。
 const ACTIVATION_LOG_LIMIT: u64 = 20;
@@ -140,14 +141,15 @@ struct KnowledgeLockView {
     works: u64,
 }
 
-#[derive(Debug, Serialize)]
-struct KnowledgeErrorBody {
-    code: &'static str,
-    message: String,
+fn knowledge_error(status: StatusCode, code: &'static str, message: String) -> Response {
+    // 统一投影 `{ "error": { code, message } }`（设计 §6，`ApiError`）。
+    ApiError::new(status, code, message).into_response()
 }
 
-fn knowledge_error(status: StatusCode, code: &'static str, message: String) -> Response {
-    (status, Json(KnowledgeErrorBody { code, message })).into_response()
+/// 落库 / 读库失败的**对外投影**：对外只出通用话术 + `package_store_failed`，原始错只进本地日志。
+/// `cause` 传 `err.display_chain()`（完整因果链）—— 直接传 `err`（`Display`）只出一行、丢掉 source。
+fn store_failure(message: &'static str, cause: impl std::fmt::Display) -> Response {
+    ApiError::internal(codes::PACKAGE_STORE_FAILED, message, cause).into_response()
 }
 
 fn record_error_response(err: KnowledgeRecordError) -> Response {
@@ -163,7 +165,11 @@ fn record_error_response(err: KnowledgeRecordError) -> Response {
         KnowledgeRecordError::SourceUnavailable(_) => StatusCode::BAD_GATEWAY,
         KnowledgeRecordError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    knowledge_error(status, err.code(), err.to_string())
+    match err {
+        // 落库失败：原始错只进日志，对外只出通用话术（原来把 err 直接透出去了）。
+        KnowledgeRecordError::Store(detail) => store_failure("录入知识库包失败（落库）", detail),
+        other => knowledge_error(status, other.code(), other.to_string()),
+    }
 }
 
 fn package_view(
@@ -306,7 +312,7 @@ pub async fn record_knowledge_package(
     if expected_sha256.is_empty() {
         return knowledge_error(
             StatusCode::BAD_REQUEST,
-            "sha256_required",
+            codes::SHA256_REQUIRED,
             "期望摘要 sha256 必填（填发布侧 *.sha256 里那串）".to_string(),
         );
     }
@@ -334,17 +340,11 @@ pub async fn record_knowledge_package(
         Ok(None) => {
             return knowledge_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "package_store_failed",
+                codes::PACKAGE_STORE_FAILED,
                 "录入成功但读不回该包".to_string(),
             );
         }
-        Err(err) => {
-            return knowledge_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "package_store_failed",
-                format!("读回该包失败：{err}"),
-            );
-        }
+        Err(err) => return store_failure("读回该包失败", err.display_chain()),
     };
     let active = state
         .store
@@ -381,11 +381,7 @@ pub async fn list_knowledge_packages(
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(err) => knowledge_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "package_store_failed",
-            format!("列出录入历史失败：{err}"),
-        ),
+        Err(err) => store_failure("列出录入历史失败", err.display_chain()),
     }
 }
 
@@ -411,14 +407,10 @@ pub async fn view_knowledge_package(
         Ok(Some(package)) => Json(package_view(&package, active.as_deref())).into_response(),
         Ok(None) => knowledge_error(
             StatusCode::NOT_FOUND,
-            "package_not_found",
+            codes::PACKAGE_NOT_FOUND,
             format!("没有录入过这个包：{package_id}"),
         ),
-        Err(err) => knowledge_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "package_store_failed",
-            format!("读该包失败：{err}"),
-        ),
+        Err(err) => store_failure("读该包失败", err.display_chain()),
     }
 }
 
@@ -441,7 +433,7 @@ pub async fn activate_knowledge_package(
     if reason != "activate" && reason != "rollback" && reason != "repair" {
         return knowledge_error(
             StatusCode::BAD_REQUEST,
-            "package_source_invalid",
+            codes::PACKAGE_SOURCE_INVALID,
             format!("reason 只能是 activate / rollback / repair（当前：{reason}）"),
         );
     }
@@ -455,17 +447,11 @@ pub async fn activate_knowledge_package(
         Ok(None) => {
             return knowledge_error(
                 StatusCode::NOT_FOUND,
-                "package_not_found",
+                codes::PACKAGE_NOT_FOUND,
                 format!("没有录入过这个包：{package_id}"),
             );
         }
-        Err(err) => {
-            return knowledge_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "package_store_failed",
-                format!("读该包失败：{err}"),
-            );
-        }
+        Err(err) => return store_failure("读该包失败", err.display_chain()),
     }
     let loaded = match load_recorded_package(&state.config, &package_id) {
         Ok(loaded) => loaded,
@@ -485,14 +471,10 @@ pub async fn activate_knowledge_package(
         Ok(Some(package)) => Json(package_view(&package, active.as_deref())).into_response(),
         Ok(None) => knowledge_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "package_store_failed",
+            codes::PACKAGE_STORE_FAILED,
             "切换成功但读不回该包".to_string(),
         ),
-        Err(err) => knowledge_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "package_store_failed",
-            format!("读回该包失败：{err}"),
-        ),
+        Err(err) => store_failure("读回该包失败", err.display_chain()),
     }
 }
 
@@ -515,7 +497,7 @@ async fn activate_loaded(
         _ => {
             return Err(knowledge_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "package_store_failed",
+                codes::PACKAGE_STORE_FAILED,
                 "内部错误：切的是未登记的包".to_string(),
             ));
         }
@@ -532,13 +514,7 @@ async fn activate_loaded(
         .await
     {
         Ok(active) => active,
-        Err(err) => {
-            return Err(knowledge_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "package_store_failed",
-                format!("落库失败：{err}"),
-            ));
-        }
+        Err(err) => return Err(store_failure("落库失败", err.display_chain())),
     };
     // ② 换内存里那一份（带上新的世代号）
     let mut loaded = loaded;
@@ -574,10 +550,6 @@ pub async fn view_knowledge_locks(
                 .collect(),
         })
         .into_response(),
-        Err(err) => knowledge_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "package_store_failed",
-            format!("统计工作版本失败：{err}"),
-        ),
+        Err(err) => store_failure("统计工作版本失败", err.display_chain()),
     }
 }

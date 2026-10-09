@@ -1,11 +1,12 @@
+use super::codes;
 use axum::{
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, header},
     response::{IntoResponse, Response},
 };
 
 use crate::infra::sha256_hex;
 
-use super::{ApiState, rate_limit};
+use super::{ApiState, error::ApiError, rate_limit};
 
 const ADMIN_AUTH_SCOPE: &str = "admin";
 
@@ -24,14 +25,22 @@ pub(super) fn require_admin_bearer(
         // rate limit lets an unauthenticated client (e.g. the web UI polling
         // the overview every few seconds before a token is entered) lock the IP
         // out for the block window even after the correct token is supplied.
-        return Err((StatusCode::UNAUTHORIZED, "missing admin bearer token").into_response());
+        return Err(ApiError::unauthorized(
+            codes::MISSING_ADMIN_BEARER_TOKEN,
+            "missing admin bearer token",
+        )
+        .into_response());
     };
     if !constant_time_eq(
         sha256_hex(token).as_bytes(),
         state.config.admin_api_token_hash.as_bytes(),
     ) {
         rate_limit::record_auth_failure(state, client_key, ADMIN_AUTH_SCOPE);
-        return Err((StatusCode::UNAUTHORIZED, "invalid admin bearer token").into_response());
+        return Err(ApiError::unauthorized(
+            codes::INVALID_ADMIN_BEARER_TOKEN,
+            "invalid admin bearer token",
+        )
+        .into_response());
     }
     rate_limit::clear_auth_failures(state, client_key, ADMIN_AUTH_SCOPE);
     Ok(())

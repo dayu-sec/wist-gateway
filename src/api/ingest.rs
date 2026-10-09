@@ -98,6 +98,7 @@ pub async fn ingest_agent_facts(
         (StatusCode::ACCEPTED, Json(body)).into_response()
     } else {
         // 非 2xx 是故意的：让 warp-parse 重试并最终落 rescue（可见），而不是静默丢。
+        // 这个 body 是**领域响应**（逐条失败明细），不是通用错误信封 —— 保留 `{ingested,rejected,failures}`。
         (StatusCode::BAD_REQUEST, Json(body)).into_response()
     }
 }

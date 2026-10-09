@@ -8,6 +8,7 @@
 //! 编排口径（批准 / 推进 / 闸门 / 结果回填后自动推进 / 重试重开）在共享 crate
 //! `wist_release::plan`（与中心同一份）；本模块只做映射、物化与落库。
 
+use super::codes;
 use std::collections::HashSet;
 
 use axum::{
@@ -25,8 +26,8 @@ use crate::infra::{
 };
 
 use super::{
-    ApiState, admin_auth::require_admin_bearer, install::effective_advertise_base, install_package,
-    rate_limit,
+    ApiState, admin_auth::require_admin_bearer, error::ApiError, install::effective_advertise_base,
+    install_package, rate_limit,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -258,8 +259,8 @@ fn select_agent_package<'a>(
 
 /// agent 平台查找失败的原因（决定对外状态码）。
 enum PlatformError {
-    /// 读库失败 —— 基础设施问题，不是调用方的错。
-    Store(String),
+    /// 读库失败 —— 基础设施问题，不是调用方的错。`message` 可对外，`cause` 只进日志。
+    Store { message: String, cause: String },
     /// 事实层面找不到平台：还没报过 / 平台不在已知发布集。
     Unavailable(String),
 }
@@ -269,10 +270,14 @@ impl PlatformError {
     /// 读库失败一律 `500`。
     fn into_response(self, unavailable: StatusCode) -> Response {
         match self {
-            PlatformError::Store(message) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+            PlatformError::Store { message, cause } => {
+                ApiError::internal(codes::ROLLOUT_PLATFORM_STORE_FAILED, message, cause)
+                    .into_response()
             }
-            PlatformError::Unavailable(message) => (unavailable, message).into_response(),
+            PlatformError::Unavailable(message) => {
+                ApiError::new(unavailable, codes::ROLLOUT_PLATFORM_UNAVAILABLE, message)
+                    .into_response()
+            }
         }
     }
 }
@@ -285,8 +290,9 @@ async fn agent_platform(state: &ApiState, agent_id: &str) -> Result<&'static str
         .store
         .get_agent_fact_summary(agent_id)
         .await
-        .map_err(|err| {
-            PlatformError::Store(format!("failed to read agent {agent_id} platform: {err}"))
+        .map_err(|err| PlatformError::Store {
+            message: format!("failed to read agent {agent_id} platform"),
+            cause: err.to_string(),
         })?;
     let Some(summary) = summary else {
         return Err(PlatformError::Unavailable(format!(
@@ -341,13 +347,15 @@ async fn dispatch_spec_for(
     if plan.action != "upgrade" {
         return Ok(plan.spec.clone());
     }
-    let selection = plan_selection(&plan.spec)
-        .map_err(|message| (StatusCode::CONFLICT, message).into_response())?;
+    let selection = plan_selection(&plan.spec).map_err(|message| {
+        ApiError::conflict(codes::ROLLOUT_PLAN_SPEC_INVALID, message).into_response()
+    })?;
     let PlanSelection::Version { version } = selection else {
         // 显式制品的旧计划：原样透传，但出站前先确认它完整 —— 缺 `package_url` 的 spec 到 agentd
         // 只会以 `spec_invalid` 拒绝，在网关这侧就挡住，报错更清楚。
-        ensure_agent_upgrade_spec(&plan.spec)
-            .map_err(|message| (StatusCode::CONFLICT, message).into_response())?;
+        ensure_agent_upgrade_spec(&plan.spec).map_err(|message| {
+            ApiError::conflict(codes::ROLLOUT_UPGRADE_SPEC_INVALID, message).into_response()
+        })?;
         return Ok(plan.spec.clone());
     };
     let platform = agent_platform(state, agent_id)
@@ -358,18 +366,19 @@ async fn dispatch_spec_for(
         .list_agent_install_packages()
         .await
         .map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list agent install packages: {err}"),
+            ApiError::internal(
+                codes::ROLLOUT_PACKAGE_LIST_FAILED,
+                "failed to list agent install packages",
+                err,
             )
-                .into_response()
+            .into_response()
         })?;
     let Some(package) = select_agent_package(&history, &version, platform) else {
-        return Err((
-            StatusCode::CONFLICT,
+        return Err(ApiError::conflict(
+            codes::ROLLOUT_PACKAGE_NOT_FOUND,
             format!("no agent install package for version {version} on platform {platform}"),
         )
-            .into_response());
+        .into_response());
     };
     let base = effective_advertise_base(&state.config, &state.store).await;
     let package_url = state
@@ -384,8 +393,9 @@ async fn dispatch_spec_for(
         serde_json::Value::String(package.package_sha256.clone()),
     );
     let resolved = serde_json::Value::Object(resolved).to_string();
-    ensure_agent_upgrade_spec(&resolved)
-        .map_err(|message| (StatusCode::CONFLICT, message).into_response())?;
+    ensure_agent_upgrade_spec(&resolved).map_err(|message| {
+        ApiError::conflict(codes::ROLLOUT_UPGRADE_SPEC_INVALID, message).into_response()
+    })?;
     Ok(resolved)
 }
 
@@ -399,32 +409,39 @@ fn build_plan(
 ) -> Result<(StoredRolloutPlan, Vec<String>), Response> {
     let action = input.action.trim();
     if action.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "action is required").into_response());
+        return Err(
+            ApiError::bad_request(codes::ROLLOUT_ACTION_REQUIRED, "action is required")
+                .into_response(),
+        );
     }
     let spec = input.spec.trim();
     if spec.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "spec is required").into_response());
+        return Err(
+            ApiError::bad_request(codes::ROLLOUT_SPEC_REQUIRED, "spec is required").into_response(),
+        );
     }
     let deadline_at = input.deadline_at.trim();
     if chrono::DateTime::parse_from_rfc3339(deadline_at).is_err() {
-        return Err((
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
+            codes::ROLLOUT_DEADLINE_INVALID,
             format!("deadline_at must be RFC3339, got {deadline_at:?}"),
         )
-            .into_response());
+        .into_response());
     }
     if input.timeout_seconds <= 0 {
-        return Err((
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
+            codes::ROLLOUT_TIMEOUT_INVALID,
             "timeout_seconds must be a positive number of seconds",
         )
-            .into_response());
+        .into_response());
     }
     // 目标去重、按阶梯切段、固定闸门策略 —— 口径在共享 crate `wist_release::plan`。
     let drafts = match wist_release::plan::build_phase_drafts(&input.target_ids, input.phase_count)
     {
         Ok(drafts) => drafts,
-        Err(err) => return Err((StatusCode::BAD_REQUEST, err).into_response()),
+        Err(err) => {
+            return Err(ApiError::bad_request(codes::ROLLOUT_PHASES_INVALID, err).into_response());
+        }
     };
     let phases: Vec<StoredRolloutPhase> = drafts
         .into_iter()
@@ -482,19 +499,21 @@ async fn materialize_targets(
             })
             .await
         {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to store one-shot work: {err}"),
+            return Err(ApiError::internal(
+                codes::ROLLOUT_WORK_STORE_FAILED,
+                "failed to store one-shot work",
+                err,
             )
-                .into_response());
+            .into_response());
         }
         // 物化出工作后 bump 该 target 的授权序号：agent 下一次 poll_work 就能看到它。
         if let Err(err) = state.store.next_work_sequence(target, now).await {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to bump work sequence: {err}"),
+            return Err(ApiError::internal(
+                codes::ROLLOUT_WORK_SEQUENCE_FAILED,
+                "failed to bump work sequence",
+                err,
             )
-                .into_response());
+            .into_response());
         }
         let entry = StoredRolloutPlanEntry {
             plan_id: plan.plan_id.clone(),
@@ -505,11 +524,12 @@ async fn materialize_targets(
             updated_at: now.to_string(),
         };
         if let Err(err) = state.store.upsert_rollout_plan_entry(&entry).await {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to store rollout plan entry: {err}"),
+            return Err(ApiError::internal(
+                codes::ROLLOUT_PLAN_ENTRY_STORE_FAILED,
+                "failed to store rollout plan entry",
+                err,
             )
-                .into_response());
+            .into_response());
         }
     }
     Ok(())
@@ -557,11 +577,12 @@ async fn advance_plan(state: &ApiState, plan: &mut StoredRolloutPlan) -> Result<
     let entries = match state.store.list_rollout_plan_entries(&plan.plan_id).await {
         Ok(entries) => entries,
         Err(err) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list rollout plan entries: {err}"),
+            return Err(ApiError::internal(
+                codes::ROLLOUT_ENTRY_LIST_FAILED,
+                "failed to list rollout plan entries",
+                err,
             )
-                .into_response());
+            .into_response());
         }
     };
     // 推进口径在共享 crate：当前段 completed；末段收尾（有失败落 failed），其余进下一段。
@@ -585,11 +606,12 @@ async fn advance_plan(state: &ApiState, plan: &mut StoredRolloutPlan) -> Result<
     plan.current_phase = current_phase;
     plan.status = status;
     if let Err(err) = state.store.save_rollout_plan(plan).await {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store rollout plan: {err}"),
+        return Err(ApiError::internal(
+            codes::ROLLOUT_PLAN_STORE_FAILED,
+            "failed to store rollout plan",
+            err,
         )
-            .into_response());
+        .into_response());
     }
     Ok(())
 }
@@ -677,11 +699,12 @@ async fn converge_finished_plan(
         .list_rollout_plan_entries(&plan.plan_id)
         .await
         .map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list rollout plan entries: {err}"),
+            ApiError::internal(
+                codes::ROLLOUT_ENTRY_LIST_FAILED,
+                "failed to list rollout plan entries",
+                err,
             )
-                .into_response()
+            .into_response()
         })?;
     let phase_entries: Vec<StoredRolloutPlanEntry> = entries
         .into_iter()
@@ -714,11 +737,12 @@ pub async fn create_rollout_plan(
     let known = match state.store.list_agent_ids().await {
         Ok(ids) => ids.into_iter().collect::<HashSet<_>>(),
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list agent ids: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_AGENT_LIST_FAILED,
+                "failed to list agent ids",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let unknown: Vec<&str> = all_targets
@@ -727,26 +751,30 @@ pub async fn create_rollout_plan(
         .filter(|target| !known.contains(*target))
         .collect();
     if !unknown.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::ROLLOUT_UNKNOWN_TARGETS,
             format!("unknown target(s): {}", unknown.join(", ")),
         )
-            .into_response();
+        .into_response();
     }
     // 按版本选择的升级计划：建计划时就确认**每个目标平台**在该版本下都有安装包 ——
     // 挑不到就整份拒（与中心「一次录入即齐备」同口径），不把失败推迟到派活时逐台暴露。
     if plan.action == "upgrade" {
         match plan_selection(&plan.spec) {
-            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+            Err(message) => {
+                return ApiError::bad_request(codes::ROLLOUT_PLAN_SPEC_INVALID, message)
+                    .into_response();
+            }
             Ok(PlanSelection::Version { version }) => {
                 let history = match state.store.list_agent_install_packages().await {
                     Ok(history) => history,
                     Err(err) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("failed to list agent install packages: {err}"),
+                        return ApiError::internal(
+                            codes::ROLLOUT_PACKAGE_LIST_FAILED,
+                            "failed to list agent install packages",
+                            err,
                         )
-                            .into_response();
+                        .into_response();
                     }
                 };
                 // 一次列出**所有**不合规的目标（缺包 / 没报平台 / 平台无制品），不是见一个报一个。
@@ -761,20 +789,20 @@ pub async fn create_rollout_plan(
                             }
                         }
                         Err(PlatformError::Unavailable(message)) => problems.push(message),
-                        Err(err @ PlatformError::Store(_)) => {
+                        Err(err @ PlatformError::Store { .. }) => {
                             return err.into_response(StatusCode::BAD_REQUEST);
                         }
                     }
                 }
                 if !problems.is_empty() {
-                    return (
-                        StatusCode::BAD_REQUEST,
+                    return ApiError::bad_request(
+                        codes::ROLLOUT_VERSION_INCOMPLETE,
                         format!(
                             "version {version} cannot be rolled out to every target platform: {}",
                             problems.join("; ")
                         ),
                     )
-                        .into_response();
+                    .into_response();
                 }
             }
             Ok(PlanSelection::Explicit) => {}
@@ -782,11 +810,12 @@ pub async fn create_rollout_plan(
     }
     let now = plan.created_at.clone();
     if let Err(err) = state.store.save_rollout_plan(&plan).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store rollout plan: {err}"),
+        return ApiError::internal(
+            codes::ROLLOUT_PLAN_STORE_FAILED,
+            "failed to store rollout plan",
+            err,
         )
-            .into_response();
+        .into_response();
     }
     // 条目在创建时先按全量 target 落成 `pending`：未到阶段前就能在视图里看到整个范围。
     for target in &all_targets {
@@ -799,11 +828,12 @@ pub async fn create_rollout_plan(
             updated_at: now.clone(),
         };
         if let Err(err) = state.store.upsert_rollout_plan_entry(&entry).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to store rollout plan entry: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_PLAN_ENTRY_STORE_FAILED,
+                "failed to store rollout plan entry",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     }
     (StatusCode::CREATED, Json(plan_view(&plan))).into_response()
@@ -820,11 +850,12 @@ pub async fn list_rollout_plans(
     }
     match state.store.list_rollout_plans().await {
         Ok(plans) => Json(plans.iter().map(plan_view).collect::<Vec<_>>()).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to list rollout plans: {err}"),
+        Err(err) => ApiError::internal(
+            codes::ROLLOUT_PLAN_LIST_FAILED,
+            "failed to list rollout plans",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -842,37 +873,38 @@ pub async fn approve_rollout_plan(
     let Some(mut plan) = (match state.store.get_rollout_plan(&plan_id).await {
         Ok(value) => value,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load rollout plan: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_PLAN_LOAD_FAILED,
+                "failed to load rollout plan",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     }) else {
-        return (
-            StatusCode::NOT_FOUND,
+        return ApiError::not_found(
+            codes::ROLLOUT_PLAN_NOT_FOUND,
             format!("unknown rollout plan {plan_id}"),
         )
-            .into_response();
+        .into_response();
     };
     if plan.status != "draft" {
-        return (
-            StatusCode::CONFLICT,
+        return ApiError::conflict(
+            codes::ROLLOUT_PLAN_CONFLICT,
             format!(
                 "rollout plan {plan_id} is {}, only draft can be approved",
                 plan.status
             ),
         )
-            .into_response();
+        .into_response();
     }
     let now = chrono::Utc::now().to_rfc3339();
     // 空阶段没有第一段可开：显式拒，不靠索引 `phases[0]` 撞出 panic（与中心 approve 同一道闸）。
     if plan.phases.is_empty() {
-        return (
-            StatusCode::CONFLICT,
+        return ApiError::conflict(
+            codes::ROLLOUT_PLAN_CONFLICT,
             format!("rollout plan {plan_id} has no phase"),
         )
-            .into_response();
+        .into_response();
     }
     // 先物化再落状态：物化是幂等的（work_id 确定性 + upsert），半途失败重试安全；
     // 反过来（先落 rolling）会让一次失败把计划停在「已 rolling、但工作没发全」的中间态。
@@ -890,11 +922,12 @@ pub async fn approve_rollout_plan(
     plan.approved_by = Some("admin".to_string());
     plan.approved_at = Some(now);
     if let Err(err) = state.store.save_rollout_plan(&plan).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store rollout plan: {err}"),
+        return ApiError::internal(
+            codes::ROLLOUT_PLAN_STORE_FAILED,
+            "failed to store rollout plan",
+            err,
         )
-            .into_response();
+        .into_response();
     }
     Json(plan_view(&plan)).into_response()
 }
@@ -913,44 +946,46 @@ pub async fn advance_rollout_plan(
     let Some(mut plan) = (match state.store.get_rollout_plan(&plan_id).await {
         Ok(value) => value,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load rollout plan: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_PLAN_LOAD_FAILED,
+                "failed to load rollout plan",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     }) else {
-        return (
-            StatusCode::NOT_FOUND,
+        return ApiError::not_found(
+            codes::ROLLOUT_PLAN_NOT_FOUND,
             format!("unknown rollout plan {plan_id}"),
         )
-            .into_response();
+        .into_response();
     };
     if plan.status != "rolling" {
-        return (
-            StatusCode::CONFLICT,
+        return ApiError::conflict(
+            codes::ROLLOUT_PLAN_CONFLICT,
             format!("rollout plan {plan_id} is {}, not rolling", plan.status),
         )
-            .into_response();
+        .into_response();
     }
     let idx = plan.current_phase as usize;
     if idx == 0 || idx > plan.phases.len() {
-        return (
-            StatusCode::CONFLICT,
+        return ApiError::conflict(
+            codes::ROLLOUT_PLAN_CONFLICT,
             format!("rollout plan {plan_id} has no phase to advance"),
         )
-            .into_response();
+        .into_response();
     }
     // 人工闸门：当前阶段须**已全部了结**（含失败）—— 「金丝雀确认无问题再推下一批」。
     // 口径在共享 crate `wist_release::plan`（与中心同一份）。
     let entries = match state.store.list_rollout_plan_entries(&plan_id).await {
         Ok(entries) => entries,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list rollout plan entries: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_ENTRY_LIST_FAILED,
+                "failed to list rollout plan entries",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let statuses = phase_entry_statuses(&entries, &plan.phases[idx - 1].target_ids);
@@ -960,11 +995,11 @@ pub async fn advance_rollout_plan(
         plan.current_phase,
         &statuses,
     ) {
-        return (
-            StatusCode::CONFLICT,
+        return ApiError::conflict(
+            codes::ROLLOUT_ADVANCE_BLOCKED,
             format!("cannot advance rollout plan {plan_id}: {reason}"),
         )
-            .into_response();
+        .into_response();
     }
     // 推进：当前阶段划 completed，物化下一阶段（受 batch_size 节流）或收敛为 completed。
     if let Err(response) = advance_plan(&state, &mut plan).await {
@@ -994,35 +1029,37 @@ pub async fn retry_rollout_plan(
     let Some(mut plan) = (match state.store.get_rollout_plan(&plan_id).await {
         Ok(value) => value,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load rollout plan: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_PLAN_LOAD_FAILED,
+                "failed to load rollout plan",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     }) else {
-        return (
-            StatusCode::NOT_FOUND,
+        return ApiError::not_found(
+            codes::ROLLOUT_PLAN_NOT_FOUND,
             format!("unknown rollout plan {plan_id}"),
         )
-            .into_response();
+        .into_response();
     };
     // 草稿阶段还没派过任何工作 —— 没有「失败」可言。
     if plan.status == "draft" {
-        return (
-            StatusCode::CONFLICT,
+        return ApiError::conflict(
+            codes::ROLLOUT_PLAN_CONFLICT,
             format!("rollout plan {plan_id} is draft; approve it before retrying"),
         )
-            .into_response();
+        .into_response();
     }
     let entries = match state.store.list_rollout_plan_entries(&plan_id).await {
         Ok(entries) => entries,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list rollout plan entries: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_ENTRY_LIST_FAILED,
+                "failed to list rollout plan entries",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     let requested: Option<HashSet<String>> = {
@@ -1044,11 +1081,11 @@ pub async fn retry_rollout_plan(
         })
         .collect();
     if failed.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
+        return ApiError::bad_request(
+            codes::ROLLOUT_NO_FAILED_TARGET,
             format!("rollout plan {plan_id} has no failed target to retry"),
         )
-            .into_response();
+        .into_response();
     }
     let now = chrono::Utc::now().to_rfc3339();
     // 先全部解析（解析失败整体不落库），再逐个写 —— 与 `materialize_targets` 同一取舍。
@@ -1071,18 +1108,20 @@ pub async fn retry_rollout_plan(
             })
             .await
         {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to store one-shot work: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_WORK_STORE_FAILED,
+                "failed to store one-shot work",
+                err,
             )
-                .into_response();
+            .into_response();
         }
         if let Err(err) = state.store.next_work_sequence(target, &now).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to bump work sequence: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_WORK_SEQUENCE_FAILED,
+                "failed to bump work sequence",
+                err,
             )
-                .into_response();
+            .into_response();
         }
         let entry = StoredRolloutPlanEntry {
             plan_id: plan.plan_id.clone(),
@@ -1093,11 +1132,12 @@ pub async fn retry_rollout_plan(
             updated_at: now.clone(),
         };
         if let Err(err) = state.store.upsert_rollout_plan_entry(&entry).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to store rollout plan entry: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_PLAN_ENTRY_STORE_FAILED,
+                "failed to store rollout plan entry",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     }
     // 重开：被重试目标所在阶段改回 rolling；计划改回 rolling；current_phase 指回最靠后的那段
@@ -1114,11 +1154,12 @@ pub async fn retry_rollout_plan(
     plan.current_phase = current_phase;
     plan.status = status;
     if let Err(err) = state.store.save_rollout_plan(&plan).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store rollout plan: {err}"),
+        return ApiError::internal(
+            codes::ROLLOUT_PLAN_STORE_FAILED,
+            "failed to store rollout plan",
+            err,
         )
-            .into_response();
+        .into_response();
     }
     Json(plan_view(&plan)).into_response()
 }
@@ -1136,18 +1177,19 @@ pub async fn view_rollout_plan(
     let Some(plan) = (match state.store.get_rollout_plan(&plan_id).await {
         Ok(value) => value,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load rollout plan: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_PLAN_LOAD_FAILED,
+                "failed to load rollout plan",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     }) else {
-        return (
-            StatusCode::NOT_FOUND,
+        return ApiError::not_found(
+            codes::ROLLOUT_PLAN_NOT_FOUND,
             format!("unknown rollout plan {plan_id}"),
         )
-            .into_response();
+        .into_response();
     };
     // 顺手对一次账：末阶段已了结但计划还挂着（见函数注释）→ 收敛为 completed，幂等。
     let plan = match converge_finished_plan(&state, plan).await {
@@ -1157,11 +1199,12 @@ pub async fn view_rollout_plan(
     let entries = match state.store.list_rollout_plan_entries(&plan_id).await {
         Ok(value) => value,
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list rollout plan entries: {err}"),
+            return ApiError::internal(
+                codes::ROLLOUT_ENTRY_LIST_FAILED,
+                "failed to list rollout plan entries",
+                err,
             )
-                .into_response();
+            .into_response();
         }
     };
     Json(RolloutPlanDetailView {

@@ -3,6 +3,60 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.0-alpha] - 2026-10-10
+
+### 新增
+
+- **中心交付 Agent 包到网关包管理（发布 ②）**：`POST /api/v1/gateway/agent-package`（**loopback-only**，仅本机
+  host 侧常驻 `wist-gwlinkd` 可用）。**取包由 gwlinkd 完成**（它持中心信任、是唯一面向中心者），把包落到本机路径后
+  交付本端点；载荷 `{artifacts:[{platform,package_url(=本机路径),origin(=中心地址,留痕),package_sha256}],requested_by?}`，
+  与 `POST /api/v1/admin/agent/install-package` **共用同一内核**（校验摘要 → 从本机路径取 → 落每平台设置 + 内容寻址历史）。
+  非环回 / 取不到对端一律 403；坏输入整次不生效。`origin` 记进历史的 `source` 作 provenance（设置里的来源仍是网关能取的本机路径）。
+  见设计 `doc/design/edge/center-content-delivery.md`（分层：中心内容 gwlinkd 取、网关只托管）与 `.../agent-package-push-to-gateways.md`（特性）。
+
+### 变更
+
+- **`init-config` 覆盖已存在配置时明确告知**：不再静默覆盖 —— 打印 `overwrote existing config`（新建仍是
+  `generated admin config`），与 `wist-gwlinkd init-config` 同口径。
+- **运行日志支持配置 `[log]` 段**：`level`（过滤器指令）、`format`（`text` | `json`）、`file`（给了就写文件、
+  相对配置目录解析、自动建父目录；否则 stderr）。优先级 **`RUST_LOG` > `[log] level` > 缺省 `info`**。
+  文件**写满自轮转**：`max_bytes`（单文件上限，缺省 64 MiB）、`keep_files`（保留分卷数，缺省 4）、
+  `max_age_seconds`（分卷保留时长，缺省 7 天）—— 日志文件不再无界增长。
+  注意与 `[logs]`（**被采集 agent 日志**的落盘保留）区分：`[log]` 是**网关进程自己**的运行日志。
+  日志在读到配置之后才初始化；配置读不了时退写 stderr。`init-config` 模板同步。
+- **对齐生态版本（收口漂移）**：`wist-contracts` `0.3 → 0.7`、`wist-api` `0.6 → 0.7`、
+  `wist-control` `0.11 → 0.14`。0.4–0.7 期间 `enrollment` / `gateway` / `work` / `agent_uplink` 的 seam
+  报文陆续迁入 `wist-api`，本仓领域类型改自 `wist-contracts 0.7` 取 —— **纯版本 pin，无代码改动**，
+  依赖图里 `wist_contracts` 单版本（不再双份）。
+- **管理面错误响应统一为 `{ "error": { code, message, … } }` 信封**：跨进程 wire 类型放在
+  `wist_shared::protocol`（`ProtocolError` / `Severity` / `ProtocolErrorEnvelope`，设计 §6 指定之家），
+  axum 侧的 `api::error::ApiError` 负责投影。**全部**管理面 / agent 面端点从 `(StatusCode, format!("…{err}"))`
+  改为 `ApiError`：4xx 给**稳定 `code`** + 可暴露 `message`；5xx 把内部因果链移进本地日志（`internal(...)`）、
+  对外不再泄 `err.to_string()`；带 `Cache-Control: no-store` 的错误响应经 `with_no_store()` 保留该头。
+  前端 `requestJson` 相应地**全局**解析信封（`ApiError.code` / `.detail`），各页面提示随之复用（
+  未识别 code 时回退原文）。ingest（facts / logs）的逐条失败响应 `{ingested,rejected,failures}`
+  是领域响应，不套信封、保持原样。
+- **升级 `orion-error` 0.8 → 0.9、`wist-error` 0.1 → 0.2**：`wist-error` 同步升级以对齐 `orion-error` 0.9
+  的错误身份 trait（否则依赖树里两版 `DomainReason` 共存、`ConfigReason`/`StoreReason` 无法满足
+  0.9 的 `ToStructError` / `SourceErr` 约束）。本仓直接依赖随之升到 0.9；对外行为不变。
+- **运行日志接入 `log` / `env_logger`**：启动 / 监听 / TLS 握手与连接失败 / 知识库来源 / ingest /
+  legacy store 导入等运行期诊断从 `println!` / `eprintln!` 改走 `log`，级别由 `RUST_LOG` 控制（缺省
+  `info`），落 stderr（systemd / journald 收集）。
+- **进程边界统一到结构化错误**：`main` 的 `Box<dyn Error>` 边界改为 `wist_error::AppError`（`orion-error`）——
+  配置 / 库 / TLS / 绑端口的失败以 `display_chain` 打印**完整因果链**再退非零；`init-config` / `build_store` /
+  `serve_tls` 同步。对外行为不变。
+- **错误信封加固（P0–P3 复核）**：管理面错误 `code` 收敛为**唯一词表** `api::codes`（174 个稳定码，
+  调用点只引用常量，附唯一性 / 契约关键码守护测试；`knowledge` 录入错误码与词表对齐）。`ApiError` 按 status
+  **默认填 `severity` / `retryable`**（5xx→`error`；`429/502/503/504`→可重试；其余 4xx→不可重试；其它 5xx 不臆断）。
+  新增 `error::logged_op`（对齐 `wist-gwlinkd` 的结构化生命周期日志）用于**低频外呼**（GitHub release / agent 包解析），
+  并新增 `ApiError::handled` 只投影、**不再记** —— 避免同一故障记两条。落库错误记完整 `display_chain`；
+  `try_init` 失败不再静默（打印告警）；`[log] file` 明确由进程自轮转、**不要**再挂 logrotate。
+
+### 修复
+
+- 环回写口的**生产注入层**补测试（`main.rs` `inject_connection_context`）：钉住真实对端 → 环回判定，
+  防该层被漏改导致所有环回写口 fail-closed（403）却无人察觉。
+
 ## [0.6.0-alpha] - 2026-10-08
 
 ### 新增

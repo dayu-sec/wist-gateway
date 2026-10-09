@@ -8,16 +8,18 @@
 // - **环回（gwlinkd）**：`POST /api/v1/gateway/linkd-status`（loopback-only）。
 // - **admin（页面）**：`GET /api/v1/admin/gateway/linkd-status`（admin bearer）。
 
+use super::codes;
 use axum::{
     Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 
 use crate::infra::{DEFAULT_GATEWAY_LINKD_STATUS_SETTING_ID, StoredGatewayLinkdStatus};
 
+use super::error::ApiError;
 use super::{ApiState, rate_limit};
 
 /// 失联阈值：心跳约 30s 一拍，超过 3 拍（90s）未见即判失联。
@@ -165,7 +167,11 @@ pub async fn report_gateway_linkd_status(
     Json(input): Json<ReportGatewayLinkdStatusRequest>,
 ) -> Response {
     if !client.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
-        return (StatusCode::FORBIDDEN, "linkd-status is loopback-only").into_response();
+        return ApiError::forbidden(
+            codes::LINKD_STATUS_LOOPBACK_ONLY,
+            "linkd-status is loopback-only",
+        )
+        .into_response();
     }
     let received_at = now_rfc3339();
     let received_at_seconds = chrono::Utc::now().timestamp();
@@ -191,11 +197,12 @@ pub async fn report_gateway_linkd_status(
         received_at: received_at.clone(),
     };
     if let Err(err) = state.store.upsert_gateway_linkd_status(&status).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store linkd status: {err}"),
+        return ApiError::internal(
+            codes::LINKD_STATUS_APPEND_FAILED,
+            "failed to store linkd status",
+            err,
         )
-            .into_response();
+        .into_response();
     }
     // 顺手落一条心跳轨迹（供页面看「最近一小时稳不稳」）。
     // 轨迹写失败**不影响**心跳本身受理 —— 当前态（上面那行）才是页面「在不在跑」的主判据。
@@ -208,7 +215,7 @@ pub async fn report_gateway_linkd_status(
         )
         .await
     {
-        eprintln!("warn append gateway linkd heartbeat failed: {err}");
+        log::warn!("warn append gateway linkd heartbeat failed: {err}");
     }
     Json(GatewayLinkdStatusAccepted {
         gateway_id: status.gateway_id,
@@ -230,11 +237,12 @@ pub async fn admin_view_gateway_linkd_status(
     match state.store.get_gateway_linkd_status().await {
         Ok(Some(status)) => Json(view(&status)).into_response(),
         Ok(None) => Json(empty_view()).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read linkd status: {err}"),
+        Err(err) => ApiError::internal(
+            codes::LINKD_STATUS_READ_FAILED,
+            "failed to read linkd status",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -274,11 +282,12 @@ pub async fn admin_view_gateway_linkd_history(
                 .collect(),
         })
         .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read linkd history: {err}"),
+        Err(err) => ApiError::internal(
+            codes::LINKD_STATUS_HISTORY_READ_FAILED,
+            "failed to read linkd history",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 

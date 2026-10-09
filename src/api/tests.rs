@@ -5813,8 +5813,8 @@ async fn get_package_with_raw_authorization(
 async fn assert_auth_rejected(response: axum::response::Response, expected_body: &str) {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_no_store(&response);
-    let body = String::from_utf8_lossy(&body_bytes(response).await).to_string();
-    assert_eq!(body, expected_body);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["message"], expected_body);
 }
 
 #[tokio::test]
@@ -5970,7 +5970,8 @@ async fn package_download_by_id_rejects_path_traversal_ids_without_reading_disk(
             b"sentinel-must-not-be-served".to_vec(),
             "traversal id {variant} must not read the sentinel file"
         );
-        assert_eq!(body, b"unknown agent package".to_vec());
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(body["error"]["message"], "unknown agent package");
     }
 
     // 超长 id（>1KB）：不 panic、不读盘，按「库里没有」处理。
@@ -6053,8 +6054,8 @@ async fn recorded_package_with_a_missing_copy_is_unavailable() {
     )
     .await;
     assert_eq!(script.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = decode_text_response(script).await;
-    assert!(body.contains("没有可用的 agent 安装包"), "{body}");
+    let body: serde_json::Value = decode_json_response(script).await;
+    assert_eq!(body["error"]["code"], "install_package_unavailable");
 }
 
 #[tokio::test]
@@ -6642,6 +6643,715 @@ async fn install_package_set_rejects_unreachable_url() {
     );
 }
 
+/// 中心下发通道（环回）：与 admin 端点**同内核**，且**只**认环回请求。
+///
+/// 设计 `wist-design/doc/design/edge/agent-package-push-to-gateways.md`（发布 ②）。
+#[tokio::test]
+async fn agent_package_push_is_loopback_only_and_shares_the_install_package_core() {
+    use std::net::SocketAddr;
+
+    // 从**未录入任何包**的环境起（默认 `new()` 已给 `aarch64-apple-darwin` 录入一份，
+    // 会让后面的「非环回不得写」断言失去意义）。
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"pushed-agentd",
+    );
+    let source = write_source_package(&env, "pushed", &pkg);
+    let digest = bytes_sha256_hex(&pkg);
+    let body = serde_json::json!({
+        "artifacts": [{
+            "platform": "aarch64-apple-darwin",
+            "package_url": source,
+            "package_sha256": format!("sha256:{digest}"),
+        }],
+        "requested_by": "wist-gwlinkd",
+    });
+
+    // 非环回：403，且**什么都没写**（该端点只给同机的 gwlinkd）。
+    let remote = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([192, 0, 2, 1], 40_001))),
+        &body,
+    )
+    .await;
+    assert_eq!(remote.status(), StatusCode::FORBIDDEN);
+    assert!(
+        env.store
+            .get_agent_install_package("aarch64-apple-darwin")
+            .await
+            .unwrap()
+            .is_none(),
+        "a non-loopback request must not touch package management"
+    );
+
+    // 环回：与 admin 端点同内核 —— 每平台设置落库 + 内容寻址历史落地。
+    let loopback = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+        &body,
+    )
+    .await;
+    assert_eq!(loopback.status(), StatusCode::OK);
+    let setting = env
+        .store
+        .get_agent_install_package("aarch64-apple-darwin")
+        .await
+        .unwrap()
+        .expect("setting stored via the loopback push");
+    assert_eq!(setting.package_url, source);
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].package_id, package_id_for_sha256(&digest));
+    assert_eq!(history[0].arch, "aarch64-apple-darwin");
+}
+
+/// 环回护栏只认环回地址：**取不到连接信息**（fail-closed）与非环回都拒；IPv6 `::1` 放行。
+#[tokio::test]
+async fn agent_package_loopback_guard_accepts_only_loopback_addresses() {
+    use std::net::{Ipv6Addr, SocketAddr};
+
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"guard-bytes",
+    );
+    let source = write_source_package(&env, "guard", &pkg);
+    let body = serde_json::json!({
+        "artifacts": [{
+            "platform": "aarch64-apple-darwin",
+            "package_url": source,
+            "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+        }],
+    });
+
+    // 无连接信息：**fail-closed**（取不到 peer 就当非环回）。
+    let none = post_agent_package_push(&env.config, &env.store_handle, None, &body).await;
+    assert_eq!(none.status(), StatusCode::FORBIDDEN);
+    // 非环回：拒。
+    let remote = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([192, 0, 2, 1], 40_001))),
+        &body,
+    )
+    .await;
+    assert_eq!(remote.status(), StatusCode::FORBIDDEN);
+    assert!(
+        env.store
+            .get_agent_install_package("aarch64-apple-darwin")
+            .await
+            .unwrap()
+            .is_none(),
+        "rejected requests must not touch package management"
+    );
+
+    // IPv6 环回 `::1`：放行（与 IPv4 `127.0.0.1` 同口径）。
+    let v6 = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from((Ipv6Addr::LOCALHOST, 40_002))),
+        &body,
+    )
+    .await;
+    assert_eq!(v6.status(), StatusCode::OK);
+    assert!(
+        env.store
+            .get_agent_install_package("aarch64-apple-darwin")
+            .await
+            .unwrap()
+            .is_some(),
+        "IPv6 loopback is still loopback"
+    );
+}
+
+/// 与 admin 端点**同一份实现**：同一 body 经两条路得到同一份设置；
+/// 重复下发同一份内容**幂等**（内容寻址历史不翻倍）。
+#[tokio::test]
+async fn agent_package_push_shares_the_core_with_the_admin_endpoint() {
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"parity-bytes",
+    );
+    let source = write_source_package(&env, "parity", &pkg);
+    let body = serde_json::json!({
+        "artifacts": [{
+            "platform": "x86_64-unknown-linux-gnu",
+            "package_url": source,
+            "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+        }],
+    });
+
+    // 人工录入（admin bearer）。
+    let admin = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &body,
+    )
+    .await;
+    assert_eq!(admin.status(), StatusCode::OK);
+    let via_admin = env
+        .store
+        .get_agent_install_package("x86_64-unknown-linux-gnu")
+        .await
+        .unwrap()
+        .expect("setting stored via admin");
+
+    // 中心下发（环回）：同 body、同内核。
+    let push = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+        &body,
+    )
+    .await;
+    assert_eq!(push.status(), StatusCode::OK);
+    let via_push = env
+        .store
+        .get_agent_install_package("x86_64-unknown-linux-gnu")
+        .await
+        .unwrap()
+        .expect("setting stored via the loopback push");
+
+    assert_eq!(via_push.package_url, via_admin.package_url);
+    assert_eq!(via_push.package_sha256, via_admin.package_sha256);
+    assert_eq!(via_push.updated_by, via_admin.updated_by);
+    assert_eq!(
+        env.store.list_agent_install_packages().await.unwrap().len(),
+        1,
+        "the same content via both routes is one content-addressed history row"
+    );
+}
+
+/// 一次下发可覆盖多平台（agentd 常态），审计字段随包落库。
+#[tokio::test]
+async fn agent_package_push_covers_multiple_platforms_and_records_the_actor() {
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new_without_package().await;
+    let mac = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"multi-mac",
+    );
+    let linux = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"multi-linux",
+    );
+    let mac_src = write_source_package(&env, "multi-mac", &mac);
+    let linux_src = write_source_package(&env, "multi-linux", &linux);
+    let body = serde_json::json!({
+        "artifacts": [
+            {
+                "platform": "aarch64-apple-darwin",
+                "package_url": mac_src,
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(&mac)),
+            },
+            {
+                "platform": "x86_64-unknown-linux-gnu",
+                "package_url": linux_src,
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(&linux)),
+            },
+        ],
+        "requested_by": "wist-gwlinkd",
+    });
+
+    let response = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for platform in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+        let setting = env
+            .store
+            .get_agent_install_package(platform)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing setting for {platform}"));
+        assert_eq!(
+            setting.updated_by, "wist-gwlinkd",
+            "actor recorded per platform"
+        );
+    }
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 2, "one content-addressed row per package");
+    assert!(
+        history
+            .iter()
+            .all(|entry| entry.created_by == "wist-gwlinkd")
+    );
+}
+
+/// `origin` 是 **provenance**：网关把它记进历史的 `source`，但**取包仍取 `package_url`**（本机路径）——
+/// 设置里的「来源」是网关能取的那份，中心地址只作留痕（网关不持中心信任、不据此取包）。
+#[tokio::test]
+async fn agent_package_push_records_the_center_origin_as_provenance() {
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"provenance-bytes",
+    );
+    let source = write_source_package(&env, "provenance", &pkg);
+    let origin = "https://center.example/api/v1/releases/artifact/wist-agentd/0.1.9/wist-agentd-0.1.9-aarch64-apple-darwin.tar.gz";
+    let body = serde_json::json!({
+        "artifacts": [{
+            "platform": "aarch64-apple-darwin",
+            "package_url": source,
+            "origin": origin,
+            "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+        }],
+    });
+
+    let response = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 设置里的「来源」= 网关实际取的那份（本机路径）。
+    let setting = env
+        .store
+        .get_agent_install_package("aarch64-apple-darwin")
+        .await
+        .unwrap()
+        .expect("setting stored");
+    assert_eq!(setting.package_url, source, "设置来源 = 网关能取的本机路径");
+    // 历史的 `source` = 中心地址（provenance）。
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].source, origin, "历史记中心地址作 provenance");
+}
+
+/// `origin` 虽是留痕，也做**长度 / 控制字符**校验：坏 origin → 400，且**什么都没写**。
+#[tokio::test]
+async fn agent_package_push_rejects_a_malformed_origin() {
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"origin-guard",
+    );
+    let source = write_source_package(&env, "origin-guard", &pkg);
+    let sha = format!("sha256:{}", bytes_sha256_hex(&pkg));
+    let loopback = Some(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    // 超长 origin。
+    let too_long = format!("https://center.example/{}", "a".repeat(4096));
+    let response = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        loopback,
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": "aarch64-apple-darwin",
+                "package_url": source,
+                "origin": too_long,
+                "package_sha256": sha,
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 带控制字符的 origin。
+    let response = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        loopback,
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": "aarch64-apple-darwin",
+                "package_url": source,
+                "origin": "https://center.example/\u{7}bad",
+                "package_sha256": sha,
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected push must not leave history"
+    );
+}
+
+/// 多平台的 `origin` **各记各的**（逐平台 provenance，不串台）。
+#[tokio::test]
+async fn agent_package_push_records_per_platform_origins() {
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new_without_package().await;
+    let mac = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"prov-mac",
+    );
+    let linux = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"prov-linux",
+    );
+    let mac_src = write_source_package(&env, "prov-mac", &mac);
+    let linux_src = write_source_package(&env, "prov-linux", &linux);
+    let mac_origin = "https://center.example/api/v1/releases/artifact/wist-agentd/0.1.9/wist-agentd-0.1.9-aarch64-apple-darwin.tar.gz";
+    let linux_origin = "https://center.example/api/v1/releases/artifact/wist-agentd/0.1.9/wist-agentd-0.1.9-x86_64-unknown-linux-gnu.tar.gz";
+
+    let response = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+        &serde_json::json!({
+            "artifacts": [
+                {"platform": "aarch64-apple-darwin", "package_url": mac_src, "origin": mac_origin, "package_sha256": format!("sha256:{}", bytes_sha256_hex(&mac))},
+                {"platform": "x86_64-unknown-linux-gnu", "package_url": linux_src, "origin": linux_origin, "package_sha256": format!("sha256:{}", bytes_sha256_hex(&linux))},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 2);
+    let by_arch: std::collections::HashMap<&str, &str> = history
+        .iter()
+        .map(|entry| (entry.arch.as_str(), entry.source.as_str()))
+        .collect();
+    assert_eq!(
+        by_arch.get("aarch64-apple-darwin").copied(),
+        Some(mac_origin)
+    );
+    assert_eq!(
+        by_arch.get("x86_64-unknown-linux-gnu").copied(),
+        Some(linux_origin)
+    );
+}
+
+/// 坏输入在环回端点上也**不落任何东西**（与 admin 端点同一批校验，只是换了入口）。
+#[tokio::test]
+async fn agent_package_push_rejects_bad_input_without_writing() {
+    use std::net::SocketAddr;
+
+    async fn assert_nothing_written(env: &TestEnv) {
+        assert!(
+            env.store
+                .list_agent_install_packages()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rejected push must not leave history"
+        );
+        assert!(
+            env.store
+                .get_agent_install_package("aarch64-apple-darwin")
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected push must not touch the setting"
+        );
+    }
+
+    let env = TestEnv::new_without_package().await;
+    let loopback = Some(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    // 空 artifacts → 400。
+    let empty = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        loopback,
+        &serde_json::json!({ "artifacts": [] }),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    assert_nothing_written(&env).await;
+
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"reject-bytes",
+    );
+    let source = write_source_package(&env, "reject", &pkg);
+
+    // 摘要不符 → 400（与 admin 端点同一批校验）。
+    let mismatched = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        loopback,
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": "aarch64-apple-darwin",
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", "0".repeat(64)),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
+    assert_nothing_written(&env).await;
+
+    // 声明平台与包内 triple 不符 → 400。
+    let wrong_platform = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        loopback,
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": "x86_64-unknown-linux-gnu",
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(wrong_platform.status(), StatusCode::BAD_REQUEST);
+    assert_nothing_written(&env).await;
+}
+
+/// 真 socket 端到端：把**真路由器**挂在 `127.0.0.1` 上（而不是 `MockConnectInfo` 假装环回），
+/// 用 HTTP 客户端按 gwlinkd `AgentPackageClient` 的**载荷形状** POST 环回端点。
+///
+/// 与 `oneshot + MockConnectInfo` 的差：环回护栏要在**真 TCP peer** 上成立（`OptionalConnectInfo`
+/// 取到真实 `ConnectInfo`），整条 HTTP 路径（头 / body 解析）也真跑一遍。
+#[tokio::test]
+async fn agent_package_push_works_over_a_real_loopback_socket() {
+    let env = TestEnv::new_without_package().await;
+    let (addr, server) = spawn_gateway_on_loopback(&env).await;
+
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"real-socket-bytes",
+    );
+    let source = write_source_package(&env, "real-socket", &pkg);
+    let digest = bytes_sha256_hex(&pkg);
+    let body = || {
+        serde_json::json!({
+            "artifacts": [{
+                "platform": "aarch64-apple-darwin",
+                "package_url": source,
+                "package_sha256": format!("sha256:{digest}"),
+            }],
+            "requested_by": "wist-gwlinkd",
+        })
+    };
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/gateway/agent-package");
+
+    // 首次：200，回执按平台列出（载荷形状 = gwlinkd `AgentPackageClient` 发出的那份）。
+    let response = client.post(&url).json(&body()).send().await.expect("send");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json");
+    let packages = payload["packages"].as_array().expect("packages");
+    assert_eq!(packages.len(), 1);
+    assert_eq!(packages[0]["platform"], "aarch64-apple-darwin");
+    assert_eq!(packages[0]["updated_by"], "wist-gwlinkd");
+
+    let setting = env
+        .store
+        .get_agent_install_package("aarch64-apple-darwin")
+        .await
+        .unwrap()
+        .expect("setting stored over a real loopback socket");
+    assert_eq!(setting.package_url, source);
+    assert_eq!(setting.updated_by, "wist-gwlinkd");
+
+    // 回执把**内容寻址摘要**报给 gwlinkd：它据此确认「网关落的就是中心发的那份内容」。
+    assert_eq!(packages[0]["package_sha256"], format!("sha256:{digest}"));
+    assert_eq!(packages[0]["package_url"], source);
+
+    // 「去中心镜像取包」这一腿也真跑了：中心发的字节落到网关的内容寻址副本，且摘要对得上。
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].package_id, package_id_for_sha256(&digest));
+    let cached = std::fs::read(&history[0].cached_path).unwrap_or_else(|err| {
+        panic!(
+            "gateway's local copy {} unreadable: {err}",
+            history[0].cached_path
+        )
+    });
+    assert_eq!(
+        bytes_sha256_hex(&cached),
+        digest,
+        "the bytes fetched into the gateway's local cache hash to the pushed digest"
+    );
+
+    // 幂等：再推同一份内容 → 仍一条内容寻址历史（副本不翻倍）。
+    let again = client.post(&url).json(&body()).send().await.expect("send");
+    assert_eq!(again.status(), StatusCode::OK);
+    assert_eq!(
+        env.store.list_agent_install_packages().await.unwrap().len(),
+        1
+    );
+
+    server.abort();
+}
+
+/// 真 socket 上的**拒绝路径**：摘要不符 → 400 且**什么都没写** ——
+/// 证明不只环回护栏，整条内核（校验 / 拉取 / 落库）在真 HTTP 上也跑通。
+#[tokio::test]
+async fn agent_package_push_rejects_a_bad_digest_over_a_real_socket() {
+    let env = TestEnv::new_without_package().await;
+    let (addr, server) = spawn_gateway_on_loopback(&env).await;
+
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"real-socket-reject",
+    );
+    let source = write_source_package(&env, "real-socket-reject", &pkg);
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/gateway/agent-package"))
+        .json(&serde_json::json!({
+            "artifacts": [{
+                "platform": "aarch64-apple-darwin",
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", "0".repeat(64)),
+            }],
+            "requested_by": "wist-gwlinkd",
+        }))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected push over a real socket must not leave history"
+    );
+    assert!(
+        env.store
+            .get_agent_install_package("aarch64-apple-darwin")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    server.abort();
+}
+
+/// 真 socket 上省略 `requested_by` → 内核回落默认操作者；一次推多平台 → 回执列出全部、
+/// 内容寻址历史两行。证明多平台分发与默认审计字段在真 HTTP 路径上同样成立。
+#[tokio::test]
+async fn agent_package_push_defaults_the_actor_and_lists_every_platform_over_a_real_socket() {
+    let env = TestEnv::new_without_package().await;
+    let (addr, server) = spawn_gateway_on_loopback(&env).await;
+
+    let mac = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"rs-default-mac",
+    );
+    let linux = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"rs-default-linux",
+    );
+    let mac_src = write_source_package(&env, "rs-default-mac", &mac);
+    let linux_src = write_source_package(&env, "rs-default-linux", &linux);
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/gateway/agent-package"))
+        .json(&serde_json::json!({
+            // `requested_by` 省略：内核回落到默认操作者。
+            "artifacts": [
+                {
+                    "platform": "aarch64-apple-darwin",
+                    "package_url": mac_src,
+                    "package_sha256": format!("sha256:{}", bytes_sha256_hex(&mac)),
+                },
+                {
+                    "platform": "x86_64-unknown-linux-gnu",
+                    "package_url": linux_src,
+                    "package_sha256": format!("sha256:{}", bytes_sha256_hex(&linux)),
+                },
+            ]
+        }))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json");
+    let packages = payload["packages"].as_array().expect("packages");
+    assert_eq!(packages.len(), 2, "回执列出每个平台：{payload}");
+    let mut platforms: Vec<&str> = packages
+        .iter()
+        .map(|entry| entry["platform"].as_str().expect("platform"))
+        .collect();
+    platforms.sort_unstable();
+    assert_eq!(
+        platforms,
+        vec!["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+    );
+    assert!(
+        packages
+            .iter()
+            .all(|entry| entry["updated_by"] == "platform-maintenance-engineer"),
+        "省略 requested_by 时默认操作者：{payload}"
+    );
+    assert_eq!(
+        env.store.list_agent_install_packages().await.unwrap().len(),
+        2,
+        "每个平台一条内容寻址历史"
+    );
+
+    server.abort();
+}
+
+/// 真 socket 上 body 不是合法 JSON → 客户端错误（请求体解析失败），且**什么都没写** ——
+/// 坏 body 绝不能触碰包管理。
+#[tokio::test]
+async fn agent_package_push_rejects_a_malformed_body_over_a_real_socket() {
+    let env = TestEnv::new_without_package().await;
+    let (addr, server) = spawn_gateway_on_loopback(&env).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/gateway/agent-package"))
+        .header("content-type", "application/json")
+        .body("{ this is not json")
+        .send()
+        .await
+        .expect("send");
+    assert!(
+        response.status().is_client_error(),
+        "malformed JSON must be a client error, got {}",
+        response.status()
+    );
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a malformed body must not leave history"
+    );
+    assert!(
+        env.store
+            .get_agent_install_package("aarch64-apple-darwin")
+            .await
+            .unwrap()
+            .is_none(),
+        "a malformed body must not touch the setting"
+    );
+
+    server.abort();
+}
+
 #[tokio::test]
 async fn install_package_history_records_non_tar_package_without_identity() {
     let env = TestEnv::new().await;
@@ -6891,6 +7601,7 @@ impl TestEnv {
             log_max_bytes: crate::infra::LogRetention::default().max_bytes,
             log_keep_files: crate::infra::LogRetention::default().keep_files,
             log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
+            log: Default::default(),
         };
         // A temp-file DB (not `:memory:`) because the router may use several
         // pooled connections; `SqliteStore` is `Clone` and shares the same pool.
@@ -7280,6 +7991,54 @@ async fn post_json_to_router<T: serde::Serialize>(
         )
         .await
         .expect("route response")
+}
+
+/// 中心下发端点的请求：`POST /api/v1/gateway/agent-package`。
+/// `addr = None` = **不注入**连接信息（模拟取不到 peer，应被环回护栏 fail-closed 拒绝）。
+async fn post_agent_package_push<T: serde::Serialize>(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    addr: Option<std::net::SocketAddr>,
+    body: &T,
+) -> axum::response::Response {
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/agent-package")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(body).expect("serialize body"),
+        ))
+        .expect("request");
+    if let Some(addr) = addr {
+        request.extensions_mut().insert(MockConnectInfo(addr));
+    }
+    router(config.clone(), Arc::clone(store))
+        .oneshot(request)
+        .await
+        .expect("route response")
+}
+
+/// 把**真路由器**挂到 `127.0.0.1` 上（真 `ConnectInfo`），返回其地址与后台服务句柄。
+///
+/// 环回护栏要在**真 TCP peer** 上成立 —— 这是 `MockConnectInfo` 假不出来的那一段。用完 `abort()`。
+async fn spawn_gateway_on_loopback(
+    env: &TestEnv,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let app = router(env.config.clone(), env.store_handle.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("loopback addr");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    (addr, handle)
 }
 
 /// agent 路由的请求：第 4 个参数是 **agent_id**，注入「握手期验过的客户端证书身份」。
@@ -8129,7 +8888,8 @@ async fn the_uplink_poll_rejects_a_wrong_kind() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(decode_text_response(response).await, "invalid uplink poll");
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "invalid_uplink_poll");
 }
 
 /// 没有生效工作就必须待命 —— 只要**开关也关着**：
@@ -11131,7 +11891,7 @@ async fn knowledge_endpoints_report_actionable_error_codes() {
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: serde_json::Value = decode_json_response(response).await;
-    assert_eq!(body["code"], "package_source_invalid");
+    assert_eq!(body["error"]["code"], "package_source_invalid");
 
     let response = post_to_state(
         &state,
@@ -11141,7 +11901,7 @@ async fn knowledge_endpoints_report_actionable_error_codes() {
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body: serde_json::Value = decode_json_response(response).await;
-    assert_eq!(body["code"], "package_not_found");
+    assert_eq!(body["error"]["code"], "package_not_found");
 
     let response = get_from_state(&state, "/api/v1/admin/knowledge/packages/kbp-nope").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
