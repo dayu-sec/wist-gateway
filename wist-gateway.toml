@@ -10,18 +10,18 @@ admin_api_token = "${WARP_INSIGHT_ADMIN_TOKEN}"
 victoria_metrics_url = "http://127.0.0.1:18429"
 
 [agent]
-bootstrap_token_ttl_seconds = 900
+bootstrap_ttl_seconds = 900
 credential_ttl_seconds = 2592000
 store_file = "state/wist-gateway-store.json"
 trust_bundle_file = "state/admin-tls.crt.pem"
-install_script_signing_private_key_file = "state/install-script-signing-ed25519.pkcs8.pem"
+signing_key_file = "state/install-script-signing-ed25519.pkcs8.pem"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 
 # agent 客户端证书（mTLS）签发 CA：与「服务端叶证书的 CA」**分开**的一把 CA
 # （见 docs/design/agent-identity-mtls.md §4.1）。两者同给同缺；都给才开 mTLS 签发。
-# agent_ca_cert_file = "state/agent-ca.crt.pem"
-# agent_ca_key_file = "state/agent-ca.key.pem"
+# ca_cert_file = "state/agent-ca.crt.pem"
+# ca_key_file = "state/agent-ca.key.pem"
 # 签发的客户端证书有效期（秒）；缺省 37 天 = 保底 30 天 + 提前 7 天续期（§4.2）。
 # client_cert_ttl_seconds = 3196800
 

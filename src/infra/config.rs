@@ -4,6 +4,9 @@ use std::{
 };
 
 use orion_error::conversion::ToStructError;
+use orion_sec::sec::NoSecConv;
+use orion_sec::{SecFileFmt, load_sec_dict, load_secfile_by};
+use orion_variate::vars::{EnvChecker, EnvDict, EnvEvaluable, ValueType};
 use serde::Deserialize;
 
 use super::{load_install_script_public_key_pem, sha256_hex};
@@ -13,6 +16,9 @@ const DEFAULT_CONFIG_PATH: &str = "wist-gateway.toml";
 /// `[ingest]` 段缺省时的内部接入端点：只绑环回，避免明文监听被动暴露到网卡上。
 const DEFAULT_INGEST_LISTEN_ADDR: &str = "127.0.0.1:3001";
 const CONFIG_ENV: &str = "WIST_GATEWAY_CONFIG";
+/// 显式指定密钥文件（**绝对路径**）；未设则用 orion 默认
+/// `./.galaxy/sec_value.yml` → `~/.galaxy/sec_value.yml`。
+const SEC_FILE_ENV: &str = "WIST_GATEWAY_SEC_FILE";
 /// 显式设置即覆盖文件值；显式置空 = 回到默认 SQLite 文件存储。
 const ENV_DATABASE_URL: &str = "WIST_GATEWAY_DATABASE_URL";
 // Lower bound on the admin token length; the actual strength gate is the
@@ -92,7 +98,7 @@ pub struct AdminConfig {
     /// 采集日志历史分卷的保留时长（秒）；`0` = 不按时间清。
     pub log_max_age_seconds: i64,
     /// `[log]` 段：本进程运行日志（级别 / 格式 / 落点 / 轮转）。与 `[logs]`（被采集 agent 日志）不同。
-    pub log: crate::logging::LogSection,
+    pub log: wist_log::LogSection,
 }
 
 pub use wist_error::ConfigError;
@@ -240,7 +246,7 @@ struct RawLogConfig {
     level: Option<String>,
     /// 输出格式（`text` | `json`）。缺省 `text`。
     #[serde(default)]
-    format: crate::logging::LogFormat,
+    format: wist_log::LogFormat,
     /// 写文件（追加；相对 config 目录解析；自动建父目录；写满轮转）。缺省写 stderr。
     #[serde(default)]
     file: Option<String>,
@@ -250,9 +256,9 @@ struct RawLogConfig {
     /// 保留的历史分卷个数；缺省 4。
     #[serde(default)]
     keep_files: Option<usize>,
-    /// 历史分卷保留时长（秒）；缺省 7 天。
-    #[serde(default)]
-    max_age_seconds: Option<i64>,
+    /// 历史分卷保留时长（秒）；缺省 7 天。旧名 `max_age_seconds` 仍接受。
+    #[serde(default, alias = "max_age_seconds")]
+    max_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,8 +274,8 @@ struct RawServerConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawAgentConfig {
-    #[serde(default = "default_bootstrap_token_ttl_seconds")]
-    bootstrap_token_ttl_seconds: i64,
+    #[serde(default = "default_bootstrap_ttl_seconds")]
+    bootstrap_ttl_seconds: i64,
     #[serde(default = "default_credential_ttl_seconds")]
     credential_ttl_seconds: i64,
     #[serde(default = "default_store_file")]
@@ -278,13 +284,16 @@ struct RawAgentConfig {
     /// 便于轮换（换证书只换文件），也免去把多行 PEM 塞进 TOML。
     trust_bundle_file: String,
     /// agent 客户端证书签发 CA（相对 config 目录的 PEM）。两者同给同缺，见 [`AdminConfig`]。
+    /// 段名已含 `agent`，键名不再重复该前缀（配置里写作 `[agent] ca_cert_file`）。
     #[serde(default)]
-    agent_ca_cert_file: Option<String>,
+    ca_cert_file: Option<String>,
     #[serde(default)]
-    agent_ca_key_file: Option<String>,
+    ca_key_file: Option<String>,
     #[serde(default = "default_client_cert_ttl_seconds")]
     client_cert_ttl_seconds: i64,
-    install_script_signing_private_key_file: String,
+    /// 签名**安装脚本**的私钥（Ed25519 PKCS#8）。`[agent]` 段内没有别的签名密钥，故键名不写
+    /// `script_` / `private_`。
+    signing_key_file: String,
     tenant_id: String,
     environment_id: String,
 }
@@ -334,14 +343,13 @@ impl AdminConfig {
     }
 
     fn from_raw(raw: RawAdminConfig, config_dir: &Path) -> Result<Self, ConfigError> {
-        let tls_cert_file = expand_env(&raw.server.tls_cert_file)?;
-        let tls_key_file = expand_env(&raw.server.tls_key_file)?;
-        let admin_api_token = expand_env(&raw.server.admin_api_token)?;
+        let env = secret_dict()?;
+        let tls_cert_file = expand(&env, &raw.server.tls_cert_file)?;
+        let tls_key_file = expand(&env, &raw.server.tls_key_file)?;
+        let admin_api_token = expand(&env, &raw.server.admin_api_token)?;
         let install_script_signing_private_key_file = absolutize_path(
             config_dir,
-            Path::new(&expand_env(
-                &raw.agent.install_script_signing_private_key_file,
-            )?),
+            Path::new(&expand(&env, &raw.agent.signing_key_file)?),
         );
         // 知识库内容包的验签公钥：只读**公钥**（私钥在发布侧，网关不持有）。
         // 格式错就地拒绝启动 —— 它是信任锚，含糊地接受比验不了更糟。
@@ -349,7 +357,7 @@ impl AdminConfig {
             raw.knowledge
                 .signing_public_key_file
                 .as_deref()
-                .map(expand_env)
+                .map(|value| expand(&env, value))
                 .transpose()?,
         )
         .map(|value| absolutize_path(config_dir, Path::new(&value)));
@@ -378,7 +386,7 @@ impl AdminConfig {
             raw.knowledge
                 .source_dir
                 .as_deref()
-                .map(expand_env)
+                .map(|value| expand(&env, value))
                 .transpose()?,
         )
         .map(|value| absolutize_path(config_dir, Path::new(&value)));
@@ -389,26 +397,31 @@ impl AdminConfig {
             MIN_ADMIN_API_TOKEN_BYTES,
         )?;
         require_non_weak_admin_token(&admin_api_token)?;
-        let trust_bundle = read_trust_bundle_file(config_dir, &raw.agent.trust_bundle_file)?;
+        let trust_bundle = read_trust_bundle_file(config_dir, &raw.agent.trust_bundle_file, &env)?;
         Ok(Self {
-            listen_addr: expand_env(&raw.server.listen_addr)?,
-            public_base_url: trim_trailing_slash(expand_env(&raw.server.public_base_url)?),
+            listen_addr: expand(&env, &raw.server.listen_addr)?,
+            public_base_url: trim_trailing_slash(expand(&env, &raw.server.public_base_url)?),
             tls_cert_file: absolutize_path(config_dir, Path::new(&tls_cert_file)),
             tls_key_file: absolutize_path(config_dir, Path::new(&tls_key_file)),
             admin_api_token_hash: sha256_hex(&admin_api_token),
-            bootstrap_token_ttl_seconds: raw.agent.bootstrap_token_ttl_seconds,
+            bootstrap_token_ttl_seconds: raw.agent.bootstrap_ttl_seconds,
             credential_ttl_seconds: raw.agent.credential_ttl_seconds,
-            store_file: absolutize_path(config_dir, Path::new(&expand_env(&raw.agent.store_file)?)),
-            database_url: resolved_database_url(&raw.store)?,
-            sqlite_path: default_sqlite_path(config_dir, &raw.agent.store_file)?,
+            store_file: absolutize_path(
+                config_dir,
+                Path::new(&expand(&env, &raw.agent.store_file)?),
+            ),
+            database_url: resolved_database_url(&raw.store, &env)?,
+            sqlite_path: default_sqlite_path(config_dir, &raw.agent.store_file, &env)?,
             trust_bundle,
             agent_ca_cert_file: resolve_optional_agent_ca_path(
                 config_dir,
-                raw.agent.agent_ca_cert_file.as_deref(),
+                raw.agent.ca_cert_file.as_deref(),
+                &env,
             )?,
             agent_ca_key_file: resolve_optional_agent_ca_path(
                 config_dir,
-                raw.agent.agent_ca_key_file.as_deref(),
+                raw.agent.ca_key_file.as_deref(),
+                &env,
             )?,
             client_cert_ttl_seconds: raw.agent.client_cert_ttl_seconds,
             install_script_signing_private_key_file: install_script_signing_private_key_file
@@ -417,16 +430,17 @@ impl AdminConfig {
                 &install_script_signing_private_key_file,
             )
             .map_err(config_validation)?,
-            tenant_id: expand_env(&raw.agent.tenant_id)?,
-            environment_id: expand_env(&raw.agent.environment_id)?,
-            victoria_metrics_url: trim_trailing_slash(expand_env(
+            tenant_id: expand(&env, &raw.agent.tenant_id)?,
+            environment_id: expand(&env, &raw.agent.environment_id)?,
+            victoria_metrics_url: trim_trailing_slash(expand(
+                &env,
                 &raw.server.victoria_metrics_url,
             )?),
             purpose_rules_file: normalize_optional(
                 raw.purpose
                     .rules_file
                     .as_deref()
-                    .map(expand_env)
+                    .map(|value| expand(&env, value))
                     .transpose()?,
             )
             .map(|value| absolutize_path(config_dir, Path::new(&value))),
@@ -434,7 +448,7 @@ impl AdminConfig {
                 raw.discovery
                     .policies_file
                     .as_deref()
-                    .map(expand_env)
+                    .map(|value| expand(&env, value))
                     .transpose()?,
             )
             .map(|value| absolutize_path(config_dir, Path::new(&value))),
@@ -442,7 +456,7 @@ impl AdminConfig {
                 raw.content
                     .catalog_file
                     .as_deref()
-                    .map(expand_env)
+                    .map(|value| expand(&env, value))
                     .transpose()?,
             )
             .map(|value| absolutize_path(config_dir, Path::new(&value))),
@@ -450,7 +464,7 @@ impl AdminConfig {
                 raw.content
                     .packs_file
                     .as_deref()
-                    .map(expand_env)
+                    .map(|value| expand(&env, value))
                     .transpose()?,
             )
             .map(|value| absolutize_path(config_dir, Path::new(&value))),
@@ -458,14 +472,14 @@ impl AdminConfig {
                 raw.content
                     .templates_file
                     .as_deref()
-                    .map(expand_env)
+                    .map(|value| expand(&env, value))
                     .transpose()?,
             )
             .map(|value| absolutize_path(config_dir, Path::new(&value))),
             ingest_listen_addr: match raw.ingest.listen_addr.as_deref() {
                 // 缺省（无 `[ingest]` 段）= 开，默认只绑环回；显式置空 = 关。
                 None => Some(DEFAULT_INGEST_LISTEN_ADDR.to_string()),
-                Some(value) => normalize_optional(Some(expand_env(value)?)),
+                Some(value) => normalize_optional(Some(expand(&env, value)?)),
             },
             knowledge_source_dir,
             knowledge_signing_public_key_file,
@@ -473,14 +487,26 @@ impl AdminConfig {
             log_max_bytes: raw.logs.max_bytes,
             log_keep_files: raw.logs.keep_files,
             log_max_age_seconds: raw.logs.max_age_seconds,
-            log: crate::logging::LogSection {
-                level: normalize_optional(raw.log.level.as_deref().map(expand_env).transpose()?),
+            log: wist_log::LogSection {
+                level: normalize_optional(
+                    raw.log
+                        .level
+                        .as_deref()
+                        .map(|value| expand(&env, value))
+                        .transpose()?,
+                ),
                 format: raw.log.format,
-                file: normalize_optional(raw.log.file.as_deref().map(expand_env).transpose()?)
-                    .map(|value| absolutize_path(config_dir, Path::new(&value))),
+                file: normalize_optional(
+                    raw.log
+                        .file
+                        .as_deref()
+                        .map(|value| expand(&env, value))
+                        .transpose()?,
+                )
+                .map(|value| absolutize_path(config_dir, Path::new(&value))),
                 max_bytes: raw.log.max_bytes,
                 keep_files: raw.log.keep_files,
-                max_age_seconds: raw.log.max_age_seconds,
+                max_seconds: raw.log.max_seconds,
             },
         })
     }
@@ -503,11 +529,11 @@ impl AdminConfig {
         require_existing_file("server.tls_cert_file", &self.tls_cert_file)?;
         require_existing_file("server.tls_key_file", &self.tls_key_file)?;
         require_positive_seconds(
-            "agent.bootstrap_token_ttl_seconds",
+            "agent.bootstrap_ttl_seconds",
             self.bootstrap_token_ttl_seconds,
         )?;
         require_seconds_at_most(
-            "agent.bootstrap_token_ttl_seconds",
+            "agent.bootstrap_ttl_seconds",
             self.bootstrap_token_ttl_seconds,
             MAX_BOOTSTRAP_TOKEN_TTL_SECONDS,
         )?;
@@ -527,7 +553,7 @@ impl AdminConfig {
         }
         require_non_empty("agent.trust_bundle", &self.trust_bundle)?;
         require_existing_file(
-            "agent.install_script_signing_private_key_file",
+            "agent.signing_key_file",
             &self.install_script_signing_private_key_file,
         )?;
         require_non_empty(
@@ -722,8 +748,8 @@ impl AdminConfig {
         state_dir.join("logs").join("agent-logs.ndjson")
     }
 
-    /// 运行日志的 `[log]` 段（供 [`crate::logging::init`] 用）。
-    pub fn log_section(&self) -> crate::logging::LogSection {
+    /// 运行日志的 `[log]` 段（供 [`wist_log::init`] 用）。
+    pub fn log_section(&self) -> wist_log::LogSection {
         self.log.clone()
     }
 
@@ -737,7 +763,7 @@ impl AdminConfig {
     }
 }
 
-fn default_bootstrap_token_ttl_seconds() -> i64 {
+fn default_bootstrap_ttl_seconds() -> i64 {
     900
 }
 
@@ -770,8 +796,12 @@ fn default_log_max_age_seconds() -> i64 {
 }
 
 /// 未配置 `database_url` 时的默认 SQLite 库：与旧存储文件同目录。
-fn default_sqlite_path(config_dir: &Path, store_file: &str) -> Result<PathBuf, ConfigError> {
-    let store_file = absolutize_path(config_dir, Path::new(&expand_env(store_file)?));
+fn default_sqlite_path(
+    config_dir: &Path,
+    store_file: &str,
+    env: &EnvDict,
+) -> Result<PathBuf, ConfigError> {
+    let store_file = absolutize_path(config_dir, Path::new(&expand(env, store_file)?));
     let file_name = store_file
         .file_name()
         .and_then(|value| value.to_str())
@@ -781,9 +811,12 @@ fn default_sqlite_path(config_dir: &Path, store_file: &str) -> Result<PathBuf, C
 }
 
 /// `database_url` 的解析：文件值 → 环境变量覆盖（显式置空等于「回到默认 SQLite 文件」）。
-fn resolved_database_url(raw: &RawStoreConfig) -> Result<Option<String>, ConfigError> {
+fn resolved_database_url(
+    raw: &RawStoreConfig,
+    env: &EnvDict,
+) -> Result<Option<String>, ConfigError> {
     let file_value = match raw.database_url.as_deref() {
-        Some(value) => Some(expand_env(value)?),
+        Some(value) => Some(expand(env, value)?),
         None => None,
     };
     let value = match env::var(ENV_DATABASE_URL) {
@@ -815,28 +848,52 @@ fn absolutize_path(base_dir: &Path, path: &Path) -> PathBuf {
     base_dir.join(path)
 }
 
-fn expand_env(value: &str) -> Result<String, ConfigError> {
-    let mut output = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(start) = rest.find("${") {
-        output.push_str(&rest[..start]);
-        let after_start = &rest[start + 2..];
-        let Some(end) = after_start.find('}') else {
-            return Err(config_validation(format!(
-                "invalid environment placeholder in {value:?}"
-            )));
-        };
-        let key = &after_start[..end];
-        if key.is_empty() {
-            return Err(config_validation("empty environment placeholder"));
-        }
-        let replacement = env::var(key)
-            .map_err(|_| config_validation(format!("missing environment variable {key}")))?;
-        output.push_str(&replacement);
-        rest = &after_start[end + 1..];
+/// 构建 `${VAR}` 展开用的变量表：**进程环境变量优先**，其下是密钥文件里的 `SEC_*`
+/// （`WIST_GATEWAY_SEC_FILE` 指定，或 orion 默认 `.galaxy/sec_value.yml`）。变量表里查不到时
+/// [`expand`] 再回落到系统环境变量（orion 内建）。
+fn secret_dict() -> Result<EnvDict, ConfigError> {
+    let mut dict = match env::var_os(SEC_FILE_ENV).filter(|path| !path.is_empty()) {
+        Some(path) => load_sec_file(Path::new(&path))?,
+        None => load_sec_dict()
+            .map_err(|err| config_validation(format!("failed to load secrets: {err}")))?,
+    };
+    // 环境变量后写入 = 优先（`EnvDict` 查表优先于系统 env，故把 env 盖进去实现 env-first）。
+    for (key, value) in env::vars() {
+        dict.insert(key, ValueType::from(value.as_str()));
     }
-    output.push_str(rest);
-    Ok(output)
+    Ok(dict)
+}
+
+/// 从指定文件载入密钥表（`WIST_GATEWAY_SEC_FILE`，YAML；键自动规范成 `SEC_<UPPER>`）。
+/// **显式指定的文件必须存在** —— 缺了就报清楚，别让下游只报「`SEC_xxx` 未解析」。
+fn load_sec_file(path: &Path) -> Result<EnvDict, ConfigError> {
+    if !path.exists() {
+        return Err(config_validation(format!(
+            "secrets file not found: {}（WIST_GATEWAY_SEC_FILE）",
+            path.display()
+        )));
+    }
+    let space = load_secfile_by(path.to_path_buf(), SecFileFmt::Yaml).map_err(|err| {
+        config_validation(format!("failed to load secrets {}: {err}", path.display()))
+    })?;
+    let mut dict = EnvDict::new();
+    for (key, value) in space.no_sec() {
+        dict.insert(key, value);
+    }
+    Ok(dict)
+}
+
+/// 展开 `${VAR}` / `${VAR:default}`：先查 [`secret_dict`] 的变量表（env 优先），再回落系统环境变量。
+/// **展开后仍含占位符 → 报错**（fail-closed）—— 绝不把未解析的 `${SEC_...}` 当字面值用。
+fn expand(env: &EnvDict, value: &str) -> Result<String, ConfigError> {
+    let expanded: String = value.to_string().env_eval(env);
+    if expanded.needs_env_eval() {
+        return Err(config_validation(format!(
+            "unresolved environment variable(s) in {value:?}: {}",
+            expanded.list_env_vars().join(", ")
+        )));
+    }
+    Ok(expanded)
 }
 
 fn trim_trailing_slash(value: String) -> String {
@@ -844,8 +901,12 @@ fn trim_trailing_slash(value: String) -> String {
 }
 
 /// 读 agent 的信任锚文件（相对 config 目录的 PEM）。
-fn read_trust_bundle_file(config_dir: &Path, file: &str) -> Result<String, ConfigError> {
-    let resolved = absolutize_path(config_dir, Path::new(&expand_env(file)?));
+fn read_trust_bundle_file(
+    config_dir: &Path,
+    file: &str,
+    env: &EnvDict,
+) -> Result<String, ConfigError> {
+    let resolved = absolutize_path(config_dir, Path::new(&expand(env, file)?));
     fs::read_to_string(&resolved).map_err(|err| {
         config_io(format!(
             "failed to read agent.trust_bundle_file {}: {err}",
@@ -863,9 +924,10 @@ fn trim_base_url(base: &str) -> &str {
 fn resolve_optional_agent_ca_path(
     config_dir: &Path,
     value: Option<&str>,
+    env: &EnvDict,
 ) -> Result<Option<PathBuf>, ConfigError> {
     let value = match value {
-        Some(value) => normalize_optional(Some(expand_env(value)?)),
+        Some(value) => normalize_optional(Some(expand(env, value)?)),
         None => None,
     };
     Ok(value.map(|value| absolutize_path(config_dir, Path::new(&value))))
@@ -879,14 +941,14 @@ fn require_agent_ca_together(
     match (cert_file, key_file) {
         (None, None) => Ok(()),
         (Some(cert), Some(key)) => {
-            require_existing_file("agent.agent_ca_cert_file", cert)?;
-            require_existing_file("agent.agent_ca_key_file", key)
+            require_existing_file("agent.ca_cert_file", cert)?;
+            require_existing_file("agent.ca_key_file", key)
         }
         (Some(_), None) => Err(config_validation(
-            "agent.agent_ca_cert_file is set but agent.agent_ca_key_file is missing",
+            "agent.ca_cert_file is set but agent.ca_key_file is missing",
         )),
         (None, Some(_)) => Err(config_validation(
-            "agent.agent_ca_key_file is set but agent.agent_ca_cert_file is missing",
+            "agent.ca_key_file is set but agent.ca_cert_file is missing",
         )),
     }
 }
@@ -1089,7 +1151,7 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         log_max_bytes: crate::infra::LogRetention::default().max_bytes,
         log_keep_files: crate::infra::LogRetention::default().keep_files,
         log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
-        log: crate::logging::LogSection::default(),
+        log: wist_log::LogSection::default(),
     }
 }
 
@@ -1187,6 +1249,68 @@ environment_id = "env-default"
         let _ = fs::remove_file(path);
     }
 
+    /// 未解析的占位符 → 拒绝启动（fail-closed），且报出缺哪个变量。
+    #[test]
+    fn unresolved_placeholder_fails_closed() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "${WIST_GW_TEST_MISSING_TOKEN_XYZ}"
+
+[agent]
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+        let err = AdminConfig::load_from_path(&path).expect_err("unresolved secret must fail");
+        assert!(
+            err.to_string().contains("WIST_GW_TEST_MISSING_TOKEN_XYZ"),
+            "{err}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// 支持 `${VAR:default}`：查不到变量时用默认值。
+    #[test]
+    fn env_default_syntax_is_supported() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[agent]
+trust_bundle = "internal-ca-stub"
+tenant_id = "${WIST_GW_TEST_MISSING_TENANT:tenant-default}"
+environment_id = "env-default"
+"#,
+        );
+        let config = AdminConfig::load_from_path(&path).expect("default used");
+        assert_eq!(config.tenant_id, "tenant-default");
+        let _ = fs::remove_file(path);
+    }
+
+    /// 自定义密钥文件（`WIST_GATEWAY_SEC_FILE` 指向的那个）：按键规范成 `SEC_<UPPER>` 载入。
+    #[test]
+    fn custom_sec_file_loads_and_prefixes_keys() {
+        let path = write_temp_file("admin_token: custom-secret-token-1234567890\n");
+        let dict = load_sec_file(&path).expect("load sec file");
+        assert!(dict.get_case_insensitive("SEC_ADMIN_TOKEN").is_some());
+        let _ = fs::remove_file(path);
+    }
+
+    /// 显式指定的密钥文件**缺失** → 明确报错（而不是含糊的「SEC_xxx 未解析」）。
+    #[test]
+    fn missing_explicit_sec_file_is_an_error() {
+        let missing = env::temp_dir().join("wist-gateway-sec-file-that-does-not-exist.yml");
+        let err = load_sec_file(&missing).expect_err("missing explicit sec file must fail");
+        assert!(err.to_string().contains("secrets file not found"), "{err}");
+    }
+
     #[test]
     fn relative_config_path_is_absolutized_against_current_dir() {
         let cwd = env::current_dir().expect("current dir");
@@ -1215,7 +1339,7 @@ admin_api_token = "test-admin-token"
 [agent]
 enrollment_token = "test-token"
 trust_bundle_file = "trust-bundle.pem"
-install_script_signing_private_key_file = "install-signing-ed25519.pkcs8.pem"
+signing_key_file = "install-signing-ed25519.pkcs8.pem"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
@@ -1490,7 +1614,7 @@ public_base_url = "https://127.0.0.1:3000"
 admin_api_token = "test-admin-token"
 
 [agent]
-bootstrap_token_ttl_seconds = 7200
+bootstrap_ttl_seconds = 7200
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
@@ -1499,10 +1623,7 @@ environment_id = "env-default"
 
         let err = AdminConfig::load_from_path(&path).expect_err("long ttl rejected");
 
-        assert!(
-            err.to_string()
-                .contains("agent.bootstrap_token_ttl_seconds")
-        );
+        assert!(err.to_string().contains("agent.bootstrap_ttl_seconds"));
         assert!(err.to_string().contains("less than or equal to 3600"));
         let _ = fs::remove_file(path);
     }
@@ -1825,7 +1946,7 @@ environment_id = "env-default"
         );
         let config = AdminConfig::load_from_path(&path).expect("config loads");
         assert_eq!(config.log.level.as_deref(), Some("warn"));
-        assert_eq!(config.log.format, crate::logging::LogFormat::Json);
+        assert_eq!(config.log.format, wist_log::LogFormat::Json);
         let file = config.log.file.expect("log file resolved");
         assert!(
             file.is_absolute(),
@@ -1839,7 +1960,7 @@ environment_id = "env-default"
         let path = write_temp_config(&config_with_purpose(""));
         let config = AdminConfig::load_from_path(&path).expect("config loads");
         assert_eq!(config.log.level, None);
-        assert_eq!(config.log.format, crate::logging::LogFormat::Text);
+        assert_eq!(config.log.format, wist_log::LogFormat::Text);
         assert_eq!(config.log.file, None);
     }
 
@@ -1877,13 +1998,10 @@ environment_id = "env-default"
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let content = if content.contains("install_script_signing_private_key_file") {
+        let content = if content.contains("signing_key_file") {
             content
         } else {
-            format!(
-                "{content}\ninstall_script_signing_private_key_file = \"{}\"\n",
-                key_path.display()
-            )
+            format!("{content}\nsigning_key_file = \"{}\"\n", key_path.display())
         };
         let content = if content.contains("tls_cert_file") {
             content
@@ -1987,18 +2105,18 @@ environment_id = "env-default"
     fn agent_ca_requires_certificate_and_key_together() {
         let (ca_cert_name, _) = write_agent_ca_files();
         let only_cert = write_temp_config(&agent_config_toml(&format!(
-            "agent_ca_cert_file = \"{ca_cert_name}\"\n"
+            "ca_cert_file = \"{ca_cert_name}\"\n"
         )));
         let err = AdminConfig::load_from_path(&only_cert).expect_err("cert without key");
-        assert!(err.to_string().contains("agent_ca_key_file"), "{err}");
+        assert!(err.to_string().contains("ca_key_file"), "{err}");
         let _ = fs::remove_file(only_cert);
 
         let (_, ca_key_name) = write_agent_ca_files();
         let only_key = write_temp_config(&agent_config_toml(&format!(
-            "agent_ca_key_file = \"{ca_key_name}\"\n"
+            "ca_key_file = \"{ca_key_name}\"\n"
         )));
         let err = AdminConfig::load_from_path(&only_key).expect_err("key without cert");
-        assert!(err.to_string().contains("agent_ca_cert_file"), "{err}");
+        assert!(err.to_string().contains("ca_cert_file"), "{err}");
         let _ = fs::remove_file(only_key);
     }
 
@@ -2008,7 +2126,7 @@ environment_id = "env-default"
         let cert = write_temp_file("not a certificate");
         let key = write_temp_file("not a key");
         let path = write_temp_config(&agent_config_toml(&format!(
-            "agent_ca_cert_file = \"{}\"\nagent_ca_key_file = \"{}\"\n",
+            "ca_cert_file = \"{}\"\nca_key_file = \"{}\"\n",
             file_name(&cert),
             file_name(&key),
         )));
@@ -2037,7 +2155,7 @@ environment_id = "env-default"
     fn agent_ca_paths_are_absolutized_and_ttl_override_is_honored() {
         let (ca_cert_name, ca_key_name) = write_agent_ca_files();
         let path = write_temp_config(&agent_config_toml(&format!(
-            "agent_ca_cert_file = \"{ca_cert_name}\"\nagent_ca_key_file = \"{ca_key_name}\"\nclient_cert_ttl_seconds = 1000\n",
+            "ca_cert_file = \"{ca_cert_name}\"\nca_key_file = \"{ca_key_name}\"\nclient_cert_ttl_seconds = 1000\n",
         )));
         let config = AdminConfig::load_from_path(&path).expect("config loads");
 

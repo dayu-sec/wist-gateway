@@ -476,26 +476,29 @@ async fn initial_config_matches_agent_config_contract() {
         None,
         &env.config.public_base_url,
     );
-    let parsed: wist_contracts::agent_config::AgentConfig =
-        toml::from_str(&text).expect("valid agent config toml");
-
-    assert_eq!(parsed.schema_version, "v1");
-    assert_eq!(parsed.agent.environment_id.as_deref(), Some("env-default"));
-    assert!(parsed.control_plane.enabled);
+    // 只做**结构化**断言（`toml::Value`），不引 agentd 的配置契约类型 —— 契约一致性由 agentd
+    // 自己解析校验；网关只保证它生成的 TOML 键值符合约定。
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    assert_eq!(parsed["schema_version"].as_str(), Some("v1"));
     assert_eq!(
-        parsed.control_plane.endpoint.as_deref(),
+        parsed["agent"]["environment_id"].as_str(),
+        Some("env-default")
+    );
+    assert_eq!(parsed["control_plane"]["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        parsed["control_plane"]["endpoint"].as_str(),
         Some("https://127.0.0.1:3000")
     );
     assert_eq!(
-        parsed.control_plane.enrollment_token.as_deref(),
+        parsed["control_plane"]["enrollment_token"].as_str(),
         Some("install-token-a")
     );
     assert_eq!(
-        parsed.control_plane.credential_request.as_deref(),
+        parsed["control_plane"]["credential_request"].as_str(),
         Some("csr")
     );
     assert_eq!(
-        parsed.control_plane.trust_bundle.as_deref(),
+        parsed["control_plane"]["trust_bundle"].as_str(),
         Some("internal-ca-stub")
     );
     // 模板不声明 [paths] / [telemetry.logs.output.file]：布局由 agentd 按配置目录推导，
@@ -505,8 +508,8 @@ async fn initial_config_matches_agent_config_contract() {
     let has_section = |name: &str| text.lines().any(|line| line.trim() == name);
     assert!(!has_section("[paths]"));
     assert!(!has_section("[telemetry.logs.output.file]"));
-    // 用户级布局不受影响：契约默认值仍是相对配置目录。
-    assert_eq!(parsed.paths.root_dir, ".");
+    // 未声明 [paths] → 该键不该出现（布局留给 agentd 推导）。
+    assert!(parsed.get("paths").is_none());
 }
 
 /// 新装 Agent 拿到初始配置时就有上送目标（同一域名 + 数据面端口），**不必先有人录入地址**；
@@ -529,15 +532,15 @@ async fn initial_config_route_records_the_derived_uplink_target() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let text = decode_text_response(response).await;
-    let parsed: wist_contracts::agent_config::AgentConfig =
-        toml::from_str(&text).expect("valid agent config toml");
-    assert_eq!(parsed.telemetry.logs.output.kind, "tcp");
-    assert_eq!(parsed.telemetry.logs.output.tcp.addr, "127.0.0.1");
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    let output = &parsed["telemetry"]["logs"]["output"];
+    assert_eq!(output["kind"].as_str(), Some("tcp"));
+    assert_eq!(output["tcp"]["addr"].as_str(), Some("127.0.0.1"));
     assert_eq!(
-        parsed.telemetry.logs.output.tcp.port,
-        DEFAULT_AGENT_UPLINK_PORT
+        output["tcp"]["port"].as_integer(),
+        Some(DEFAULT_AGENT_UPLINK_PORT as i64)
     );
-    assert!(!parsed.telemetry.logs.output.enabled);
+    assert_eq!(output["enabled"].as_bool(), Some(false));
 }
 
 #[tokio::test]
@@ -555,12 +558,17 @@ async fn initial_config_without_uplink_keeps_local_only_output() {
     assert!(text.contains("kind = \"file\""));
     assert!(text.contains("enabled = false"));
     assert!(!text.contains("file_inputs_file"));
-    let parsed: wist_contracts::agent_config::AgentConfig =
-        toml::from_str(&text).expect("valid agent config toml");
-    assert!(!parsed.telemetry.logs.output.enabled);
-    assert_eq!(parsed.telemetry.logs.output.kind, "file");
-    assert!(parsed.telemetry.logs.file_inputs.is_empty());
-    assert!(parsed.telemetry.logs.file_inputs_file.is_none());
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    let output = &parsed["telemetry"]["logs"]["output"];
+    assert_eq!(output["enabled"].as_bool(), Some(false));
+    assert_eq!(output["kind"].as_str(), Some("file"));
+    // 未声明 file_inputs / file_inputs_file → 不该出现。
+    assert!(parsed["telemetry"]["logs"].get("file_inputs").is_none());
+    assert!(
+        parsed["telemetry"]["logs"]
+            .get("file_inputs_file")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -581,18 +589,21 @@ async fn initial_config_records_uplink_target_stays_idle() {
         &env.config.public_base_url,
     );
 
-    let parsed: wist_contracts::agent_config::AgentConfig =
-        toml::from_str(&text).expect("valid agent config toml");
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    let output = &parsed["telemetry"]["logs"]["output"];
     // 上送目标记录下来（kind = tcp）...
-    assert_eq!(parsed.telemetry.logs.output.tcp.addr, "10.0.1.9");
-    assert_eq!(parsed.telemetry.logs.output.tcp.port, 9100);
-    assert_eq!(parsed.telemetry.logs.output.tcp.framing, "line");
-    assert_eq!(parsed.telemetry.logs.output.kind, "tcp");
+    assert_eq!(output["tcp"]["addr"].as_str(), Some("10.0.1.9"));
+    assert_eq!(output["tcp"]["port"].as_integer(), Some(9100));
+    assert_eq!(output["tcp"]["framing"].as_str(), Some("line"));
+    assert_eq!(output["kind"].as_str(), Some("tcp"));
     // ...但 enabled = false：设了地址也不等于开始干活。
-    // 待命由 enabled 表达、与 kind 正交：目标记成 tcp，开关仍是关的。
-    assert!(!parsed.telemetry.logs.output.enabled);
-    assert!(parsed.telemetry.logs.file_inputs.is_empty());
-    assert!(parsed.telemetry.logs.file_inputs_file.is_none());
+    assert_eq!(output["enabled"].as_bool(), Some(false));
+    assert!(parsed["telemetry"]["logs"].get("file_inputs").is_none());
+    assert!(
+        parsed["telemetry"]["logs"]
+            .get("file_inputs_file")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -643,9 +654,11 @@ async fn initial_config_preserves_multiline_trust_bundle() {
         .expect("trust_bundle line");
     assert!(trust_bundle_line.contains("\\n"));
 
-    let parsed: wist_contracts::agent_config::AgentConfig =
-        toml::from_str(&text).expect("valid agent config toml");
-    assert_eq!(parsed.control_plane.trust_bundle, Some(trust_bundle));
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    assert_eq!(
+        parsed["control_plane"]["trust_bundle"].as_str(),
+        Some(trust_bundle.as_str())
+    );
 }
 
 #[tokio::test]
@@ -4964,10 +4977,10 @@ async fn uplink_store_failure_is_reported_but_does_not_break_install() {
         .expect("route response");
     assert_eq!(response.status(), StatusCode::OK);
     let text = decode_text_response(response).await;
-    let parsed: wist_contracts::agent_config::AgentConfig =
-        toml::from_str(&text).expect("valid agent config toml");
-    assert_eq!(parsed.telemetry.logs.output.tcp.addr, "127.0.0.1");
-    assert!(!parsed.telemetry.logs.output.enabled);
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    let output = &parsed["telemetry"]["logs"]["output"];
+    assert_eq!(output["tcp"]["addr"].as_str(), Some("127.0.0.1"));
+    assert_eq!(output["enabled"].as_bool(), Some(false));
 }
 
 #[tokio::test]
@@ -8298,10 +8311,10 @@ async fn initial_config_never_enables_the_uplink() {
             );
             // 只信解析结果，不做文本匹配：模板里 `[control_plane] enabled = true` 也会命中
             // 子串/行匹配（`enabled` 这个键名不止一处），而解析后看的是**输出那一段**的真值。
-            let parsed: wist_contracts::agent_config::AgentConfig =
-                toml::from_str(&text).expect("valid agent config toml");
-            assert!(
-                !parsed.telemetry.logs.output.enabled,
+            let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+            assert_eq!(
+                parsed["telemetry"]["logs"]["output"]["enabled"].as_bool(),
+                Some(false),
                 "网关签发的初始配置必须待命（switch={switch} with_target={with_target}）:\n{text}"
             );
         }

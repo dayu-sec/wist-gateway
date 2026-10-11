@@ -25,6 +25,10 @@ pub(super) fn require_admin_bearer(
         // rate limit lets an unauthenticated client (e.g. the web UI polling
         // the overview every few seconds before a token is entered) lock the IP
         // out for the block window even after the correct token is supplied.
+        log::warn!(
+            "event=AdminAuthMissingBearer scope={} client={client_key}",
+            ADMIN_AUTH_SCOPE
+        );
         return Err(ApiError::unauthorized(
             codes::MISSING_ADMIN_BEARER_TOKEN,
             "missing admin bearer token",
@@ -35,6 +39,8 @@ pub(super) fn require_admin_bearer(
         sha256_hex(token).as_bytes(),
         state.config.admin_api_token_hash.as_bytes(),
     ) {
+        // Invalid token: count it toward the brute-force window
+        // (`record_auth_failure` logs `event=AuthFailure` / `event=AuthBlocked`).
         rate_limit::record_auth_failure(state, client_key, ADMIN_AUTH_SCOPE);
         return Err(ApiError::unauthorized(
             codes::INVALID_ADMIN_BEARER_TOKEN,

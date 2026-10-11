@@ -52,7 +52,10 @@ async fn run_main() -> Result<(), wist_gateway::AppError> {
     }
     let config = wist_gateway::infra::AdminConfig::load_from_env().conv_err()?;
     // 运行日志在**读到配置之后**初始化：级别 / 格式 / 落点由 `[log]` 段决定（`RUST_LOG` 优先）。
-    wist_gateway::logging::init(&config.log_section());
+    wist_log::init(
+        &config.log_section(),
+        &wist_log::Identity::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+    );
 
     // 单实例闸门：**一个操作系统上只允许一个网关**。放在打开库之前 —— 真正的破坏是两个实例
     // 同时写一份 SQLite，而不是端口被占（端口可以配成不同的）。

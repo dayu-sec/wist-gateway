@@ -81,6 +81,9 @@ pub fn check_rate_limit(state: &ApiState, client_key: &str, scope: &str) -> Opti
                 .as_secs()
                 .max(1)
                 .to_string();
+            log::warn!(
+                "event=AuthRateLimited scope={scope} client={client_key} retry_after_secs={retry_after}"
+            );
             return Some(
                 (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -118,8 +121,15 @@ pub fn record_auth_failure(state: &ApiState, client_key: &str, scope: &str) {
         bucket.blocked_until = None;
     }
     bucket.failures = bucket.failures.saturating_add(1);
-    if bucket.failures >= MAX_FAILURES_PER_WINDOW {
+    let failures = bucket.failures;
+    if failures >= MAX_FAILURES_PER_WINDOW {
         bucket.blocked_until = Some(now + BLOCK_DURATION);
+        log::warn!(
+            "event=AuthBlocked scope={scope} client={client_key} failures={failures} block_secs={}",
+            BLOCK_DURATION.as_secs()
+        );
+    } else {
+        log::warn!("event=AuthFailure scope={scope} client={client_key} failures={failures}");
     }
 }
 

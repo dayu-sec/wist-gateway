@@ -7,7 +7,7 @@ pub mod app;
 // 重新生成控制面代码时需回补本模块。
 pub mod error;
 pub mod infra;
-pub mod logging;
+// NOTE(hand-added): 本进程运行日志（`[log]` 段）已抽到共享 crate `wist-log`（见 config 里的 `wist_log::LogSection`）。
 
 // NOTE(hand-added): 测试期定位跨仓数据（策展知识 `wist-knowledge`、模型仓 `wist-design`）。
 // 重新生成控制面代码时需回补本模块。

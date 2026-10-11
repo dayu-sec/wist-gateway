@@ -3,6 +3,30 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.0-alpha] - 2026-10-11
+
+### 变更
+
+- **对齐生态 0.8**：`wist-contracts` / `wist-api` 由 `0.7` 升到 `0.8`（后者删了 agent 的本地运行配置
+  `agent_config` 模块），`wist-release` 收到 `0.6`。无线上 JSON 变化。
+- **运行日志实现改用共享 crate `wist-log`**：删掉本仓 `logging.rs`，`[log]` 段由 `wist_log::init`
+  装配（级别 / 格式 / 落点 / 轮转），与 center / gwlinkd / agentd 同口径；键名规范为 `max_seconds`
+  （旧名 `max_age_seconds` 以 alias 继续接受）。
+- **配置键名精简（可读性）**：`[agent]` 段去掉冗余前缀/词 —— `agent_ca_cert_file` → `ca_cert_file`、
+  `agent_ca_key_file` → `ca_key_file`、`bootstrap_token_ttl_seconds` → `bootstrap_ttl_seconds`、
+  `install_script_signing_private_key_file` → `signing_key_file`。段名已含 `agent`，键里不重复；
+  该键签名的是**安装脚本**，段内无别的签名密钥、且只有私钥文件，故取最短名（省去 `install_`/`script_`/`private_`）。
+  模板 `wist-gateway.toml` 同步。
+  迁移：`RawAgentConfig` 有意无 `deny_unknown_fields`（兼容历史键），**旧键会被静默忽略**；其中
+  `signing_key_file` 为必填，旧键会导致启动报 missing field。升级请用新版模板重渲染
+  （`gops sys localize`），不要沿用旧配置。
+- **配置里的 `${SEC_...}` 解析改用 `orion-sec` + `orion-variate`**：所有字符串字段支持 `${VAR}` /
+  `${VAR:default}`；变量来源为**进程环境变量优先**，其下是密钥文件（`WIST_GATEWAY_SEC_FILE` 指定，
+  或 orion 默认 `./.galaxy/sec_value.yml` / `~/.galaxy/sec_value.yml`），键规范成 `SEC_<UPPER>`。
+  **展开后仍含占位符 → 拒绝启动**（fail-closed）。据此 `server.admin_api_token` 等密钥可以留成
+  `${SEC_...}` 由外部注入，**配置不再写明文**。依赖：`orion-sec 0.7` / `orion-variate 0.14`
+  （`orion-error` 从两份收敛到 0.9 一份）。
+
 ## [0.7.0-alpha] - 2026-10-10
 
 ### 新增
