@@ -12501,3 +12501,18 @@ async fn admin_reads_gateway_self_state_history() {
     .await;
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// 网关版本端点（公开）：命中 200 + `{version}`，且**不带任何凭据**也能拿到 —— 页面左下角
+/// 在未登录时也要显示后端版本（见 api/version.rs）。
+#[tokio::test]
+async fn version_route_is_public_and_reports_a_non_empty_version() {
+    let env = TestEnv::new_without_package().await;
+    let response = get_to_router(&env.config, &env.store_handle, "/api/v1/version", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let version = body["version"].as_str().unwrap_or("");
+    assert!(
+        !version.is_empty(),
+        "缺省 `version` 必须非空（页面据此显示后端版本）：{body}"
+    );
+}

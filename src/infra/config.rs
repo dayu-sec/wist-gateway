@@ -16,6 +16,14 @@ const DEFAULT_CONFIG_PATH: &str = "wist-gateway.toml";
 /// `[ingest]` 段缺省时的内部接入端点：只绑环回，避免明文监听被动暴露到网卡上。
 const DEFAULT_INGEST_LISTEN_ADDR: &str = "127.0.0.1:3001";
 const CONFIG_ENV: &str = "WIST_GATEWAY_CONFIG";
+/// 可选的**接口层**配置（默认文件名 `wist-gateway-pub.toml`）：现场选择（对外地址 / 身份引用 /
+/// 归属）单独一份，与主配置**分文件**。
+///
+/// 为什么要分：主配置是**交付物**（模板渲染、升级该被覆盖），接口层是**现场选择**（升级必须保留）。
+/// 混在一个文件里时，`preserve` / `ignore` / `backup` 只能互相让步。
+/// 显式设了 `PUB_CONFIG_ENV` 就用它（相对路径按主配置目录解析）；未设则取主配置同目录的同名文件（**存在才用**）。
+const PUB_CONFIG_ENV: &str = "WIST_GATEWAY_PUB_CONFIG";
+const PUB_CONFIG_FILE_NAME: &str = "wist-gateway-pub.toml";
 /// 显式指定密钥文件（**绝对路径**）；未设则用 orion 默认
 /// `./.galaxy/sec_value.yml` → `~/.galaxy/sec_value.yml`。
 const SEC_FILE_ENV: &str = "WIST_GATEWAY_SEC_FILE";
@@ -113,6 +121,57 @@ fn config_io(message: impl Into<String>) -> ConfigError {
 
 fn config_parse(message: impl Into<String>) -> ConfigError {
     ConfigReason::Parse.to_err().with_detail(message)
+}
+
+/// 解析**接口层**配置路径：显式 `PUB_CONFIG_ENV` 优先（相对路径按主配置目录解析）；
+/// 未设则取主配置同目录的 `wist-gateway-pub.toml`（**存在才用**），否则 `None`。
+fn resolve_pub_config_path(config_path: &Path) -> Option<PathBuf> {
+    if let Ok(raw) = env::var(PUB_CONFIG_ENV) {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            let dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+            return Some(absolutize_path(dir, Path::new(raw)));
+        }
+    }
+    let sibling = config_path.with_file_name(PUB_CONFIG_FILE_NAME);
+    sibling.is_file().then_some(sibling)
+}
+
+/// 把**接口层**配置 `overlay` 并进主配置 `base`。
+///
+/// - 段（TOML table）可以两边都写 —— 各自的键各写各的（`[server]` / `[agent]` 正是这样切的）；
+/// - **叶子键不允许重复**：同一个键在两份里都出现 → 直接报错。
+///
+/// 这是「归属唯一」的硬保证：否则“两处都写了、到底哪份说了算”就靠加载顺序决定，
+/// 而那正是分文件要消灭的东西。
+fn merge_disjoint(
+    base: &mut toml::Value,
+    overlay: toml::Value,
+    pub_path: &Path,
+) -> Result<(), ConfigError> {
+    let (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) = (base, overlay)
+    else {
+        return Err(config_parse(format!(
+            "接口层配置 {} 与主配置都必须是 TOML 表",
+            pub_path.display()
+        )));
+    };
+    for (key, overlay_value) in overlay_table {
+        if !base_table.contains_key(&key) {
+            base_table.insert(key, overlay_value);
+            continue;
+        }
+        let base_value = base_table.get_mut(&key).expect("checked contains_key");
+        if base_value.is_table() && overlay_value.is_table() {
+            merge_disjoint(base_value, overlay_value, pub_path)?;
+            continue;
+        }
+        return Err(config_validation(format!(
+            "键 `{key}` 同时出现在主配置与接口层配置 {} —— 同一个键只能有一处，请只留一份",
+            pub_path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -325,7 +384,30 @@ impl AdminConfig {
                 config_path.display()
             ))
         })?;
-        let raw: RawAdminConfig = toml::from_str(&raw_content).map_err(|err| {
+        let mut doc: toml::Value = toml::from_str(&raw_content).map_err(|err| {
+            config_parse(format!(
+                "failed to parse config {}: {err}",
+                config_path.display()
+            ))
+        })?;
+        // 可选的接口层（现场选择：对外地址 / 身份引用 / 归属）单独一份；升级/重渲只碰主配置。
+        // 两份的键不相交 —— 重复即拒（见 `merge_disjoint`）。
+        if let Some(pub_path) = resolve_pub_config_path(&config_path) {
+            let pub_content = fs::read_to_string(&pub_path).map_err(|err| {
+                config_io(format!(
+                    "failed to read public config {}: {err}",
+                    pub_path.display()
+                ))
+            })?;
+            let pub_doc: toml::Value = toml::from_str(&pub_content).map_err(|err| {
+                config_parse(format!(
+                    "failed to parse public config {}: {err}",
+                    pub_path.display()
+                ))
+            })?;
+            merge_disjoint(&mut doc, pub_doc, &pub_path)?;
+        }
+        let raw: RawAdminConfig = doc.try_into().map_err(|err| {
             config_parse(format!(
                 "failed to parse config {}: {err}",
                 config_path.display()
@@ -1962,6 +2044,89 @@ environment_id = "env-default"
         assert_eq!(config.log.level, None);
         assert_eq!(config.log.format, wist_log::LogFormat::Text);
         assert_eq!(config.log.file, None);
+    }
+
+    /// 接口层（pub）与主配置**段可以重合**（`[server]` / `[agent]`），各自的键各写各的。
+    #[test]
+    fn pub_overlay_merges_disjoint_keys_within_the_same_section() {
+        let mut base: toml::Value =
+            toml::from_str("[server]\nlisten_addr = \"0.0.0.0:3000\"\n").expect("base");
+        let overlay: toml::Value =
+            toml::from_str("[server]\npublic_base_url = \"https://gw.example\"\n").expect("pub");
+        merge_disjoint(&mut base, overlay, Path::new("wist-gateway-pub.toml")).expect("merge");
+        let server = base.get("server").expect("server table");
+        assert_eq!(
+            server.get("public_base_url").and_then(|v| v.as_str()),
+            Some("https://gw.example")
+        );
+        assert_eq!(
+            server.get("listen_addr").and_then(|v| v.as_str()),
+            Some("0.0.0.0:3000"),
+            "主配置的键不被接口层动到"
+        );
+    }
+
+    /// 同一个键出现在两份里 —— 归属错乱，必须拒（“哪份说了算”不能靠加载顺序）。
+    #[test]
+    fn pub_overlay_rejects_a_key_defined_in_both_files() {
+        let mut base: toml::Value = toml::from_str("[agent]\ntenant_id = \"t1\"\n").expect("base");
+        let overlay: toml::Value = toml::from_str("[agent]\ntenant_id = \"t2\"\n").expect("pub");
+        assert!(
+            merge_disjoint(&mut base, overlay, Path::new("wist-gateway-pub.toml")).is_err(),
+            "同一个键两处都写必须拒绝"
+        );
+    }
+
+    /// 兄弟文件（`wist-gateway-pub.toml`）**存在才用**；不存在就回到单文件行为。
+    #[test]
+    fn pub_sibling_is_resolved_only_when_it_exists() {
+        let dir = env::temp_dir().join(format!("wist-gateway-pub-{}", unique_suffix()));
+        fs::create_dir_all(&dir).expect("create dir");
+        let main = dir.join("wist-gateway.toml");
+        assert_eq!(resolve_pub_config_path(&main), None, "兄弟文件不在就不用它");
+        let pub_path = dir.join("wist-gateway-pub.toml");
+        fs::write(&pub_path, "[server]\n").expect("write pub");
+        assert_eq!(resolve_pub_config_path(&main), Some(pub_path));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端：主配置（不含对外地址）+ 接口层（给对外地址与归属）→ 合并后可加载。
+    #[test]
+    fn pub_sibling_overlay_is_merged_into_the_loaded_config() {
+        let dir = env::temp_dir().join(format!("wist-gateway-pub-{}", unique_suffix()));
+        fs::create_dir_all(&dir).expect("create dir");
+        write_install_signing_key(&dir.join("install-signing-ed25519.pkcs8.pem"));
+        let config_path = dir.join("wist-gateway.toml");
+        fs::write(
+            &config_path,
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+tls_cert_file = "admin-tls.crt.pem"
+tls_key_file = "admin-tls.key.pem"
+admin_api_token = "test-admin-token"
+
+[agent]
+trust_bundle_file = "trust-bundle.pem"
+signing_key_file = "install-signing-ed25519.pkcs8.pem"
+environment_id = "env-default"
+"#,
+        )
+        .expect("write config");
+        fs::write(dir.join("admin-tls.crt.pem"), "cert").expect("write cert");
+        fs::write(dir.join("admin-tls.key.pem"), "key").expect("write key");
+        fs::write(dir.join("trust-bundle.pem"), "bundle").expect("write bundle");
+        // 接口层：**现场选择**（对外地址 / 归属）。
+        fs::write(
+            dir.join("wist-gateway-pub.toml"),
+            "[server]\npublic_base_url = \"https://gw.example.com\"\n\n[agent]\ntenant_id = \"tenant-acme\"\n",
+        )
+        .expect("write pub");
+
+        let config = AdminConfig::load_from_path(&config_path).expect("config loads");
+        assert_eq!(config.public_base_url, "https://gw.example.com");
+        assert_eq!(config.tenant_id, "tenant-acme", "接口层的键生效");
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn write_temp_config(content: &str) -> PathBuf {

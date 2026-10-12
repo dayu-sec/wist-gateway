@@ -75,6 +75,9 @@ mod agent_package;
 // `api/agent_api/`（版本并存约定见 design/foundation/api-seam-inventory.md §7）。
 // 加 v2 = 新增版本子模块 + 往 `VERSIONS` 加一行。重新生成控制面代码时需回补本模块。
 mod agent_api;
+// NOTE(hand-added): 网关版本端点（公开、无鉴权）—— 页面左下角显示后端版本用，未登录也要可见，
+// 故独立于管理面。不在 jumo 静态模型 binding.mju 声明里，重新生成控制面代码时需回补本模块与下方路由。
+mod version;
 
 pub mod wist_gateway_management_interface;
 pub mod wist_gateway_public_install_interface;
@@ -109,6 +112,7 @@ use rollout_ops::{
     retry_rollout_plan, view_rollout_plan,
 };
 use software_ops::{view_agent_software, view_software_holdings};
+use version::gateway_version;
 
 pub mod work_expiry;
 pub use work_expiry::{
@@ -267,6 +271,8 @@ pub fn ingest_router(state: ApiState) -> Router {
 
 pub fn router_with_state(state: ApiState) -> Router {
     let router: Router<ApiState> = Router::new()
+        // NOTE(hand-added): 网关版本（公开、无鉴权）—— 页面左下角常驻显示，未登录也要答。见 api/version.rs。
+        .route("/api/v1/version", get(gateway_version))
         .route("/api/v1/agent/install-code", get(get_agent_install_code))
         // NOTE(hand-added): 网关自述面（环回；CR-003）。见上方 `mod self_state` 说明。
         .route(
