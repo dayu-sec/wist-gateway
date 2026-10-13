@@ -24,6 +24,21 @@ const CONFIG_ENV: &str = "WIST_GATEWAY_CONFIG";
 /// 显式设了 `PUB_CONFIG_ENV` 就用它（相对路径按主配置目录解析）；未设则取主配置同目录的同名文件（**存在才用**）。
 const PUB_CONFIG_ENV: &str = "WIST_GATEWAY_PUB_CONFIG";
 const PUB_CONFIG_FILE_NAME: &str = "wist-gateway-pub.toml";
+/// 现场态**值**的约定文件名：与现场态声明同目录（docker-compose 的 `.env` 口径）。
+const PUB_ENV_FILE_NAME: &str = ".env";
+/// 指向现场态 `.env` 的环境变量（docker-compose 的 `--env-file` 对应物）：
+/// 显式设了就用它（相对路径按现场态声明目录解析）；未设 = 声明旁边的 `.env`。
+const PUB_ENV_FILE_ENV: &str = "WIST_GATEWAY_ENV_FILE";
+
+/// 本组件的「分层配置」约定 —— 交给共享 crate `wist-config` 干活
+/// （主配置 + 现场态声明 `${VAR}` 插值 + 同目录 `.env` 合并），与 center / gwlinkd 同一套口径。
+const LAYER: wist_config::LayerSpec = wist_config::LayerSpec {
+    overlay_file: PUB_CONFIG_FILE_NAME,
+    overlay_env: PUB_CONFIG_ENV,
+    values_file: PUB_ENV_FILE_NAME,
+    values_env: PUB_ENV_FILE_ENV,
+};
+
 /// 显式指定密钥文件（**绝对路径**）；未设则用 orion 默认
 /// `./.galaxy/sec_value.yml` → `~/.galaxy/sec_value.yml`。
 const SEC_FILE_ENV: &str = "WIST_GATEWAY_SEC_FILE";
@@ -123,56 +138,9 @@ fn config_parse(message: impl Into<String>) -> ConfigError {
     ConfigReason::Parse.to_err().with_detail(message)
 }
 
-/// 解析**接口层**配置路径：显式 `PUB_CONFIG_ENV` 优先（相对路径按主配置目录解析）；
-/// 未设则取主配置同目录的 `wist-gateway-pub.toml`（**存在才用**），否则 `None`。
-fn resolve_pub_config_path(config_path: &Path) -> Option<PathBuf> {
-    if let Ok(raw) = env::var(PUB_CONFIG_ENV) {
-        let raw = raw.trim();
-        if !raw.is_empty() {
-            let dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-            return Some(absolutize_path(dir, Path::new(raw)));
-        }
-    }
-    let sibling = config_path.with_file_name(PUB_CONFIG_FILE_NAME);
-    sibling.is_file().then_some(sibling)
-}
-
-/// 把**接口层**配置 `overlay` 并进主配置 `base`。
-///
-/// - 段（TOML table）可以两边都写 —— 各自的键各写各的（`[server]` / `[agent]` 正是这样切的）；
-/// - **叶子键不允许重复**：同一个键在两份里都出现 → 直接报错。
-///
-/// 这是「归属唯一」的硬保证：否则“两处都写了、到底哪份说了算”就靠加载顺序决定，
-/// 而那正是分文件要消灭的东西。
-fn merge_disjoint(
-    base: &mut toml::Value,
-    overlay: toml::Value,
-    pub_path: &Path,
-) -> Result<(), ConfigError> {
-    let (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) = (base, overlay)
-    else {
-        return Err(config_parse(format!(
-            "接口层配置 {} 与主配置都必须是 TOML 表",
-            pub_path.display()
-        )));
-    };
-    for (key, overlay_value) in overlay_table {
-        if !base_table.contains_key(&key) {
-            base_table.insert(key, overlay_value);
-            continue;
-        }
-        let base_value = base_table.get_mut(&key).expect("checked contains_key");
-        if base_value.is_table() && overlay_value.is_table() {
-            merge_disjoint(base_value, overlay_value, pub_path)?;
-            continue;
-        }
-        return Err(config_validation(format!(
-            "键 `{key}` 同时出现在主配置与接口层配置 {} —— 同一个键只能有一处，请只留一份",
-            pub_path.display()
-        )));
-    }
-    Ok(())
-}
+// 接口层（`wist-gateway-pub.toml`）的**路径解析**与**无重复叶子合并**不再在本文件手写：
+// 统一由共享 crate `wist-config` 提供（`overlay_path` / `merge_disjoint` / `load_layered_toml`），
+// 与 center / gwlinkd 同一套口径（见上面的 `LAYER`）。
 
 #[derive(Debug, Deserialize)]
 struct RawAdminConfig {
@@ -378,35 +346,10 @@ impl AdminConfig {
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let config_path = absolutize_config_path(path.as_ref())?;
-        let raw_content = fs::read_to_string(&config_path).map_err(|err| {
-            config_io(format!(
-                "failed to read config {}: {err}",
-                config_path.display()
-            ))
-        })?;
-        let mut doc: toml::Value = toml::from_str(&raw_content).map_err(|err| {
-            config_parse(format!(
-                "failed to parse config {}: {err}",
-                config_path.display()
-            ))
-        })?;
-        // 可选的接口层（现场选择：对外地址 / 身份引用 / 归属）单独一份；升级/重渲只碰主配置。
-        // 两份的键不相交 —— 重复即拒（见 `merge_disjoint`）。
-        if let Some(pub_path) = resolve_pub_config_path(&config_path) {
-            let pub_content = fs::read_to_string(&pub_path).map_err(|err| {
-                config_io(format!(
-                    "failed to read public config {}: {err}",
-                    pub_path.display()
-                ))
-            })?;
-            let pub_doc: toml::Value = toml::from_str(&pub_content).map_err(|err| {
-                config_parse(format!(
-                    "failed to parse public config {}: {err}",
-                    pub_path.display()
-                ))
-            })?;
-            merge_disjoint(&mut doc, pub_doc, &pub_path)?;
-        }
+        // 主配置 + 可选的现场态**声明**（`wist-gateway-pub.toml`，其中 `${VAR}` 由「进程环境 > 同目录
+        // `.env`」插值）+ **无重复叶子**合并 —— 全部交给共享 crate `wist-config`（与 center / gwlinkd
+        // 同一套口径）。声明不存在时只读主配置，行为与之前一致。
+        let doc: toml::Value = wist_config::load_layered_toml(&config_path, &LAYER)?;
         let raw: RawAdminConfig = doc.try_into().map_err(|err| {
             config_parse(format!(
                 "failed to parse config {}: {err}",
@@ -2053,7 +1996,8 @@ environment_id = "env-default"
             toml::from_str("[server]\nlisten_addr = \"0.0.0.0:3000\"\n").expect("base");
         let overlay: toml::Value =
             toml::from_str("[server]\npublic_base_url = \"https://gw.example\"\n").expect("pub");
-        merge_disjoint(&mut base, overlay, Path::new("wist-gateway-pub.toml")).expect("merge");
+        wist_config::merge_disjoint(&mut base, overlay, Path::new("wist-gateway-pub.toml"))
+            .expect("merge");
         let server = base.get("server").expect("server table");
         assert_eq!(
             server.get("public_base_url").and_then(|v| v.as_str()),
@@ -2072,7 +2016,8 @@ environment_id = "env-default"
         let mut base: toml::Value = toml::from_str("[agent]\ntenant_id = \"t1\"\n").expect("base");
         let overlay: toml::Value = toml::from_str("[agent]\ntenant_id = \"t2\"\n").expect("pub");
         assert!(
-            merge_disjoint(&mut base, overlay, Path::new("wist-gateway-pub.toml")).is_err(),
+            wist_config::merge_disjoint(&mut base, overlay, Path::new("wist-gateway-pub.toml"))
+                .is_err(),
             "同一个键两处都写必须拒绝"
         );
     }
@@ -2083,10 +2028,17 @@ environment_id = "env-default"
         let dir = env::temp_dir().join(format!("wist-gateway-pub-{}", unique_suffix()));
         fs::create_dir_all(&dir).expect("create dir");
         let main = dir.join("wist-gateway.toml");
-        assert_eq!(resolve_pub_config_path(&main), None, "兄弟文件不在就不用它");
+        assert_eq!(
+            wist_config::resolve_overlay_path(&main, &LAYER),
+            None,
+            "兄弟文件不在就不用它"
+        );
         let pub_path = dir.join("wist-gateway-pub.toml");
         fs::write(&pub_path, "[server]\n").expect("write pub");
-        assert_eq!(resolve_pub_config_path(&main), Some(pub_path));
+        assert_eq!(
+            wist_config::resolve_overlay_path(&main, &LAYER),
+            Some(pub_path)
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

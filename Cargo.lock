@@ -3527,6 +3527,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wist-config"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5142e160e51e452c633df571b7f30a334823530afabff340cb0cf923ef43353"
+dependencies = [
+ "orion-error",
+ "toml",
+ "wist-error",
+]
+
+[[package]]
 name = "wist-contracts"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3561,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "wist-gateway"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3593,6 +3604,7 @@ dependencies = [
  "toml",
  "tower",
  "wist-api",
+ "wist-config",
  "wist-contracts",
  "wist-control",
  "wist-error",

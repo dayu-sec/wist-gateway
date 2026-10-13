@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.9.0" #@gxl:set(version)
+version = "0.9.1" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -32,6 +32,9 @@ wist-control = { version = "0.14" }
 #wist-control = { version = "0.14", path = "../wist-control" }
 wist-error = { version = "0.2" }
 #wist-error = { version = "0.2", path = "../wist-error" }
+# 分层配置（主配置 + 接口层声明 `${VAR}` + 同目录 `.env`），与 center / gwlinkd 共用。
+wist-config = { version = "0.1" }
+#wist-config = { version = "0.1", path = "../wist-config" }
 # 跨进程错误投影 wire 类型（`ProtocolError` / `Severity`），见 `api/error.rs`。
 wist-shared = { version = "0.2" }
 #wist-shared = { version = "0.2", path = "../wist-shared" }

@@ -3,6 +3,14 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.1-alpha] - 2026-10-13
+
+### 变更
+
+- **分层配置读取改用共享 crate `wist-config`**（与 `wist-center` / `wist-gwlinkd` 同一套口径）：接口层配置的
+  路径解析 + 「段可重合、**叶子键不许重复**」合并 + 可选的同目录 `.env` 插值不再在本仓手写；
+  行为与 0.9.0 一致（**不提供 pub 文件时行为不变**）。
+
 ## [0.9.0-alpha] - 2026-10-12
 
 ### 新增
