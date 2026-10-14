@@ -3,6 +3,14 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.3-alpha] - 2026-10-14
+
+### 变更
+
+- **制品推送到 COS 时自带 sha256**：上传的每个对象带自定义元数据 `x-cos-meta-artifact-sha256`
+  （COS 只存 MD5 ETag，GitHub 资产摘要过不来）；可用 `coscli stat`（HEAD）读回。`x-cos-meta-`
+  是 COS 对自定义元数据的强制前缀。
+
 ## [0.9.2-alpha] - 2026-10-13
 
 ### 变更
