@@ -146,6 +146,7 @@ jobs:
   #   Variables：COS_BUCKET（含 -APPID）、COS_REGION（如 ap-guangzhou）、可选 COS_PREFIX（默认取仓库名）
   #   Secrets：  COS_SECRET_ID、COS_SECRET_KEY（临时密钥再加 COS_SESSION_TOKEN）
   # 对象键：<COS_PREFIX>/<tag>/<文件名> 与 <COS_PREFIX>/latest/<文件名>
+  # 每个对象带自定义元数据 x-cos-meta-artifact-sha256=<hex>（COS 只存 MD5 ETag，sha256 得自带）。
   upload-cos:
     name: Upload artifacts to Tencent COS
     needs: [release]
@@ -218,10 +219,20 @@ jobs:
           for f in "${files[@]}"; do
             [ -f "${f}" ] || continue
             name="$(basename "${f}")"
-            coscli cp "${f}" "cos://${COS_BUCKET}/${prefix}/${TAG}/${name}" -c "${cfg}" \
+            # COS 对象只存 MD5（ETag），GitHub 侧资产 digest（sha256）过不来。把 sha256 作为
+            # **对象自定义元数据**写进对象本身（x-cos-meta-artifact-sha256 —— 与设计里的
+            # artifact_sha256 字段同名）—— 随对象走，录 COS 地址时可用 `coscli stat`（HEAD）
+            # 读回填 expected_sha256（`ls` 不返回自定义元数据）。--meta 形如 key:value（多个用 # 分隔）。
+            # 本 step 只有 `set -eu`（无 pipefail），管道失败会被 cut 吃掉；空摘要等于又「丢」了，
+            # 故显式兜一道。
+            sha="$(sha256sum "${f}" | cut -d' ' -f1)"
+            [ -n "${sha}" ] || { echo "::error::无法计算 ${name} 的 sha256" >&2; exit 1; }
+            meta="x-cos-meta-artifact-sha256:${sha}"
+            coscli cp "${f}" "cos://${COS_BUCKET}/${prefix}/${TAG}/${name}" -c "${cfg}" --meta "${meta}" \
               || dump_err "上传 ${name} 失败（${TAG}）"
-            coscli cp "${f}" "cos://${COS_BUCKET}/${prefix}/latest/${name}" -c "${cfg}" \
+            coscli cp "${f}" "cos://${COS_BUCKET}/${prefix}/latest/${name}" -c "${cfg}" --meta "${meta}" \
               || dump_err "上传 ${name} 失败（latest）"
+            echo "已上传 ${name}  sha256=${sha}"
           done
           echo "COS 上传完成。"
           coscli ls "cos://${COS_BUCKET}/${prefix}/" -c "${cfg}" \
