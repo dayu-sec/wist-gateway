@@ -268,7 +268,10 @@ agent 走 **mTLS**（出示客户端证书）→ 网关 `WebPkiClientVerifier` �
 - **周期性续期 + 本地有效期自检**：今天续期只在 daemon **启动时**评估一次
   （`src/control/runtime_entry.rs:524`），需补定时任务（§4.2）；过期判定靠**本地读 `notAfter`**（§5.4）；
 - **续签留痕与上报**：续签结果 / 证书状态落 state 并上报（§5.5）；过期置「需重装」并上报；
-- `enroll --force`（丢弃本地身份、凭 token 重新注册）——现已缺失，是「重装 ≠ 重注册」的补口。
+- `enroll --force`（丢弃本地身份、凭 token 重新注册）——**已具备**（`enroll_with_token_forced`，
+  f3e057e），是「重装 ≠ 重注册」的补口：state 里已有身份时注册会被跳过，证书过期 / 换网关 /
+ 本机身份错乱都靠它把旧身份扔掉。入口已接到安装面：安装页的「重装（替换证书）」模式会让
+ `install.sh` 走 `service uninstall` → `enroll --force` → `service install`（不再传 token）。
 - 收到终态 code（`TERMINAL_AUTH_CODES`：`certificate_revoked` / `certificate_mismatch`）→ 进**终态**：
   停止一切控制面请求（状态 / 工作 / 上送 / 续期）并把上送压成待命，落台账
   （`identity/renewal.json` 记 `revoked`）并打一行可操作的 `event=AgentAuthTerminal code=…`。

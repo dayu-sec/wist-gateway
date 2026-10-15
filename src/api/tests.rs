@@ -301,25 +301,26 @@ async fn install_script_places_binaries() {
     let script = rendered_install_script(&env);
 
     assert!(script.contains("CONFIG_DIR=\"$WIST_AGENTD_HOME\""));
+    // 只装系统级：`/usr/local/bin` + `/etc/wist-agentd`（用户级自 agentd 0.4.0 起已移除）。
     assert!(script.contains("BIN_DIR=\"${WIST_AGENTD_BIN_DIR:-/usr/local/bin}\""));
-    assert!(script.contains("BIN_DIR=\"${WIST_AGENTD_BIN_DIR:-$HOME/bin}\""));
     assert!(script.contains("WIST_AGENTD_HOME=\"${WIST_AGENTD_HOME:-/etc/wist-agentd}\""));
-    assert!(script.contains("WIST_AGENTD_HOME=\"${WIST_AGENTD_HOME:-$HOME/.wist-agentd}\""));
 }
 
 #[tokio::test]
-async fn install_script_escalates_for_system_scope() {
+async fn install_script_escalates_to_root_without_scope_flags() {
     let env = TestEnv::new().await;
     let script = rendered_install_script(&env);
 
-    // 作用域靠 `id -u` 猜会让页面那条普通用户粘贴的指令永远落回用户级：改成显式参数，
-    // 默认系统级，并由脚本自己提权。
-    assert!(script.contains("SCOPE=\"${WIST_AGENTD_SCOPE:-system}\""));
-    assert!(script.contains("if [ \"$SCOPE\" = \"system\" ] && [ \"$(id -u)\" != \"0\" ]; then"));
+    // 只装系统级，由脚本自己提权（不是要求使用者手工加 sudo）。
+    assert!(script.contains("if [ \"$(id -u)\" != \"0\" ]; then"));
     // 手工加 sudo 会清掉 token 所在的环境变量，所以重跑自己时把 token 作为参数带过去。
     assert!(script.contains("sh \"$0\" --enrollment-token \"$WIST_ENROLLMENT_TOKEN\""));
-    // 免 sudo 的用户级安装是显式退出路径。
-    assert!(script.contains("WIST_AGENTD_SCOPE=user"));
+    // agentd 0.4.0 已移除作用域旗标（`service` 不再接受 `--system` / `--user`）：仍然传它会把
+    // 安装卡在第 4 步（`unknown argument or command: --system`）。`--system` 在 0.3.x 上是默认值，
+    // 省略它对旧包也兼容。
+    assert!(!script.contains("SERVICE_SCOPE_ARG"));
+    assert!(!script.contains("--system"));
+    assert!(!script.contains("--user"));
 }
 
 #[tokio::test]
@@ -350,18 +351,219 @@ async fn install_script_registers_managed_service() {
     let env = TestEnv::new().await;
     let script = rendered_install_script(&env);
 
-    // 装完必须交常驻托管（自启 + 崩溃拉起）：root 走系统级，普通用户走用户级；
+    // 装完必须交常驻托管（自启 + 崩溃拉起）；不传作用域旗标（系统级是 agentd 唯一且默认的作用域）。
     // 注册与定义同一步完成，因此必须显式给出 bin / config-dir / 一次性 token。
-    assert!(script.contains("\"$BIN_DIR/wist-agentd\" service install \"$SERVICE_SCOPE_ARG\""));
+    assert!(script.contains("\"$BIN_DIR/wist-agentd\" service install \\"));
     assert!(script.contains("--bin \"$BIN_DIR/wist-agentd\""));
     assert!(script.contains("--config-dir \"$CONFIG_DIR\""));
     assert!(script.contains("--enrollment-token \"$WIST_ENROLLMENT_TOKEN\""));
     // --force 让重复执行等价于升级：换二进制后必须重建服务进程才会生效。
     assert!(script.contains("--force"));
-    assert!(script.contains("SERVICE_SCOPE_ARG=\"--system\""));
-    assert!(script.contains("SERVICE_SCOPE_ARG=\"--user\""));
     // 逃生口：只装二进制与配置、自行决定怎么跑。
     assert!(script.contains("WIST_AGENTD_SERVICE"));
+}
+
+#[tokio::test]
+async fn install_script_supports_reinstall_replacing_the_certificate() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    // 重装模式默认关；页面在「重装」模式下导出 WIST_AGENTD_REINSTALL=1，自我提权时用
+    // `--reinstall` 参数回传（sudo 会清掉环境变量）。
+    assert!(script.contains("REINSTALL=\"${WIST_AGENTD_REINSTALL:-0}\""));
+    assert!(script.contains("--reinstall)"));
+    assert!(script.contains("sh \"$0\" --reinstall --enrollment-token \"$WIST_ENROLLMENT_TOKEN\""));
+
+    // 换证书那一步是 `enroll --force`（丢掉本地凭据 state + 客户端证书 + 续期台账，凭 token
+    // 重注册），而不是单纯重跑安装 —— 后者在已注册的机器上会被跳过，证书不会被换。
+    assert!(
+        script.contains("\"$BIN_DIR/wist-agentd\" enroll --force --config-dir \"$CONFIG_DIR\"")
+    );
+
+    // 换之前先停掉在跑的 agentd：否则它可能在新证书落盘之后又把旧状态写回去。
+    assert!(
+        script.contains("\"$BIN_DIR/wist-agentd\" service uninstall --config-dir \"$CONFIG_DIR\"")
+    );
+
+    // 装服务那一步在重装路径下不再带 token（身份已经就位）。
+    assert!(script.contains("service_install()"));
+    assert!(script.contains("if ! service_install >\"$TOOL_OUT\" 2>&1; then"));
+}
+
+/// 跑一遍 `install.sh`（**真执行**），把脚本发出的调用按顺序记下来。
+///
+/// 做法：`curl` 与 `id` 用桩替掉，「安装包」本身就是一段会记账的 agentd 桩 —— 装到
+/// `$BIN_DIR/wist-agentd` 之后它就把收到的参数追进 `CALLS_LOG`。于是这步**不联网、不装服务**，
+/// 只观察脚本真实发出的调用序列（`curl|…` 是下载，其余是 agentd 调用）。
+///
+/// 为什么不只断言脚本文本：「停服务在写完配置**之后**」「换证书不被跳过注册顺手跳过」这两条
+/// 都是**顺序**性质，文本顺序断言撞到注释里的同名词就会假失败/假通过。
+#[cfg(unix)]
+fn run_install_script_case(env: &TestEnv, name: &str, extra_env: &[(&str, &str)]) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = env._root.join(format!("harness-{name}"));
+    for dir in ["conf", "bin", "stub"] {
+        std::fs::create_dir_all(root.join(dir)).expect("create harness dir");
+    }
+    let calls = root.join("calls.log");
+    std::fs::write(&calls, "").expect("init calls log");
+
+    let write_exec = |path: &std::path::Path, body: &str| {
+        std::fs::write(path, body).expect("write harness file");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x harness file");
+    };
+
+    // 「安装包」：装上去后就是 BIN_DIR/wist-agentd，负责记账。
+    let package = root.join("package-body");
+    write_exec(
+        &package,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALLS_LOG\"\n",
+    );
+
+    // 桩 curl：把 `-o` 的目标写出来（配置写个最小 toml，其余原样拷「安装包」），并记账。
+    write_exec(
+        &root.join("stub/curl"),
+        "#!/bin/sh\nprintf 'curl|%s\\n' \"$*\" >> \"$CALLS_LOG\"\nout=\"\"\n\
+         while [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o) out=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n\
+         [ -n \"$out\" ] || exit 0\n\
+         case \"$out\" in\n  *agentd.toml) printf 'schema_version = \"v1\"\\n' > \"$out\" ;;\n  *) cat \"$FAKE_PACKAGE\" > \"$out\" ;;\nesac\n",
+    );
+
+    // 桩 id：假装 root。否则脚本会去 sudo（CI 上非 root，会卡住/失败）。
+    write_exec(
+        &root.join("stub/id"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"-u\" ]; then printf '0\\n'; exit 0; fi\nexec /usr/bin/id \"$@\"\n",
+    );
+
+    // 渲染并落盘 install.sh：摘要取这份「安装包」的真实 sha256，于是下载后的校验会真的通过。
+    let source = AgentPackageSource::from_local_file(
+        &env.config,
+        &env.config.public_base_url,
+        TEST_PLATFORM,
+        package.clone(),
+    )
+    .expect("local package source");
+    let script = super::install::install_script(
+        &env.config,
+        TEST_PLATFORM,
+        &source,
+        &env.config.public_base_url,
+    );
+    let script_path = root.join("install.sh");
+    std::fs::write(&script_path, script).expect("write install script");
+
+    let path = std::env::var("PATH").expect("PATH");
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg(&script_path)
+        .env("PATH", format!("{}:{path}", root.join("stub").display()))
+        .env("WIST_AGENTD_HOME", root.join("conf"))
+        .env("WIST_AGENTD_BIN_DIR", root.join("bin"))
+        .env("WIST_ENROLLMENT_TOKEN", "tok-harness")
+        .env("CALLS_LOG", &calls)
+        .env("FAKE_PACKAGE", &package)
+        // 别让跑测试的那台机器的环境变量渗进来（否则本机设过 REINSTALL/SERVICE 就会串例）。
+        .env_remove("WIST_AGENTD_REINSTALL")
+        .env_remove("WIST_AGENTD_SERVICE");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+
+    let output = command.output().expect("run install.sh");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "install.sh（{name}）退出非 0：\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    // 夹具自证：摘要必须真的被校验过。摘要为空时脚本会跳掉校验（少走一段真链路），
+    // 那会让上面几个用例的“跑通了”变得没有意义。
+    assert!(
+        stdout.contains("sha256") && !stdout.contains("未设置校验摘要"),
+        "harness 夹具异常：安装包摘要没被校验：\n{stdout}"
+    );
+
+    std::fs::read_to_string(&calls)
+        .expect("read calls log")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// 调用序列里的 agentd 调用（过滤掉 `curl|` 那些下载）。
+#[cfg(unix)]
+fn agentd_calls(log: &[String]) -> Vec<&str> {
+    log.iter()
+        .filter(|line| !line.starts_with("curl|"))
+        .map(String::as_str)
+        .collect()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn install_script_reinstall_swaps_the_certificate_in_the_right_order() {
+    let env = TestEnv::new().await;
+    let at = |log: &[String], needle: &str| {
+        log.iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("调用序列里没有 {needle}：{log:?}"))
+    };
+
+    // ① 普通安装：一步注册（带 token），不碰本机已有身份。
+    let normal = run_install_script_case(&env, "normal", &[]);
+    let calls = agentd_calls(&normal);
+    assert_eq!(calls.len(), 1, "普通安装只应调 agentd 一次：{normal:?}");
+    assert!(calls[0].starts_with("service install "), "{:?}", calls[0]);
+    assert!(
+        calls[0].contains("--enrollment-token tok-harness"),
+        "{:?}",
+        calls[0]
+    );
+    assert!(calls[0].contains("--force"), "{:?}", calls[0]);
+
+    // ② 重装：**先停旧服务 → 再 enroll --force 换证书 → 最后装服务**（这一步不再带 token）。
+    let reinstall = run_install_script_case(&env, "reinstall", &[("WIST_AGENTD_REINSTALL", "1")]);
+    let calls = agentd_calls(&reinstall);
+    assert_eq!(
+        calls.len(),
+        3,
+        "重装应停一次、换一次、装一次：{reinstall:?}"
+    );
+    assert!(calls[0].starts_with("service uninstall "), "{:?}", calls[0]);
+    assert!(calls[1].starts_with("enroll --force "), "{:?}", calls[1]);
+    assert!(calls[1].contains("--token tok-harness"), "{:?}", calls[1]);
+    assert!(calls[2].starts_with("service install "), "{:?}", calls[2]);
+    assert!(
+        !calls[2].contains("--enrollment-token"),
+        "身份已就位，装服务不该再带 token：{:?}",
+        calls[2]
+    );
+    // 停服务必须发生在**写完配置之后**：[1/4]~[3/4] 失败时机器上在跑的 agentd 不受影响，
+    // 停服务只落在「不可回头」那一点。
+    assert!(
+        at(&reinstall, "initial-config") < at(&reinstall, "service uninstall"),
+        "先写配置、后停服务：{reinstall:?}"
+    );
+
+    // ③ 重装 + 跳过服务注册：证书**照样换**（换证书不该被 `WIST_AGENTD_SERVICE=0` 顺手跳过）。
+    let skipped = run_install_script_case(
+        &env,
+        "reinstall-no-service",
+        &[("WIST_AGENTD_REINSTALL", "1"), ("WIST_AGENTD_SERVICE", "0")],
+    );
+    let calls = agentd_calls(&skipped);
+    assert_eq!(
+        calls.len(),
+        2,
+        "跳过注册只该少一次 service install：{skipped:?}"
+    );
+    assert!(calls[0].starts_with("service uninstall "), "{:?}", calls[0]);
+    assert!(
+        calls[1].starts_with("enroll --force "),
+        "跳过注册也必须换证书：{skipped:?}"
+    );
 }
 
 #[tokio::test]

@@ -3,6 +3,16 @@
 #
 # 顺序：装包并校验摘要 → 装二进制 → 写初始配置 → 注册常驻服务（交给 launchd / systemd）。
 # 幂等：重跑等价于升级（覆盖二进制 + 重建服务进程）；任何一步失败都会明确说明停在哪。
+#
+# 两种模式（WIST_AGENTD_REINSTALL 选）：
+#   * 首次安装 / 升级（默认）：没注册过时用一次性 token 完成注册，再交给常驻服务托管。
+#     已在册的机器重跑只换二进制、配置并重建服务 —— **本机已有的客户端证书不会被换**
+#     （注册会被跳过：`ensure_enrolled` 见到 state 里已有身份就早返回）。
+#   * 重装（WIST_AGENTD_REINSTALL=1）：**替换本机的客户端证书**。先停旧服务，写完配置后用
+#     `wist-agentd enroll --force` 丢掉本机旧身份（凭据 state + 客户端证书 + 续期台账）、
+#     凭 token 重交 CSR 换一张新证书，再重建服务。用于：证书已过期、换过网关、本机身份错乱。
+#     保留本机私钥（私钥是耗材，「身份」才是网关签出来的东西）；agent_id 是机器标识的稳定
+#     哈希，重装后不变，也不影响其它机器。
 set -eu
 
 # 自我提权时用参数回传一次性 token：sudo 默认会清掉父进程的环境变量，参数不会。
@@ -17,6 +27,10 @@ while [ "$#" -gt 0 ]; do
       WIST_ENROLLMENT_TOKEN="$2"
       shift 2
       ;;
+    --reinstall)
+      WIST_AGENTD_REINSTALL=1
+      shift
+      ;;
     *)
       printf '未知参数 %s\n' "$1" >&2
       exit 1
@@ -29,6 +43,9 @@ AGENT_PACKAGE_SHA256="{{AGENT_PACKAGE_SHA256}}"
 # 网关生成的安装指令导出 WARP_INSIGHT_ENROLLMENT_TOKEN（旧命名），脚本读 WIST_ENROLLMENT_TOKEN。
 # 两个名字都接受：否则照着页面复制粘贴就会静默丢掉 token。
 WIST_ENROLLMENT_TOKEN="${WIST_ENROLLMENT_TOKEN:-${WARP_INSIGHT_ENROLLMENT_TOKEN:-}}"
+# 重装模式开关，默认关。页面在「重装」模式下会在这条命令前导出 WIST_AGENTD_REINSTALL=1；
+# 自我提权时用 `--reinstall` 参数回传（sudo 会清掉环境变量）。
+REINSTALL="${WIST_AGENTD_REINSTALL:-0}"
 
 OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
 HOST_ARCH="$(uname -m 2>/dev/null || echo unknown)"
@@ -38,46 +55,30 @@ case "$OS_NAME" in
   *) SERVICE_MANAGER="服务管理器" ;;
 esac
 
-# 作用域默认**系统级**：开机自起（不依赖登录）、能读 /var/log 等受限路径，配置落
-# /etc/wist-agentd，数据与日志分别落 /var/lib|/var/log/wist-agentd。
-# 要装用户级（免 sudo、登录即起、全部落 ${HOME}）就设 WIST_AGENTD_SCOPE=user。
+# 只装**系统级**：开机自起（不依赖登录）、以 root 运行、能读 /var/log 等受限路径。
+# agentd 自 0.4.0 起只保留系统级托管，`service` 子命令不再接受任何作用域旗标（系统级即默认
+# 且唯一）—— 所以这里一律不传作用域参数（0.3.x 上省略它同样落系统级）。
 #
 # 系统级配置目录只能是 /etc/wist-agentd：agentd 只把该目录（及其子目录）认作系统级
-# （`is_system_config_dir`），并据此把数据放 /var/lib/wist-agentd、日志放
-# /var/log/wist-agentd。落到别处就不再是系统级布局，run/state/spool 与日志会退回配置目录下。
-SCOPE="${WIST_AGENTD_SCOPE:-system}"
-case "$SCOPE" in
-  system)
-    SERVICE_SCOPE_ARG="--system"
-    SERVICE_SCOPE_NOTE="system（开机自起，以 root 运行）"
-    ;;
-  user)
-    SERVICE_SCOPE_ARG="--user"
-    SERVICE_SCOPE_NOTE="user（登录即起，以当前用户运行）"
-    ;;
-  *)
-    printf 'WIST_AGENTD_SCOPE 只能是 system 或 user，收到 %s\n' "$SCOPE" >&2
-    exit 2
-    ;;
-esac
+# （`is_system_config_dir`），并据此把数据放 /var/lib/wist-agentd、日志放 /var/log/wist-agentd。
+# 落到别处就不再是系统级布局，run/state/spool 与日志会退回配置目录下。
+#
 # 系统级由脚本自己提权，而不是要求使用者手工加 sudo：手工加 sudo 会清掉 token 所在的
-# 环境变量，token 静默丢失、脚本退到交互提示。重新执行自己时把 token 作为参数带过去。
-if [ "$SCOPE" = "system" ] && [ "$(id -u)" != "0" ]; then
+# 环境变量，token 静默丢失、脚本退到交互提示。重新执行自己时把 token 与重装标记作为参数带过去。
+if [ "$(id -u)" != "0" ]; then
   if [ ! -f "$0" ] || { [ ! -t 0 ] && [ ! -r /dev/tty ]; }; then
-    printf '%s\n' "系统级安装需要 root：请用 sudo 重跑本脚本，或设 WIST_AGENTD_SCOPE=user 装用户级。" >&2
+    printf '%s\n' "系统级安装需要 root：请用 sudo 重跑本脚本。" >&2
     exit 2
+  fi
+  if [ "${REINSTALL}" = "1" ]; then
+    exec sudo -p '系统级安装需要管理员权限: ' sh "$0" --reinstall --enrollment-token "$WIST_ENROLLMENT_TOKEN" "$@"
   fi
   exec sudo -p '系统级安装需要管理员权限: ' sh "$0" --enrollment-token "$WIST_ENROLLMENT_TOKEN" "$@"
 fi
 # 二进制放标准 bin 目录，与配置目录解耦；配置目录只放 config + tasks。
 # （系统级下 state/run/spool 落 /var/lib/wist-agentd、日志落 /var/log/wist-agentd。）
-if [ "$SCOPE" = "system" ]; then
-  WIST_AGENTD_HOME="${WIST_AGENTD_HOME:-/etc/wist-agentd}"
-  BIN_DIR="${WIST_AGENTD_BIN_DIR:-/usr/local/bin}"
-else
-  WIST_AGENTD_HOME="${WIST_AGENTD_HOME:-$HOME/.wist-agentd}"
-  BIN_DIR="${WIST_AGENTD_BIN_DIR:-$HOME/bin}"
-fi
+WIST_AGENTD_HOME="${WIST_AGENTD_HOME:-/etc/wist-agentd}"
+BIN_DIR="${WIST_AGENTD_BIN_DIR:-/usr/local/bin}"
 CONFIG_DIR="$WIST_AGENTD_HOME"
 
 # 输出约定：`==> ` 是脚本自己推进的步骤，缩进的是外部工具（wist-agentd / curl）的输出，
@@ -116,7 +117,11 @@ show_tool_output() {
 
 printf '%swist-agentd 安装程序%s\n' "$BOLD" "$RESET"
 printf '  主机    %s %s\n' "$OS_NAME" "$HOST_ARCH"
-printf '  作用域  %s\n' "$SERVICE_SCOPE_NOTE"
+if [ "${REINSTALL}" = "1" ]; then
+  printf '  模式    %s\n' "重装（替换本机客户端证书）"
+else
+  printf '  模式    %s\n' "首次安装 / 升级"
+fi
 printf '  二进制  %s\n' "$(short "$BIN_DIR/wist-agentd")"
 printf '  配置    %s\n' "$(short "$CONFIG_DIR/agentd.toml")"
 
@@ -227,23 +232,68 @@ fi
 chmod 0600 "$CONFIG_DIR/agentd.toml"
 note "$(short "$CONFIG_DIR/agentd.toml")（0600，注册成功后 token 会被清掉）"
 
-step "[4/4] 注册常驻服务（${SERVICE_MANAGER}，${SERVICE_SCOPE_ARG}）"
+if [ "${REINSTALL}" = "1" ]; then
+  step "[4/4] 替换客户端证书并重建服务（${SERVICE_MANAGER}）"
+else
+  step "[4/4] 注册常驻服务（${SERVICE_MANAGER}）"
+fi
+
+# 一次性 token 只走命令行，不落盘。
+# 首次安装 / 升级：注册与落服务定义同一步（`service install --enrollment-token`）—— token
+#   无效或控制面不可达时不会留下启动即报错的半成品服务；已在册的机器上注册会被跳过。
+# 重装：**先停旧服务、再换证书**（`enroll --force`，这一步才是「替换客户端证书」），
+#   最后落服务定义 —— 此时身份已就位，装服务那一步不再需要 token。
+# 顺序上两点讲究：
+#   * 停服务放在**这里**（不放到更早的步骤）：前面几步只是换二进制与写配置，失败了机器上在
+#     跑的 agentd 不受影响；到这一步才是「不可回头」的点。
+#   * 换证书放在 `WIST_AGENTD_SERVICE` 早退（跳过注册）**之前**：跳过注册是「自己决定怎么跑」
+#     的逃生口，不该顺手把「替换证书」这件事也跳过去。
+# --force 让重复执行等价于升级（换二进制后必须重建服务进程才会生效）。
+TOOL_OUT="$(mktemp "${TMPDIR:-/tmp}/wist-service.XXXXXX")"
+if [ "${REINSTALL}" = "1" ]; then
+  # 换证书前先停掉在跑的 agentd：否则它可能在新证书落盘之后又把旧状态写回去。
+  # 停不掉（没装过 / 已经停了）不算错误 —— 下面会重建服务定义。
+  if "$BIN_DIR/wist-agentd" service uninstall --config-dir "$CONFIG_DIR" >/dev/null 2>&1; then
+    note "重装模式：已停止并移除旧服务定义（下面重建）"
+  else
+    note "重装模式：没有可停的旧服务（首次装或已停）"
+  fi
+  if ! "$BIN_DIR/wist-agentd" enroll --force --config-dir "$CONFIG_DIR" \
+    --token "$WIST_ENROLLMENT_TOKEN" >"$TOOL_OUT" 2>&1; then
+    show_tool_output "$TOOL_OUT" >&2
+    printf '\n' >&2
+    bad "重新注册失败（本机旧客户端证书已被丢弃，常驻服务当前未注册）：见上方输出。处理完重跑本脚本即可重建服务（必要时换一条新的注册 token）。"
+    exit 1
+  fi
+  show_tool_output "$TOOL_OUT"
+fi
+
 if [ "${WIST_AGENTD_SERVICE:-1}" != "1" ]; then
   note "已跳过注册（WIST_AGENTD_SERVICE=0）"
-  note "自行注册：$BIN_DIR/wist-agentd service install $SERVICE_SCOPE_ARG --config-dir \"$CONFIG_DIR\""
+  note "自行注册：$BIN_DIR/wist-agentd service install --config-dir \"$CONFIG_DIR\""
   note "或前台运行：$BIN_DIR/wist-agentd --config-dir \"$CONFIG_DIR\""
+  if [ "${REINSTALL}" = "1" ]; then
+    note "客户端证书已按重装模式替换（只跳过了常驻服务注册）。"
+  fi
   exit 0
 fi
 
-# 一次性 token 只走命令行，不落盘；先注册再落服务定义——token 无效或控制面不可达时，
-# 不会留下一个启动即报错的半成品服务。--force 让重复执行等价于升级（换二进制后必须重建
-# 服务进程才会生效）。
-TOOL_OUT="$(mktemp "${TMPDIR:-/tmp}/wist-service.XXXXXX")"
-if ! "$BIN_DIR/wist-agentd" service install "$SERVICE_SCOPE_ARG" \
-  --bin "$BIN_DIR/wist-agentd" \
-  --config-dir "$CONFIG_DIR" \
-  --enrollment-token "$WIST_ENROLLMENT_TOKEN" \
-  --force >"$TOOL_OUT" 2>&1; then
+# 装服务那一步：重装模式下身份已就位，不再需要 token。
+service_install() {
+  if [ "${REINSTALL}" = "1" ]; then
+    "$BIN_DIR/wist-agentd" service install \
+      --bin "$BIN_DIR/wist-agentd" \
+      --config-dir "$CONFIG_DIR" \
+      --force
+  else
+    "$BIN_DIR/wist-agentd" service install \
+      --bin "$BIN_DIR/wist-agentd" \
+      --config-dir "$CONFIG_DIR" \
+      --enrollment-token "$WIST_ENROLLMENT_TOKEN" \
+      --force
+  fi
+}
+if ! service_install >"$TOOL_OUT" 2>&1; then
   show_tool_output "$TOOL_OUT" >&2
   printf '\n' >&2
   bad "注册常驻服务失败：见上方输出。二进制与配置已就位，重跑本脚本即可重试。"
@@ -252,3 +302,6 @@ fi
 show_tool_output "$TOOL_OUT"
 
 printf '\n%s安装完成：wist-agentd 已交给 %s 托管，当前在后台持续运行%s\n' "$GREEN" "$SERVICE_MANAGER" "$RESET"
+if [ "${REINSTALL}" = "1" ]; then
+  note "重装模式：本机客户端证书已替换；agent_id 是机器标识的稳定哈希，保持不变。"
+fi
