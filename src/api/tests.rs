@@ -49,7 +49,10 @@ use super::{
         validate_bootstrap_token_for_config,
     },
     install_package::{AgentPackageSource, package_id_for_sha256, read_package_identity},
-    overview::{RecentOnlineRegisteredAgentSource, agent_is_online, agent_overview},
+    overview::{
+        OVERVIEW_RECENT_AGENT_LIMIT, RecentOnlineRegisteredAgentSource, agent_is_online,
+        agent_overview, record_recent_online_agent,
+    },
     router,
     work_expiry::expire_overdue_one_shot_works,
 };
@@ -4631,6 +4634,45 @@ async fn agent_overview_is_empty_before_enrollment() {
     assert_eq!(overview.metrics.online_agents, 0);
     assert!(overview.recent_online_agents.is_empty());
     assert!(overview.abnormal_agents.is_empty());
+}
+
+/// 总览的卡片列表要**列全**最近上线的 Agent，而不是截断到 6 张。
+///
+/// 这里以前是 6（前端卡片网格的老上限）：7 台的网关会出现「已接入 Agent = 7、下面只列 6」，
+/// 而且没有任何提示说少了一台 —— 多出来的那台在总览页看不到。这条测试就是钉住那次修复。
+#[tokio::test]
+async fn agent_overview_lists_every_recently_registered_agent() {
+    let state = test_state().await;
+    let registered = 7;
+    for index in 0..registered {
+        record_recent_online_agent(
+            &state.runtime,
+            &format!("agent-host-{index}"),
+            &format!("host-{index}"),
+            "v0.9.1",
+            "2026-07-28T00:00:00Z",
+        );
+    }
+
+    // 内存环形缓冲自身也得留住这么多，否则卡片会缺指标历史。
+    let ring_len = state
+        .runtime
+        .lock()
+        .expect("runtime state poisoned")
+        .recent_online_agents
+        .len();
+    assert_eq!(ring_len, registered);
+
+    let overview = agent_overview(&state).await;
+    assert_eq!(
+        overview.recent_online_agents.len(),
+        registered,
+        "总览要把最近上线的每一台都列出来，不能只给 6 张卡片"
+    );
+    assert!(
+        registered < OVERVIEW_RECENT_AGENT_LIMIT,
+        "这条测试的前提是机队规模远小于上限"
+    );
 }
 
 #[tokio::test]

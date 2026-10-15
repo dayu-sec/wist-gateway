@@ -82,6 +82,17 @@ pub async fn get_agent_overview(
     Json(agent_overview(&state).await).into_response()
 }
 
+/// 总览页「最近上线注册 Agent」一次最多给多少台。
+///
+/// 这里以前是 **6**：卡片列表被截断到 6 张，而左上角「已接入 Agent」的指标是对**全部** Agent 算的 ——
+/// 于是 7 台的网关会出现「总数 7、下面只列 6」的矛盾，多出来的那台在总览页**根本看不到**（也没有
+/// 任何提示说被截断了）。现在按「一页」给（与 Agent 列表的 `DEFAULT_AGENT_PAGE_LIMIT` 同量级），
+/// 真正的截断由前端明说（少于总数时给出「去 Agent 机队看全部」）。
+///
+/// 保留上限的理由是这个端点喂的是一屏卡片网格（每张卡还带指标迷你趋势），不设界的话上千台机队
+/// 会把一屏拖垮；100 台是「看得见全部常见机队」与「一屏放得下」的折中。
+pub(crate) const OVERVIEW_RECENT_AGENT_LIMIT: usize = 100;
+
 const ONLINE_WINDOW_SECONDS: i64 = 300;
 const HISTORY_WINDOW_SECONDS: i64 = 3600;
 const HISTORY_STEP_SECONDS: i64 = 30;
@@ -95,7 +106,7 @@ pub async fn agent_overview(state: &ApiState) -> AgentOverview {
         .unwrap_or_default();
     let now = DateTime::now();
 
-    // 总览指标对「全部 agent」计算，而不是只对最近 6 张卡片（卡片列表单独 truncate）。
+    // 总览指标对「全部 agent」计算，卡片列表另行截断到 `OVERVIEW_RECENT_AGENT_LIMIT`。
     let total_agents = agents.len() as i64;
     let online_agents = agents
         .iter()
@@ -125,7 +136,7 @@ pub async fn agent_overview(state: &ApiState) -> AgentOverview {
         }
     }
     recent_online_agents.sort_by(|left, right| right.registered_at.cmp(&left.registered_at));
-    recent_online_agents.truncate(6);
+    recent_online_agents.truncate(OVERVIEW_RECENT_AGENT_LIMIT);
 
     let agent_ids: Vec<String> = recent_online_agents
         .iter()
@@ -207,7 +218,9 @@ pub fn record_recent_online_agent(
         .recent_online_agents
         .retain(|existing| existing.agent_id != agent_id);
     state.recent_online_agents.insert(0, agent);
-    state.recent_online_agents.truncate(6);
+    state
+        .recent_online_agents
+        .truncate(OVERVIEW_RECENT_AGENT_LIMIT);
 }
 
 #[allow(clippy::too_many_arguments)]
