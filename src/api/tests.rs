@@ -390,16 +390,98 @@ async fn install_script_supports_reinstall_replacing_the_certificate() {
     assert!(script.contains("if ! service_install >\"$TOOL_OUT\" 2>&1; then"));
 }
 
+/// `install.sh` 真跑一次的结果。
+#[cfg(unix)]
+struct HarnessRun {
+    root: std::path::PathBuf,
+    calls: Vec<String>,
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+#[cfg(unix)]
+impl HarnessRun {
+    /// agentd 收到的调用（去掉 `curl|` 下载与装完自检那一次 `version`）。
+    fn agentd_calls(&self) -> Vec<&str> {
+        self.calls
+            .iter()
+            .filter(|line| !line.starts_with("curl|") && line.as_str() != "version")
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// 装完有没有自检一次二进制能跑（`[2/4]` 末尾那次 `version`）。
+    fn ran_binary_smoke_test(&self) -> bool {
+        self.calls.iter().any(|line| line == "version")
+    }
+
+    fn expect_ok(&self, name: &str) {
+        assert!(
+            self.success,
+            "install.sh（{name}）应成功：\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.stdout, self.stderr
+        );
+        // 夹具自证：摘要必须真的被校验过。摘要为空时脚本会跳掉校验（少走一段真链路），
+        // 那会让用例的“跑通了”变得没意义。
+        assert!(
+            self.stdout.contains("sha256") && !self.stdout.contains("未设置校验摘要"),
+            "harness 夹具异常：安装包摘要没被校验：\n{}",
+            self.stdout
+        );
+    }
+
+    /// `$BIN_DIR` 里装了什么（拒绝的用例用它证明「一个字节都没写」）。
+    fn installed_binaries(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.root.join("bin"))
+            .expect("read bin dir")
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+/// 目标三元组 → 本机（`uname -s` / `uname -m`）该怎么回答。
+///
+/// 脚本第一步就核对平台（装错平台会把二进制换成跑不起来的那种），而用例渲染的是
+/// `TEST_PLATFORM` 的包 —— 开发机是 macOS、CI 是 Linux，所以 `uname` 必须用桩固定下来，
+/// 否则同一份用例换台机器跑法就不一样了。
+#[cfg(unix)]
+fn host_for(triple: &str) -> (&'static str, &'static str) {
+    if triple.contains("apple-darwin") {
+        ("Darwin", "arm64")
+    } else if triple.starts_with("x86_64") {
+        ("Linux", "x86_64")
+    } else {
+        ("Linux", "aarch64")
+    }
+}
+
 /// 跑一遍 `install.sh`（**真执行**），把脚本发出的调用按顺序记下来。
 ///
-/// 做法：`curl` 与 `id` 用桩替掉，「安装包」本身就是一段会记账的 agentd 桩 —— 装到
+/// 做法：`curl` / `id` / `uname` 用桩替掉，「安装包」本身就是一段会记账的 agentd 桩 —— 装到
 /// `$BIN_DIR/wist-agentd` 之后它就把收到的参数追进 `CALLS_LOG`。于是这步**不联网、不装服务**，
 /// 只观察脚本真实发出的调用序列（`curl|…` 是下载，其余是 agentd 调用）。
 ///
-/// 为什么不只断言脚本文本：「停服务在写完配置**之后**」「换证书不被跳过注册顺手跳过」这两条
-/// 都是**顺序**性质，文本顺序断言撞到注释里的同名词就会假失败/假通过。
+/// 为什么不只断言脚本文本：「停服务在写完配置**之后**」「换证书不被跳过注册顺手跳过」
+/// 「平台不符时一个字节都不写」都是**行为**，文本顺序断言撞到注释里的同名词就会假失败/假通过。
+///
+/// `triple` 是**渲染用的包平台**，`host` 是**夹具假装的机器**：两者不一致就是「装错平台」那一幕。
 #[cfg(unix)]
-fn run_install_script_case(env: &TestEnv, name: &str, extra_env: &[(&str, &str)]) -> Vec<String> {
+fn run_install_script_case(
+    env: &TestEnv,
+    name: &str,
+    triple: &str,
+    host: (&str, &str),
+    extra_env: &[(&str, &str)],
+) -> HarnessRun {
     use std::os::unix::fs::PermissionsExt;
 
     let root = env._root.join(format!("harness-{name}"));
@@ -437,20 +519,36 @@ fn run_install_script_case(env: &TestEnv, name: &str, extra_env: &[(&str, &str)]
         "#!/bin/sh\nif [ \"${1:-}\" = \"-u\" ]; then printf '0\\n'; exit 0; fi\nexec /usr/bin/id \"$@\"\n",
     );
 
+    // 桩 uname：把「本机是什么平台」固定下来（脚本第一步就据此核对包对不对得上）。
+    write_exec(
+        &root.join("stub/uname"),
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n  -s) printf '%s\\n' \"{}\" ;;\n  -m) printf '%s\\n' \"{}\" ;;\n  *) printf '%s\\n' \"{}\" ;;\nesac\n",
+            host.0, host.1, host.0
+        ),
+    );
+
+    // 桩 sysctl：脚本用 `hw.optional.arm64` 判硬件（避开 Rosetta 下 `uname -m` 报 x86_64）。
+    // 固定成夹具给的平台，否则这条用例的结果会跟跑测那台机器的真实硬件绑定。
+    write_exec(
+        &root.join("stub/sysctl"),
+        if host.1 == "arm64" {
+            "#!/bin/sh\nprintf '1\\n'\n"
+        } else {
+            "#!/bin/sh\nexit 1\n"
+        },
+    );
+
     // 渲染并落盘 install.sh：摘要取这份「安装包」的真实 sha256，于是下载后的校验会真的通过。
     let source = AgentPackageSource::from_local_file(
         &env.config,
         &env.config.public_base_url,
-        TEST_PLATFORM,
+        triple,
         package.clone(),
     )
     .expect("local package source");
-    let script = super::install::install_script(
-        &env.config,
-        TEST_PLATFORM,
-        &source,
-        &env.config.public_base_url,
-    );
+    let script =
+        super::install::install_script(&env.config, triple, &source, &env.config.public_base_url);
     let script_path = root.join("install.sh");
     std::fs::write(&script_path, script).expect("write install script");
 
@@ -472,49 +570,52 @@ fn run_install_script_case(env: &TestEnv, name: &str, extra_env: &[(&str, &str)]
     }
 
     let output = command.output().expect("run install.sh");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "install.sh（{name}）退出非 0：\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-    // 夹具自证：摘要必须真的被校验过。摘要为空时脚本会跳掉校验（少走一段真链路），
-    // 那会让上面几个用例的“跑通了”变得没有意义。
-    assert!(
-        stdout.contains("sha256") && !stdout.contains("未设置校验摘要"),
-        "harness 夹具异常：安装包摘要没被校验：\n{stdout}"
-    );
 
-    std::fs::read_to_string(&calls)
-        .expect("read calls log")
-        .lines()
-        .map(str::to_string)
-        .collect()
-}
-
-/// 调用序列里的 agentd 调用（过滤掉 `curl|` 那些下载）。
-#[cfg(unix)]
-fn agentd_calls(log: &[String]) -> Vec<&str> {
-    log.iter()
-        .filter(|line| !line.starts_with("curl|"))
-        .map(String::as_str)
-        .collect()
+    HarnessRun {
+        root,
+        calls: std::fs::read_to_string(&calls)
+            .expect("read calls log")
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn install_script_reinstall_swaps_the_certificate_in_the_right_order() {
     let env = TestEnv::new().await;
+    let host = host_for(TEST_PLATFORM);
+    // 另一端平台（用来演「装错平台」）：本机假装是这个，包却是另一个。
+    let other_triple = if host.0 == "Darwin" {
+        "x86_64-unknown-linux-musl"
+    } else {
+        "aarch64-apple-darwin"
+    };
     let at = |log: &[String], needle: &str| {
         log.iter()
             .position(|line| line.contains(needle))
             .unwrap_or_else(|| panic!("调用序列里没有 {needle}：{log:?}"))
     };
 
-    // ① 普通安装：一步注册（带 token），不碰本机已有身份。
-    let normal = run_install_script_case(&env, "normal", &[]);
-    let calls = agentd_calls(&normal);
-    assert_eq!(calls.len(), 1, "普通安装只应调 agentd 一次：{normal:?}");
+    // ① 普通安装：装完自检一次，再一步注册（带 token），不碰本机已有身份。
+    let normal = run_install_script_case(&env, "normal", TEST_PLATFORM, host, &[]);
+    normal.expect_ok("normal");
+    assert!(
+        normal.ran_binary_smoke_test(),
+        "装完必须先自检二进制能跑：{:?}",
+        normal.calls
+    );
+    let calls = normal.agentd_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "普通安装只应调 agentd 一次：{:?}",
+        normal.calls
+    );
     assert!(calls[0].starts_with("service install "), "{:?}", calls[0]);
     assert!(
         calls[0].contains("--enrollment-token tok-harness"),
@@ -524,12 +625,20 @@ async fn install_script_reinstall_swaps_the_certificate_in_the_right_order() {
     assert!(calls[0].contains("--force"), "{:?}", calls[0]);
 
     // ② 重装：**先停旧服务 → 再 enroll --force 换证书 → 最后装服务**（这一步不再带 token）。
-    let reinstall = run_install_script_case(&env, "reinstall", &[("WIST_AGENTD_REINSTALL", "1")]);
-    let calls = agentd_calls(&reinstall);
+    let reinstall = run_install_script_case(
+        &env,
+        "reinstall",
+        TEST_PLATFORM,
+        host,
+        &[("WIST_AGENTD_REINSTALL", "1")],
+    );
+    reinstall.expect_ok("reinstall");
+    let calls = reinstall.agentd_calls();
     assert_eq!(
         calls.len(),
         3,
-        "重装应停一次、换一次、装一次：{reinstall:?}"
+        "重装应停一次、换一次、装一次：{:?}",
+        reinstall.calls
     );
     assert!(calls[0].starts_with("service uninstall "), "{:?}", calls[0]);
     assert!(calls[1].starts_with("enroll --force "), "{:?}", calls[1]);
@@ -543,27 +652,74 @@ async fn install_script_reinstall_swaps_the_certificate_in_the_right_order() {
     // 停服务必须发生在**写完配置之后**：[1/4]~[3/4] 失败时机器上在跑的 agentd 不受影响，
     // 停服务只落在「不可回头」那一点。
     assert!(
-        at(&reinstall, "initial-config") < at(&reinstall, "service uninstall"),
-        "先写配置、后停服务：{reinstall:?}"
+        at(&reinstall.calls, "initial-config") < at(&reinstall.calls, "service uninstall"),
+        "先写配置、后停服务：{:?}",
+        reinstall.calls
     );
 
     // ③ 重装 + 跳过服务注册：证书**照样换**（换证书不该被 `WIST_AGENTD_SERVICE=0` 顺手跳过）。
     let skipped = run_install_script_case(
         &env,
         "reinstall-no-service",
+        TEST_PLATFORM,
+        host,
         &[("WIST_AGENTD_REINSTALL", "1"), ("WIST_AGENTD_SERVICE", "0")],
     );
-    let calls = agentd_calls(&skipped);
+    skipped.expect_ok("reinstall-no-service");
+    let calls = skipped.agentd_calls();
     assert_eq!(
         calls.len(),
         2,
-        "跳过注册只该少一次 service install：{skipped:?}"
+        "跳过注册只该少一次 service install：{:?}",
+        skipped.calls
     );
     assert!(calls[0].starts_with("service uninstall "), "{:?}", calls[0]);
     assert!(
         calls[1].starts_with("enroll --force "),
-        "跳过注册也必须换证书：{skipped:?}"
+        "跳过注册也必须换证书：{:?}",
+        skipped.calls
     );
+
+    // ④ 平台不符：包与机器对不上时必须**就地拒绝** —— 不下包、不装二进制、不动服务，一个字节都不写。
+    //    两个方向都钉：
+    //      a) 机器是另一端（包与 `TEST_PLATFORM` 一致）；
+    //      b) 包的平台是另一端、机器是本机 —— **现场那一幕**：Linux 的 ELF 往 macOS 上装。
+    for (name, triple, wrong_host) in [
+        ("wrong-host", TEST_PLATFORM, opposite_host(host)),
+        ("wrong-package", other_triple, host),
+    ] {
+        let refused = run_install_script_case(&env, name, triple, wrong_host, &[]);
+        assert!(
+            !refused.success,
+            "{name}：平台不符必须拒绝（退出码非 0）：{}",
+            refused.stderr
+        );
+        assert!(
+            refused.calls.is_empty(),
+            "{name}：拒绝时不该有任何动作（含下载）：{:?}",
+            refused.calls
+        );
+        assert!(
+            refused.installed_binaries().is_empty(),
+            "{name}：拒绝时不该写 $BIN_DIR：{:?}",
+            refused.installed_binaries()
+        );
+        assert!(
+            refused.stderr.contains("已中止"),
+            "{name}：要说清为什么拒绝：{}",
+            refused.stderr
+        );
+    }
+}
+
+/// 另一端的平台（macOS ↔ Linux），用来演「装错平台」。
+#[cfg(unix)]
+fn opposite_host(host: (&str, &str)) -> (&'static str, &'static str) {
+    if host.0 == "Darwin" {
+        ("Linux", "x86_64")
+    } else {
+        ("Darwin", "arm64")
+    }
 }
 
 #[tokio::test]

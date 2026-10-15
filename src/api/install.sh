@@ -49,6 +49,34 @@ REINSTALL="${WIST_AGENTD_REINSTALL:-0}"
 
 OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
 HOST_ARCH="$(uname -m 2>/dev/null || echo unknown)"
+# macOS 上 `uname -m` 报的是**当前进程**的架构：在 Rosetta 下跑会给出 x86_64，而机器其实是 Apple
+# Silicon —— 那会让下面的平台校验把一份合法的 macOS 包装成「平台不符」拒掉。硬件架构问 sysctl：
+# `hw.optional.arm64 = 1` 即 Apple Silicon（与是否在 Rosetta 下无关）；Intel 机上该键不存在。
+if [ "$OS_NAME" = "Darwin" ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = "1" ]; then
+  HOST_ARCH="arm64"
+fi
+# 包是**按平台**发布的：`ARCH` 是网关渲染时就定死的 target-triple，`[1/4]` 取的就是这个平台的制品。
+# 装错平台不是「跑不起来」那么简单：Linux 的 ELF 盖到 macOS 上，会把跑得好好的 agentd 换成一个
+# 无法执行的文件，而且要拖到第 4 步才报错（那时二进制已被换掉、旧服务也已经动过）。
+# 所以这是脚本做的**第一件事**：在提权之前、下载之前、写任何文件之前先核对本机 —— 不匹配就
+# 就地拒绝，一个字节都不写。
+case "{{ARCH}}" in
+  *-apple-darwin) EXPECT_OS="Darwin"; EXPECT_ARCH="arm64" ;;
+  x86_64-*-linux-*) EXPECT_OS="Linux"; EXPECT_ARCH="x86_64" ;;
+  aarch64-*-linux-*) EXPECT_OS="Linux"; EXPECT_ARCH="aarch64" ;;
+  *) EXPECT_OS=""; EXPECT_ARCH="" ;;
+esac
+# arm64 与 aarch64 是同一颗芯片的两种写法（macOS 用前者、Linux 用后者）。
+ARCH_ALIAS="$HOST_ARCH"
+case "$HOST_ARCH" in arm64) ARCH_ALIAS="aarch64" ;; esac
+EXPECT_ALIAS="$EXPECT_ARCH"
+case "$EXPECT_ARCH" in arm64) EXPECT_ALIAS="aarch64" ;; esac
+if [ -n "$EXPECT_OS" ] && { [ "$OS_NAME" != "$EXPECT_OS" ] || [ "$ARCH_ALIAS" != "$EXPECT_ALIAS" ]; }; then
+  printf '%s\n' "这份安装命令是给 {{ARCH}} 的，但本机是 ${OS_NAME} ${HOST_ARCH} —— 已中止，未做任何改动。" >&2
+  printf '%s\n' "请在网关「安装 Agent」页按「目标主机」选对应那一栏的命令（macOS 与 Linux 不能混用）。" >&2
+  exit 2
+fi
+
 case "$OS_NAME" in
   Darwin) SERVICE_MANAGER="launchd" ;;
   Linux) SERVICE_MANAGER="systemd" ;;
@@ -154,7 +182,8 @@ chmod 0600 "$CA_CERT"
 
 PACKAGE_FILE="$(mktemp "${TMPDIR:-/tmp}/wist-package.XXXXXX")"
 EXTRACT_DIR=""
-TOOL_OUT=""
+# 外部工具的输出统一收在这里（自检、注册、服务三步共用），出错时原样展示给操作者。
+TOOL_OUT="$(mktemp "${TMPDIR:-/tmp}/wist-tool.XXXXXX")"
 cleanup() {
   rm -f "$CA_CERT" "$PACKAGE_FILE"
   if [ -n "$EXTRACT_DIR" ]; then rm -rf "$EXTRACT_DIR"; fi
@@ -224,6 +253,17 @@ else
   note "裸二进制包不含 wist-exec / wist-upgrader：执行类与升级类工作在这台机器上会失败"
 fi
 
+# 装上去的二进制必须能在这台机器上真的跑起来：平台不对 / 包损坏 / 丢了执行位，都在这里就明确拦住 ——
+# 而不是拖到第 4 步（那时旧服务已停、报错也更难对上原因）。
+if ! "$BIN_DIR/wist-agentd" version >"$TOOL_OUT" 2>&1; then
+  show_tool_output "$TOOL_OUT" >&2
+  printf '\n' >&2
+  bad "装上去的 wist-agentd 跑不起来（平台不对 / 包损坏）。"
+  printf '%s\n' "  注意：$BIN_DIR 下的二进制已被本次安装替换；请用与目标主机匹配的平台的安装命令重跑。" >&2
+  exit 1
+fi
+note "自检通过：$(short "$BIN_DIR/wist-agentd") version"
+
 step "[3/4] 写入初始配置"
 if ! curl -fsSL --cacert "$CA_CERT" -H "authorization: Bearer $WIST_ENROLLMENT_TOKEN" "{{AGENT_INITIAL_CONFIG_URL}}" -o "$CONFIG_DIR/agentd.toml"; then
   bad "下载初始配置失败：见上方 curl 报错。"
@@ -249,20 +289,23 @@ fi
 #   * 换证书放在 `WIST_AGENTD_SERVICE` 早退（跳过注册）**之前**：跳过注册是「自己决定怎么跑」
 #     的逃生口，不该顺手把「替换证书」这件事也跳过去。
 # --force 让重复执行等价于升级（换二进制后必须重建服务进程才会生效）。
-TOOL_OUT="$(mktemp "${TMPDIR:-/tmp}/wist-service.XXXXXX")"
 if [ "${REINSTALL}" = "1" ]; then
   # 换证书前先停掉在跑的 agentd：否则它可能在新证书落盘之后又把旧状态写回去。
-  # 停不掉（没装过 / 已经停了）不算错误 —— 下面会重建服务定义。
-  if "$BIN_DIR/wist-agentd" service uninstall --config-dir "$CONFIG_DIR" >/dev/null 2>&1; then
-    note "重装模式：已停止并移除旧服务定义（下面重建）"
+  # 停不掉要**说出来**（可能本机本来就没装过服务，也可能是别的毛病）—— 不能把「停不掉」
+  # 讲成「本来就没有」：那正好把真正的故障藏起来。为了不阻断「服务已手工停掉」这种常见情形，
+  # 这里不中止，只把原样输出摆出来。
+  if ! "$BIN_DIR/wist-agentd" service uninstall --config-dir "$CONFIG_DIR" >"$TOOL_OUT" 2>&1; then
+    note "重装模式：停止 / 移除旧服务定义没成功；原样如下（本机本来就没装过服务时，这也算正常）"
+    show_tool_output "$TOOL_OUT"
   else
-    note "重装模式：没有可停的旧服务（首次装或已停）"
+    note "重装模式：旧服务已停止并移除定义（下面重建）"
   fi
   if ! "$BIN_DIR/wist-agentd" enroll --force --config-dir "$CONFIG_DIR" \
     --token "$WIST_ENROLLMENT_TOKEN" >"$TOOL_OUT" 2>&1; then
     show_tool_output "$TOOL_OUT" >&2
     printf '\n' >&2
-    bad "重新注册失败（本机旧客户端证书已被丢弃，常驻服务当前未注册）：见上方输出。处理完重跑本脚本即可重建服务（必要时换一条新的注册 token）。"
+    bad "重新注册失败：见上方输出。重装不会自动回滚 —— 若上面这一步已经丢掉了本机旧身份，它会停在未注册状态。"
+    printf '%s\n' "  修好上面那个原因后重跑本脚本即可重建；token 若已被用掉，换一条新的。" >&2
     exit 1
   fi
   show_tool_output "$TOOL_OUT"
