@@ -3,6 +3,23 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.11.0-alpha] - 2026-10-16
+
+### 新增
+
+- **`[server] self_face_allow`**：给非标准网络（自建网桥 / 宿主源 IP 被 SNAT 成别处）显式列出可信
+  对端（IP 或 CIDR）。一般不用填 —— 容器里会自动认默认网关。`/0` 会被**拒启**（那等于把无鉴权的
+  环回面公开给所有地址）。
+
+### 修复
+
+- **容器部署下宿主侧常驻（`wist-gwlinkd`）连不上网关**：网关跑在容器里时，本机环回面（自述面 /
+  接入请求 / gwlinkd 心跳 / agent 包下发）会把宿主自己的连接当成「外来」而一律 403 —— 表现为
+  `journalctl -u wist-gwlinkd` 每 30s 一对 `LinkRequestFailed` / `LinkdStatusPushFailed`，且网关页
+  「接入代理」报「未检测到 gwlinkd 心跳」（进程其实活着）。现在这些面把**容器所在网络的网关**
+  （= 宿主在该网络上的地址）也认作本机。**外部客户端仍被拒**（在发布端口上它们带的是真实源 IP）。
+  排查入口：启动日志新增 `event=LocalHostPeers loopback + container_gateway=<ip> + allow=[…]`。
+
 ## [0.10.0-alpha] - 2026-10-15
 
 ### 新增
