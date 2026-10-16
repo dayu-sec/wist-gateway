@@ -238,7 +238,7 @@ pub async fn query_gateway_link_request(
     State(state): State<ApiState>,
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
 ) -> Response {
-    if !client.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
+    if !state.is_local_host_peer(client) {
         return ApiError::forbidden(
             codes::LINK_REQUEST_LOOPBACK_ONLY,
             "link-request is loopback-only",
@@ -276,7 +276,7 @@ pub async fn report_gateway_link_result(
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
     Json(input): Json<ReportGatewayLinkResultRequest>,
 ) -> Response {
-    if !client.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
+    if !state.is_local_host_peer(client) {
         return ApiError::forbidden(
             codes::LINK_RESULT_LOOPBACK_ONLY,
             "link-result is loopback-only",

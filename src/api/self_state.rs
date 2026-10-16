@@ -85,9 +85,9 @@ pub async fn query_self_state(
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
     Query(params): Query<SelfStateQuery>,
 ) -> Response {
-    // 自述面只面向**本机** host 侧常驻：非环回一律拒绝（模型里的 bind 一旦把它记成环回路由，这条手加
-    // 的检查可与之合一）。
-    if !client.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
+    // 自述面只面向**本机** host 侧常驻：非本机一律拒绝（本机 = 环回 ∪ 容器默认网关 ∪ 配置放行，
+    // 见 [`ApiState::is_local_host_peer`]）。
+    if !state.is_local_host_peer(client) {
         return ApiError::forbidden(
             codes::SELF_STATE_LOOPBACK_ONLY,
             "self-state is loopback-only",

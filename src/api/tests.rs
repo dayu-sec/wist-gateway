@@ -23,7 +23,7 @@ use wist_api::status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
 use crate::app::knowledge::{KnowledgeSource, LoadedKnowledge};
 use crate::infra::{
     AdminConfig, AgentStatusUpdate, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
-    KnowledgeActivation, SqliteStore, Store, StoredAgentInstallPackage,
+    KnowledgeActivation, LocalPeers, SqliteStore, Store, StoredAgentInstallPackage,
     StoredAgentInstallPackageAddress, StoredAgentRevocation, StoredAgentUplinkAddress,
     StoredCredentialStatus, StoredEnrollmentTokenStatus, StoredKnowledgePackage,
     VerifiedAgentIdentity, bytes_sha256_hex, load_install_script_public_key_pem, sha256_hex,
@@ -7978,6 +7978,7 @@ impl TestEnv {
             tls_cert_file,
             tls_key_file: root.join("admin-tls.key.pem"),
             admin_api_token_hash: sha256_hex(TEST_ADMIN_API_TOKEN),
+            self_face_allow: Vec::new(),
             bootstrap_token_ttl_seconds: 900,
             credential_ttl_seconds: 30 * 24 * 60 * 60,
             store_file,
@@ -8068,6 +8069,7 @@ async fn test_state() -> ApiState {
         rate_limits: Arc::new(Mutex::new(super::rate_limit::RateLimitState::default())),
         knowledge: Arc::new(RwLock::new(Arc::new(knowledge))),
         link_request: Arc::new(Mutex::new(None)),
+        local_peers: LocalPeers::resolve(&env.config),
     }
 }
 
@@ -12915,4 +12917,123 @@ async fn version_route_is_public_and_reports_a_non_empty_version() {
         !version.is_empty(),
         "缺省 `version` 必须非空（页面据此显示后端版本）：{body}"
     );
+}
+
+/// 容器部署的准入（`[server] self_face_allow`）：列出的那个对端按「本机」放行，
+/// 同网段的**别的**地址与外部地址仍 403 —— 这条钉住「放宽只放宿主、不外扩」。
+#[tokio::test]
+async fn gateway_loopback_face_allows_the_configured_peer_and_rejects_the_rest() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new().await;
+    let mut config = env.config.clone();
+    // 就是容器里「宿主那一跳」的样子：对端 = 网络网关（这里显式列入放行）。
+    config.self_face_allow = vec![crate::infra::IpNet::parse("172.28.0.1").expect("ip")];
+    let store = env.store_handle.clone();
+
+    let request = |addr: SocketAddr| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/gateway/self-state?gateway_id=gw-1")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(MockConnectInfo(addr));
+        request
+    };
+
+    let allowed = router(config.clone(), Arc::clone(&store))
+        .oneshot(request(SocketAddr::from(([172, 28, 0, 1], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(allowed.status(), StatusCode::OK, "列出的本机对端必须放行");
+
+    // 同网段的**别的**地址（别的容器）不是本机 —— 放行的是那一个地址，不是整网段。
+    let sibling = router(config.clone(), Arc::clone(&store))
+        .oneshot(request(SocketAddr::from(([172, 28, 0, 9], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(sibling.status(), StatusCode::FORBIDDEN);
+
+    let external = router(config, store)
+        .oneshot(request(SocketAddr::from(([203, 0, 113, 9], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(external.status(), StatusCode::FORBIDDEN);
+}
+
+/// 不外扩：环回面（这里以自述面为代表）对外部地址与**取不到 peer** 都 fail-closed。
+#[tokio::test]
+async fn gateway_loopback_face_rejects_non_local_and_unknown_peers() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new().await;
+
+    let request = |addr: Option<SocketAddr>| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/gateway/self-state?gateway_id=gw-1")
+            .body(Body::empty())
+            .expect("request");
+        if let Some(addr) = addr {
+            request.extensions_mut().insert(MockConnectInfo(addr));
+        }
+        request
+    };
+
+    let remote = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(request(Some(SocketAddr::from(([192, 0, 2, 7], 40_000)))))
+        .await
+        .expect("response");
+    assert_eq!(remote.status(), StatusCode::FORBIDDEN, "非本机不得读自述面");
+
+    // 取不到 peer（没注入连接信息）→ 也拒绝，不因「没连接信息」就放行。
+    let unknown = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(request(None))
+        .await
+        .expect("response");
+    assert_eq!(unknown.status(), StatusCode::FORBIDDEN);
+}
+
+/// 容器部署的**自动**准入（B 方案的主体）：对端 = 容器默认网关（= 宿主那一跳）时环回面也放行，
+/// 而同网段的**别的**容器仍拒。这里用显式装配的 `ApiState` 把「探到的网关按名单收」钉住。
+#[tokio::test]
+async fn gateway_loopback_face_accepts_the_container_gateway_peer() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new().await;
+    let mut state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    // 模拟「容器里探到默认网关 172.17.0.1」：`resolve` 在容器里就是这么填的。
+    state.local_peers = LocalPeers::new(Some("172.17.0.1".parse().expect("ip")), Vec::new());
+    let app = super::router_with_state(state);
+
+    let request = |addr: SocketAddr| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/gateway/self-state?gateway_id=gw-1")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(MockConnectInfo(addr));
+        request
+    };
+
+    let host = app
+        .clone()
+        .oneshot(request(SocketAddr::from(([172, 17, 0, 1], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(
+        host.status(),
+        StatusCode::OK,
+        "容器默认网关 = 宿主，必须放行"
+    );
+
+    // 同网段的**别的**地址（别的容器）不是本机。
+    let sibling = app
+        .oneshot(request(SocketAddr::from(([172, 17, 0, 2], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(sibling.status(), StatusCode::FORBIDDEN);
 }

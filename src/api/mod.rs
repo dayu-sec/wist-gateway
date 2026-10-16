@@ -10,7 +10,7 @@ use axum::{
 };
 
 use crate::app::knowledge::LoadedKnowledge;
-use crate::infra::{AdminConfig, AgentCa, Store};
+use crate::infra::{AdminConfig, AgentCa, LocalPeers, Store};
 
 mod admin_auth;
 mod admin_ops;
@@ -157,6 +157,9 @@ pub struct ApiState {
     /// **只挂进程内存、不落 DB**：待办是**一次性**的过路（gwlinkd 拉到即消费，并把它写进自己的
     /// `gwlinkd.toml` 作为持久记录），网关重启即丢 —— 丢了重提即可，无需持久化。
     pub link_request: Arc<Mutex<Option<link_request::LinkRequest>>>,
+    /// 环回面的「本机对端」判据（环回 ∪ 容器默认网关 ∪ `[server] self_face_allow`）。
+    /// 启动时解析一次（见 [`crate::infra::LocalPeers`]）。
+    pub local_peers: LocalPeers,
 }
 
 impl ApiState {
@@ -181,6 +184,18 @@ impl ApiState {
             .write()
             .unwrap_or_else(|err| err.into_inner());
         *guard = knowledge;
+    }
+
+    /// 环回面准入：对端是不是**本机**。
+    ///
+    /// 这几个面（`self-state` / `link-request` / `linkd-status` / `agent-package`）**无鉴权**，
+    /// 只面向宿主侧常驻 gwlinkd，靠**网络来源**把关。判据不是单纯的 `is_loopback()` —— 容器里宿主的
+    /// 连接看起来来自 docker 网络网关，详见 [`crate::infra::LocalPeers`]。取不到 peer（fail-closed）
+    /// 也拒。
+    pub fn is_local_host_peer(&self, client: Option<std::net::SocketAddr>) -> bool {
+        client
+            .map(|addr| self.local_peers.is_local(addr.ip()))
+            .unwrap_or(false)
     }
 }
 
@@ -223,6 +238,7 @@ pub fn build_state_with_knowledge(
     knowledge: LoadedKnowledge,
 ) -> ApiState {
     let agent_ca = load_agent_ca(&config);
+    let local_peers = LocalPeers::resolve(&config);
     ApiState {
         config,
         store,
@@ -231,6 +247,7 @@ pub fn build_state_with_knowledge(
         knowledge: Arc::new(RwLock::new(Arc::new(knowledge))),
         agent_ca,
         link_request: Arc::new(Mutex::new(None)),
+        local_peers,
     }
 }
 

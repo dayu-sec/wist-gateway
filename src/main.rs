@@ -104,6 +104,9 @@ async fn run_main() -> Result<(), wist_gateway::AppError> {
         .source_raw_err(AppReason::system_error(), "load knowledge content")?;
     log::info!("knowledge source = {}", knowledge.source.describe());
     let state = wist_gateway::api::build_state_with_knowledge(config, store, knowledge);
+    // 环回面的「本机」集合：解析错（如容器里探测不到默认网关）时这是第一现场 —— 那条路
+    // 一旦不对，gwlinkd 的心跳 / 接入（以及 agent 机队明细上报）会全线 403。
+    log::info!("event=LocalHostPeers {}", state.local_peers.describe());
 
     // 一次性工作的到期判定：过了截止的标 expired、预算尽的标 timed_out。
     // 与 agent 在不在线无关 —— 掉线的 agent 恰恰是活最容易卡住的时候。

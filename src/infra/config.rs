@@ -9,7 +9,7 @@ use orion_sec::{SecFileFmt, load_sec_dict, load_secfile_by};
 use orion_variate::vars::{EnvChecker, EnvDict, EnvEvaluable, ValueType};
 use serde::Deserialize;
 
-use super::{load_install_script_public_key_pem, sha256_hex};
+use super::{IpNet, load_install_script_public_key_pem, sha256_hex};
 use wist_error::ConfigReason;
 
 const DEFAULT_CONFIG_PATH: &str = "wist-gateway.toml";
@@ -72,6 +72,16 @@ pub struct AdminConfig {
     pub tls_cert_file: PathBuf,
     pub tls_key_file: PathBuf,
     pub admin_api_token_hash: String,
+    /// 环回面（`self-state` / `link-request` / `linkd-status` / `agent-package`）
+    /// 除环回外**额外**放行的对端（`[server] self_face_allow`；IP 或 CIDR）。
+    ///
+    /// 容器部署时**通常不用填**：网关启动时会自动认**容器默认路由的下一跳**（= 宿主在容器网络
+    /// 上的地址）为本机（见 [`crate::infra::LocalPeers`]）。这里填是给非标准网络（自建网桥 /
+    /// 宿主源 IP 被 SNAT 成别处）兑底。
+    ///
+    /// **`/0` 一律拒启**（那等于把这些**无鉴权**面公开给所有地址）—— 手滑写 `0.0.0.0/0` 是最容易
+    /// 犯的错，宁可起不来也不静默放行。
+    pub self_face_allow: Vec<IpNet>,
     pub bootstrap_token_ttl_seconds: i64,
     pub credential_ttl_seconds: i64,
     /// 旧版单文件 JSON 存储路径：现在只作为「首次启动一次性导入」的来源。
@@ -297,6 +307,9 @@ struct RawServerConfig {
     admin_api_token: String,
     #[serde(default = "default_victoria_metrics_url")]
     victoria_metrics_url: String,
+    /// 环回面额外放行的对端（IP / CIDR）；缺省空（容器里靠自动认默认网关）。
+    #[serde(default)]
+    self_face_allow: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,6 +442,27 @@ impl AdminConfig {
             tls_cert_file: absolutize_path(config_dir, Path::new(&tls_cert_file)),
             tls_key_file: absolutize_path(config_dir, Path::new(&tls_key_file)),
             admin_api_token_hash: sha256_hex(&admin_api_token),
+            // 环回面额外放行的对端：在这里就解析成网段（形态不对 → 启动即拒，不拖到第一个请求）。
+            self_face_allow: raw
+                .server
+                .self_face_allow
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    let value = expand(&env, value)?;
+                    let net = IpNet::parse(&value).map_err(|err| {
+                        config_validation(format!("server.self_face_allow: {err}"))
+                    })?;
+                    // `/0` = 「谁都放」：这几个面无鉴权，写它等于公开 —— 拒启（fail-closed）。
+                    if net.is_unbounded() {
+                        return Err(config_validation(format!(
+                            "server.self_face_allow: 不允许 /0（会把这些无鉴权面暴露给所有地址）：{value}"
+                        )));
+                    }
+                    Ok(net)
+                })
+                .collect::<Result<Vec<IpNet>, ConfigError>>()?,
             bootstrap_token_ttl_seconds: raw.agent.bootstrap_ttl_seconds,
             credential_ttl_seconds: raw.agent.credential_ttl_seconds,
             store_file: absolutize_path(
@@ -1149,6 +1183,7 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         tls_cert_file: root.join("admin-tls.crt.pem"),
         tls_key_file: root.join("admin-tls.key.pem"),
         admin_api_token_hash: sha256_hex("test-admin-token-0001"),
+        self_face_allow: Vec::new(),
         bootstrap_token_ttl_seconds: 900,
         credential_ttl_seconds: 30 * 24 * 60 * 60,
         store_file: root.join("state").join("admin-store.json"),
@@ -2079,6 +2114,61 @@ environment_id = "env-default"
         assert_eq!(config.public_base_url, "https://gw.example.com");
         assert_eq!(config.tenant_id, "tenant-acme", "接口层的键生效");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `[server] self_face_allow`：解析成网段（单地址 / CIDR），供环回面准入用。
+    #[test]
+    fn self_face_allow_parses_ips_and_cidrs() {
+        let path = write_temp_config(
+            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\n\
+             admin_api_token = \"test-admin-token\"\n\
+             self_face_allow = [\"172.17.0.1\", \"172.28.0.0/16\"]\n\n\
+             [agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        );
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(config.self_face_allow.len(), 2);
+        // 单个地址 = /32：只命中它自己。
+        assert!(config.self_face_allow[0].contains("172.17.0.1".parse().expect("ip")));
+        assert!(!config.self_face_allow[0].contains("172.17.0.2".parse().expect("ip")));
+        // CIDR：命中网段内。
+        assert!(config.self_face_allow[1].contains("172.28.9.9".parse().expect("ip")));
+    }
+
+    /// 缺省（不写该项）= 空 —— 容器里靠自动认默认网关，不是配置错。
+    #[test]
+    fn self_face_allow_defaults_to_empty() {
+        let path = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert!(config.self_face_allow.is_empty());
+    }
+
+    /// 形态不对 → **启动即拒**（而不是拖到第一个请求才爆），且报出是哪个字段。
+    #[test]
+    fn self_face_allow_rejects_a_bad_value() {
+        let path = write_temp_config(
+            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\n\
+             admin_api_token = \"test-admin-token\"\n\
+             self_face_allow = [\"not-an-ip\"]\n\n\
+             [agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        );
+        let err = AdminConfig::load_from_path(&path).expect_err("bad allow entry must be rejected");
+        let text = err.to_string();
+        assert!(text.contains("server.self_face_allow"), "{text}");
+    }
+
+    /// `0.0.0.0/0` = 「谁都放」：这几个面无鉴权，必须**拒启**（fail-closed），不能静默生效。
+    #[test]
+    fn self_face_allow_rejects_the_unbounded_net() {
+        let path = write_temp_config(
+            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\n\
+             admin_api_token = \"test-admin-token\"\n\
+             self_face_allow = [\"0.0.0.0/0\"]\n\n\
+             [agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        );
+        let err = AdminConfig::load_from_path(&path).expect_err("/0 must be rejected");
+        let text = err.to_string();
+        assert!(text.contains("server.self_face_allow"), "{text}");
+        assert!(text.contains("/0"), "{text}");
     }
 
     fn write_temp_config(content: &str) -> PathBuf {

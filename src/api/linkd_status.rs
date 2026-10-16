@@ -166,7 +166,7 @@ pub async fn report_gateway_linkd_status(
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
     Json(input): Json<ReportGatewayLinkdStatusRequest>,
 ) -> Response {
-    if !client.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
+    if !state.is_local_host_peer(client) {
         return ApiError::forbidden(
             codes::LINKD_STATUS_LOOPBACK_ONLY,
             "linkd-status is loopback-only",

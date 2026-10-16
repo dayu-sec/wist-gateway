@@ -37,7 +37,7 @@ pub async fn receive_agent_package(
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
     Json(input): Json<SetAgentInstallPackageRequest>,
 ) -> Response {
-    if !client.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
+    if !state.is_local_host_peer(client) {
         return ApiError::forbidden(
             codes::AGENT_PACKAGE_LOOPBACK_ONLY,
             "agent-package is loopback-only",

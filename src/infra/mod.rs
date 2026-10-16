@@ -11,6 +11,9 @@ pub mod github;
 pub use github::*;
 pub mod install_signing;
 pub use install_signing::*;
+// NOTE(hand-added): 环回面「本机对端」判据（容器里「宿主」= 网络网关）。见本模块文件头注释。
+pub mod local_peer;
+pub use local_peer::*;
 pub mod secret;
 pub use secret::*;
 pub mod single_instance;
