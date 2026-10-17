@@ -3,6 +3,29 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.12.0-alpha] - 2026-10-17
+
+### 修复
+
+- **安装命令不再要求目标机有 OpenSSL ≥ 3**：Linux 引导命令改用「命令内嵌的脚本 sha256」校验
+  （`sha256sum`，缺失时 `shasum`），一致才执行；不匹配则明确报错且**不执行**（fail-closed）。
+  此前用 `openssl pkeyutl -verify -rawin`，它要求 OpenSSL ≥ 3.0 —— EL7/8、Ubuntu 16.04–20.04、
+  Debian 8–11 一律报 `pkeyutl: Option unknown option -rawin`，脚本没跑、也装不上。现在底线回到
+  「curl + systemd」的老发行版（见 README「Supported target hosts」：Ubuntu 20.04+ / Debian 11+ /
+  EL8+ / macOS 11+）。
+- **某平台未录入安装包时**：该平台的安装命令不再下发一条注定 503 的命令，而是直接说明
+  「网关当前没有该平台的包、去哪补」。
+
+### 变更
+
+- **移除安装脚本签名（`.sig`）**：它唯一的消费者就是上面那条 OpenSSL 校验。随之删除
+  `GET /api/v1/agent/install/{platform}/install.sh.sig`、`[agent] signing_key_file` 及其
+  **启动校验**（不再要求该文件存在）、`init-config` 的签名密钥生成。
+  **无需迁移**：旧配置里残留的 `signing_key_file` 会被静默忽略；磁盘上旧的
+  `install-script-signing-*.pkcs8.pem` 已无消费者、可删。
+  已发出的旧安装命令（若还留着）会因摘要不匹配而拒跑 —— 重新复制一次命令即可。
+- 知识库内容包的验签**不受影响**（`[knowledge] signing_public_key_file` 是另一把钥匙，仍保留）。
+
 ## [0.11.0-alpha] - 2026-10-16
 
 ### 新增
