@@ -185,9 +185,8 @@ async fn build_store(
     Ok(Arc::new(store))
 }
 
-/// Generate a wist-gateway.toml with a freshly random admin API token
-/// (and the install-script signing key it references), so a newly initialized
-/// admin never runs with a predictable or shared default token.
+/// Generate a wist-gateway.toml with a freshly random admin API token, so a newly
+/// initialized admin never runs with a predictable or shared default token.
 fn init_config_command(out_arg: Option<&str>) -> Result<(), wist_gateway::AppError> {
     let token = wist_gateway::infra::new_admin_token().map_err(|err| {
         AppReason::system_error()
@@ -202,15 +201,11 @@ fn init_config_command(out_arg: Option<&str>) -> Result<(), wist_gateway::AppErr
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let state_dir = parent.join("state");
-    let key_path = state_dir.join("install-script-signing-ed25519.pkcs8.pem");
-    if !key_path.exists() {
-        std::fs::create_dir_all(&state_dir).source_err(
-            AppReason::system_error(),
-            format!("create state dir {}", state_dir.display()),
-        )?;
-        wist_gateway::infra::generate_install_script_signing_key(&key_path)
-            .map_err(|err| AppReason::system_error().to_err().with_detail(err))?;
-    }
+    // `state/` 是 TLS 证书与库的落点，启动前就要在——即使 init-config 不再生成任何密钥。
+    std::fs::create_dir_all(&state_dir).source_err(
+        AppReason::system_error(),
+        format!("create state dir {}", state_dir.display()),
+    )?;
     let existed = out_path.exists();
     std::fs::write(&out_path, wist_gateway::infra::default_config_text(&token)).source_err(
         AppReason::system_error(),
@@ -222,7 +217,6 @@ fn init_config_command(out_arg: Option<&str>) -> Result<(), wist_gateway::AppErr
         println!("generated admin config: {}", out_path.display());
     }
     println!("admin api token: {}", token);
-    println!("install script signing key: {}", key_path.display());
     println!(
         "note: create a TLS certificate/key pair at {}/admin-tls.crt.pem and {}/admin-tls.key.pem before starting",
         state_dir.display(),
@@ -334,6 +328,25 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{ConnectionContext, inject_connection_context};
+
+    /// `init-config` 不再生成任何密钥，但 `state/` 仍必须建（TLS 证书与库的落点），
+    /// 且模板里不得再出现已移除的 `signing_key_file`。
+    #[test]
+    fn init_config_creates_state_dir_and_omits_signing_key() {
+        let dir = std::env::temp_dir().join(format!("wist-gateway-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("wist-gateway.toml");
+
+        super::init_config_command(Some(path.to_str().expect("path"))).expect("init config");
+
+        assert!(path.exists(), "配置必须写出来");
+        assert!(dir.join("state").is_dir(), "state/ 必须被创建");
+        let text = std::fs::read_to_string(&path).expect("read config");
+        assert!(!text.contains("signing_key_file"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 探针：读的就是环回护栏赖以判定的 `ConnectInfo`（取不到就 500，等于护栏 fail-closed 失效）。
     async fn peer_kind(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> &'static str {

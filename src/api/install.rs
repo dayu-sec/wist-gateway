@@ -11,8 +11,8 @@ use axum::{
 use crate::infra::{
     AdminConfig, BootstrapTokenCheck, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
     Store, StoreResult, StoredAgentUplinkAddress, StoredEnrollmentToken,
-    StoredEnrollmentTokenStatus, VerifiedAgentIdentity, new_secret_token, sha256_hex,
-    sign_install_script,
+    StoredEnrollmentTokenStatus, VerifiedAgentIdentity, bytes_sha256_hex, new_secret_token,
+    sha256_hex,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use ring::digest::{SHA256, digest};
@@ -91,50 +91,6 @@ pub async fn get_agent_install_script(
             install_script(&state.config, platform, &package, &base),
         )
             .into_response(),
-    }
-}
-
-pub async fn get_agent_install_script_signature(
-    State(state): State<ApiState>,
-    Path(platform): Path<String>,
-) -> Response {
-    let Ok(platform) = supported_agent_platform(&platform) else {
-        return unknown_platform_response();
-    };
-    let base = effective_advertise_base(&state.config, &state.store).await;
-    let package = match crate::error::logged_op(
-        module_path!(),
-        "resolve agent package",
-        &[("platform", platform.to_string())],
-        resolve_agent_package(&state.config, &state.store, &base, platform).await,
-    ) {
-        Ok(package) => package,
-        // 失败已由 logged_op 记（含链路）；这里只投影，不重复记。
-        Err(_) => {
-            return ApiError::handled(
-                StatusCode::SERVICE_UNAVAILABLE,
-                codes::INSTALL_PACKAGE_UNAVAILABLE,
-                format!("agent package for platform {platform} is not available"),
-            )
-            .with_no_store()
-            .into_response();
-        }
-    };
-    match install_script_signature(&state.config, platform, &package, &base) {
-        Ok(signature) => (
-            [
-                (header::CONTENT_TYPE, "application/octet-stream"),
-                (header::CACHE_CONTROL, NO_STORE),
-            ],
-            signature,
-        )
-            .into_response(),
-        Err(err) => ApiError::internal(
-            codes::INSTALL_SCRIPT_SIGN_FAILED,
-            "failed to sign install script",
-            err,
-        )
-        .into_response(),
     }
 }
 
@@ -539,8 +495,6 @@ pub fn agent_install_code(
     packages: &[(String, AgentPackageSource)],
     base: &str,
 ) -> Result<AgentInstallCode, String> {
-    let x86_install_script_url = config.install_script_url_at(base, PLATFORM_LINUX_X86);
-    let arm_install_script_url = config.install_script_url_at(base, PLATFORM_LINUX_ARM);
     let macos_install_code = macos_install_command(config, base)?;
     // 每平台一份：安装脚本地址（平台限定）+ 网关托管包地址/摘要。
     let platforms: Vec<AgentPlatformPackage> = packages
@@ -553,9 +507,9 @@ pub fn agent_install_code(
         })
         .collect();
     Ok(AgentInstallCode {
-        x86_linux_install_code: install_command(config, &x86_install_script_url),
+        x86_linux_install_code: linux_install_command(config, packages, base, PLATFORM_LINUX_X86),
         bootstrap_enrollment_token: token.to_string(),
-        arm_linux_install_code: install_command(config, &arm_install_script_url),
+        arm_linux_install_code: linux_install_command(config, packages, base, PLATFORM_LINUX_ARM),
         macos_install_code,
         bootstrap_bundle: AgentBootstrapBundle {
             bundle_id: format!("agent-bootstrap-{}", short_token_id(token)),
@@ -572,8 +526,8 @@ pub fn agent_install_code(
 
 /// 渲染 install.sh，并把生效的安装包地址与校验摘要写进模板。
 ///
-/// 调用方必须与 [`install_script_signature`] 传入同一个 [`AgentPackageSource`]，
-/// 否则客户端下载到的脚本与其签名会不一致。
+/// 调用方给的 [`AgentPackageSource`] 必须与**引导命令算摘要时用的那份**一致（同 platform + 同包来源）：
+/// 两侧各渲一次，换一份来源摘要就对不上、校验白装。
 pub fn install_script(
     config: &AdminConfig,
     platform: &str,
@@ -591,23 +545,71 @@ pub fn install_script(
         .replace("{{TRUST_BUNDLE}}", &config.trust_bundle)
 }
 
-fn install_command(config: &AdminConfig, script_url: &str) -> String {
-    let signature_url = install_script_signature_url(script_url);
-    // The two downloads use -k (skip cert verification) because the admin runs
-    // a self-signed CA that a fresh host cannot yet trust. This is safe: the
-    // script's integrity/authenticity is verified by the embedded public key
-    // below (openssl pkeyutl -verify), so TLS is just transport here.
+/// Linux 引导命令：下载安装脚本，**按内嵌的 sha256 校验通过后才执行**。
+///
+/// 下载带 `-k`（跳过证书校验）：管理面用的是自签 CA，全新主机还不信任它。这安全的前提是
+/// **完整性由命令里内嵌的摘要保证** —— 摘要是运维从已认证的管理面**带外**粘贴过来的，
+/// TLS 在这里只当传输层用。macOS 走另一条路（`curl --pinnedpubkey`，见
+/// [`macos_install_command`]）。
+///
+/// 老写法（Ed25519 + `openssl pkeyutl -verify -rawin`）已弃用：它要求目标机有
+/// **OpenSSL ≥ 3.0**，把兼容底线抬到 EL9+ / Ubuntu 22.04+，与 `install.sh`、agentd 自己的
+/// 口径（systemd + curl 的老发行版）不一致。取摘要工具的写法与 `install.sh` 一致
+/// （`sha256sum` 优先、`shasum` 兜底）—— 两者都只在底线内。
+fn install_command(script_url: &str, script_sha256: &str) -> String {
     format!(
         r#"set -eu; D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT INT TERM
 curl -fsSLk "{script_url}" -o "$D/s"
-curl -fsSLk "{signature_url}" -o "$D/sig"
-echo "==> 校验安装脚本签名"
-cat >"$D/key.pem" <<'EOF'
-{public_key_pem}EOF
-openssl pkeyutl -verify -pubin -inkey "$D/key.pem" -rawin -in "$D/s" -sigfile "$D/sig" && sh "$D/s""#,
-        script_url = script_url,
-        signature_url = signature_url,
-        public_key_pem = config.install_script_signing_public_key_pem,
+echo "==> 校验安装脚本摘要"
+if command -v sha256sum >/dev/null 2>&1; then actual="$(sha256sum "$D/s" | awk '{{print $1}}')"
+elif command -v shasum >/dev/null 2>&1; then actual="$(shasum -a 256 "$D/s" | awk '{{print $1}}')"
+else echo "缺少 sha256sum / shasum：无法校验安装脚本（底线要求二者有其一），已中止" >&2; exit 1; fi
+if [ "$actual" != "{script_sha256}" ]; then echo "安装脚本摘要不匹配：已中止，未执行任何脚本" >&2; exit 1; fi
+sh "$D/s""#,
+    )
+}
+
+/// 某一 linux 平台的引导命令。
+///
+/// 摘要**必须**取自与脚本端点**同一次渲染**（同 `platform` + 同包来源）：端点下发的就是
+/// [`install_script`] 用同一个包渲染出来的字节，换一份来源摘要就对不上、校验白装。
+fn linux_install_command(
+    config: &AdminConfig,
+    packages: &[(String, AgentPackageSource)],
+    base: &str,
+    platform: &str,
+) -> String {
+    let Some(package) = package_for_platform(packages, platform) else {
+        return package_unavailable_command(platform);
+    };
+    let script = install_script(config, platform, package, base);
+    install_command(
+        &config.install_script_url_at(base, platform),
+        &bytes_sha256_hex(script.as_bytes()),
+    )
+}
+
+fn package_for_platform<'a>(
+    packages: &'a [(String, AgentPackageSource)],
+    platform: &str,
+) -> Option<&'a AgentPackageSource> {
+    packages
+        .iter()
+        .find(|(candidate, _)| candidate == platform)
+        .map(|(_, source)| source)
+}
+
+/// 该平台**没有可用安装包**时下发的命令：什么都不做，只说明去哪补包。
+///
+/// 为什么不照旧下发「一条能下载、但注定失败」的命令：摘要只能由网关**从将要下发的那份脚本**
+/// 算出来（包不在就算不出脚本），所以这种情况给不出一条**能校验**的命令；
+/// 而「跳过校验直接执行」与「跑到一半撞 503」两个都不行。
+fn package_unavailable_command(platform: &str) -> String {
+    format!(
+        r#"set -eu
+printf '%s\n' "网关当前没有 {platform} 的 agent 安装包，这条命令不会做任何改动。" >&2
+printf '%s\n' "到网关「安装包」页为该平台录入安装包，再回本页重新复制命令。" >&2
+exit 1"#
     )
 }
 
@@ -644,23 +646,6 @@ sh "$D/s""#,
         pin = pin,
         script_url = script_url,
     ))
-}
-
-fn install_script_signature_url(script_url: &str) -> String {
-    format!("{script_url}.sig")
-}
-
-pub(crate) fn install_script_signature(
-    config: &AdminConfig,
-    platform: &str,
-    package: &AgentPackageSource,
-    base: &str,
-) -> Result<Vec<u8>, String> {
-    let script = install_script(config, platform, package, base);
-    sign_install_script(
-        &config.install_script_signing_private_key_file,
-        script.as_bytes(),
-    )
 }
 
 pub fn agent_initial_config_toml(

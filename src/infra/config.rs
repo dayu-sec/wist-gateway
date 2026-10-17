@@ -9,7 +9,7 @@ use orion_sec::{SecFileFmt, load_sec_dict, load_secfile_by};
 use orion_variate::vars::{EnvChecker, EnvDict, EnvEvaluable, ValueType};
 use serde::Deserialize;
 
-use super::{IpNet, load_install_script_public_key_pem, sha256_hex};
+use super::{IpNet, sha256_hex};
 use wist_error::ConfigReason;
 
 const DEFAULT_CONFIG_PATH: &str = "wist-gateway.toml";
@@ -98,8 +98,6 @@ pub struct AdminConfig {
     pub agent_ca_key_file: Option<PathBuf>,
     /// 签发的 agent 客户端证书有效期（秒）。缺省 37 天 = 保底 30 天 + 提前 7 天续期（§4.2）。
     pub client_cert_ttl_seconds: i64,
-    pub install_script_signing_private_key_file: PathBuf,
-    pub install_script_signing_public_key_pem: String,
     pub tenant_id: String,
     pub environment_id: String,
     pub victoria_metrics_url: String,
@@ -331,9 +329,6 @@ struct RawAgentConfig {
     ca_key_file: Option<String>,
     #[serde(default = "default_client_cert_ttl_seconds")]
     client_cert_ttl_seconds: i64,
-    /// 签名**安装脚本**的私钥（Ed25519 PKCS#8）。`[agent]` 段内没有别的签名密钥，故键名不写
-    /// `script_` / `private_`。
-    signing_key_file: String,
     tenant_id: String,
     environment_id: String,
 }
@@ -385,10 +380,6 @@ impl AdminConfig {
         let tls_cert_file = expand(&env, &raw.server.tls_cert_file)?;
         let tls_key_file = expand(&env, &raw.server.tls_key_file)?;
         let admin_api_token = expand(&env, &raw.server.admin_api_token)?;
-        let install_script_signing_private_key_file = absolutize_path(
-            config_dir,
-            Path::new(&expand(&env, &raw.agent.signing_key_file)?),
-        );
         // 知识库内容包的验签公钥：只读**公钥**（私钥在发布侧，网关不持有）。
         // 格式错就地拒绝启动 —— 它是信任锚，含糊地接受比验不了更糟。
         let knowledge_signing_public_key_file = normalize_optional(
@@ -483,12 +474,6 @@ impl AdminConfig {
                 &env,
             )?,
             client_cert_ttl_seconds: raw.agent.client_cert_ttl_seconds,
-            install_script_signing_private_key_file: install_script_signing_private_key_file
-                .clone(),
-            install_script_signing_public_key_pem: load_install_script_public_key_pem(
-                &install_script_signing_private_key_file,
-            )
-            .map_err(config_validation)?,
             tenant_id: expand(&env, &raw.agent.tenant_id)?,
             environment_id: expand(&env, &raw.agent.environment_id)?,
             victoria_metrics_url: trim_trailing_slash(expand(
@@ -611,14 +596,6 @@ impl AdminConfig {
                 .map_err(config_validation)?;
         }
         require_non_empty("agent.trust_bundle", &self.trust_bundle)?;
-        require_existing_file(
-            "agent.signing_key_file",
-            &self.install_script_signing_private_key_file,
-        )?;
-        require_non_empty(
-            "agent.install_script_signing_public_key_pem",
-            &self.install_script_signing_public_key_pem,
-        )?;
         require_non_empty("agent.tenant_id", &self.tenant_id)?;
         require_non_empty("agent.environment_id", &self.environment_id)?;
         require_non_empty("server.victoria_metrics_url", &self.victoria_metrics_url)?;
@@ -1175,8 +1152,6 @@ fn require_existing_file(field: &str, path: &Path) -> Result<(), ConfigError> {
 /// 还要挂内容/规则/策略文件；这里只要一个"什么都不配"的干净配置）。
 #[cfg(test)]
 pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
-    let signing_key = root.join("install-signing-ed25519.pkcs8.pem");
-    write_test_signing_key(&signing_key);
     AdminConfig {
         listen_addr: "127.0.0.1:3000".to_string(),
         public_base_url: "https://127.0.0.1:3000".to_string(),
@@ -1193,9 +1168,6 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         agent_ca_cert_file: None,
         agent_ca_key_file: None,
         client_cert_ttl_seconds: super::agent_ca::DEFAULT_CLIENT_CERT_TTL_SECONDS,
-        install_script_signing_private_key_file: signing_key.clone(),
-        install_script_signing_public_key_pem: load_install_script_public_key_pem(&signing_key)
-            .expect("derive install signing public key"),
         tenant_id: "tenant-default".to_string(),
         environment_id: "env-default".to_string(),
         victoria_metrics_url: "http://127.0.0.1:18429".to_string(),
@@ -1213,24 +1185,6 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
         log: wist_log::LogSection::default(),
     }
-}
-
-/// 生成一把测试用的 Ed25519 签名私钥（PEM/PKCS8）。
-#[cfg(test)]
-fn write_test_signing_key(path: &Path) {
-    use base64::Engine;
-    use ring::{rand as ring_rand, signature::Ed25519KeyPair};
-
-    let rng = ring_rand::SystemRandom::new();
-    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate signing key");
-    let encoded = base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref());
-    let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
-    for chunk in encoded.as_bytes().chunks(64) {
-        pem.push_str(std::str::from_utf8(chunk).expect("base64 utf8"));
-        pem.push('\n');
-    }
-    pem.push_str("-----END PRIVATE KEY-----\n");
-    fs::write(path, pem).expect("write signing key");
 }
 
 #[cfg(test)]
@@ -1299,13 +1253,6 @@ environment_id = "env-default"
             config.agent_package_url("x86_64-unknown-linux-musl"),
             "https://127.0.0.1:3000/api/v1/agent/packages/current?platform=x86_64-unknown-linux-musl"
         );
-        assert!(config.install_script_signing_private_key_file.is_absolute());
-        assert!(
-            config
-                .install_script_signing_public_key_pem
-                .starts_with("-----BEGIN PUBLIC KEY-----\n")
-        );
-
         let _ = fs::remove_file(path);
     }
 
@@ -1384,7 +1331,6 @@ environment_id = "env-default"
     fn relative_paths_are_absolutized_against_config_dir() {
         let dir = env::temp_dir().join(format!("wist-gateway-dir-{}", unique_suffix()));
         fs::create_dir_all(&dir).expect("create dir");
-        write_install_signing_key(&dir.join("install-signing-ed25519.pkcs8.pem"));
         let config_path = dir.join("admin.toml");
         fs::write(
             &config_path,
@@ -1399,7 +1345,6 @@ admin_api_token = "test-admin-token"
 [agent]
 enrollment_token = "test-token"
 trust_bundle_file = "trust-bundle.pem"
-signing_key_file = "install-signing-ed25519.pkcs8.pem"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
@@ -1413,10 +1358,6 @@ environment_id = "env-default"
 
         assert_eq!(config.tls_cert_file, dir.join("admin-tls.crt.pem"));
         assert_eq!(config.tls_key_file, dir.join("admin-tls.key.pem"));
-        assert_eq!(
-            config.install_script_signing_private_key_file,
-            dir.join("install-signing-ed25519.pkcs8.pem")
-        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2082,7 +2023,6 @@ environment_id = "env-default"
     fn pub_sibling_overlay_is_merged_into_the_loaded_config() {
         let dir = env::temp_dir().join(format!("wist-gateway-pub-{}", unique_suffix()));
         fs::create_dir_all(&dir).expect("create dir");
-        write_install_signing_key(&dir.join("install-signing-ed25519.pkcs8.pem"));
         let config_path = dir.join("wist-gateway.toml");
         fs::write(
             &config_path,
@@ -2095,7 +2035,6 @@ admin_api_token = "test-admin-token"
 
 [agent]
 trust_bundle_file = "trust-bundle.pem"
-signing_key_file = "install-signing-ed25519.pkcs8.pem"
 environment_id = "env-default"
 "#,
         )
@@ -2173,11 +2112,9 @@ environment_id = "env-default"
 
     fn write_temp_config(content: &str) -> PathBuf {
         let path = env::temp_dir().join(format!("wist-gateway-{}.toml", unique_suffix()));
-        let key_path = path.with_extension("ed25519.pkcs8.pem");
         let tls_cert_path = path.with_extension("tls.crt.pem");
         let tls_key_path = path.with_extension("tls.key.pem");
         let bundle_path = path.with_extension("trust-bundle.pem");
-        write_install_signing_key(&key_path);
         fs::write(&tls_cert_path, "cert").expect("write TLS cert");
         fs::write(&tls_key_path, "key").expect("write TLS key");
         fs::write(
@@ -2205,11 +2142,6 @@ environment_id = "env-default"
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let content = if content.contains("signing_key_file") {
-            content
-        } else {
-            format!("{content}\nsigning_key_file = \"{}\"\n", key_path.display())
-        };
         let content = if content.contains("tls_cert_file") {
             content
         } else {
@@ -2286,25 +2218,6 @@ environment_id = "env-default"
             .expect("time")
             .as_nanos()
             + seq
-    }
-
-    fn write_install_signing_key(path: &Path) {
-        let rng = ring_rand::SystemRandom::new();
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate signing key");
-        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse signing key");
-        assert_eq!(key_pair.public_key().as_ref().len(), 32);
-        fs::write(path, private_key_pem(pkcs8.as_ref())).expect("write signing key");
-    }
-
-    fn private_key_pem(der: &[u8]) -> String {
-        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der);
-        let mut output = String::from("-----BEGIN PRIVATE KEY-----\n");
-        for chunk in encoded.as_bytes().chunks(64) {
-            output.push_str(std::str::from_utf8(chunk).expect("base64 utf8"));
-            output.push('\n');
-        }
-        output.push_str("-----END PRIVATE KEY-----\n");
-        output
     }
 
     /// 只给一半的 agent CA 是配置错误：宁可起不来，也不静默降级成「没有 mTLS」。

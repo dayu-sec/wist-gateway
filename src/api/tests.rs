@@ -9,10 +9,6 @@ use axum::{
     http::{Request, StatusCode, header},
     response::Response,
 };
-use ring::{
-    rand as ring_rand,
-    signature::{self, Ed25519KeyPair, KeyPair},
-};
 use tower::ServiceExt;
 use wist_api::enrollment::{
     AgentIdentityStatus, CredentialRenewal, CredentialRenewed, EnrollmentEnvelope,
@@ -26,7 +22,7 @@ use crate::infra::{
     KnowledgeActivation, LocalPeers, SqliteStore, Store, StoredAgentInstallPackage,
     StoredAgentInstallPackageAddress, StoredAgentRevocation, StoredAgentUplinkAddress,
     StoredCredentialStatus, StoredEnrollmentTokenStatus, StoredKnowledgePackage,
-    VerifiedAgentIdentity, bytes_sha256_hex, load_install_script_public_key_pem, sha256_hex,
+    VerifiedAgentIdentity, bytes_sha256_hex, sha256_hex,
 };
 use wist_api::action_result::{ReportActionResult, ResultAttestation};
 use wist_api::discovery_policies::{
@@ -48,7 +44,10 @@ use super::{
         agent_initial_config_toml, agent_install_code, issue_agent_install_code, token_hash,
         validate_bootstrap_token_for_config,
     },
-    install_package::{AgentPackageSource, package_id_for_sha256, read_package_identity},
+    install_package::{
+        AgentPackageSource, PLATFORM_LINUX_ARM, PLATFORM_LINUX_X86, package_id_for_sha256,
+        read_package_identity,
+    },
     overview::{
         OVERVIEW_RECENT_AGENT_LIMIT, RecentOnlineRegisteredAgentSource, agent_is_online,
         agent_overview, record_recent_online_agent,
@@ -64,10 +63,16 @@ const TEST_PLATFORM: &str = "aarch64-apple-darwin";
 
 /// 测试用的本地制品来源（直接从文件构造 `AgentPackageSource`，不经过库）。
 fn local_package(env: &TestEnv) -> AgentPackageSource {
+    local_package_for(env, TEST_PLATFORM)
+}
+
+/// 按**平台**构造本地来源：同一个制品文件即可 —— 测试只关心由平台决定的那部分
+/// （分发 URL / 摘要），不关心制品内容。
+fn local_package_for(env: &TestEnv, platform: &str) -> AgentPackageSource {
     AgentPackageSource::from_local_file(
         &env.config,
         &env.config.public_base_url,
-        TEST_PLATFORM,
+        platform,
         env.package_file.clone(),
     )
     .expect("local package source")
@@ -129,6 +134,28 @@ async fn local_package_install_code(env: &TestEnv) -> wist_control::types::Agent
     .expect("install code")
 }
 
+/// linux 两份命令要按平台算脚本摘要，因此夹具里得有对应平台的包。
+async fn linux_package_install_code(env: &TestEnv) -> wist_control::types::AgentInstallCode {
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(900);
+    agent_install_code(
+        &env.config,
+        "token-a",
+        expires_at,
+        &[
+            (
+                PLATFORM_LINUX_X86.to_string(),
+                local_package_for(env, PLATFORM_LINUX_X86),
+            ),
+            (
+                PLATFORM_LINUX_ARM.to_string(),
+                local_package_for(env, PLATFORM_LINUX_ARM),
+            ),
+        ],
+        &env.config.public_base_url,
+    )
+    .expect("install code")
+}
+
 #[tokio::test]
 async fn install_code_bundle_targets_gateway_package() {
     let env = TestEnv::new().await;
@@ -145,9 +172,9 @@ async fn install_code_bundle_targets_gateway_package() {
 }
 
 #[tokio::test]
-async fn linux_install_code_verifies_signed_script() {
+async fn linux_install_code_checks_script_digest() {
     let env = TestEnv::new().await;
-    let install_code = local_package_install_code(&env).await;
+    let install_code = linux_package_install_code(&env).await;
     let command = &install_code.x86_linux_install_code;
 
     assert!(install_code.arm_linux_install_code.contains(
@@ -159,18 +186,402 @@ async fn linux_install_code_verifies_signed_script() {
     assert!(command.contains("mktemp -d"));
     // 引导命令只报「在做什么」，不把临时工作目录这种实现细节吐给运维（安装脚本自己有进度输出）。
     assert!(!command.contains("working dir"));
-    assert!(command.contains("echo \"==> 校验安装脚本签名\""));
-    assert!(command.contains(
-        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/x86_64-unknown-linux-musl/install.sh.sig\" -o \"$D/sig\""
-    ));
-    assert!(command.contains("-----BEGIN PUBLIC KEY-----"));
-    assert!(command.contains(&env.config.install_script_signing_public_key_pem));
-    assert!(command.contains(
-        "openssl pkeyutl -verify -pubin -inkey \"$D/key.pem\" -rawin -in \"$D/s\" -sigfile \"$D/sig\""
-    ));
+    assert!(command.contains("echo \"==> 校验安装脚本摘要\""));
+    // 摘要必须等于**同一平台、同一份包来源**渲染出的那份脚本的 sha256。
+    let expected = bytes_sha256_hex(
+        super::install::install_script(
+            &env.config,
+            PLATFORM_LINUX_X86,
+            &local_package_for(&env, PLATFORM_LINUX_X86),
+            &env.config.public_base_url,
+        )
+        .as_bytes(),
+    );
+    assert_eq!(expected.len(), 64);
+    assert!(command.contains(&expected));
+    // 摘要工具的取法与 install.sh 同口径：sha256sum 优先、shasum 兜底。
+    assert!(command.contains("command -v sha256sum"));
+    assert!(command.contains("command -v shasum"));
+    // 不匹配就不执行（fail-closed），并且要给出可读报错。
+    assert!(command.contains("摘要不匹配"));
     assert!(command.contains("sh \"$D/s\""));
-    // 不把脚本管进 shell：必须先验签，验过才执行。
+    // 不再依赖 openssl（底线兼容），也不再下载 .sig。
+    assert!(!command.contains("openssl"));
+    assert!(!command.contains(".sig"));
+    // 公钥不再被塞进命令（摘要取代了它）：底部机不需要任何 PEM / 密钥材料。
+    assert!(!command.contains("BEGIN PUBLIC KEY"));
+    assert!(!command.contains("key.pem"));
+    // 不把脚本管进 shell：必须先校验，校验过了才执行。
     assert!(!command.contains("| sh"));
+}
+
+#[tokio::test]
+async fn linux_install_codes_carry_per_platform_digests() {
+    let env = TestEnv::new().await;
+    let code = linux_package_install_code(&env).await;
+    let digest_for = |platform: &str| {
+        bytes_sha256_hex(
+            super::install::install_script(
+                &env.config,
+                platform,
+                &local_package_for(&env, platform),
+                &env.config.public_base_url,
+            )
+            .as_bytes(),
+        )
+    };
+    let x86 = digest_for(PLATFORM_LINUX_X86);
+    let arm = digest_for(PLATFORM_LINUX_ARM);
+
+    // 同一份制品、不同平台：脚本本身不同（ARCH / 分发地址），摘要必须各自独立。
+    assert_ne!(x86, arm);
+    assert!(code.x86_linux_install_code.contains(&x86));
+    assert!(code.arm_linux_install_code.contains(&arm));
+    // 一份命令里不能挟带另一平台的摘要（那意味着取错了脚本）。
+    assert!(!code.x86_linux_install_code.contains(&arm));
+    assert!(!code.arm_linux_install_code.contains(&x86));
+    // 口径：小写裸 hex（与 sha256sum 输出可直接比对）。
+    assert!(
+        x86.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    );
+}
+
+#[tokio::test]
+async fn linux_install_code_digest_follows_the_advertise_base() {
+    // 脚本里含分发地址与 initial-config 地址，二者都由**生效基址**派生 → 换基址摘要必须跟着变，
+    // 且等于新基址下那份脚本的 sha256（防住「复用/缓存了旧摘要」这类错）。
+    let env = TestEnv::new().await;
+    let package = local_package_for(&env, PLATFORM_LINUX_X86);
+    let render = |base: &str| {
+        let code = agent_install_code(
+            &env.config,
+            "token-a",
+            chrono::Utc::now() + chrono::Duration::seconds(900),
+            &[(PLATFORM_LINUX_X86.to_string(), package.clone())],
+            base,
+        )
+        .expect("install code");
+        let digest = bytes_sha256_hex(
+            super::install::install_script(&env.config, PLATFORM_LINUX_X86, &package, base)
+                .as_bytes(),
+        );
+        (code.x86_linux_install_code, digest)
+    };
+
+    let (command_a, digest_a) = render("https://a.example.com");
+    let (command_b, digest_b) = render("https://b.example.com");
+    assert_ne!(digest_a, digest_b);
+    assert!(command_a.contains(&digest_a));
+    assert!(command_b.contains(&digest_b));
+    assert!(!command_a.contains(&digest_b));
+}
+
+#[tokio::test]
+async fn linux_install_code_is_bound_to_the_package_at_issue_time() {
+    // B 方案与签名方案的一个**真实差异**：摘要在**签发时刻**算好并写进命令，而签名是在
+    // **取用时刻**由端点现场生成的。后果：签发后换了包（脚本内容随之变化），旧命令会因摘要
+    // 不匹配而拒跑。这是有意的：宁可拒跑，也不执行一份没校验过的脚本（fail-closed）；
+    // 换包后重新复制一次命令即可（安装代码本来就是短时效的）。
+    let env = TestEnv::new().await;
+    let issued = linux_package_install_code(&env).await;
+
+    let other_path = env._root.join("package-v2.tar.gz");
+    std::fs::write(&other_path, b"another build").expect("write package v2");
+    let other = AgentPackageSource::from_local_file(
+        &env.config,
+        &env.config.public_base_url,
+        PLATFORM_LINUX_X86,
+        other_path,
+    )
+    .expect("package source");
+    let digest_after_reupload = bytes_sha256_hex(
+        super::install::install_script(
+            &env.config,
+            PLATFORM_LINUX_X86,
+            &other,
+            &env.config.public_base_url,
+        )
+        .as_bytes(),
+    );
+
+    // 旧命令押的是旧包那份脚本的摘要 → 对不上新脚本（在目标机上就是「摘要不匹配」而中止）。
+    assert!(
+        !issued
+            .x86_linux_install_code
+            .contains(&digest_after_reupload)
+    );
+    // 而旧命令的摘要本身仍是有效的（只要包没换）：它等于签发时那份脚本的 sha256。
+    let digest_at_issue = bytes_sha256_hex(
+        super::install::install_script(
+            &env.config,
+            PLATFORM_LINUX_X86,
+            &local_package_for(&env, PLATFORM_LINUX_X86),
+            &env.config.public_base_url,
+        )
+        .as_bytes(),
+    );
+    assert!(issued.x86_linux_install_code.contains(&digest_at_issue));
+}
+
+#[tokio::test]
+async fn linux_install_codes_handle_a_partly_recorded_platform_set() {
+    // 真实常见的中间态：只录了 x86 的包。此时 x86 必须是完整命令，arm 必须只是说明 ——
+    // 两个平台互不影响。
+    let env = TestEnv::new().await;
+    let code = agent_install_code(
+        &env.config,
+        "token-a",
+        chrono::Utc::now() + chrono::Duration::seconds(900),
+        &[(
+            PLATFORM_LINUX_X86.to_string(),
+            local_package_for(&env, PLATFORM_LINUX_X86),
+        )],
+        &env.config.public_base_url,
+    )
+    .expect("install code");
+
+    assert!(
+        code.x86_linux_install_code.contains("install.sh")
+            && code.x86_linux_install_code.contains("sha256sum")
+    );
+    assert!(code.arm_linux_install_code.contains(PLATFORM_LINUX_ARM));
+    assert!(code.arm_linux_install_code.contains("安装包"));
+    assert!(!code.arm_linux_install_code.contains("sha256sum"));
+}
+
+#[tokio::test]
+async fn linux_install_code_without_package_explains_instead_of_running() {
+    // 夹具只录了 macOS 包 → 两份 linux 命令都算不出脚本摘要（摘要只能从**将要下发的那份脚本**算）。
+    let env = TestEnv::new().await;
+    let install_code = local_package_install_code(&env).await;
+
+    for (platform, command) in [
+        (PLATFORM_LINUX_X86, &install_code.x86_linux_install_code),
+        (PLATFORM_LINUX_ARM, &install_code.arm_linux_install_code),
+    ] {
+        assert!(command.contains(platform), "{command}");
+        assert!(command.contains("安装包"), "{command}");
+        assert!(command.contains("exit 1"), "{command}");
+        // 什么都不做：不下载、不校验、不执行。
+        assert!(!command.contains("curl"), "{command}");
+        assert!(!command.contains("sh \"$D/s\""), "{command}");
+    }
+}
+
+/// e2e 用的假 `curl`：按 URL 把本地预置文件搬到 `-o` 指定的位置。
+/// 只实现本测试用到的那几个 flag（`-fsSLk` / `--cacert` / `-H` / `-o`）。
+const E2E_FAKE_CURL: &str = r#"#!/bin/sh
+url=""; out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift; out="$1" ;;
+    http*) url="$1" ;;
+  esac
+  shift
+done
+[ -n "$out" ] || { echo "fake curl: missing -o" >&2; exit 2; }
+case "$url" in
+  *install.sh) cp "$FAKE_SCRIPT" "$out" ;;
+  */agent/packages/current*) cp "$FAKE_PACKAGE" "$out" ;;
+  *initial-config*) cp "$FAKE_CONFIG" "$out" ;;
+  *) echo "fake curl: unexpected url: $url" >&2; exit 22 ;;
+esac
+"#;
+
+fn e2e_run_ok(program: &str, args: &[&str]) -> String {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("跑不起 {program}：{err}"));
+    assert!(
+        out.status.success(),
+        "{program} {args:?} 失败：\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// 底线机 e2e：在 `ubuntu:20.04` 里跑**真正渲染出来的** linux 引导命令。
+///
+/// 单测只能断言命令的「形状」；这条要证明它**在那台机器上真能跑**（`sh` 是 dash、coreutils
+/// 是老版本），且覆盖到 `install.sh` 的 下载 → 校验 → 落盘 → 自检 整条路径。
+///
+/// 有意画出的边界：
+///  - HTTP 换成假 `curl`（按 URL 分发本地预置文件）：钉的是「底线机的 shell + 工具链 + 命令/脚本
+///    逻辑」，不是 curl 本身；真网络 / TLS 不在这里。
+///  - `WIST_AGENTD_SERVICE=0`：容器里没有 systemd（PID 1），服务托管另行在 systemd 环境里验。
+///  - token 不进命令（`install_code_leaks_no_enrollment_token` 钉住了），安装页在命令外层注入；
+///    这里等价地用容器环境变量给。
+///
+/// 默认跳过：常规 `cargo test` 不该依赖 docker 与镜像拉取。设 `WIST_GATEWAY_DOCKER_E2E=1` 开启。
+#[tokio::test]
+async fn linux_install_command_runs_on_ubuntu_2004() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::env::var_os("WIST_GATEWAY_DOCKER_E2E").is_none() {
+        eprintln!("跳过：设 WIST_GATEWAY_DOCKER_E2E=1 才跑（需要 docker 与 ubuntu:20.04）");
+        return;
+    }
+
+    let env = TestEnv::new().await;
+    let dir = env._root.join("e2e");
+    std::fs::create_dir_all(dir.join("bin")).expect("e2e dir");
+
+    // 命令必须按**底线机的架构**选，否则 install.sh 的平台检查会先把它拒掉。
+    let arch = e2e_run_ok("docker", &["run", "--rm", "ubuntu:20.04", "uname", "-m"]);
+    let platform = match arch.trim() {
+        "x86_64" => PLATFORM_LINUX_X86,
+        "aarch64" => PLATFORM_LINUX_ARM,
+        other => panic!("底线机架构异常：{other}"),
+    };
+
+    // 一个「装上去真能跑」的包：tarball 形态要求三件齐全，各自打印版本即可（自检只跑 `version`）。
+    let pkg_root = dir.join("pkg");
+    let pkg_dir = pkg_root.join("wist-agentd-0.0.0-test");
+    std::fs::create_dir_all(&pkg_dir).expect("pkg dir");
+    for name in ["wist-agentd", "wist-exec", "wist-upgrader"] {
+        let path = pkg_dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\necho 0.0.0-test\n").expect("stub binary");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    e2e_run_ok(
+        "tar",
+        &[
+            "-czf",
+            dir.join("package.tar.gz").to_str().expect("path"),
+            "-C",
+            pkg_root.to_str().expect("path"),
+            "wist-agentd-0.0.0-test",
+        ],
+    );
+
+    let source = AgentPackageSource::from_local_file(
+        &env.config,
+        &env.config.public_base_url,
+        platform,
+        dir.join("package.tar.gz"),
+    )
+    .expect("package source");
+    let install_code = agent_install_code(
+        &env.config,
+        "token-a",
+        chrono::Utc::now() + chrono::Duration::seconds(900),
+        &[(platform.to_string(), source.clone())],
+        &env.config.public_base_url,
+    )
+    .expect("install code");
+    let command = if platform == PLATFORM_LINUX_X86 {
+        &install_code.x86_linux_install_code
+    } else {
+        &install_code.arm_linux_install_code
+    };
+
+    // 预置件：真脚本（与命令内嵌的摘要同源 —— 就取同一次渲染的输出）、被篡改的脚本、
+    // 初始配置、假 curl。
+    let script =
+        super::install::install_script(&env.config, platform, &source, &env.config.public_base_url);
+    std::fs::write(dir.join("script.sh"), &script).expect("script");
+    std::fs::write(
+        dir.join("tampered.sh"),
+        "#!/bin/sh\necho TAMPERED_SCRIPT_RAN\n",
+    )
+    .expect("tampered script");
+    std::fs::write(dir.join("config.toml"), "").expect("initial config");
+    // 一份“跟脚本里记录的摘要不一致”的包：给内层（install.sh）的包校验用。
+    std::fs::write(
+        dir.join("bad-package.tar.gz"),
+        b"not the package the script expects\n",
+    )
+    .expect("bad package");
+    let shim = dir.join("bin/curl");
+    std::fs::write(&shim, E2E_FAKE_CURL).expect("fake curl");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let run = |cmd: &str, fake_script: &str, fake_package: &str| -> (bool, String) {
+        let mount = format!("{}:/t:ro", dir.display());
+        let fake_script_env = format!("FAKE_SCRIPT={fake_script}");
+        let fake_package_env = format!("FAKE_PACKAGE={fake_package}");
+        let out = std::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "-v",
+                mount.as_str(),
+                "-e",
+                "PATH=/t/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "-e",
+                "WIST_ENROLLMENT_TOKEN=token-a",
+                "-e",
+                "WIST_AGENTD_SERVICE=0",
+                "-e",
+                fake_script_env.as_str(),
+                "-e",
+                fake_package_env.as_str(),
+                "-e",
+                "FAKE_CONFIG=/t/config.toml",
+                "ubuntu:20.04",
+                "sh",
+                "-c",
+                cmd,
+            ])
+            .output()
+            .expect("docker run");
+        (
+            out.status.success(),
+            format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+
+    // ① 摘要正确：命令放行 → install.sh 下载/校验/落盘/自检 → 跳过注册（容器里没有 systemd）。
+    let (ok, log) = run(command, "/t/script.sh", "/t/package.tar.gz");
+    assert!(ok, "底线机上应当装完（WIST_AGENTD_SERVICE=0）：\n{log}");
+    // 这几行只会在 install.sh 真的在底线机上执行时出现（不是命令自己的输出）。
+    assert!(log.contains("wist-agentd 安装程序"), "{log}");
+    assert!(log.contains("[1/4] 下载安装包并校验摘要"), "{log}");
+    assert!(log.contains("形态 tarball"), "{log}");
+    assert!(log.contains("自检通过"), "{log}");
+    assert!(log.contains("已跳过注册"), "{log}");
+    assert!(!log.contains("摘要不匹配"), "{log}");
+
+    // ② 摘要不匹配：不执行脚本（fail-closed），并给出可读报错。
+    let (ok, log) = run(command, "/t/tampered.sh", "/t/package.tar.gz");
+    assert!(!ok, "摘要不匹配时必须失败：\n{log}");
+    assert!(log.contains("安装脚本摘要不匹配"), "{log}");
+    assert!(!log.contains("TAMPERED_SCRIPT_RAN"), "{log}");
+    assert!(!log.contains("wist-agentd 安装程序"), "{log}");
+
+    // ③ 包被换掉（脚本自身记录的是另一个 sha256）：命令放行，但 install.sh 的包校验必须拦下。
+    //    外层（命令对脚本）与内层（脚本对制品）各一道闸，这里钉住内层。
+    let (ok, log) = run(command, "/t/script.sh", "/t/bad-package.tar.gz");
+    assert!(!ok, "包摘要不符时必须失败：\n{log}");
+    assert!(log.contains("agent package sha256 mismatch"), "{log}");
+    assert!(!log.contains("已跳过注册"), "{log}");
+
+    // ④ 连 sha256sum / shasum 都没有：命令必须明确拒绝（底线要求二者有其一），且不执行脚本。
+    //    20.04 自带 sha256sum 而没有 shasum，删掉前者就落到 else 分支。
+    let stripped = format!("rm -f /usr/bin/sha256sum; {command}");
+    let (ok, log) = run(&stripped, "/t/script.sh", "/t/package.tar.gz");
+    assert!(!ok, "缺校验工具时必须失败：\n{log}");
+    assert!(log.contains("缺少 sha256sum / shasum"), "{log}");
+    assert!(!log.contains("wist-agentd 安装程序"), "{log}");
+
+    // ⑤ 「该平台没录包」的那条说明命令也要能真跑（页面对三份命令都会渲染）：
+    //    必须明确失败、且什么都不做（不下载、不执行）。
+    let stub = if platform == PLATFORM_LINUX_X86 {
+        &install_code.arm_linux_install_code
+    } else {
+        &install_code.x86_linux_install_code
+    };
+    let (ok, log) = run(stub, "/t/script.sh", "/t/package.tar.gz");
+    assert!(!ok, "无包说明命令必须以非 0 退出：\n{log}");
+    assert!(log.contains("这条命令不会做任何改动"), "{log}");
+    assert!(!log.contains("wist-agentd 安装程序"), "{log}");
 }
 
 #[tokio::test]
@@ -187,7 +598,6 @@ async fn macos_install_code_pins_gateway_certificate() {
     assert!(!macos.contains("working dir"));
     // macOS 靠 curl 的证书锁定认证，不靠 Ed25519 脚本签名（系统自带的 LibreSSL 验不了）。
     assert!(!macos.contains("openssl pkeyutl"));
-    assert!(!macos.contains("install.sh.sig"));
 }
 
 #[tokio::test]
@@ -786,46 +1196,6 @@ async fn local_package_requires_readable_file() {
     .expect_err("unreadable package");
 
     assert!(!err.is_empty());
-}
-
-#[tokio::test]
-async fn install_script_signature_matches_script_body() {
-    let env = TestEnv::new().await;
-    let script = super::install::install_script(
-        &env.config,
-        "x86",
-        &local_package(&env),
-        &env.config.public_base_url,
-    );
-    let signature = super::install::install_script_signature(
-        &env.config,
-        "x86",
-        &local_package(&env),
-        &env.config.public_base_url,
-    )
-    .expect("sign script");
-
-    signature::UnparsedPublicKey::new(&signature::ED25519, &env.install_public_key_bytes)
-        .verify(script.as_bytes(), &signature)
-        .expect("signature verifies");
-}
-
-#[tokio::test]
-async fn install_script_signature_rejects_modified_body() {
-    let env = TestEnv::new().await;
-    let signature = super::install::install_script_signature(
-        &env.config,
-        "x86",
-        &local_package(&env),
-        &env.config.public_base_url,
-    )
-    .expect("sign script");
-
-    let err = signature::UnparsedPublicKey::new(&signature::ED25519, &env.install_public_key_bytes)
-        .verify(b"tampered install script", &signature)
-        .expect_err("tampered script rejected");
-
-    assert_eq!(format!("{err:?}"), "Unspecified");
 }
 
 #[tokio::test]
@@ -4149,43 +4519,6 @@ async fn install_code_route_requires_admin_bearer_token() {
 }
 
 #[tokio::test]
-async fn install_script_signature_route_matches_script() {
-    let env = TestEnv::new().await;
-    let script_response = get_to_router(
-        &env.config,
-        &env.store_handle,
-        &format!("/api/v1/agent/install/{TEST_PLATFORM}/install.sh"),
-        None,
-    )
-    .await;
-    assert_eq!(script_response.status(), StatusCode::OK);
-    assert_no_store(&script_response);
-    let script = body_bytes(script_response).await;
-
-    let signature_response = get_to_router(
-        &env.config,
-        &env.store_handle,
-        &format!("/api/v1/agent/install/{TEST_PLATFORM}/install.sh.sig"),
-        None,
-    )
-    .await;
-    assert_eq!(signature_response.status(), StatusCode::OK);
-    assert_no_store(&signature_response);
-    assert_eq!(
-        signature_response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("application/octet-stream")
-    );
-    let signature = body_bytes(signature_response).await;
-
-    signature::UnparsedPublicKey::new(&signature::ED25519, &env.install_public_key_bytes)
-        .verify(&script, &signature)
-        .expect("route signature verifies script body");
-}
-
-#[tokio::test]
 async fn install_script_route_rejects_bad_arch() {
     let env = TestEnv::new().await;
     let unknown = get_to_router(
@@ -4207,16 +4540,6 @@ async fn install_script_route_rejects_bad_arch() {
     .await;
     assert_eq!(injected_script.status(), StatusCode::NOT_FOUND);
     assert_no_store(&injected_script);
-
-    let injected_signature = get_to_router(
-        &env.config,
-        &env.store_handle,
-        "/api/v1/agent/install/x86%22%0Aecho%20pwned%0A%23/install.sh.sig",
-        None,
-    )
-    .await;
-    assert_eq!(injected_signature.status(), StatusCode::NOT_FOUND);
-    assert_no_store(&injected_signature);
 }
 
 #[tokio::test]
@@ -5687,18 +6010,19 @@ async fn advertise_url_drives_install_code_and_initial_config() {
                 "https://gw.example.com/api/v1/agent/packages/current?platform=aarch64-apple-darwin"
             ))
     );
-    assert!(after.x86_linux_install_code.contains(
-        "https://gw.example.com/api/v1/agent/install/x86_64-unknown-linux-musl/install.sh"
-    ));
     assert!(
         after
             .macos_install_code
             .contains("https://gw.example.com/api/v1/agent/install/")
     );
+    // 夹具里只录了 macOS 包：x86 侧没有包 → 算不出可校验的摘要，命令就不该再指向任何地址，
+    // 而是直接说明去哪补包。顺手钉住「旧基址不会残留在这条命令里」。
+    assert!(after.x86_linux_install_code.contains("安装包"));
+    assert!(!after.x86_linux_install_code.contains("https://"));
     assert!(
         !after
             .x86_linux_install_code
-            .contains(&env.config.public_base_url)
+            .contains(env.config.public_base_url.as_str())
     );
 
     // 初始配置里的控制面 endpoint 与 tls_mode 同源派生自它。
@@ -7891,7 +8215,6 @@ struct TestEnv {
     config: AdminConfig,
     store: SqliteStore,
     store_handle: Arc<dyn Store>,
-    install_public_key_bytes: Vec<u8>,
     /// 就绪的本地安装包**制品**（测试夹具）。它不再是配置项 —— 运行时网关只认
     /// 管理面录入的那份；这里只给「从本地文件构造来源」这类单测提供一个可读文件。
     package_file: std::path::PathBuf,
@@ -7954,11 +8277,6 @@ impl TestEnv {
         std::fs::write(&tls_cert_file, TEST_TLS_CERT_PEM).expect("write tls cert");
         let store_file = root.join("state").join("admin-store.json");
         let db_path = root.join("state").join("wist-gateway.db");
-        let (install_signing_private_key_file, install_public_key_bytes) =
-            write_install_signing_key(&root);
-        let install_script_signing_public_key_pem =
-            load_install_script_public_key_pem(&install_signing_private_key_file)
-                .expect("derive install signing public key");
         let (content_catalog_file, content_packs_file, content_templates_file) = if content {
             let content_dir = root.join("content");
             std::fs::create_dir_all(&content_dir).expect("create content dir");
@@ -7988,8 +8306,6 @@ impl TestEnv {
             agent_ca_cert_file: Some(shared_test_agent_ca_paths().0),
             agent_ca_key_file: Some(shared_test_agent_ca_paths().1),
             client_cert_ttl_seconds: crate::infra::agent_ca::DEFAULT_CLIENT_CERT_TTL_SECONDS,
-            install_script_signing_private_key_file: install_signing_private_key_file,
-            install_script_signing_public_key_pem,
             tenant_id: "tenant-default".to_string(),
             environment_id: "env-default".to_string(),
             victoria_metrics_url: "http://127.0.0.1:18429".to_string(),
@@ -8044,7 +8360,6 @@ impl TestEnv {
             config,
             store,
             store_handle,
-            install_public_key_bytes,
             package_file,
             _root: root,
         }
@@ -8500,26 +8815,6 @@ async fn body_bytes(response: axum::response::Response) -> axum::body::Bytes {
     to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body bytes")
-}
-
-fn write_install_signing_key(root: &std::path::Path) -> (std::path::PathBuf, Vec<u8>) {
-    let rng = ring_rand::SystemRandom::new();
-    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate install signing key");
-    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse signing key");
-    let path = root.join("install-signing-ed25519.pkcs8.pem");
-    std::fs::write(&path, private_key_pem(pkcs8.as_ref())).expect("write signing key");
-    (path, key_pair.public_key().as_ref().to_vec())
-}
-
-fn private_key_pem(der: &[u8]) -> String {
-    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der);
-    let mut output = String::from("-----BEGIN PRIVATE KEY-----\n");
-    for chunk in encoded.as_bytes().chunks(64) {
-        output.push_str(std::str::from_utf8(chunk).expect("base64 utf8"));
-        output.push('\n');
-    }
-    output.push_str("-----END PRIVATE KEY-----\n");
-    output
 }
 
 fn unique_suffix() -> u128 {

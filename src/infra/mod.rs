@@ -9,8 +9,8 @@ pub mod config;
 pub use config::*;
 pub mod github;
 pub use github::*;
-pub mod install_signing;
-pub use install_signing::*;
+pub mod ed25519;
+pub use ed25519::*;
 // NOTE(hand-added): 环回面「本机对端」判据（容器里「宿主」= 网络网关）。见本模块文件头注释。
 pub mod local_peer;
 pub use local_peer::*;

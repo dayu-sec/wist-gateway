@@ -14,7 +14,6 @@ bootstrap_ttl_seconds = 900
 credential_ttl_seconds = 2592000
 store_file = "state/wist-gateway-store.json"
 trust_bundle_file = "state/admin-tls.crt.pem"
-signing_key_file = "state/install-script-signing-ed25519.pkcs8.pem"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 
@@ -63,6 +62,6 @@ listen_addr = "127.0.0.1:3001"
 # knowledge-content-management.md）。上面那三个 `*_file` 是过渡期路子，管理面入口落地后退役。
 #
 # 验签是**可选**的：不给公钥 = 只记 sha256；给了就**必须**验过签名才允许录入（一把钥匙，
-# 与 agent.install_script_signing_* 方向相反、密钥不复用）。
+# 私钥在发布 CI、公钥在网关配置里）。
 # [knowledge]
 # signing_public_key_file = "state/knowledge-signing.pub.pem"

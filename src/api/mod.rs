@@ -98,7 +98,7 @@ use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
 use ingest::{MAX_INGEST_BODY_BYTES, ingest_agent_facts};
 use install::{
     download_agent_package, download_agent_package_by_id, get_agent_initial_config_with_token,
-    get_agent_install_code, get_agent_install_script, get_agent_install_script_signature,
+    get_agent_install_code, get_agent_install_script,
 };
 use knowledge_ops::{
     activate_knowledge_package, list_knowledge_packages, record_knowledge_package, view_knowledge,
@@ -318,10 +318,6 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/agent/install/{platform}/install.sh",
             get(get_agent_install_script),
-        )
-        .route(
-            "/api/v1/agent/install/{platform}/install.sh.sig",
-            get(get_agent_install_script_signature),
         )
         .route(
             "/api/v1/agent/initial-config",

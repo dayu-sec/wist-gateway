@@ -83,7 +83,6 @@ codes! {
     INSTALL_PACKAGE_PLATFORM_REQUIRED => "install_package_platform_required",
     INSTALL_PACKAGE_SOURCE_UNAVAILABLE => "install_package_source_unavailable",
     INSTALL_PACKAGE_UNAVAILABLE => "install_package_unavailable",
-    INSTALL_SCRIPT_SIGN_FAILED => "install_script_sign_failed",
     INVALID_ADMIN_BEARER_TOKEN => "invalid_admin_bearer_token",
     INVALID_AGENT_CREDENTIAL => "invalid_agent_credential",
     INVALID_CERTIFICATE_SIGNING_REQUEST => "invalid_certificate_signing_request",

@@ -35,6 +35,13 @@ cargo build --release
 
 This produces the `wist-gateway` binary in `target/release/`.
 
+The floor-machine compatibility e2e (`linux_install_command_runs_on_ubuntu_2004`) needs docker and
+is skipped by default; enable it with:
+
+```bash
+WIST_GATEWAY_DOCKER_E2E=1 cargo test --lib linux_install_command_runs_on_ubuntu_2004
+```
+
 ## Quick start
 
 Generate a default config (with a freshly random admin token and install-script signing key),
@@ -101,6 +108,36 @@ keep the address they were generated with. Both are admin-bearer authenticated a
 > WAL mode allows concurrent readers but only a single writer, and the database is not shared
 > across hosts. Run a single `wist-gateway` replica; a shared database (Postgres) would be needed
 > to scale out behind a load balancer.
+
+## Supported target hosts (agent install)
+
+The Linux install command the gateway hands out downloads `install.sh`, checks it against the
+sha256 **embedded in the command itself**, and only then runs it. It needs **no OpenSSL**: the
+previous `openssl pkeyutl -verify -rawin` path required OpenSSL ≥ 3.0, which was stricter than
+every other link in the install chain (the script and agentd only ever needed systemd + curl).
+
+Baseline a target host must provide:
+
+- a POSIX `sh` (dash/ash are fine), `curl`, `tar` with gzip, `awk`, and `sha256sum`
+  (`shasum` is accepted as a fallback — same order as `install.sh`);
+- root — the script re-executes itself under `sudo` when not already root;
+- Linux: **systemd as PID 1** (the only Linux service backend `wist-agentd` implements);
+  macOS: launchd.
+
+Equivalent distributions: Ubuntu 20.04+, Debian 11+, RHEL/CentOS 8+, macOS 11+ (ARM).
+Out of scope: systems without systemd (EL6, Ubuntu 14.04 and older), and trimmed images that ship
+neither `curl` nor `awk` — install those first, the floor does not assume them.
+
+`WIST_AGENTD_SERVICE=0` runs the agent in the foreground and drops the systemd requirement, at the
+cost of no supervised restart — for containers and other self-managed setups.
+
+macOS keeps its own command: `curl --pinnedpubkey` authenticates the TLS channel by pinning the
+gateway's serving certificate, because macOS ships LibreSSL (no Ed25519 raw verification either).
+
+The digest is fixed **when the install code is issued** (the rendered script embeds the package
+address and the package digest). Re-uploading a package or changing the advertise URL afterwards
+makes an already issued command fail closed with a digest mismatch — re-copy the command instead
+of reusing the old one.
 
 ## Repository layout
 
