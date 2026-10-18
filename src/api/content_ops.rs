@@ -56,9 +56,24 @@ struct ReadinessView {
 }
 
 #[derive(Debug, Serialize)]
+struct FamilyView {
+    /// 协议值（大小写敏感，不翻译）。
+    id: String,
+    /// 允许出现的平台；空 = 全平台。
+    platforms: Vec<String>,
+    semantics_version: i64,
+    name_zh: String,
+    name_en: String,
+    summary_zh: String,
+    summary_en: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ContentView {
     catalog_version: i64,
     superseded_by: Option<i64>,
+    /// 面词表：ID、平台归属与展示文案（**值来自知识库**，不是前端硬编码）。
+    families: Vec<FamilyView>,
     templates: Vec<TemplateView>,
     readiness: Vec<ReadinessView>,
 }
@@ -115,9 +130,23 @@ pub async fn view_content(
         })
         .collect();
 
+    let families = content
+        .families()
+        .map(|meta| FamilyView {
+            id: meta.id.clone(),
+            platforms: meta.platforms.clone(),
+            semantics_version: meta.semantics_version,
+            name_zh: meta.name_zh.clone(),
+            name_en: meta.name_en.clone(),
+            summary_zh: meta.summary_zh.clone(),
+            summary_en: meta.summary_en.clone(),
+        })
+        .collect();
+
     Json(ContentView {
         catalog_version: content.catalog_version,
         superseded_by: content.superseded_by,
+        families,
         templates,
         readiness,
     })

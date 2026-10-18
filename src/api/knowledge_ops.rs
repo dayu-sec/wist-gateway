@@ -457,6 +457,25 @@ pub async fn activate_knowledge_package(
         Ok(loaded) => loaded,
         Err(err) => return record_error_response(err),
     };
+    // 词表只增：除「回滚」外的激活，不得删掉当前生效词表里的面。
+    // 回滚是 operator 明确要把旧版落回来，允许它越过这条（否则永远回不去）。
+    if reason != "rollback" {
+        let current = state.knowledge();
+        if let Some(new_content) = loaded.content.as_deref()
+            && let Some(old_content) = current.content.as_deref()
+            && let Err(removed) =
+                crate::app::content::check_vocabulary_append_only(old_content, new_content)
+        {
+            return knowledge_error(
+                StatusCode::CONFLICT,
+                codes::VOCABULARY_NOT_APPEND_ONLY,
+                format!(
+                    "新包删掉了已生效的采集面 {removed:?}：面 ID 只增不改名\
+                     （要改语义请新建面并保留旧面）"
+                ),
+            );
+        }
+    }
     if let Err(response) = activate_loaded(&state, loaded, &reason, &actor).await {
         return response;
     }

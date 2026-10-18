@@ -171,6 +171,7 @@ codes! {
     UNKNOWN_PLATFORM => "unknown_platform",
     UNKNOWN_WORK_KIND => "unknown_work_kind",
     UNSUPPORTED_CREDENTIAL_REQUEST => "unsupported_credential_request",
+    VOCABULARY_NOT_APPEND_ONLY => "vocabulary_not_append_only",
     WORK_ACK_STORE_FAILED => "work_ack_store_failed",
     WORK_ACK_UNAVAILABLE => "work_ack_unavailable",
     WORK_ACTION_REQUIRED => "work_action_required",

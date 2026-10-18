@@ -11,7 +11,7 @@
 //!   * 一次性工作只有「可中断 + 正在跑」才允许暂停 —— 不可中断的**拒绝**，
 //!     而不是「尽力暂停」（挂起半个升级进程比不暂停更危险）。
 
-use crate::app::content::{ContentSet, FAMILIES, family_applies_to};
+use crate::app::content::ContentSet;
 use crate::infra::{StoredAgentFactSummary, StoredOneShotWork};
 use wist_contracts::work::{OneShotWork, WorkSpec, WorkSpecSource, WorkSpecUnit};
 
@@ -36,9 +36,12 @@ impl WorkRejection {
     }
 }
 
-/// `family` 是否是采集面闭集里的名字（笔误要响，不能当自由字符串收下）。
-pub fn check_family(family: &str) -> Result<(), WorkRejection> {
-    if FAMILIES.contains(&family) {
+/// `family` 是否是采集面词表里的名字（笔误要响，不能当自由字符串收下）。
+///
+/// 词表来自已装载的知识库（`catalog.toml` 的 `[[families]]`），不是代码里的常量 ——
+/// 加面只改数据，网关不发版。
+pub fn check_family(content: &ContentSet, family: &str) -> Result<(), WorkRejection> {
+    if content.has_family(family) {
         return Ok(());
     }
     Err(WorkRejection::BadRequest(format!(
@@ -57,8 +60,8 @@ pub fn check_family_grantable(
     family: &str,
     platform: &str,
 ) -> Result<(), WorkRejection> {
-    check_family(family)?;
-    if !family_applies_to(family, platform) {
+    check_family(content, family)?;
+    if !content.family_applies_to(family, platform) {
         return Err(WorkRejection::BadRequest(format!(
             "collection family {family} does not apply to platform {platform}"
         )));

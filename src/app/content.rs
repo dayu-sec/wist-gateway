@@ -30,9 +30,10 @@ use crate::infra::StoredAgentFactSummary;
 pub const PLATFORMS: &[&str] = &["macos", "linux"];
 /// 采集面闭集（与模型 `families.mju` 的 `variant CollectionFamily` **逐字一致**）。
 ///
-/// 为什么以常量形式放在这里：网关装载采集目录时要**拒掉未知的面**（面名写错不能静默收下），
-/// 而运行期不能去读模型仓。两侧的一致性由测试钉住
-/// （`the_family_closed_set_matches_the_model`）—— 加面/改名要同时改两处。
+/// **运行期以知识库词表为准**（`catalog.toml` 的 `[[families]]`，见 [`FamilyMeta`]）；
+/// 这里的常量只剩**旧包回落**：包还没有 `[[families]]` 时用它，避免升级即拒载。
+/// 两侧的一致性由两个测试钉住：本常量 vs 模型（`the_family_closed_set_matches_the_model`）、
+/// 知识库词表 vs 模型（`the_knowledge_vocabulary_matches_the_model`）。
 /// 含义与维护规矩（**只增不改名**）见 `doc/design/center/collection-families.md`。
 pub const FAMILIES: &[&str] = &[
     "LoginSession",
@@ -54,9 +55,10 @@ pub const FAMILIES: &[&str] = &[
     "BackupJob",
     "NetworkService",
 ];
-/// 只在 macOS 出现的面（照 `families.mju` 的分类）。
+/// 只在 macOS 出现的面（照 `families.mju` 的分类）。**仅用于旧包回落**：
+/// 带 `[[families]]` 的包按词表里的 `platforms` 判，不看这里。
 const MACOS_ONLY_FAMILIES: &[&str] = &["PrivacyTcc", "GatekeeperQuarantine", "DevToolchain"];
-/// 只在 Linux 出现的面。
+/// 只在 Linux 出现的面（同样仅用于旧包回落）。
 const LINUX_ONLY_FAMILIES: &[&str] = &[
     "KernelSystem",
     "DatabaseService",
@@ -111,8 +113,33 @@ struct CatalogFile {
     published_at: String,
     #[serde(default)]
     superseded_by: Option<i64>,
+    /// 采集面词表。**空 = 旧包**（还没有 `[[families]]`），回落内置基线（过渡期）。
+    #[serde(default)]
+    families: Vec<FamilyRow>,
     #[serde(default)]
     units: Vec<UnitRow>,
+}
+
+/// `[[families]]` 的一行：面的**元数据**（值在知识库，不在代码）。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FamilyRow {
+    /// 协议值：大小写敏感，只增不改名。
+    id: String,
+    /// 允许出现的平台。空 = 全平台。
+    #[serde(default)]
+    platforms: Vec<String>,
+    /// 语义版本：改语义要出新面，这里只用于审计。
+    #[serde(default)]
+    semantics_version: i64,
+    #[serde(default)]
+    name_zh: String,
+    #[serde(default)]
+    name_en: String,
+    #[serde(default)]
+    summary_zh: String,
+    #[serde(default)]
+    summary_en: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,11 +334,36 @@ impl FamilyReadiness {
     }
 }
 
+/// 一个采集面的元数据（词表条目）。
+///
+/// **值来自知识库**（`catalog.toml` 的 `[[families]]`），不来自代码：加面只改数据。
+/// 内置的 [`FAMILIES`] 只在旧包没有 `[[families]]` 时兜底（过渡期，见 `build_vocabulary`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyMeta {
+    pub id: String,
+    /// 允许出现的平台；空 = 全平台。
+    pub platforms: Vec<String>,
+    pub semantics_version: i64,
+    pub name_zh: String,
+    pub name_en: String,
+    pub summary_zh: String,
+    pub summary_en: String,
+}
+
+impl FamilyMeta {
+    /// 这个面是否可能出现在该平台。
+    pub fn applies_to(&self, platform: &str) -> bool {
+        self.platforms.is_empty() || self.platforms.iter().any(|value| value == platform)
+    }
+}
+
 /// 一份已装载、已校验的内容集。
 #[derive(Debug, Clone)]
 pub struct ContentSet {
     pub catalog_version: i64,
     pub superseded_by: Option<i64>,
+    /// 面词表（`id → 元数据`）。
+    families: BTreeMap<String, FamilyMeta>,
     units: BTreeMap<String, Unit>,
     packs: BTreeMap<String, Pack>,
     templates: BTreeMap<String, Template>,
@@ -352,7 +404,8 @@ fn build_content(
     packs: PacksFile,
     templates: TemplatesFile,
 ) -> ConfigResult<ContentSet> {
-    let catalog_version = validate_catalog(&catalog)?;
+    let families = build_vocabulary(&catalog.families)?;
+    let catalog_version = validate_catalog(&catalog, &families)?;
     let units = catalog
         .units
         .into_iter()
@@ -386,13 +439,89 @@ fn build_content(
     Ok(ContentSet {
         catalog_version,
         superseded_by: catalog.superseded_by,
+        families,
         units,
         packs,
         templates,
     })
 }
 
-fn validate_catalog(catalog: &CatalogFile) -> ConfigResult<i64> {
+/// 把 `[[families]]` 变成词表；**旧包（字段为空）回落内置基线**。
+///
+/// 为什么留回落而不是直接拒：已经装在现场的包还没有 `[[families]]`（它们先于本字段），
+/// 拒载会把升级变成事故。等所有在役包都带上词表后删掉 `FAMILIES` 与这条回落
+/// （见 `doc/design/center/collection-family-capability-contract.md` §12.1 第 1 步）。
+fn build_vocabulary(rows: &[FamilyRow]) -> ConfigResult<BTreeMap<String, FamilyMeta>> {
+    if rows.is_empty() {
+        return Ok(default_vocabulary());
+    }
+    let mut vocabulary: BTreeMap<String, FamilyMeta> = BTreeMap::new();
+    for row in rows {
+        let id = row.id.trim();
+        if id.is_empty() {
+            return Err(invalid("[[families]] has an empty id"));
+        }
+        if row.id != id {
+            return Err(invalid(format!(
+                "family {id:?}: id 不能带前后空白（协议值原样写进数据帧）"
+            )));
+        }
+        for platform in &row.platforms {
+            if !PLATFORMS.contains(&platform.as_str()) {
+                return Err(invalid(format!(
+                    "family {id:?}: unknown platform {platform:?}"
+                )));
+            }
+        }
+        let meta = FamilyMeta {
+            id: id.to_string(),
+            platforms: row.platforms.clone(),
+            semantics_version: row.semantics_version,
+            name_zh: row.name_zh.clone(),
+            name_en: row.name_en.clone(),
+            summary_zh: row.summary_zh.clone(),
+            summary_en: row.summary_en.clone(),
+        };
+        if vocabulary.insert(meta.id.clone(), meta).is_some() {
+            return Err(invalid(format!("duplicate family {id:?}")));
+        }
+    }
+    Ok(vocabulary)
+}
+
+/// 内置基线：旧包（无 `[[families]]`）的过渡期词表。
+///
+/// 平台归属从 `MACOS_ONLY_FAMILIES` / `LINUX_ONLY_FAMILIES` 推——这两个常量是**模型分类的
+/// 影子**，只在这一条回落路上用到。
+fn default_vocabulary() -> BTreeMap<String, FamilyMeta> {
+    FAMILIES
+        .iter()
+        .map(|id| {
+            let platforms = if MACOS_ONLY_FAMILIES.contains(id) {
+                vec!["macos".to_string()]
+            } else if LINUX_ONLY_FAMILIES.contains(id) {
+                vec!["linux".to_string()]
+            } else {
+                Vec::new()
+            };
+            let meta = FamilyMeta {
+                id: (*id).to_string(),
+                platforms,
+                semantics_version: 0,
+                name_zh: String::new(),
+                name_en: String::new(),
+                summary_zh: String::new(),
+                summary_en: String::new(),
+            };
+            (meta.id.clone(), meta)
+        })
+        .collect()
+}
+
+fn validate_catalog(
+    catalog: &CatalogFile,
+    families: &BTreeMap<String, FamilyMeta>,
+) -> ConfigResult<i64> {
     if catalog.catalog_version < 1 {
         return Err(invalid(format!(
             "catalog_version {} must be >= 1",
@@ -404,7 +533,7 @@ fn validate_catalog(catalog: &CatalogFile) -> ConfigResult<i64> {
     }
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for unit in &catalog.units {
-        validate_unit(unit)?;
+        validate_unit(unit, families)?;
         if !seen.insert(unit.unit_id.as_str()) {
             return Err(invalid(format!("duplicate unit_id {:?}", unit.unit_id)));
         }
@@ -412,17 +541,17 @@ fn validate_catalog(catalog: &CatalogFile) -> ConfigResult<i64> {
     Ok(catalog.catalog_version)
 }
 
-fn validate_unit(unit: &UnitRow) -> ConfigResult<()> {
+fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> ConfigResult<()> {
     let id = unit.unit_id.as_str();
     if id.trim().is_empty() {
         return Err(invalid("empty unit_id"));
     }
-    if !FAMILIES.contains(&unit.family.as_str()) {
+    let Some(meta) = families.get(unit.family.as_str()) else {
         return Err(invalid(format!(
             "unit {id}: unknown family {:?}",
             unit.family
         )));
-    }
+    };
     if !CAPABILITIES.contains(&unit.capability.as_str()) {
         return Err(invalid(format!(
             "unit {id}: unknown capability {:?}",
@@ -447,17 +576,11 @@ fn validate_unit(unit: &UnitRow) -> ConfigResult<()> {
             unit.status
         )));
     }
-    // 面与平台的对应：macOS 侧重的面不该出现在 linux 单元上，反之亦然。
-    if MACOS_ONLY_FAMILIES.contains(&unit.family.as_str()) && unit.platform != "macos" {
+    // 面与平台的对应：词表里声明的 `platforms` 是唯一依据。
+    if !meta.applies_to(unit.platform.as_str()) {
         return Err(invalid(format!(
-            "unit {id}: family {:?} is macOS-only but platform is {:?}",
-            unit.family, unit.platform
-        )));
-    }
-    if LINUX_ONLY_FAMILIES.contains(&unit.family.as_str()) && unit.platform != "linux" {
-        return Err(invalid(format!(
-            "unit {id}: family {:?} is Linux-only but platform is {:?}",
-            unit.family, unit.platform
+            "unit {id}: family {:?} does not apply to platform {:?} (allowed: {:?})",
+            unit.family, unit.platform, meta.platforms
         )));
     }
     if unit.sources.is_empty() {
@@ -698,22 +821,24 @@ pub fn platform_for_machine_class(machine_class: &str) -> Option<&'static str> {
     }
 }
 
-/// 某个采集面是否可能出现在某平台上（照 `families.mju` 的分类）。
+/// 词表**追加式**校验：新词表不得删除旧面。
 ///
-/// 与 [`ContentSet::is_family_ready`] 分工不同：那个回答「采集要素齐不齐」，
-/// 这个回答「这个面在这类机器上存不存在」。派活时要分开报 —— 对一台 Linux 机器说
-/// 「TCC 面采集未就绪」是把**不适用**说成了**没准备好**，会把人引向错误的下一步。
-pub fn family_applies_to(family: &str, platform: &str) -> bool {
-    if !FAMILIES.contains(&family) || !PLATFORMS.contains(&platform) {
-        return false;
+/// 改名在值集上等同于「删旧名 + 加新名」，因此只能验「删」——但这已经能挡住两类真实错误：
+/// 手滑删掉一条，或把改名当成无害修改。返回被删掉的面（供报错直接列出）。
+///
+/// 回滚不走这里（`activate` 的 `reason = rollback` 是有意的旧版落地，见 `knowledge_ops`）。
+pub fn check_vocabulary_append_only(old: &ContentSet, new: &ContentSet) -> Result<(), Vec<String>> {
+    let removed: Vec<String> = old
+        .families
+        .keys()
+        .filter(|id| !new.families.contains_key(*id))
+        .cloned()
+        .collect();
+    if removed.is_empty() {
+        Ok(())
+    } else {
+        Err(removed)
     }
-    if MACOS_ONLY_FAMILIES.contains(&family) {
-        return platform == "macos";
-    }
-    if LINUX_ONLY_FAMILIES.contains(&family) {
-        return platform == "linux";
-    }
-    true
 }
 
 /// 由 `pack_refs` 派生 `(family_scope, capability_scope)`（保持稳定顺序）。
@@ -758,6 +883,33 @@ impl ContentSet {
 
     pub fn templates(&self) -> impl Iterator<Item = &Template> {
         self.templates.values()
+    }
+
+    /// 面词表（按 `id` 排序，稳定）。
+    pub fn families(&self) -> impl Iterator<Item = &FamilyMeta> {
+        self.families.values()
+    }
+
+    pub fn family(&self, id: &str) -> Option<&FamilyMeta> {
+        self.families.get(id)
+    }
+
+    /// 这个词是不是词表里的合法值。
+    pub fn has_family(&self, id: &str) -> bool {
+        self.families.contains_key(id)
+    }
+
+    /// 某个采集面是否可能出现在某平台上（依据词表的 `platforms`）。
+    ///
+    /// 与 [`Self::is_family_ready`] 分工不同：那个回答「采集要素齐不齐」，
+    /// 这个回答「这个面在这类机器上存不存在」。派活时要分开报 —— 对一台 Linux 机器说
+    /// 「TCC 面采集未就绪」是把**不适用**说成了**没准备好**，会把人引向错误的下一步。
+    pub fn family_applies_to(&self, family: &str, platform: &str) -> bool {
+        PLATFORMS.contains(&platform)
+            && self
+                .families
+                .get(family)
+                .is_some_and(|meta| meta.applies_to(platform))
     }
 
     pub fn template(&self, template_id: &str) -> Option<&Template> {
@@ -1163,6 +1315,279 @@ status = "active"
         );
     }
 
+    /// 词表的**值**在知识库：不在内置常量里的面，只要 `[[families]]` 声明了就能用；
+    /// 平台归属与「词表外拒收」也由这份数据决定，而不是代码里的两份常量。
+    #[test]
+    fn the_vocabulary_comes_from_the_catalog_not_from_the_const() {
+        let vocabulary = build_vocabulary(&[
+            family_row("ContainerRuntime", &["linux"]),
+            family_row("HostMetrics", &[]),
+        ])
+        .expect("vocabulary");
+
+        assert!(vocabulary.contains_key("ContainerRuntime"));
+        assert!(
+            !vocabulary.contains_key("LoginSession"),
+            "没在词表里声明的面不该凭空出现"
+        );
+        assert_eq!(
+            vocabulary["ContainerRuntime"].platforms,
+            vec!["linux".to_string()]
+        );
+
+        validate_unit(&unit_row("u1", "ContainerRuntime", "linux"), &vocabulary)
+            .expect("valid unit");
+
+        let err = validate_unit(&unit_row("u2", "ContainerRuntime", "macos"), &vocabulary)
+            .expect_err("platform mismatch");
+        assert!(
+            err.to_string().contains("does not apply to platform"),
+            "报错要说清是平台不适用：{err}"
+        );
+
+        let err = validate_unit(&unit_row("u3", "LoginSession", "linux"), &vocabulary)
+            .expect_err("unknown family");
+        assert!(err.to_string().contains("unknown family"), "{err}");
+    }
+
+    /// 平台归属也来自词表，而不是代码里的两份常量。
+    #[test]
+    fn a_family_platform_comes_from_the_vocabulary() {
+        let catalog = r#"
+catalog_version = 1
+origin = "Gateway"
+published_at = "2026-10-18T00:00:00Z"
+
+[[families]]
+id = "MacOnly"
+platforms = ["macos"]
+
+[[units]]
+unit_id = "u1"
+family = "MacOnly"
+capability = "collect_logs"
+platform = "linux"
+match = ""
+rule_ref = ""
+requires_privilege = "none"
+status = "draft"
+
+[[units.sources]]
+kind = "FileGlob"
+target = "/var/log/x.log"
+"#;
+        let err = parse_content(catalog, "", "").expect_err("must reject platform mismatch");
+        assert!(
+            err.to_string().contains("does not apply to platform"),
+            "报错要说清是平台不适用：{err}"
+        );
+    }
+
+    /// 词表外的面名仍然是错（拼写错误不能被当成新面收下）。
+    #[test]
+    fn a_unit_outside_the_vocabulary_is_rejected() {
+        let catalog = r#"
+catalog_version = 1
+origin = "Gateway"
+published_at = "2026-10-18T00:00:00Z"
+
+[[families]]
+id = "Alpha"
+
+[[units]]
+unit_id = "u1"
+family = "Beta"
+capability = "collect_logs"
+platform = "linux"
+match = ""
+rule_ref = ""
+requires_privilege = "none"
+status = "draft"
+
+[[units.sources]]
+kind = "FileGlob"
+target = "/var/log/x.log"
+"#;
+        let err = parse_content(catalog, "", "").expect_err("must reject unknown family");
+        assert!(err.to_string().contains("unknown family"));
+    }
+
+    /// 词表只增：删掉一个面要报出来（改名在值集上就是「删 + 增」）。
+    #[test]
+    fn the_vocabulary_is_append_only() {
+        let old = content_with_families(&["Alpha", "Beta"]);
+        let same = content_with_families(&["Alpha", "Beta"]);
+        let added = content_with_families(&["Alpha", "Beta", "Gamma"]);
+        let removed = content_with_families(&["Alpha"]);
+
+        assert!(check_vocabulary_append_only(&old, &same).is_ok());
+        assert!(check_vocabulary_append_only(&old, &added).is_ok());
+        assert_eq!(
+            check_vocabulary_append_only(&old, &removed),
+            Err(vec!["Beta".to_string()])
+        );
+    }
+
+    /// 改名在值集上就是「旧名消失 + 新名出现」—— 必须当成删除报出来。
+    #[test]
+    fn a_rename_is_reported_as_a_removal() {
+        let old = content_with_families(&["LoginSession"]);
+        let renamed = content_with_families(&["UserSession"]);
+        assert_eq!(
+            check_vocabulary_append_only(&old, &renamed),
+            Err(vec!["LoginSession".to_string()])
+        );
+    }
+
+    /// 空词表 = 旧包，回落内置基线（不能因为没词表就拒载，否则升级即事故）。
+    #[test]
+    fn an_empty_vocabulary_falls_back_to_the_built_in_baseline() {
+        let vocabulary = build_vocabulary(&[]).expect("fallback");
+        assert_eq!(vocabulary.len(), FAMILIES.len());
+        assert!(vocabulary.contains_key("LoginSession"));
+        assert_eq!(
+            vocabulary["PrivacyTcc"].platforms,
+            vec!["macos".to_string()],
+            "基线里的平台归属也要跟着推出来"
+        );
+    }
+
+    #[test]
+    fn duplicate_family_ids_are_rejected() {
+        let err = build_vocabulary(&[family_row("Alpha", &[]), family_row("Alpha", &[])])
+            .expect_err("duplicate");
+        assert!(err.to_string().contains("duplicate family"), "{err}");
+    }
+
+    #[test]
+    fn a_family_id_must_not_carry_surrounding_whitespace() {
+        // 前后空白会变成两个不同的协议值（统计/回溯从此分叉），必须在装载时就拒。
+        let err = build_vocabulary(&[family_row(" Alpha", &[])]).expect_err("whitespace");
+        assert!(err.to_string().contains("前后空白"), "{err}");
+    }
+
+    #[test]
+    fn a_family_platform_must_be_known() {
+        let err =
+            build_vocabulary(&[family_row("Alpha", &["windows"])]).expect_err("unknown platform");
+        assert!(err.to_string().contains("unknown platform"), "{err}");
+    }
+
+    /// 词表外的面在任何平台上都不适用；未知平台也不适用（两道都读过词表）。
+    #[test]
+    fn an_unknown_family_does_not_apply_to_any_platform() {
+        let content = content_with_families(&["Alpha"]);
+        assert!(content.family_applies_to("Alpha", "linux"));
+        assert!(content.family_applies_to("Alpha", "macos"));
+        assert!(!content.family_applies_to("Beta", "linux"));
+        assert!(!content.family_applies_to("Alpha", "windows"));
+        assert!(!content.has_family("Beta"));
+    }
+
+    /// 知识库里的**真实**词表必须与模型一致（CI 的模型一致校验）。
+    #[test]
+    fn the_knowledge_vocabulary_matches_the_model() {
+        let catalog = std::fs::read_to_string(crate::test_support::knowledge_file("catalog.toml"))
+            .expect("read catalog.toml");
+        let packs = std::fs::read_to_string(crate::test_support::knowledge_file("packs.toml"))
+            .expect("read packs.toml");
+        let templates =
+            std::fs::read_to_string(crate::test_support::knowledge_file("templates.toml"))
+                .expect("read templates.toml");
+        let content = parse_content(&catalog, &packs, &templates).expect("real knowledge parses");
+
+        let path = crate::test_support::model_file(
+            "jumo/model/static/control/module/agent/content/families.mju",
+        );
+        let text = std::fs::read_to_string(&path).expect("read families.mju");
+        let mut model = parse_family_variant(&text);
+        model.sort();
+
+        let mut vocabulary: Vec<String> = content.families().map(|meta| meta.id.clone()).collect();
+        vocabulary.sort();
+        assert_eq!(
+            model, vocabulary,
+            "面词表不一致：模型 families.mju vs 知识库 catalog.toml 的 [[families]]"
+        );
+
+        // 展示文案是页面直接渲染的东西：真数据里不能有空洞（缺了只能回落成 ID）。
+        for meta in content.families() {
+            for (field, value) in [
+                ("name_zh", &meta.name_zh),
+                ("name_en", &meta.name_en),
+                ("summary_zh", &meta.summary_zh),
+                ("summary_en", &meta.summary_en),
+            ] {
+                assert!(
+                    !value.trim().is_empty(),
+                    "family {}: {field} 为空（页面会退回面 ID）",
+                    meta.id
+                );
+            }
+        }
+    }
+
+    /// `[[families]]` 的一行（测试用）。
+    fn family_row(id: &str, platforms: &[&str]) -> FamilyRow {
+        FamilyRow {
+            id: id.to_string(),
+            platforms: platforms.iter().map(|value| value.to_string()).collect(),
+            semantics_version: 0,
+            name_zh: String::new(),
+            name_en: String::new(),
+            summary_zh: String::new(),
+            summary_en: String::new(),
+        }
+    }
+
+    /// 一个最小单元（测试用）：只关心面与平台，来源给一条可执行的显式路径。
+    fn unit_row(id: &str, family: &str, platform: &str) -> UnitRow {
+        UnitRow {
+            unit_id: id.to_string(),
+            family: family.to_string(),
+            capability: "collect_logs".to_string(),
+            platform: platform.to_string(),
+            match_expr: String::new(),
+            rule_ref: String::new(),
+            requires_privilege: "none".to_string(),
+            status: "draft".to_string(),
+            sources: vec![SourceRow {
+                kind: "FileGlob".to_string(),
+                target: "/var/log/x.log".to_string(),
+                multiline: "none".to_string(),
+            }],
+        }
+    }
+
+    /// 只带词表的 `ContentSet`：追加式校验只看面集合，不需要单元/包/模板。
+    fn content_with_families(ids: &[&str]) -> ContentSet {
+        let families = ids
+            .iter()
+            .map(|id| {
+                (
+                    (*id).to_string(),
+                    FamilyMeta {
+                        id: (*id).to_string(),
+                        platforms: Vec::new(),
+                        semantics_version: 0,
+                        name_zh: String::new(),
+                        name_en: String::new(),
+                        summary_zh: String::new(),
+                        summary_en: String::new(),
+                    },
+                )
+            })
+            .collect();
+        ContentSet {
+            catalog_version: 1,
+            superseded_by: None,
+            families,
+            units: Default::default(),
+            packs: Default::default(),
+            templates: Default::default(),
+        }
+    }
+
     /// 从 `families.mju` 里取出 `variant CollectionFamily` 的成员名。
     ///
     /// 故意写得很笨（按行 + 括号计数）：这个文件是固定写法，**写法一变就让测试红**，
@@ -1546,7 +1971,10 @@ status = "active"
             1,
         );
         let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("linux-only family on macos");
-        assert!(err.to_string().contains("Linux-only"), "{err}");
+        assert!(
+            err.to_string().contains("does not apply to platform"),
+            "{err}"
+        );
     }
 
     #[test]
