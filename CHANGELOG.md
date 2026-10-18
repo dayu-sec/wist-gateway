@@ -3,6 +3,24 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.0-alpha] - 2026-10-18
+
+### 新增
+
+- **`POST /api/v1/admin/cos/resolve`：解析腾讯 COS 路径**（管理面，供录入页一键填充）。
+  输入 `wist-1347593047/wist-agentd/v0.5.0-alpha`（也接受 `cos://桶/前缀` 与带 region 的
+  `https://<桶>.cos.<region>.myqcloud.com/…`），按发布命名约定展开各平台制品，返回与
+  GitHub Release 解析**同形**的 `{version, assets:[{name, artifact_url, sha256, platform}]}`。
+  - **无凭据**：桶公有读，sha256 随对象自定义元数据 `x-cos-meta-artifact-sha256` 带回
+    （COS 只存 MD5 ETag）；按命名约定拼候选对象地址逐个匿名 `HEAD`。
+  - 下载 host 带 region，用错 region 时 COS 只回 404：路径里带了就用，否则读
+    `WIST_GATEWAY_COS_REGION`，都没有时按常见区域逐个探测。整体 60s 上限。
+  - 兼容两种制品命名：文件名带 `v`（agentd / gwlinkd）与不带 `v`（知识库打包脚本）。
+
+### 升级提示
+
+- 前端 `wist-gateway-web` ≥ 0.11.0 的「一键填充（COS 路径）」依赖本接口；旧网关会 404。
+
 ## [0.14.0-alpha] - 2026-10-18
 
 ### 新增
