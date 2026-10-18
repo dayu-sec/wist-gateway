@@ -1860,8 +1860,8 @@ impl Store for SqliteStore {
     ) -> StoreResult<Option<StoredAgentFactSummary>> {
         let row = sqlx::query(
             "SELECT agent_id, content_digest, revision, observed_at, os, arch, process_count, \
-             process_executables, packages, listen_ports, host_id, host_name, network_addresses, \
-             received_at \
+             process_executables, packages, listen_ports, probed_paths, present_paths, host_id, \
+             host_name, network_addresses, received_at \
              FROM agent_fact_summary WHERE agent_id = ?1",
         )
         .bind(agent_id)
@@ -1890,18 +1890,22 @@ impl Store for SqliteStore {
         )?;
         let packages = serialize_json_array(&summary.packages, "serialize packages")?;
         let listen_ports = serialize_json_array(&summary.listen_ports, "serialize listen ports")?;
+        let probed_paths = serialize_json_array(&summary.probed_paths, "serialize probed paths")?;
+        let present_paths =
+            serialize_json_array(&summary.present_paths, "serialize present paths")?;
         let network_addresses =
             serialize_json_array(&summary.network_addresses, "serialize network addresses")?;
         sqlx::query(
             "INSERT INTO agent_fact_summary (agent_id, content_digest, revision, observed_at, os, \
-             arch, process_count, process_executables, packages, listen_ports, host_id, host_name, \
-             network_addresses, received_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+             arch, process_count, process_executables, packages, listen_ports, probed_paths, \
+             present_paths, host_id, host_name, network_addresses, received_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
              ON CONFLICT (agent_id) DO UPDATE SET content_digest = excluded.content_digest, \
              revision = excluded.revision, observed_at = excluded.observed_at, os = excluded.os, \
              arch = excluded.arch, process_count = excluded.process_count, \
              process_executables = excluded.process_executables, packages = excluded.packages, \
-             listen_ports = excluded.listen_ports, host_id = excluded.host_id, \
+             listen_ports = excluded.listen_ports, probed_paths = excluded.probed_paths, \
+             present_paths = excluded.present_paths, host_id = excluded.host_id, \
              host_name = excluded.host_name, network_addresses = excluded.network_addresses, \
              received_at = excluded.received_at",
         )
@@ -1915,6 +1919,8 @@ impl Store for SqliteStore {
         .bind(process_executables)
         .bind(packages)
         .bind(listen_ports)
+        .bind(probed_paths)
+        .bind(present_paths)
         .bind(&summary.host_id)
         .bind(&summary.host_name)
         .bind(network_addresses)
@@ -2867,6 +2873,8 @@ fn fact_summary_from_row(row: &SqliteRow) -> StoreResult<StoredAgentFactSummary>
     let process_executables: String = column!(row, "process_executables");
     let packages: String = column!(row, "packages");
     let listen_ports: String = column!(row, "listen_ports");
+    let probed_paths: String = column!(row, "probed_paths");
+    let present_paths: String = column!(row, "present_paths");
     let network_addresses: String = column!(row, "network_addresses");
     Ok(StoredAgentFactSummary {
         agent_id: column!(row, "agent_id"),
@@ -2882,6 +2890,8 @@ fn fact_summary_from_row(row: &SqliteRow) -> StoreResult<StoredAgentFactSummary>
         )?,
         packages: deserialize_json_array(&packages, "read packages")?,
         listen_ports: deserialize_json_array(&listen_ports, "read listen ports")?,
+        probed_paths: deserialize_json_array(&probed_paths, "read probed paths")?,
+        present_paths: deserialize_json_array(&present_paths, "read present paths")?,
         host_id: column!(row, "host_id"),
         host_name: column!(row, "host_name"),
         network_addresses: deserialize_json_array(&network_addresses, "read network addresses")?,

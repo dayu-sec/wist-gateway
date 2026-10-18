@@ -432,6 +432,8 @@ weight = 40
             process_executables: processes.iter().map(|value| value.to_string()).collect(),
             packages: Vec::new(),
             listen_ports: Vec::new(),
+            probed_paths: Vec::new(),
+            present_paths: Vec::new(),
             host_id: String::new(),
             host_name: String::new(),
             network_addresses: Vec::new(),

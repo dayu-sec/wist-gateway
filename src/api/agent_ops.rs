@@ -305,14 +305,26 @@ pub async fn poll_discovery_policies(
     }
     let knowledge = state.knowledge();
     match knowledge.discovery_policies.as_deref() {
-        Some(set) => (
-            StatusCode::OK,
-            Json(DiscoveryPoliciesReturned::from_set(
-                set,
-                chrono::Utc::now().to_rfc3339(),
-            )),
-        )
-            .into_response(),
+        Some(set) => {
+            // 探测白名单由**采集目录**推导（`path_exists:` 条件），不是策展表自带的：
+            // 两处各写一份必然漂移。目录为空时白名单也为空 → agent 不探，`path_exists`
+            // 求值自然是 Unknown（不冒充「不存在」）。
+            let probe_paths = knowledge
+                .content
+                .as_deref()
+                .map(|content| content.probe_paths())
+                .unwrap_or_default();
+            let mut set = set.clone();
+            set.probe_paths = probe_paths;
+            (
+                StatusCode::OK,
+                Json(DiscoveryPoliciesReturned::from_set(
+                    &set,
+                    chrono::Utc::now().to_rfc3339(),
+                )),
+            )
+                .into_response()
+        }
         None => ApiError::unavailable(
             codes::DISCOVERY_POLICY_TABLE_UNCONFIGURED,
             "discovery policy table is not configured",
@@ -1000,6 +1012,8 @@ pub(super) async fn ingest_fact_summary(
         process_executables: input.process_executables.clone(),
         packages: input.packages.clone(),
         listen_ports: input.listen_ports.clone(),
+        probed_paths: input.probed_paths.clone(),
+        present_paths: input.present_paths.clone(),
         host_id: input.host_id.clone(),
         host_name: input.host_name.clone(),
         network_addresses: input.network_addresses.clone(),
@@ -1088,6 +1102,8 @@ fn gateway_digest(input: &ReportAgentFactSummary) -> String {
         input.process_executables.clone(),
         input.packages.clone(),
         input.listen_ports.clone(),
+        input.probed_paths.clone(),
+        input.present_paths.clone(),
     )
     .content_digest()
 }
@@ -1098,8 +1114,10 @@ pub(super) const MAX_FACT_SUMMARY_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROCESS_EXECUTABLES: usize = 10_000;
 const MAX_PACKAGES: usize = 5_000;
 const MAX_LISTEN_PORTS: usize = 1_000;
+/// 待探测路径条数上限：目录里的 `path_exists` 条件是人工策展的，不会多到几百。
+const MAX_PROBE_PATHS: usize = 512;
 const MAX_ELEMENT_BYTES: usize = 4096;
-/// `content_digest` 是固定格式的标识符（`fact-v1:sha256:<64 hex>`）。
+/// `content_digest` 是固定格式的标识符（`fact-v2:sha256:<64 hex>`）。
 /// 封顶是必要的：它会进告警日志，不限长就能让一条上报写出几 MB 的单行日志。
 const MAX_CONTENT_DIGEST_BYTES: usize = 128;
 /// 单个展示字段（`host_id` / `host_name`）的字节上限。主机名按 DNS 上限（253）留余量，
@@ -1130,6 +1148,19 @@ fn validate_fact_summary(input: &ReportAgentFactSummary) -> Result<(), String> {
     )?;
     check_list("packages", &input.packages, MAX_PACKAGES)?;
     check_list("listen_ports", &input.listen_ports, MAX_LISTEN_PORTS)?;
+    check_list("probed_paths", &input.probed_paths, MAX_PROBE_PATHS)?;
+    check_list("present_paths", &input.present_paths, MAX_PROBE_PATHS)?;
+    // 「存在的路径」必须是「探测过的路径」的子集：否则求值与摘要会各读一套事实。
+    // 选择拒收而不是静默丢弃：上报方坏了要看得见，不能把它的错误当成一次正常上报。
+    if let Some(extra) = input
+        .present_paths
+        .iter()
+        .find(|path| !input.probed_paths.contains(path))
+    {
+        return Err(format!(
+            "present_paths contains {extra:?} which is not in probed_paths"
+        ));
+    }
     check_value("host_id", &input.host_id, MAX_HOST_FIELD_BYTES)?;
     check_value("host_name", &input.host_name, MAX_HOST_FIELD_BYTES)?;
     check_list(

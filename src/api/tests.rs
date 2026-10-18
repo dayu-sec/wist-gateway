@@ -1902,6 +1902,8 @@ fn digest_of(report: &ReportAgentFactSummary) -> String {
         report.process_executables.clone(),
         report.packages.clone(),
         report.listen_ports.clone(),
+        report.probed_paths.clone(),
+        report.present_paths.clone(),
     )
     .content_digest()
 }
@@ -2018,6 +2020,47 @@ async fn fact_summary_ingest_rejects_an_unparseable_body() {
     )
     .await;
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_keeps_path_probe_results() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let mut report = fact_report(&["/usr/bin/xcodebuild"]);
+    report.probed_paths = vec![
+        "/var/log/sudo.log".to_string(),
+        "/var/log/not-here.log".to_string(),
+    ];
+    report.present_paths = vec!["/var/log/sudo.log".to_string()];
+    report.content_digest = digest_of(&report);
+
+    let accepted = post_facts(&env, &report).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    assert_eq!(stored.probed_paths, report.probed_paths);
+    assert_eq!(stored.present_paths, report.present_paths);
+    // 路径参与摘要：存的就是网关自算的那一份。
+    assert_eq!(stored.content_digest, digest_of(&report));
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_rejects_present_paths_that_were_not_probed() {
+    // 子集关系不成立 = 上报方坏了。静默丢弃会把它的 bug 当成一次正常上报，
+    // 求值也会读到一套自相矛盾的事实。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let mut report = fact_report(&["/usr/bin/xcodebuild"]);
+    report.probed_paths = vec!["/var/log/present.log".to_string()];
+    report.present_paths = vec!["/var/log/never-probed.log".to_string()];
+
+    let response = post_facts(&env, &report).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -3420,6 +3463,11 @@ async fn discovery_policies_poll_serves_the_configured_table() {
     assert_eq!(returned.policy_version, 7);
     assert_eq!(returned.published_at, "2026-09-22T00:00:00Z");
     assert_eq!(returned.policies.len(), 7);
+    // 测试内容目录没有 `path_exists` 条件 → 白名单为空（不影响旧行为）。
+    assert!(
+        returned.probe_paths.is_empty(),
+        "fixture 没有路径条件时不应凭空下发探测项"
+    );
     let host = returned
         .policies
         .iter()

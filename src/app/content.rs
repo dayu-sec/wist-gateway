@@ -583,6 +583,25 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
             unit.family, unit.platform, meta.platforms
         )));
     }
+    // `path_exists` 的值必须是绝对路径：相对路径的结果取决于进程 cwd，
+    // 同一台机器换一种启动方式就翻面，不能当事实（agentd 侧也会丢弃）。
+    for condition in parse_conditions(&unit.match_expr) {
+        if condition.kind != "path_exists" {
+            continue;
+        }
+        if condition.values.is_empty() {
+            return Err(invalid(format!("unit {id}: path_exists has no path")));
+        }
+        if let Some(bad) = condition
+            .values
+            .iter()
+            .find(|value| !value.starts_with('/'))
+        {
+            return Err(invalid(format!(
+                "unit {id}: path_exists expects absolute paths, got {bad:?}"
+            )));
+        }
+    }
     if unit.sources.is_empty() {
         return Err(invalid(format!("unit {id}: no sources")));
     }
@@ -899,6 +918,27 @@ impl ContentSet {
         self.families.contains_key(id)
     }
 
+    /// 目录里 `match` 用到的 `path_exists:<绝对路径>`（去重、定序）。
+    ///
+    /// 这是网关下发给 agentd 的**探测白名单**：agentd 只探这些路径，不探任意路径。
+    /// 派活求值与探测白名单同源，避免「求值要的路径没下发」这种静默永不命中的情况。
+    pub fn probe_paths(&self) -> Vec<String> {
+        let mut paths: BTreeSet<String> = BTreeSet::new();
+        for unit in self.units.values() {
+            for condition in parse_conditions(&unit.match_expr) {
+                if condition.kind != "path_exists" {
+                    continue;
+                }
+                for value in condition.values {
+                    if value.starts_with('/') {
+                        paths.insert(value);
+                    }
+                }
+            }
+        }
+        paths.into_iter().collect()
+    }
+
     /// 某个采集面是否可能出现在某平台上（依据词表的 `platforms`）。
     ///
     /// 与 [`Self::is_family_ready`] 分工不同：那个回答「采集要素齐不齐」，
@@ -1149,6 +1189,12 @@ fn first_non_yes_condition(
 }
 
 fn eval_condition(condition: &Condition, facts: &StoredAgentFactSummary) -> Truth {
+    // `path_exists` 需要的是「探测过才判得出来」，与其它 kind 的「空事实 = 无法判定」不同，
+    // 所以单独走一条分支。
+    if condition.kind == "path_exists" {
+        return eval_path_exists(condition, facts);
+    }
+
     let haystack: &[String] = match condition.kind.as_str() {
         // 已装包清单：探针没实现时**恒空** → 空表示“没采”，不是“没装”。
         "installed" => &facts.packages,
@@ -1170,6 +1216,31 @@ fn eval_condition(condition: &Condition, facts: &StoredAgentFactSummary) -> Trut
             .any(|fact| fact.to_lowercase().contains(&needle))
     });
     if matched { Truth::Yes } else { Truth::No }
+}
+
+/// `path_exists:/a|/b` 的求值。
+///
+/// 语义是 **OR**：任一路径存在 → Yes；全部**探测过**且都不存在 → No；
+/// 有路径没被探测过（旧 agent / 该路径不在白名单）→ Unknown。
+fn eval_path_exists(condition: &Condition, facts: &StoredAgentFactSummary) -> Truth {
+    if condition.values.is_empty() {
+        return Truth::Unknown;
+    }
+    let mut all_probed = true;
+    for value in &condition.values {
+        let probed = facts.probed_paths.iter().any(|path| path == value);
+        if probed && facts.present_paths.iter().any(|path| path == value) {
+            return Truth::Yes;
+        }
+        if !probed {
+            all_probed = false;
+        }
+    }
+    if all_probed {
+        Truth::No
+    } else {
+        Truth::Unknown
+    }
 }
 
 #[cfg(test)]
@@ -1838,9 +1909,11 @@ target = "/var/log/x.log"
             &crate::test_support::knowledge_file("templates.toml"),
         )
         .expect("load checked-in content");
-        let expansion = set
-            .expand("linux-host", &facts("linux", &[]))
-            .expect("expand");
+        let mut host_facts = facts("linux", &[]);
+        // sudo.log 被探测过且存在：与「没探测过」必须区分开（前者不选、后者报无法判定）。
+        host_facts.probed_paths = vec!["/var/log/sudo.log".to_string()];
+        host_facts.present_paths = vec!["/var/log/sudo.log".to_string()];
+        let expansion = set.expand("linux-host", &host_facts).expect("expand");
         assert_eq!(
             expansion
                 .works
@@ -1870,6 +1943,81 @@ target = "/var/log/x.log"
             "{:?}",
             expansion.excluded_units
         );
+    }
+
+    #[test]
+    fn path_exists_is_three_state_and_needs_probing() {
+        let expr = "path_exists:/var/log/sudo.log";
+        let facts_with = |probed: &[&str], present: &[&str]| StoredAgentFactSummary {
+            probed_paths: probed.iter().map(|value| value.to_string()).collect(),
+            present_paths: present.iter().map(|value| value.to_string()).collect(),
+            ..Default::default()
+        };
+
+        // 没探测过 → 无法判定（不是「不存在」）。
+        assert_eq!(eval_match(expr, &facts_with(&[], &[])), Truth::Unknown);
+
+        // 探测过、但不存在 → 不满足。
+        assert_eq!(
+            eval_match(expr, &facts_with(&["/var/log/sudo.log"], &[])),
+            Truth::No
+        );
+
+        // 存在 → 满足。
+        assert_eq!(
+            eval_match(
+                expr,
+                &facts_with(&["/var/log/sudo.log"], &["/var/log/sudo.log"])
+            ),
+            Truth::Yes
+        );
+
+        // 多条是 OR：任一路径存在即可。
+        assert_eq!(
+            eval_match("path_exists:/a|/b", &facts_with(&["/a", "/b"], &["/b"])),
+            Truth::Yes
+        );
+
+        // 只探了 /a（不存在）、/b 没探 → 无法判定，不说「两个都不存在」。
+        assert_eq!(
+            eval_match("path_exists:/a|/b", &facts_with(&["/a"], &[])),
+            Truth::Unknown
+        );
+
+        // 与其它条件用 `;` 组合是 **AND**：路径命中、但包事实缺位 → 仍无法判定。
+        assert_eq!(
+            eval_match(
+                "path_exists:/a;installed:nginx",
+                &facts_with(&["/a"], &["/a"])
+            ),
+            Truth::Unknown
+        );
+
+        // 「存在」但没标「探测过」= 自相矛盾的上报：按无法判定处理，不冒充命中。
+        assert_eq!(
+            eval_match(expr, &facts_with(&[], &["/var/log/sudo.log"])),
+            Truth::Unknown
+        );
+    }
+
+    #[test]
+    fn probe_paths_are_derived_from_path_exists_conditions() {
+        let catalog = CATALOG.replacen(
+            "match = \"\"",
+            "match = \"path_exists:/var/log/sudo.log\"",
+            1,
+        );
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("parses");
+        assert_eq!(set.probe_paths(), vec!["/var/log/sudo.log".to_string()]);
+        // 没有路径条件时为空：不探测任何路径。
+        assert!(minimal().probe_paths().is_empty());
+    }
+
+    #[test]
+    fn path_exists_rejects_relative_paths() {
+        let catalog = CATALOG.replacen("match = \"\"", "match = \"path_exists:relative.log\"", 1);
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("relative path");
+        assert!(err.to_string().contains("absolute paths"), "{err}");
     }
 
     #[test]

@@ -496,6 +496,10 @@ pub struct StoredAgentFactSummary {
     pub process_executables: Vec<String>,
     pub packages: Vec<String>,
     pub listen_ports: Vec<String>,
+    /// 网关下发、agent **实际探测过**的路径白名单（来自发现策略）。
+    pub probed_paths: Vec<String>,
+    /// 其中存在的路径（`probed_paths` 的子集）。
+    pub present_paths: Vec<String>,
     /// 发现方向 `host` 的 `host.id`。**留痕/展示**：不进内容摘要、不参与判重。
     ///
     /// 与它下面两项一样，值会在内容不变的情况下变（改名、换网），所以 `duplicate`

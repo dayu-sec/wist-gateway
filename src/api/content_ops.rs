@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
+use wist_contracts::work::is_executable_source;
 
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 
@@ -69,16 +70,48 @@ struct FamilyView {
 }
 
 #[derive(Debug, Serialize)]
+struct UnitSourceView {
+    kind: String,
+    target: String,
+    multiline: String,
+    /// agentd 今天能不能执行这条来源（与网关派活闸门**同一判据**）。
+    executable: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UnitView {
+    unit_id: String,
+    family: String,
+    platform: String,
+    capability: String,
+    /// 采集前提条件（空 = 无条件）。
+    #[serde(rename = "match")]
+    match_expr: String,
+    rule_ref: String,
+    requires_privilege: String,
+    status: String,
+    /// 采集就绪（`status = active`）。
+    collect_ready: bool,
+    /// 解析就绪（`rule_ref` 非空）。**不参与闸门**。
+    parse_ready: bool,
+    /// 至少一条来源 agentd 能执行（否则派下去也会报 `unsupported`）。
+    executable: bool,
+    sources: Vec<UnitSourceView>,
+}
+
+#[derive(Debug, Serialize)]
 struct ContentView {
     catalog_version: i64,
     superseded_by: Option<i64>,
     /// 面词表：ID、平台归属与展示文案（**值来自知识库**，不是前端硬编码）。
     families: Vec<FamilyView>,
+    /// 采集单元明细：一个面具体采什么（来源 / 条件 / 规则 / 权限）。
+    units: Vec<UnitView>,
     templates: Vec<TemplateView>,
     readiness: Vec<ReadinessView>,
 }
 
-/// 查看网关已装载的采集内容：模板组成 + 各平台的面就绪度。
+/// 查看网关已装载的采集内容：面词表、单元明细、模板组成、各平台的面就绪度。
 pub async fn view_content(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -108,6 +141,36 @@ pub async fn view_content(
             status: template.status.clone(),
             family_scope: template.family_scope.clone(),
             capability_scope: template.capability_scope.clone(),
+        })
+        .collect();
+
+    let units = content
+        .units()
+        .map(|unit| {
+            let sources: Vec<UnitSourceView> = unit
+                .sources
+                .iter()
+                .map(|source| UnitSourceView {
+                    kind: source.kind.clone(),
+                    target: source.target.clone(),
+                    multiline: source.multiline.clone(),
+                    executable: is_executable_source(&source.kind, &source.target),
+                })
+                .collect();
+            UnitView {
+                unit_id: unit.unit_id.clone(),
+                family: unit.family.clone(),
+                platform: unit.platform.clone(),
+                capability: unit.capability.clone(),
+                match_expr: unit.match_expr.clone(),
+                rule_ref: unit.rule_ref.clone(),
+                requires_privilege: unit.requires_privilege.clone(),
+                status: unit.status.clone(),
+                collect_ready: unit.collect_ready(),
+                parse_ready: unit.parse_ready(),
+                executable: sources.iter().any(|source| source.executable),
+                sources,
+            }
         })
         .collect();
 
@@ -147,6 +210,7 @@ pub async fn view_content(
         catalog_version: content.catalog_version,
         superseded_by: content.superseded_by,
         families,
+        units,
         templates,
         readiness,
     })
