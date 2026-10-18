@@ -3,6 +3,27 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.13.0-alpha] - 2026-10-18
+
+### 新增
+
+- **采集面词表改由知识库装载**：`catalog.toml` 新增 `[[families]]`（面 ID、平台归属、
+  中英文名称与说明），网关装载后用它做值域校验与平台判断 —— **新增采集面不再需要发网关**。
+  `FAMILIES` 常量降级为**旧包回落**（包还没有 `[[families]]` 时用它，避免升级即拒载）。
+- **`GET /api/v1/admin/content` 返回 `families`**：ID、`platforms`、`semantics_version`
+  与中英文名称/说明，供管理面直接渲染（面名是协议值，不翻译）。
+
+### 变更
+
+- **词表追加式校验**：激活知识包时对比当前生效词表，删面 / 改名（值集上等于删 + 增）
+  直接拒绝，错误码 `vocabulary_not_append_only`；`reason = rollback` 除外（回滚本就要落回旧版）。
+- **面与平台的对应改读词表的 `platforms`**：`MACOS_ONLY` / `LINUX_ONLY` 两份常量只留给旧包回落。
+
+### 升级提示
+
+- **必须先升级网关，再激活带 `[[families]]` 的知识包**：旧网关的目录结构是
+  `deny_unknown_fields`，遇到不认识的 `families` 会拒载整包。顺序：网关 → 知识包 → 激活。
+
 ## [0.12.0-alpha] - 2026-10-17
 
 ### 修复
