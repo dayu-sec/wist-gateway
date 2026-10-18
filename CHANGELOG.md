@@ -3,6 +3,21 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.17.0-alpha] - 2026-10-18
+
+### 新增
+
+- **gwlinkd 心跳带上宿主依赖工具版本**：`POST /api/v1/gateway/linkd-status` 新增
+  `gops_version` / `gx_version`（可选）；admin 视图同步返回（空串 = 未安装 / 探测失败）。
+  网关栈由 `gops` 部署与升级，容器里看不见这两个工具 —— 只有宿主侧 gwlinkd 能探测。
+- 存储：`gateway_linkd_status` 加两列（迁移 `0030`），心跳单行 upsert 一并更新；
+  页面在「接入代理」明细里能看到宿主工具是否就绪。
+
+### 兼容性
+
+- 老 gwlinkd 不传这两个键 → 存空串，页面显示「—」；新 gwlinkd 对旧网关也安全
+  （载荷反序列化不拒绝未知字段）。
+
 ## [0.16.0-alpha] - 2026-10-18
 
 ### 新增
