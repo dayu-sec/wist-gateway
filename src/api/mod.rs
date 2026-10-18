@@ -71,6 +71,9 @@ mod linkd_status;
 // （`admin_ops::apply_agent_install_package`）。见 api/agent_package.rs 与设计
 // `wist-design/doc/design/edge/agent-package-push-to-gateways.md`。重新生成控制面代码时需回补本模块与下方路由。
 mod agent_package;
+// NOTE(hand-added): 「知识库包下发」通道（环回写入）。中心把 wist-knowledge 包交给网关知识库
+// 管理的意图由 gwlinkd 拉取后环回 POST 到本端点；与 admin 录入同内核。见 api/knowledge_package.rs。
+mod knowledge_package;
 // NOTE(hand-added): agent 面（edge seam B：gateway ↔ agentd）的路由按 API 版本集中到
 // `api/agent_api/`（版本并存约定见 design/foundation/api-seam-inventory.md §7）。
 // 加 v2 = 新增版本子模块 + 往 `VERSIONS` 加一行。重新生成控制面代码时需回补本模块。
@@ -314,6 +317,11 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/gateway/agent-package",
             post(agent_package::receive_agent_package),
+        )
+        // NOTE(hand-added): 中心下发知识库包（环回写入）。见 api/knowledge_package.rs 说明。
+        .route(
+            "/api/v1/gateway/knowledge-package",
+            post(knowledge_package::receive_knowledge_package),
         )
         .route(
             "/api/v1/agent/install/{platform}/install.sh",

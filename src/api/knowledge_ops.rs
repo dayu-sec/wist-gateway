@@ -28,7 +28,7 @@ use super::{ApiState, admin_auth::require_admin_bearer, error::ApiError, rate_li
 /// 激活留痕一次最多返这么多：管理面展示"最近换过什么"，不做分页。
 const ACTIVATION_LOG_LIMIT: u64 = 20;
 /// 没写 `requested_by` 时的缺省主体（与安装包录入同一口径）。
-const DEFAULT_ACTOR: &str = "platform-maintenance-engineer";
+pub(super) const DEFAULT_ACTOR: &str = "platform-maintenance-engineer";
 
 // ── 请求体 ──────────────────────────────────────────────────────────────────
 
@@ -141,18 +141,18 @@ struct KnowledgeLockView {
     works: u64,
 }
 
-fn knowledge_error(status: StatusCode, code: &'static str, message: String) -> Response {
+pub(super) fn knowledge_error(status: StatusCode, code: &'static str, message: String) -> Response {
     // 统一投影 `{ "error": { code, message } }`（设计 §6，`ApiError`）。
     ApiError::new(status, code, message).into_response()
 }
 
 /// 落库 / 读库失败的**对外投影**：对外只出通用话术 + `package_store_failed`，原始错只进本地日志。
 /// `cause` 传 `err.display_chain()`（完整因果链）—— 直接传 `err`（`Display`）只出一行、丢掉 source。
-fn store_failure(message: &'static str, cause: impl std::fmt::Display) -> Response {
+pub(super) fn store_failure(message: &'static str, cause: impl std::fmt::Display) -> Response {
     ApiError::internal(codes::PACKAGE_STORE_FAILED, message, cause).into_response()
 }
 
-fn record_error_response(err: KnowledgeRecordError) -> Response {
+pub(super) fn record_error_response(err: KnowledgeRecordError) -> Response {
     // 状态码按"谁能修"分：来源/摘要错是**填错了**（400）；内容/签名不合法是**包不对**（422）；
     // 来源拿不到是**环境问题**（502）；落库失败是服务端（500）。
     let status = match &err {
@@ -503,7 +503,7 @@ pub async fn activate_knowledge_package(
 /// `Response` 本身偏大，所以按仓里既有做法对这条 lint 明确豁免（同 `agent_ops` 的
 /// `authenticate_agent`）。
 #[allow(clippy::result_large_err)]
-async fn activate_loaded(
+pub(super) async fn activate_loaded(
     state: &ApiState,
     loaded: crate::app::knowledge::LoadedKnowledge,
     reason: &str,

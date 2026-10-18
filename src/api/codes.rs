@@ -39,6 +39,7 @@ codes! {
     AGENT_PACKAGE_COPY_MISSING => "agent_package_copy_missing",
     AGENT_PACKAGE_HISTORY_LOAD_FAILED => "agent_package_history_load_failed",
     AGENT_PACKAGE_LOOPBACK_ONLY => "agent_package_loopback_only",
+    KNOWLEDGE_PACKAGE_LOOPBACK_ONLY => "knowledge_package_loopback_only",
     AGENT_PACKAGE_NOT_CONFIGURED => "agent_package_not_configured",
     AGENT_PACKAGE_NOT_FOUND => "agent_package_not_found",
     AGENT_PACKAGE_READ_FAILED => "agent_package_read_failed",
