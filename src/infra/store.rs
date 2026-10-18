@@ -250,6 +250,10 @@ pub struct StoredGatewayLinkdStatus {
     pub instance_id: String,
     /// gwlinkd 版本。
     pub version: String,
+    /// 宿主依赖工具 `gops` 的版本（空串 = 未安装 / 探测失败）。
+    pub gops_version: String,
+    /// 宿主依赖工具 `gx` 的版本（空串 = 未安装 / 探测失败）。
+    pub gx_version: String,
     /// 当前接入的中心（未接入时空串）。
     pub center_endpoint: String,
     /// `WaitingLinkRequest` / `Linking` / `Linked` / `Degraded`。

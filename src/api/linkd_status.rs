@@ -39,6 +39,11 @@ pub struct ReportGatewayLinkdStatusRequest {
     pub instance_id: String,
     #[serde(default)]
     pub version: String,
+    /// 宿主依赖工具版本（gwlinkd 探测；未安装 / 探测失败 → 空）。
+    #[serde(default)]
+    pub gops_version: Option<String>,
+    #[serde(default)]
+    pub gx_version: Option<String>,
     #[serde(default)]
     pub center_endpoint: String,
     #[serde(default)]
@@ -61,6 +66,9 @@ pub struct GatewayLinkdStatusView {
     pub gateway_id: String,
     pub instance_id: String,
     pub version: String,
+    /// 宿主依赖工具版本（空串 = 未安装 / 探测失败）。
+    pub gops_version: String,
+    pub gx_version: String,
     pub center_endpoint: String,
     pub state: String,
     pub credential_expires_at: String,
@@ -127,6 +135,8 @@ fn view(status: &StoredGatewayLinkdStatus) -> GatewayLinkdStatusView {
         gateway_id: status.gateway_id.clone(),
         instance_id: status.instance_id.clone(),
         version: status.version.clone(),
+        gops_version: status.gops_version.clone(),
+        gx_version: status.gx_version.clone(),
         center_endpoint: status.center_endpoint.clone(),
         state: status.state.clone(),
         credential_expires_at: status.credential_expires_at.clone(),
@@ -148,6 +158,8 @@ fn empty_view() -> GatewayLinkdStatusView {
         gateway_id: String::new(),
         instance_id: String::new(),
         version: String::new(),
+        gops_version: String::new(),
+        gx_version: String::new(),
         center_endpoint: String::new(),
         state: String::new(),
         credential_expires_at: String::new(),
@@ -180,6 +192,8 @@ pub async fn report_gateway_linkd_status(
         gateway_id: input.gateway_id.trim().to_string(),
         instance_id: input.instance_id.trim().to_string(),
         version: input.version.trim().to_string(),
+        gops_version: input.gops_version.unwrap_or_default().trim().to_string(),
+        gx_version: input.gx_version.unwrap_or_default().trim().to_string(),
         center_endpoint: input.center_endpoint.trim().to_string(),
         state: input.state.trim().to_string(),
         credential_expires_at: input
@@ -304,6 +318,8 @@ mod tests {
             gateway_id: "gw-1".into(),
             instance_id: "gw-1/inst-1".into(),
             version: "0.4.0".into(),
+            gops_version: "2.4.0".into(),
+            gx_version: "0.17.0".into(),
             center_endpoint: "https://center.example".into(),
             state: "Linked".into(),
             credential_expires_at: "2026-12-01T00:00:00+00:00".into(),
@@ -319,6 +335,8 @@ mod tests {
             "gateway_id",
             "instance_id",
             "version",
+            "gops_version",
+            "gx_version",
             "center_endpoint",
             "state",
             "credential_expires_at",
@@ -332,6 +350,8 @@ mod tests {
             assert!(object.contains_key(key), "缺 {key}: {value}");
         }
         assert_eq!(value["stale"], Value::Bool(false), "刚心跳：不算失联");
+        assert_eq!(value["gops_version"], "2.4.0");
+        assert_eq!(value["gx_version"], "0.17.0");
     }
 
     #[test]
@@ -379,6 +399,8 @@ mod tests {
             "gateway_id",
             "instance_id",
             "version",
+            "gops_version",
+            "gx_version",
             "center_endpoint",
             "state",
             "credential_expires_at",

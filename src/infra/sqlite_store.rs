@@ -1167,7 +1167,8 @@ impl Store for SqliteStore {
 
     async fn get_gateway_linkd_status(&self) -> StoreResult<Option<StoredGatewayLinkdStatus>> {
         let row = sqlx::query(
-            "SELECT setting_id, gateway_id, instance_id, version, center_endpoint, state, \
+            "SELECT setting_id, gateway_id, instance_id, version, gops_version, gx_version, \
+             center_endpoint, state, \
              credential_expires_at, last_center_report_at, last_error, reported_at, received_at \
              FROM gateway_linkd_status WHERE setting_id = ?1",
         )
@@ -1181,6 +1182,8 @@ impl Store for SqliteStore {
                 gateway_id: column!(row, "gateway_id"),
                 instance_id: column!(row, "instance_id"),
                 version: column!(row, "version"),
+                gops_version: column!(row, "gops_version"),
+                gx_version: column!(row, "gx_version"),
                 center_endpoint: column!(row, "center_endpoint"),
                 state: column!(row, "state"),
                 credential_expires_at: column!(row, "credential_expires_at"),
@@ -1199,11 +1202,12 @@ impl Store for SqliteStore {
     ) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO gateway_linkd_status (setting_id, gateway_id, instance_id, version, \
-             center_endpoint, state, credential_expires_at, last_center_report_at, last_error, \
-             reported_at, received_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             gops_version, gx_version, center_endpoint, state, credential_expires_at, \
+             last_center_report_at, last_error, reported_at, received_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
              ON CONFLICT (setting_id) DO UPDATE SET gateway_id = excluded.gateway_id, \
              instance_id = excluded.instance_id, version = excluded.version, \
+             gops_version = excluded.gops_version, gx_version = excluded.gx_version, \
              center_endpoint = excluded.center_endpoint, state = excluded.state, \
              credential_expires_at = excluded.credential_expires_at, \
              last_center_report_at = excluded.last_center_report_at, \
@@ -1214,6 +1218,8 @@ impl Store for SqliteStore {
         .bind(&status.gateway_id)
         .bind(&status.instance_id)
         .bind(&status.version)
+        .bind(&status.gops_version)
+        .bind(&status.gx_version)
         .bind(&status.center_endpoint)
         .bind(&status.state)
         .bind(&status.credential_expires_at)
@@ -4380,6 +4386,8 @@ mod tests {
             gateway_id: "gw-1".to_string(),
             instance_id: "gw-1/inst-1".to_string(),
             version: "0.4.0".to_string(),
+            gops_version: "2.4.0".to_string(),
+            gx_version: "0.17.0".to_string(),
             center_endpoint: "https://center.example".to_string(),
             state: "Linked".to_string(),
             credential_expires_at: "2026-12-01T00:00:00+00:00".to_string(),
@@ -4395,6 +4403,8 @@ mod tests {
             .unwrap()
             .expect("status");
         assert_eq!(loaded.state, "Linked");
+        assert_eq!(loaded.gops_version, "2.4.0");
+        assert_eq!(loaded.gx_version, "0.17.0");
         assert_eq!(loaded.received_at, "2026-10-05T00:00:00+00:00");
 
         // 单例覆盖：重复心跳更新同一行（幂等）。

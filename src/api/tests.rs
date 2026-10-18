@@ -13046,6 +13046,8 @@ async fn gateway_linkd_status_heartbeat_round_trips() {
                 "gateway_id": "GX01",
                 "instance_id": "GX01/inst-1",
                 "version": "0.4.0",
+                "gops_version": "2.4.0",
+                "gx_version": "0.17.0",
                 "center_endpoint": "https://center.example",
                 "state": "Linked",
                 "credential_expires_at": "2026-12-01T00:00:00Z",
@@ -13071,6 +13073,8 @@ async fn gateway_linkd_status_heartbeat_round_trips() {
     assert_eq!(view["has_status"], true);
     assert_eq!(view["state"], "Linked");
     assert_eq!(view["gateway_id"], "GX01");
+    assert_eq!(view["gops_version"], "2.4.0");
+    assert_eq!(view["gx_version"], "0.17.0");
     assert_eq!(view["center_endpoint"], "https://center.example");
     assert_eq!(view["stale"], false, "刚心跳不算失联");
     let age = view["age_seconds"].as_i64().expect("i64");
