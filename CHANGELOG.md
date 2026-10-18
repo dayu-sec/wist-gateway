@@ -3,6 +3,28 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.14.0-alpha] - 2026-10-18
+
+### 新增
+
+- **`GET /api/v1/admin/content` 返回采集单元明细（`units`）**：每个单元的来源、`match` 前提、
+  `rule_ref`、权限与**来源可执行性**（与派活闸门同一判据）。管理面因此能展开看到
+  「这个面具体采什么」，而不只是计数。
+- **`match` 支持 `path_exists:<绝对路径>`**：只在路径真存在时才派该单元（三态：
+  没探测过 = 无法判定，探测过但不存在 = 不命中）。探测白名单由目录的 `path_exists`
+  条件推导，随发现策略下发给 agentd。
+
+### 变更
+
+- **事实摘要随 `wist-contracts 0.9` / `wist-api 0.9` 升级**：落库增加 `probed_paths` /
+  `present_paths`（迁移 `0029`），摘要版本 `fact-v2`。
+- **入库校验**：「存在的路径」必须是「探测过的路径」的子集，否则拒收（不静默丢弃）。
+
+### 升级提示
+
+- **先升网关，再升 agentd，最后上新知识包**：新 agentd 多报两个字段，旧网关
+  （`deny_unknown_fields`）会拒整份事实上报。
+
 ## [0.13.0-alpha] - 2026-10-18
 
 ### 新增
