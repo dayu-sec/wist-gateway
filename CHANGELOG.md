@@ -3,6 +3,23 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.16.0-alpha] - 2026-10-18
+
+### 新增
+
+- **`POST /api/v1/gateway/knowledge-package`（环回，仅同机 gwlinkd）**：中心下发知识库包的
+  接收面 —— 与 admin 录入**同内核**（校验摘要 / 验签 → 内容寻址缓存 → 记历史），
+  `activate = true` 时在同一次请求里切生效指针。
+  - 载荷：`{source, sha256, origin?, activate?, requested_by?}`；`source` 是网关能取的
+    容器内路径，`origin` 只作 provenance（网关不用它取包）。
+  - 非环回一律 403（`knowledge_package_loopback_only`）。
+  - 签名旁文件按既有约定读 `<source>.sig`：gwlinkd 交付时会把 `.sig` 一起落到投放目录。
+
+### 升级提示
+
+- 中心「知识库下发」需要本版网关；顺序：**网关 → gwlinkd → 中心 → 前端**。
+- 本版无端点 / 存储 / 迁移变更，可独立升级。
+
 ## [0.15.0-alpha] - 2026-10-18
 
 ### 新增
