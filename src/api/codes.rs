@@ -61,6 +61,8 @@ codes! {
     CERTIFICATE_REVOKED => "certificate_revoked",
     CLASSIFICATION_REQUIRES_FACT_SUMMARY => "classification_requires_fact_summary",
     COLLECTION_CONTENT_UNAVAILABLE => "collection_content_unavailable",
+    COS_PATH_REQUIRED => "cos_path_required",
+    COS_RESOLVE_FAILED => "cos_resolve_failed",
     CREDENTIAL_ID_GENERATION_FAILED => "credential_id_generation_failed",
     CREDENTIAL_RENEWAL_FAILED => "credential_renewal_failed",
     CREDENTIAL_REQUIRED => "credential_required",

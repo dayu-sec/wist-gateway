@@ -86,12 +86,12 @@ pub mod wist_agentd_online_registration_interface;
 pub use wist_agentd_online_registration_interface::WistAgentdOnlineRegistrationInterface;
 
 use admin_ops::{
-    admin_resolve_github_release, classify_agent, delete_agent, get_agent_runtime_status,
-    grant_work, lift_agent_revocation, list_agent_install_packages, list_agent_revocations,
-    list_agents, pause_work, resume_work, revoke_agent, revoke_agent_credential, revoke_work,
-    set_agent_advertise_url, set_agent_install_package, set_agent_uplink, view_agent_advertise_url,
-    view_agent_install_package, view_agent_purpose, view_agent_uplink, view_agent_work,
-    view_discovery_policies, view_purpose_coverage,
+    admin_resolve_cos_path, admin_resolve_github_release, classify_agent, delete_agent,
+    get_agent_runtime_status, grant_work, lift_agent_revocation, list_agent_install_packages,
+    list_agent_revocations, list_agents, pause_work, resume_work, revoke_agent,
+    revoke_agent_credential, revoke_work, set_agent_advertise_url, set_agent_install_package,
+    set_agent_uplink, view_agent_advertise_url, view_agent_install_package, view_agent_purpose,
+    view_agent_uplink, view_agent_work, view_discovery_policies, view_purpose_coverage,
 };
 use content_ops::view_content;
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
@@ -442,6 +442,8 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/admin/github-release/resolve",
             post(admin_resolve_github_release),
         )
+        // 管理面：解析腾讯 COS 路径（按 bucket/组件/版本 展开三平台制品；与上面同形）。
+        .route("/api/v1/admin/cos/resolve", post(admin_resolve_cos_path))
         // NOTE(hand-added): Agent 数据面上送地址的读取/设置。它是 `uplink:poll` 现算上送
         // 授权时的目标来源；未设置时授权只能是待命（没有目标，Agent 不采集日志也不上送数据面）。
         .route(

@@ -2197,6 +2197,63 @@ pub async fn admin_resolve_github_release(
     }
 }
 
+/// 解析腾讯 COS 路径的请求体（安装包页「一键填充」用）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveCosPathRequest {
+    pub cos_path: String,
+}
+
+/// COS 解析的**总**超时：region 不固定时要逐个试，最坏情况是「16 个 region × 4 个候选」。
+/// 每个 HEAD 已有 15s 单请求超时，但没有总量上限时，网络卡住会让管理面请求挂很久 —— 页面
+/// 上就是一个永远转圈的「解析中…」。60s 足够覆盖正常的跨区探测。
+const COS_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 解析腾讯 COS 路径：按 `bucket/component/version` 前缀展开各平台制品（管理面，供安装包页一键填充）。
+///
+/// 制品桶公有读、sha256 在对象自定义元数据里，所以不需要对象存储凭据；网关按发布命名约定
+/// 拼候选对象地址并逐个匿名 `HEAD`（见 `infra::cos`）。返回形状与 GitHub resolver **同形**。
+pub async fn admin_resolve_cos_path(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Json(request): Json<ResolveCosPathRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let cos_path = request.cos_path.trim();
+    if cos_path.is_empty() {
+        return ApiError::bad_request(codes::COS_PATH_REQUIRED, "cos_path must not be empty")
+            .into_response();
+    }
+    match tokio::time::timeout(COS_RESOLVE_TIMEOUT, async {
+        crate::error::logged_op(
+            module_path!(),
+            "resolve cos path",
+            &[("cos_path", cos_path.to_string())],
+            crate::infra::resolve_cos_path(cos_path).await,
+        )
+    })
+    .await
+    {
+        Ok(Ok(resolved)) => Json(resolved).into_response(),
+        // 失败已由 logged_op 记（含链路）；这里只投影，不重复记。
+        Ok(Err(_)) => ApiError::handled(
+            StatusCode::BAD_GATEWAY,
+            codes::COS_RESOLVE_FAILED,
+            "failed to resolve cos path",
+        )
+        .into_response(),
+        Err(_) => ApiError::handled(
+            StatusCode::GATEWAY_TIMEOUT,
+            codes::COS_RESOLVE_FAILED,
+            "cos resolve timed out",
+        )
+        .into_response(),
+    }
+}
+
 /// 列出 wist-agentd 安装包的**录入历史**（管理面）。
 ///
 /// 按录入时间倒序返回；每条带内容寻址 id（可用于 `GET /api/v1/agent/packages/{package_id}`

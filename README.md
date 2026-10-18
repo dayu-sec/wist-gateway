@@ -105,6 +105,22 @@ New install codes and freshly rendered `install.sh` use the setting; already-iss
 keep the address they were generated with. Both are admin-bearer authenticated and stored in the
 `agent_install_package` table.
 
+### Package sources (one-click fill)
+
+The admin console's install-package entry can fill the three agentd artifacts from a GitHub
+release or a Tencent COS prefix (the knowledge entry uses the same two endpoints and takes the
+single `.tar.gz` asset):
+
+- `POST /api/v1/admin/github-release/resolve` — `{ "release_url": "https://github.com/…" }`.
+- `POST /api/v1/admin/cos/resolve` — `{ "cos_path": "<bucket>/wist-agentd/<tag>" }`; also accepts
+  `cos://bucket/prefix` and a region-qualified `https://<bucket>.cos.<region>.myqcloud.com/…` URL.
+
+Both return the same shape: `{version, assets:[{name, artifact_url, sha256, platform}]}`. The COS
+resolver needs no credentials: the bucket is public-read and the sha256 is carried in the
+`x-cos-meta-artifact-sha256` object metadata (COS only stores an MD5 ETag). Because the download host
+contains the region, the resolver probes the usual regions in order unless the region is present in
+the path or set via `WIST_GATEWAY_COS_REGION`; a whole lookup is capped at 60 seconds.
+
 > WAL mode allows concurrent readers but only a single writer, and the database is not shared
 > across hosts. Run a single `wist-gateway` replica; a shared database (Postgres) would be needed
 > to scale out behind a load balancer.

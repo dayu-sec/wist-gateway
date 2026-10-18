@@ -7,6 +7,9 @@ pub mod agent_logs;
 pub use agent_logs::*;
 pub mod config;
 pub use config::*;
+// NOTE(hand-added): 腾讯 COS 路径解析（安装包页一键填充）。与 github.rs 同款、无凭据。
+pub mod cos;
+pub use cos::*;
 pub mod github;
 pub use github::*;
 pub mod ed25519;
