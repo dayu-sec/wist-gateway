@@ -2,7 +2,7 @@
 //! 下载地址 / sha256 / 平台 —— 镜像 [`crate::infra::github`] 的 GitHub release 解析。
 //!
 //! 供网关「安装包录入」页一键填充多平台制品：输入
-//! `wist-1347593047/wist-gwlinkd/v0.9.3-alpha`（或 `cos://…` / 带 region 的下载地址）→
+//! `github-1347593047/wist-gwlinkd/v0.9.3-alpha`（或 `cos://…` / 带 region 的下载地址）→
 //! 返回 `{version, assets[]}`，每个 asset 带 `artifact_url`（COS 虚拟主机公开地址）、
 //! `sha256`（对象自定义元数据 `x-cos-meta-artifact-sha256`，缺失为 `None`）与
 //! `platform`（完整 target-triple，如 `x86_64-unknown-linux-musl`；单制品为 `None`）。
@@ -199,7 +199,7 @@ pub async fn resolve_cos_path(cos_path: &str) -> Result<ResolvedRelease, String>
         .collect();
     if segments.len() < 2 {
         return Err("cos path must be <bucket>/<component>/<version> (e.g. \
-             wist-1347593047/wist-gwlinkd/v0.9.3-alpha)"
+             github-1347593047/wist-gwlinkd/v0.9.3-alpha)"
             .to_string());
     }
     let component = segments[0];
@@ -276,29 +276,41 @@ mod tests {
     fn parses_all_accepted_cos_path_forms() {
         // 1. cos:// URL。
         assert_eq!(
-            parse_cos_path("cos://wist-1347593047/wist-gwlinkd/v0.9.3-alpha"),
-            Ok(parsed("wist-1347593047", "wist-gwlinkd/v0.9.3-alpha", None))
+            parse_cos_path("cos://github-1347593047/wist-gwlinkd/v0.9.3-alpha"),
+            Ok(parsed(
+                "github-1347593047",
+                "wist-gwlinkd/v0.9.3-alpha",
+                None
+            ))
         );
         // 2. 裸 bucket/prefix。
         assert_eq!(
-            parse_cos_path("wist-1347593047/wist-gwlinkd/v0.9.3-alpha"),
-            Ok(parsed("wist-1347593047", "wist-gwlinkd/v0.9.3-alpha", None))
+            parse_cos_path("github-1347593047/wist-gwlinkd/v0.9.3-alpha"),
+            Ok(parsed(
+                "github-1347593047",
+                "wist-gwlinkd/v0.9.3-alpha",
+                None
+            ))
         );
         // 3. 虚拟主机下载地址（含 query / fragment / 末尾斜杠）→ 顺带读出 region。
         assert_eq!(
             parse_cos_path(
-                "https://wist-1347593047.cos.ap-guangzhou.myqcloud.com/wist-gwlinkd/v0.9.3-alpha/?x=1#y"
+                "https://github-1347593047.cos.ap-hongkong.myqcloud.com/wist-gwlinkd/v0.9.3-alpha/?x=1#y"
             ),
             Ok(parsed(
-                "wist-1347593047",
+                "github-1347593047",
                 "wist-gwlinkd/v0.9.3-alpha",
-                Some("ap-guangzhou")
+                Some("ap-hongkong")
             ))
         );
         // 空白环绕也归一化。
         assert_eq!(
-            parse_cos_path("  wist-1347593047/wist-gwlinkd/v0.9.3-alpha  "),
-            Ok(parsed("wist-1347593047", "wist-gwlinkd/v0.9.3-alpha", None))
+            parse_cos_path("  github-1347593047/wist-gwlinkd/v0.9.3-alpha  "),
+            Ok(parsed(
+                "github-1347593047",
+                "wist-gwlinkd/v0.9.3-alpha",
+                None
+            ))
         );
     }
 
@@ -307,11 +319,11 @@ mod tests {
         for bad in [
             "",
             "   ",
-            "cos://wist-1347593047",  // 缺 prefix
-            "wist-1347593047",        // 裸形式缺 prefix
-            "cos:///wist-gwlinkd/v1", // 空 bucket
-            "cos://wist-1347593047/", // 空 prefix
-            "wist-1347593047/",       // 空 prefix
+            "cos://github-1347593047",  // 缺 prefix
+            "github-1347593047",        // 裸形式缺 prefix
+            "cos:///wist-gwlinkd/v1",   // 空 bucket
+            "cos://github-1347593047/", // 空 prefix
+            "github-1347593047/",       // 空 prefix
         ] {
             assert!(parse_cos_path(bad).is_err(), "should reject {bad:?}");
         }

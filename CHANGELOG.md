@@ -3,6 +3,19 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.0-alpha] - 2026-10-19
+
+### 新增
+
+- **主机指标逐挂载点容量**：`GET /api/v1/admin/agents/{id}/host-metrics` 新增 `filesystems[]`
+  （`mount` / `fstype` / `usagePercent` / `totalKb` / `availableKb`），主机列表摘要新增
+  `maxFilesystemUsagePercent`；旧 `disk*` 字段保留兼容。
+
+### 修复
+
+- **COS 示例桶名对齐当前对象存储**：`wist-1347593047` → `github-1347593047`
+  （解析逻辑不变，仅示例、测试与前端提示）。
+
 ## [0.17.0-alpha] - 2026-10-18
 
 ### 新增
@@ -40,7 +53,7 @@
 ### 新增
 
 - **`POST /api/v1/admin/cos/resolve`：解析腾讯 COS 路径**（管理面，供录入页一键填充）。
-  输入 `wist-1347593047/wist-agentd/v0.5.0-alpha`（也接受 `cos://桶/前缀` 与带 region 的
+  输入 `github-1347593047/wist-agentd/v0.5.0-alpha`（也接受 `cos://桶/前缀` 与带 region 的
   `https://<桶>.cos.<region>.myqcloud.com/…`），按发布命名约定展开各平台制品，返回与
   GitHub Release 解析**同形**的 `{version, assets:[{name, artifact_url, sha256, platform}]}`。
   - **无凭据**：桶公有读，sha256 随对象自定义元数据 `x-cos-meta-artifact-sha256` 带回

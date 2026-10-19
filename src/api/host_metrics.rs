@@ -53,8 +53,26 @@ pub struct AgentHostMetrics {
     pub disk_total_kb: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_available_kb: Option<i64>,
+    /// 逐挂载点容量（`system.filesystem.*`）。旧字段保留兼容，但无法定位具体挂载点。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filesystems: Vec<AgentFilesystemMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<AgentHostMetricsHistory>,
+}
+
+/// 单个挂载点的容量快照。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentFilesystemMetrics {
+    pub mount: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fstype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_kb: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_kb: Option<i64>,
 }
 
 /// 各指标的时间序列，`points` 为 `(unix 毫秒, 值)` 列表，按时间升序。
@@ -92,6 +110,9 @@ pub struct AgentHostMetricsSummary {
     pub memory_available_kb: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_usage_percent: Option<f64>,
+    /// 当前最紧张的挂载点使用率（`system.filesystem.usage` 的最大值）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_filesystem_usage_percent: Option<f64>,
 }
 
 pub async fn get_agent_host_metrics(
@@ -189,10 +210,12 @@ async fn query_all_host_metrics(
     if identities.is_empty() {
         return Ok(Vec::new());
     }
-    // 一次拉取所有主机的 system.* 指标，再按 `agent` 标签分组。
+    // 只拉列表页实际用到的 system 指标，再按 `agent` 标签分组。
+    // 逐挂载点容量上线后 `system.filesystem.*` 会按挂载点数展开；这里用名称白名单
+    // 避免把全部 filesystem series 都拉给列表页。
     // 注意：VictoriaMetrics 的 PromQL 字符串字面量里 `\.` 不是合法转义，
-    // 用 `system..*`（`.` 匹配任意字符）即可命中全部 `system.<name>` 指标。
-    let query = r#"{__name__=~"system..*"}"#;
+    // 用 `.`（匹配任意字符）分隔即可。
+    let query = r#"{__name__=~"system.(load_average.1m|memory.total|memory.available|disk.usage|filesystem.usage)"}"#;
     let instant = query_json(vm_url, "/api/v1/query", &[("query", query)]).await?;
 
     let mut map: std::collections::HashMap<String, AgentHostMetricsSummary> =
@@ -220,12 +243,24 @@ async fn query_all_host_metrics(
                 memory_total_kb: None,
                 memory_available_kb: None,
                 disk_usage_percent: None,
+                max_filesystem_usage_percent: None,
             });
         match name {
             "system.load_average.1m" => entry.load_average_1m = parse_f64(value),
             "system.memory.total" => entry.memory_total_kb = parse_i64(value),
             "system.memory.available" => entry.memory_available_kb = parse_i64(value),
             "system.disk.usage" => entry.disk_usage_percent = parse_f64(value),
+            "system.filesystem.usage" => {
+                if item["metric"]["mount"].as_str().is_some()
+                    && let Some(usage) = parse_f64(value)
+                {
+                    entry.max_filesystem_usage_percent = Some(
+                        entry
+                            .max_filesystem_usage_percent
+                            .map_or(usage, |current| current.max(usage)),
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -281,8 +316,11 @@ fn build_metrics(
         disk_usage_percent: None,
         disk_total_kb: None,
         disk_available_kb: None,
+        filesystems: Vec::new(),
         history: None,
     };
+
+    let mut filesystems: HashMap<String, AgentFilesystemMetrics> = HashMap::new();
 
     for item in instant["data"]["result"]
         .as_array()
@@ -291,6 +329,37 @@ fn build_metrics(
     {
         let name = item["metric"]["__name__"].as_str().unwrap_or("");
         let value = scalar_value(&item);
+        if name.starts_with("system.filesystem.")
+            && matches!(
+                name,
+                "system.filesystem.usage"
+                    | "system.filesystem.total"
+                    | "system.filesystem.available"
+            )
+            && let Some(mount) = item["metric"]["mount"].as_str()
+        {
+            let fstype = item["metric"]["fstype"].as_str();
+            let entry =
+                filesystems
+                    .entry(mount.to_string())
+                    .or_insert_with(|| AgentFilesystemMetrics {
+                        mount: mount.to_string(),
+                        fstype: None,
+                        usage_percent: None,
+                        total_kb: None,
+                        available_kb: None,
+                    });
+            if let Some(fstype) = fstype {
+                entry.fstype = Some(fstype.to_string());
+            }
+            match name {
+                "system.filesystem.usage" => entry.usage_percent = parse_f64(value),
+                "system.filesystem.total" => entry.total_kb = parse_i64(value),
+                "system.filesystem.available" => entry.available_kb = parse_i64(value),
+                _ => {}
+            }
+            continue;
+        }
         match name {
             "system.load_average.1m" => metrics.load_average_1m = parse_f64(value),
             "system.load_average.5m" => metrics.load_average_5m = parse_f64(value),
@@ -304,6 +373,10 @@ fn build_metrics(
             _ => {}
         }
     }
+    metrics.filesystems = filesystems.into_values().collect();
+    metrics
+        .filesystems
+        .sort_by(|left, right| left.mount.cmp(&right.mount));
 
     let mut history = AgentHostMetricsHistory::default();
     for item in range["data"]["result"]
@@ -357,4 +430,81 @@ fn parse_f64(value: Option<&str>) -> Option<f64> {
 
 fn parse_i64(value: Option<&str>) -> Option<i64> {
     value.and_then(|value| value.parse::<i64>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_metrics;
+    use serde_json::json;
+
+    #[test]
+    fn build_metrics_groups_filesystem_series_by_mount() {
+        let instant = json!({
+            "data": {
+                "result": [
+                    {"metric": {"__name__": "system.filesystem.usage", "mount": "/var", "fstype": "xfs"}, "value": [1, "95"]},
+                    {"metric": {"__name__": "system.filesystem.total", "mount": "/var", "fstype": "xfs"}, "value": [1, "20971520"]},
+                    {"metric": {"__name__": "system.filesystem.available", "mount": "/var", "fstype": "xfs"}, "value": [1, "1048576"]},
+                    {"metric": {"__name__": "system.filesystem.usage", "mount": "/", "fstype": "ext4"}, "value": [1, "60"]},
+                    {"metric": {"__name__": "system.filesystem.usage", "mount": "/data"}, "value": [1, "50"]},
+                    {"metric": {"__name__": "system.filesystem.usage"}, "value": [1, "99"]},
+                    {"metric": {"__name__": "system.filesystem.inodes.usage", "mount": "/var"}, "value": [1, "88"]},
+                    {"metric": {"__name__": "system.disk.usage"}, "value": [1, "26.5"]}
+                ]
+            }
+        });
+        let range = json!({"data": {"result": []}});
+
+        let metrics = build_metrics("agent-001", &instant, &range);
+
+        // 没有 `mount` 的 series 被忽略，不会造出一个空挂载点。
+        assert_eq!(metrics.filesystems.len(), 3);
+        let var = metrics
+            .filesystems
+            .iter()
+            .find(|filesystem| filesystem.mount == "/var")
+            .expect("/var filesystem");
+        assert_eq!(var.fstype.as_deref(), Some("xfs"));
+        assert_eq!(var.usage_percent, Some(95.0));
+        assert_eq!(var.total_kb, Some(20_971_520));
+        assert_eq!(var.available_kb, Some(1_048_576));
+
+        let data = metrics
+            .filesystems
+            .iter()
+            .find(|filesystem| filesystem.mount == "/data")
+            .expect("/data filesystem");
+        assert_eq!(data.fstype, None, "missing fstype stays None");
+        assert_eq!(data.usage_percent, Some(50.0));
+
+        // 旧字段仍然独立解析，保持兼容。
+        assert_eq!(metrics.disk_usage_percent, Some(26.5));
+
+        // 序列化保持 camelCase，前端按这个形状消费。
+        let json = serde_json::to_value(&metrics).expect("serialize metrics");
+        assert_eq!(json["filesystems"][0]["mount"], "/");
+        assert_eq!(json["filesystems"][0]["usagePercent"], 60.0);
+        assert_eq!(json["filesystems"][2]["mount"], "/var");
+    }
+
+    #[test]
+    fn build_metrics_keeps_legacy_disk_fields_without_filesystems() {
+        let instant = json!({
+            "data": {
+                "result": [
+                    {"metric": {"__name__": "system.disk.usage"}, "value": [1, "60"]},
+                    {"metric": {"__name__": "system.disk.total"}, "value": [1, "20971520"]},
+                    {"metric": {"__name__": "system.disk.available"}, "value": [1, "1048576"]}
+                ]
+            }
+        });
+        let range = json!({"data": {"result": []}});
+
+        let metrics = build_metrics("agent-001", &instant, &range);
+
+        assert!(metrics.filesystems.is_empty());
+        assert_eq!(metrics.disk_usage_percent, Some(60.0));
+        assert_eq!(metrics.disk_total_kb, Some(20_971_520));
+        assert_eq!(metrics.disk_available_kb, Some(1_048_576));
+    }
 }
