@@ -27,7 +27,7 @@ wist-error = { version = "0.1" }
 #wist-contracts = { version = "0.1.1", path = "../wist-contracts" }
 #wist-control = { version = "0.1.1", path = "../wist-control" }
 #wist-error = { version = "0.1.1", path = "../wist-error" }
-orion-error = { version = "0.8", features = ["derive", "serde_json"] }
+orion-error = { version = "0.9", features = ["derive", "serde_json"] }
 ring = "0.17"
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
