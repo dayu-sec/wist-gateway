@@ -3,6 +3,13 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.1-alpha] - 2026-10-19
+
+### 新增
+
+- **主机列表摘要带上最紧张挂载点路径**：新增 `maxFilesystemUsageMount`，与
+  `maxFilesystemUsagePercent` 成对返回；列表页可以直接显示「95% · /var」。
+
 ## [0.18.0-alpha] - 2026-10-19
 
 ### 新增

@@ -113,6 +113,9 @@ pub struct AgentHostMetricsSummary {
     /// 当前最紧张的挂载点使用率（`system.filesystem.usage` 的最大值）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_filesystem_usage_percent: Option<f64>,
+    /// 当前最紧张的挂载点路径（与上面的百分比成对返回）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_filesystem_usage_mount: Option<String>,
 }
 
 pub async fn get_agent_host_metrics(
@@ -244,6 +247,7 @@ async fn query_all_host_metrics(
                 memory_available_kb: None,
                 disk_usage_percent: None,
                 max_filesystem_usage_percent: None,
+                max_filesystem_usage_mount: None,
             });
         match name {
             "system.load_average.1m" => entry.load_average_1m = parse_f64(value),
@@ -251,14 +255,10 @@ async fn query_all_host_metrics(
             "system.memory.available" => entry.memory_available_kb = parse_i64(value),
             "system.disk.usage" => entry.disk_usage_percent = parse_f64(value),
             "system.filesystem.usage" => {
-                if item["metric"]["mount"].as_str().is_some()
+                if let Some(mount) = item["metric"]["mount"].as_str()
                     && let Some(usage) = parse_f64(value)
                 {
-                    entry.max_filesystem_usage_percent = Some(
-                        entry
-                            .max_filesystem_usage_percent
-                            .map_or(usage, |current| current.max(usage)),
-                    );
+                    record_filesystem_usage(entry, mount, usage);
                 }
             }
             _ => {}
@@ -424,6 +424,16 @@ fn series_points(item: &serde_json::Value) -> Vec<(i64, f64)> {
         .unwrap_or_default()
 }
 
+fn record_filesystem_usage(entry: &mut AgentHostMetricsSummary, mount: &str, usage: f64) {
+    let is_worse = entry
+        .max_filesystem_usage_percent
+        .is_none_or(|current| usage > current);
+    if is_worse {
+        entry.max_filesystem_usage_percent = Some(usage);
+        entry.max_filesystem_usage_mount = Some(mount.to_string());
+    }
+}
+
 fn parse_f64(value: Option<&str>) -> Option<f64> {
     value.and_then(|value| value.parse::<f64>().ok())
 }
@@ -434,8 +444,23 @@ fn parse_i64(value: Option<&str>) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_metrics;
+    use super::{AgentHostMetricsSummary, build_metrics, record_filesystem_usage};
     use serde_json::json;
+
+    fn summary() -> AgentHostMetricsSummary {
+        AgentHostMetricsSummary {
+            agent_id: "agent-1".to_string(),
+            node_id: String::new(),
+            hostname: String::new(),
+            ip_addresses: Vec::new(),
+            load_average_1m: None,
+            memory_total_kb: None,
+            memory_available_kb: None,
+            disk_usage_percent: None,
+            max_filesystem_usage_percent: None,
+            max_filesystem_usage_mount: None,
+        }
+    }
 
     #[test]
     fn build_metrics_groups_filesystem_series_by_mount() {
@@ -485,6 +510,26 @@ mod tests {
         assert_eq!(json["filesystems"][0]["mount"], "/");
         assert_eq!(json["filesystems"][0]["usagePercent"], 60.0);
         assert_eq!(json["filesystems"][2]["mount"], "/var");
+    }
+
+    #[test]
+    fn keeps_the_worst_filesystem_mount() {
+        let mut entry = summary();
+
+        record_filesystem_usage(&mut entry, "/", 60.0);
+        assert_eq!(entry.max_filesystem_usage_mount.as_deref(), Some("/"));
+
+        // 更低的使用率不能覆盖更紧张的挂载点。
+        record_filesystem_usage(&mut entry, "/data", 50.0);
+        assert_eq!(entry.max_filesystem_usage_percent, Some(60.0));
+        assert_eq!(entry.max_filesystem_usage_mount.as_deref(), Some("/"));
+
+        record_filesystem_usage(&mut entry, "/var", 95.0);
+        assert_eq!(entry.max_filesystem_usage_percent, Some(95.0));
+        assert_eq!(entry.max_filesystem_usage_mount.as_deref(), Some("/var"));
+
+        let json = serde_json::to_value(&entry).expect("serialize summary");
+        assert_eq!(json["maxFilesystemUsageMount"], "/var");
     }
 
     #[test]
