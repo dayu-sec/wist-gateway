@@ -74,6 +74,9 @@ struct UnitSourceView {
     kind: String,
     target: String,
     multiline: String,
+    /// 选源排除项（空则不输出，保持旧响应的字节不变）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exclude_globs: Vec<String>,
     /// agentd 今天能不能执行这条来源（与网关派活闸门**同一判据**）。
     executable: bool,
 }
@@ -154,6 +157,7 @@ pub async fn view_content(
                     kind: source.kind.clone(),
                     target: source.target.clone(),
                     multiline: source.multiline.clone(),
+                    exclude_globs: source.exclude_globs.clone(),
                     executable: is_executable_source(&source.kind, &source.target),
                 })
                 .collect();

@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.18.1" #@gxl:set(version)
+version = "0.19.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -90,3 +90,8 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+# 本地联调：与 `wist-contracts` 同期改动时，取消下面两行的注释 ——
+# `[patch]` 放在这里（而不是逐条改依赖行），是为了让 api/control/shared 也解析到本地版本。
+# [patch.crates-io]
+# wist-contracts = { path = "../wist-contracts" }

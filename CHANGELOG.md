@@ -3,6 +3,31 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.19.0-alpha] - 2026-10-22
+
+### 新增
+
+- **采集目录接受文件族 glob 来源（W1）**：`FileGlob` 的 target 现在可以是绝对路径 + 单层通配
+  （`/var/log/containers/*.log`），`**` 仍被拒（采集端未实现递归展开）。
+  `active` 单元的「至少一条可执行来源」判据随 `wist-contracts` 0.9.1 自动放宽。
+- **来源级 `exclude_globs`**：`[[units.sources]]` 可声明绝对路径排除项（只允许 `FileGlob`，
+  相对路径被拒），随工作参数一起下发；管理面 `content-catalog` 的 `sources[]`
+  也会返回 `exclude_globs`（空则不输出，旧响应字节不变）。
+
+### 变更
+
+- 派活物化（`materialize_spec`）透传 `exclude_globs`；按事实裁剪仍只针对**显式路径**，
+  文件族不参与（通配目标不探存在性）。
+
+### 升级提示
+
+- **依赖 `wist-contracts` 0.9.1**；先发 contracts 再发本仓。
+- 知识库里靠通配的单元**仍保持 `draft`**：机队里还有不认识 glob 的旧 agentd，
+  要等能力协商/机队验证后再单独发一版目录翻 `active`。
+- **目录与网关的耦合**：`catalog.toml` 的 `[[units.sources]]` 若写了 `exclude_globs`，
+  需要网关 ≥ 0.19（旧网关的 `SourceRow` 是 `deny_unknown_fields`，会把整份目录判为非法）。
+  当前目录没有单元声明排除项，所以本版无此约束。
+
 ## [0.18.1-alpha] - 2026-10-19
 
 ### 新增

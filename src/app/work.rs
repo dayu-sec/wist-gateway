@@ -164,6 +164,8 @@ fn materialize_spec(
                 // 「怎么读这条来源」跟工作内容一起发出去：agentd 不该自己去猜文件格式，
                 // 策展在目录里已经知道并声明了。
                 multiline: source.multiline.clone(),
+                // 选源排除项同样属于「这份采集面不该采什么」，跟着单元走。
+                exclude_globs: source.exclude_globs.clone(),
             });
         }
         if sources.is_empty() {
@@ -983,6 +985,37 @@ status = "active"
         assert_eq!(spec.units[0].requires_privilege, "root");
     }
 
+    // ── W1：选源排除项跟着单元走 ───────────────────────────────
+
+    #[test]
+    fn source_exclude_globs_are_dispatched_with_the_unit() {
+        // 排除项不在网关这一层求值：它是「这份采集面不该采什么」的声明，
+        // 要在 agentd 端按实际展开结果匹配。不传下去，容器单元就只能退回成
+        // 「把业务名写进 pattern」。
+        let catalog = CATALOG.replacen(
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql/*.log\"\n\
+             exclude_globs = [\"/var/log/postgresql/archive-*.log\"]",
+            1,
+        );
+        let content =
+            crate::app::content::parse_content(&catalog, PACKS, TEMPLATES).expect("fixture parses");
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts_with_paths("linux", &["postgresql"], &[], &[]),
+        )
+        .unwrap();
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert_eq!(spec.units[0].sources[0].target, "/var/log/postgresql/*.log");
+        assert_eq!(
+            spec.units[0].sources[0].exclude_globs,
+            vec!["/var/log/postgresql/archive-*.log".to_string()]
+        );
+    }
+
     #[test]
     fn a_hand_written_spec_is_not_filtered_by_path_facts() {
         // 人工点名是运维的显式动作：不过滤，失败了也要看得见。
@@ -1088,11 +1121,13 @@ status = "active"
             kind: "FileGlob".to_string(),
             target: "/var/log/misc/*".to_string(),
             multiline: "none".to_string(),
+            exclude_globs: Vec::new(),
         };
         let exporter = UnitSource {
             kind: "Exporter".to_string(),
             target: "dmesg:panic".to_string(),
             multiline: "none".to_string(),
+            exclude_globs: Vec::new(),
         };
         assert!(!source_is_absent_on_this_machine(&glob, Some(&facts)));
         assert!(!source_is_absent_on_this_machine(&exporter, Some(&facts)));

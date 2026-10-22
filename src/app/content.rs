@@ -167,6 +167,9 @@ struct SourceRow {
     target: String,
     #[serde(default = "default_multiline")]
     multiline: String,
+    /// 从文件族匹配集里剔掉的绝对路径 glob（默认空，只对 `FileGlob` 有意义）。
+    #[serde(default)]
+    exclude_globs: Vec<String>,
 }
 
 fn default_multiline() -> String {
@@ -260,6 +263,8 @@ pub struct UnitSource {
     pub target: String,
     /// `none`（一行一条）| `indented`（行首缩进是上一条的续行）。
     pub multiline: String,
+    /// 从匹配集里剔掉的绝对路径 glob；空 = 不排除。
+    pub exclude_globs: Vec<String>,
 }
 
 impl Unit {
@@ -426,6 +431,7 @@ fn build_content(
                         kind: source.kind,
                         target: source.target,
                         multiline: source.multiline,
+                        exclude_globs: source.exclude_globs,
                     })
                     .collect(),
             };
@@ -543,11 +549,14 @@ fn validate_catalog(
     Ok(catalog.catalog_version)
 }
 
-/// 同一平台上，同一个显式文件只能被**一个** `active` 单元采集。
+/// 同一平台上，同一个文件只能被**一个** `active` 单元采集。
 ///
 /// 一条来源对应一条采集任务：两个 active 单元写同一个路径，agentd 会建两个 input
 /// （各自 checkpoint），同一批行被上送两次。而「一份文件出多个 log_type」应当由数据面
 /// 按正文分派，不是重复读。只约束 active×active —— draft 单元允许并列（渐进启用）。
+///
+/// 能查的只有**同字串**的 target：显式路径、目录、glob 都一样。两条不同的 glob 是否重叠
+/// （`/var/log/*.log` 与 `/var/log/app*.log`）在装载期无法判定，只能靠策展约束。
 fn validate_unique_active_paths(units: &BTreeMap<String, Unit>) -> ConfigResult<()> {
     let mut claimed: BTreeMap<(String, String), String> = BTreeMap::new();
     for unit in units.values() {
@@ -555,7 +564,7 @@ fn validate_unique_active_paths(units: &BTreeMap<String, Unit>) -> ConfigResult<
             continue;
         }
         for source in &unit.sources {
-            if source.kind != "FileGlob" || !is_explicit_path(&source.target) {
+            if source.kind != "FileGlob" {
                 continue;
             }
             match claimed.insert(
@@ -565,13 +574,13 @@ fn validate_unique_active_paths(units: &BTreeMap<String, Unit>) -> ConfigResult<
                 None => {}
                 Some(existing) if existing == unit.unit_id => {
                     return Err(invalid(format!(
-                        "unit {}: source path {:?} is declared more than once",
+                        "unit {}: source target {:?} is declared more than once",
                         unit.unit_id, source.target
                     )));
                 }
                 Some(existing) => {
                     return Err(invalid(format!(
-                        "unit {}: path {:?} is already collected by unit {existing} on {} \
+                        "unit {}: target {:?} is already collected by unit {existing} on {} \
                          (同一文件只允许一个 active 单元采集；多个 log_type 由数据面按正文分派)",
                         unit.unit_id, source.target, unit.platform
                     )));
@@ -665,6 +674,23 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
                 source.kind, source.multiline
             )));
         }
+        // 排除项只在文件族有意义，且必须是**绝对路径**：匹配是对展开后的完整路径做的，
+        // 相对路径的结果取决于进程 cwd —— 同一台机器换一种启动方式就会少采一个文件。
+        if !source.exclude_globs.is_empty() && source.kind != "FileGlob" {
+            return Err(invalid(format!(
+                "unit {id}: source {} cannot declare exclude_globs (只对 FileGlob 有意义)",
+                source.kind
+            )));
+        }
+        if let Some(bad) = source
+            .exclude_globs
+            .iter()
+            .find(|pattern| !pattern.starts_with('/'))
+        {
+            return Err(invalid(format!(
+                "unit {id}: exclude_globs expects absolute paths, got {bad:?}"
+            )));
+        }
         // 多行归并只对可 tail 的文件来源有意义。写在别的 kind 上不是“多一个无害的字段”，
         // 而是对人误导读它的人 —— 要么策展想表达别的意思，要么放错了位置。
         if source.multiline != "none" && source.kind != "FileGlob" {
@@ -678,8 +704,9 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
     //
     // 这里刻意**不看** `rule_ref`：采原文不需要解析规则，拿它当闸门是把「能解析」当成「能采」。
     // 卡住的是「这条来源采集端到底能不能执行」（`is_executable_source`，与 agentd 同源：
-    // kind 要能执行，`FileGlob` 的 target 还要是**显式绝对路径**、`Exporter` 的 ID 还要在
-    // `EXPORTER_IDS` 里）。否则就会出现「网关说可采、agent 拿到后报 unsupported」这种自相矛盾的运行态。
+    // kind 要能执行，`FileGlob` 的 target 还要是**可采的绝对路径**（显式路径或单层 glob），
+    // `Exporter` 的 ID 还要在 `EXPORTER_IDS` 里）。否则就会出现「网关说可采、agent 拿到后报
+    // unsupported」这种自相矛盾的运行态。
     if unit.status == "active"
         && !unit
             .sources
@@ -688,8 +715,8 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
     {
         return Err(invalid(format!(
             "unit {id}: status = active but no source agentd can collect \
-             (kind 要去 {EXECUTABLE_SOURCE_KINDS:?}；FileGlob 的 target 要是显式绝对路径、\
-              Exporter 的 ID 要在 EXPORTER_IDS 里)"
+             (kind 要去 {EXECUTABLE_SOURCE_KINDS:?}；FileGlob 的 target 要是绝对路径 \
+             （显式路径或单层 glob，不支持 `**`）、Exporter 的 ID 要在 EXPORTER_IDS 里)"
         )));
     }
     Ok(())
@@ -1676,6 +1703,7 @@ target = "/var/log/x.log"
                 kind: "FileGlob".to_string(),
                 target: "/var/log/x.log".to_string(),
                 multiline: "none".to_string(),
+                exclude_globs: Vec::new(),
             }],
         }
     }
@@ -1834,7 +1862,8 @@ target = "/var/log/x.log"
                 "linux {family} 应当采集就绪"
             );
         }
-        // 靠**通配**的来源仍不可执行：DB 服务面（`/var/log/*/*`）还没开。
+        // DB 服务面（`/var/log/postgresql/*` 这类目录族）仍是 `draft`：glob 本身已可执行（W1），
+        // 但按发布纪律等机队验证后再翻 `active`。
         assert!(!set.is_family_ready("linux", "DatabaseService"));
         let linux_readiness = set.family_readiness("linux");
         let linux_by_family = |family: &str| {
@@ -2166,6 +2195,90 @@ target = "/var/log/x.log"
         assert!(unit.collect_ready());
     }
 
+    // ── W1：文件族 glob ──────────────────────────────────────────────
+
+    #[test]
+    fn accepts_an_active_unit_backed_by_a_file_family_glob() {
+        // W1 起单层 glob 是可执行来源：容器日志的选源就是一条 glob + 排除项。
+        let catalog = format!(
+            "{CATALOG}\n\
+             [[units]]\n\
+             unit_id = \"linux-container-stdout\"\n\
+             family = \"DatabaseService\"\n\
+             capability = \"collect_logs\"\n\
+             platform = \"linux\"\n\
+             match = \"\"\n\
+             rule_ref = \"\"\n\
+             requires_privilege = \"root\"\n\
+             status = \"active\"\n\n\
+             [[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/containers/*.log\"\n\
+             exclude_globs = [\"/var/log/containers/*_kube-system_*.log\"]\n"
+        );
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("glob source is executable");
+        let unit = set
+            .units()
+            .find(|unit| unit.unit_id == "linux-container-stdout")
+            .expect("container unit");
+        assert!(unit.collect_ready());
+        assert_eq!(
+            unit.sources[0].exclude_globs,
+            vec!["/var/log/containers/*_kube-system_*.log".to_string()]
+        );
+        // 文件族不参与探测白名单：白名单只收**显式**路径（探测不到就裁剪的前提不成立）。
+        assert!(
+            !set.probe_paths()
+                .contains(&"/var/log/containers/*.log".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_recursive_globs_on_an_active_unit() {
+        // `**` 没实现：接受它就等于承诺一个采不到的面。
+        let catalog = CATALOG.replacen(
+            "target = \"/var/log/postgresql.log\"",
+            "target = \"/var/log/**/*.log\"",
+            1,
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("recursive glob");
+        assert!(
+            err.to_string().contains("no source agentd can collect"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_relative_exclude_globs() {
+        // 排除项按**展开后的完整路径**匹配：相对路径的结果取决于进程 cwd。
+        let catalog = CATALOG.replacen(
+            "target = \"/var/log/postgresql.log\"",
+            "target = \"/var/log/postgresql/*.log\"\nexclude_globs = [\"*/archive/*\"]",
+            1,
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("relative exclude");
+        assert!(
+            err.to_string()
+                .contains("exclude_globs expects absolute paths"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_exclude_globs_on_a_non_file_source() {
+        // 写在别的 kind 上不是“多一个无害的字段”：要么策展想表达别的意思，要么放错了位置。
+        let catalog = CATALOG.replacen(
+            "kind = \"MetricInterval\"\ntarget = \"15s\"",
+            "kind = \"MetricInterval\"\ntarget = \"15s\"\nexclude_globs = [\"/var/log/x.log\"]",
+            1,
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("exclude on metric");
+        assert!(
+            err.to_string().contains("cannot declare exclude_globs"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn rejects_an_unknown_family() {
         let catalog = CATALOG.replacen("family = \"HostMetrics\"", "family = \"Nope\"", 1);
@@ -2332,6 +2445,46 @@ target = "/var/log/x.log"
             "{err}"
         );
         assert!(err.to_string().contains("linux-db"), "{err}");
+    }
+
+    #[test]
+    fn rejects_two_active_units_with_the_same_glob_target() {
+        // 两条 active 单元写同一条 glob = agentd 两个 input 读同一批文件，行会重复上送。
+        // 重叠的不同 glob（`/var/log/*.log` vs `/var/log/app*.log`）装载期查不出，但**同字串**
+        // 的必须拦下。
+        let catalog = format!(
+            "{CATALOG}\n\
+             [[units]]\n\
+             unit_id = \"linux-container-a\"\n\
+             family = \"DatabaseService\"\n\
+             capability = \"collect_logs\"\n\
+             platform = \"linux\"\n\
+             match = \"\"\n\
+             rule_ref = \"\"\n\
+             requires_privilege = \"root\"\n\
+             status = \"active\"\n\n\
+             [[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/containers/*.log\"\n\n\
+             [[units]]\n\
+             unit_id = \"linux-container-b\"\n\
+             family = \"DatabaseService\"\n\
+             capability = \"collect_logs\"\n\
+             platform = \"linux\"\n\
+             match = \"\"\n\
+             rule_ref = \"\"\n\
+             requires_privilege = \"root\"\n\
+             status = \"active\"\n\n\
+             [[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/containers/*.log\"\n"
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("duplicate glob target");
+        assert!(
+            err.to_string().contains("already collected by unit"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("linux-container-a"), "{err}");
     }
 
     #[test]
