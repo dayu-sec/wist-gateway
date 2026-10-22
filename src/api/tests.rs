@@ -13264,6 +13264,14 @@ async fn version_route_is_public_and_reports_a_non_empty_version() {
         !version.is_empty(),
         "缺省 `version` 必须非空（页面据此显示后端版本）：{body}"
     );
+    // 全栈版本可选：stack 没挂 `version.txt` 时不返回；一旦返回就必须是非空字符串。
+    match body.get("stack_version") {
+        None => {}
+        Some(value) => assert!(
+            value.as_str().is_some_and(|value| !value.trim().is_empty()),
+            "`stack_version` 要么不出现，要么是非空字符串：{body}"
+        ),
+    }
 }
 
 /// 容器部署的准入（`[server] self_face_allow`）：列出的那个对端按「本机」放行，
