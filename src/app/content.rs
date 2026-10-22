@@ -21,7 +21,7 @@ use std::path::Path;
 use orion_error::conversion::ToStructError;
 use orion_error::prelude::*;
 use serde::Deserialize;
-use wist_contracts::work::{EXECUTABLE_SOURCE_KINDS, is_executable_source};
+use wist_contracts::work::{EXECUTABLE_SOURCE_KINDS, is_executable_source, is_explicit_path};
 use wist_error::{ConfigError, ConfigReason, ConfigResult};
 
 use crate::infra::StoredAgentFactSummary;
@@ -433,6 +433,8 @@ fn build_content(
         })
         .collect::<BTreeMap<_, _>>();
 
+    validate_unique_active_paths(&units)?;
+
     let packs = validate_packs(&packs, catalog_version, &units)?;
     let templates = validate_templates(&templates, catalog_version, &packs, &units)?;
 
@@ -539,6 +541,45 @@ fn validate_catalog(
         }
     }
     Ok(catalog.catalog_version)
+}
+
+/// 同一平台上，同一个显式文件只能被**一个** `active` 单元采集。
+///
+/// 一条来源对应一条采集任务：两个 active 单元写同一个路径，agentd 会建两个 input
+/// （各自 checkpoint），同一批行被上送两次。而「一份文件出多个 log_type」应当由数据面
+/// 按正文分派，不是重复读。只约束 active×active —— draft 单元允许并列（渐进启用）。
+fn validate_unique_active_paths(units: &BTreeMap<String, Unit>) -> ConfigResult<()> {
+    let mut claimed: BTreeMap<(String, String), String> = BTreeMap::new();
+    for unit in units.values() {
+        if unit.status != "active" {
+            continue;
+        }
+        for source in &unit.sources {
+            if source.kind != "FileGlob" || !is_explicit_path(&source.target) {
+                continue;
+            }
+            match claimed.insert(
+                (unit.platform.clone(), source.target.clone()),
+                unit.unit_id.clone(),
+            ) {
+                None => {}
+                Some(existing) if existing == unit.unit_id => {
+                    return Err(invalid(format!(
+                        "unit {}: source path {:?} is declared more than once",
+                        unit.unit_id, source.target
+                    )));
+                }
+                Some(existing) => {
+                    return Err(invalid(format!(
+                        "unit {}: path {:?} is already collected by unit {existing} on {} \
+                         (同一文件只允许一个 active 单元采集；多个 log_type 由数据面按正文分派)",
+                        unit.unit_id, source.target, unit.platform
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> ConfigResult<()> {
@@ -918,10 +959,14 @@ impl ContentSet {
         self.families.contains_key(id)
     }
 
-    /// 目录里 `match` 用到的 `path_exists:<绝对路径>`（去重、定序）。
+    /// 目录里 `match` 用到的 `path_exists:<绝对路径>`，以及所有**显式文件来源**的目标。
     ///
     /// 这是网关下发给 agentd 的**探测白名单**：agentd 只探这些路径，不探任意路径。
     /// 派活求值与探测白名单同源，避免「求值要的路径没下发」这种静默永不命中的情况。
+    ///
+    /// 显式来源也要探：派活物化时按「探测过且不存在」把来源裁掉
+    /// （`work.rs::materialize_spec`），否则 Ubuntu 上会派 `dnf.log`、RHEL 上派 `auth.log`
+    /// 这类永远失败的输入。探测白名单与裁剪判据必须同源。
     pub fn probe_paths(&self) -> Vec<String> {
         let mut paths: BTreeSet<String> = BTreeSet::new();
         for unit in self.units.values() {
@@ -933,6 +978,11 @@ impl ContentSet {
                     if value.starts_with('/') {
                         paths.insert(value);
                     }
+                }
+            }
+            for source in &unit.sources {
+                if source.kind == "FileGlob" && is_explicit_path(&source.target) {
+                    paths.insert(source.target.clone());
                 }
             }
         }
@@ -1901,7 +1951,8 @@ target = "/var/log/x.log"
 
     #[test]
     fn linux_host_expands_the_collect_ready_families() {
-        // LinuxHost 模板（`linux-base` 包）10 个面全采集就绪：4 个显式路径日志面
+        // LinuxHost 模板（`linux-base` 包）10 个面全采集就绪：5 个显式路径日志面
+        // （auth/secure、sudo.log、dpkg/apt/dnf/yum、kern.log/messages、audit.log）
         // + 4 个导出器面 + 指标面。别让「Linux 只能采指标」的旧状态悄悄回来。
         let set = load_content(
             &crate::test_support::knowledge_file("catalog.toml"),
@@ -1910,9 +1961,13 @@ target = "/var/log/x.log"
         )
         .expect("load checked-in content");
         let mut host_facts = facts("linux", &[]);
-        // sudo.log 被探测过且存在：与「没探测过」必须区分开（前者不选、后者报无法判定）。
-        host_facts.probed_paths = vec!["/var/log/sudo.log".to_string()];
-        host_facts.present_paths = vec!["/var/log/sudo.log".to_string()];
+        // 路径门控要“探测过且存在”才命中；这里模拟 Debian 系（auth.log、sudo.log、audit.log 都在）。
+        host_facts.probed_paths = vec![
+            "/var/log/auth.log".to_string(),
+            "/var/log/sudo.log".to_string(),
+            "/var/log/audit/audit.log".to_string(),
+        ];
+        host_facts.present_paths = host_facts.probed_paths.clone();
         let expansion = set.expand("linux-host", &host_facts).expect("expand");
         assert_eq!(
             expansion
@@ -2001,16 +2056,25 @@ target = "/var/log/x.log"
     }
 
     #[test]
-    fn probe_paths_are_derived_from_path_exists_conditions() {
+    fn probe_paths_cover_match_conditions_and_explicit_sources() {
         let catalog = CATALOG.replacen(
             "match = \"\"",
             "match = \"path_exists:/var/log/sudo.log\"",
             1,
         );
         let set = parse_with(&catalog, PACKS, TEMPLATES).expect("parses");
-        assert_eq!(set.probe_paths(), vec!["/var/log/sudo.log".to_string()]);
-        // 没有路径条件时为空：不探测任何路径。
-        assert!(minimal().probe_paths().is_empty());
+        assert_eq!(
+            set.probe_paths(),
+            vec![
+                "/var/log/postgresql.log".to_string(),
+                "/var/log/sudo.log".to_string()
+            ]
+        );
+        // 没有路径条件时，显式文件来源仍然要探（派活裁剪要用）。
+        assert_eq!(
+            minimal().probe_paths(),
+            vec!["/var/log/postgresql.log".to_string()]
+        );
     }
 
     #[test]
@@ -2228,5 +2292,139 @@ target = "/var/log/x.log"
         );
         let err = parse_with(CATALOG, PACKS, &templates).expect_err("class/platform mismatch");
         assert!(err.to_string().contains("belongs to"), "{err}");
+    }
+
+    // ── W0：探测白名单与「同一文件只读一次」 ─────────────────────────────
+
+    #[test]
+    fn probe_paths_includes_explicit_file_sources() {
+        // 派活裁剪要靠探测结果；显式来源不在白名单里，裁剪就永远只能当「没探测过」。
+        let content = minimal();
+        assert!(
+            content
+                .probe_paths()
+                .contains(&"/var/log/postgresql.log".to_string()),
+            "explicit FileGlob target must be probed"
+        );
+    }
+
+    #[test]
+    fn rejects_two_active_units_collecting_the_same_file() {
+        // 同一文件两个 active 单元 = agentd 建两个 input、同一批行上送两次。
+        let catalog = format!(
+            "{CATALOG}\n\
+             [[units]]\n\
+             unit_id = \"linux-db-2\"\n\
+             family = \"DatabaseService\"\n\
+             capability = \"collect_logs\"\n\
+             platform = \"linux\"\n\
+             match = \"\"\n\
+             rule_ref = \"\"\n\
+             requires_privilege = \"root\"\n\
+             status = \"active\"\n\n\
+             [[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/postgresql.log\"\n"
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("duplicate active path");
+        assert!(
+            err.to_string().contains("already collected by unit"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("linux-db"), "{err}");
+    }
+
+    #[test]
+    fn a_draft_unit_may_share_a_path_with_an_active_unit() {
+        // draft 不派活：允许与 active 并列，否则「先策展、后启用」的路被堵死。
+        let catalog = format!(
+            "{CATALOG}\n\
+             [[units]]\n\
+             unit_id = \"linux-db-draft\"\n\
+             family = \"DatabaseService\"\n\
+             capability = \"collect_logs\"\n\
+             platform = \"linux\"\n\
+             match = \"\"\n\
+             rule_ref = \"\"\n\
+             requires_privilege = \"root\"\n\
+             status = \"draft\"\n\n\
+             [[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/postgresql.log\"\n"
+        );
+        parse_with(&catalog, PACKS, TEMPLATES).expect("draft may share the path");
+    }
+
+    #[test]
+    fn rejects_a_unit_that_declares_the_same_file_twice() {
+        // 同一个单元里写两遍同一路径也是重复采集，错误信息要说清是“同一单元重复声明”。
+        let catalog = format!(
+            "{CATALOG}\n\
+             [[units]]\n\
+             unit_id = \"linux-db-dup\"\n\
+             family = \"DatabaseService\"\n\
+             capability = \"collect_logs\"\n\
+             platform = \"linux\"\n\
+             match = \"\"\n\
+             rule_ref = \"\"\n\
+             requires_privilege = \"root\"\n\
+             status = \"active\"\n\n\
+             [[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/dup-only.log\"\n\n\
+             [[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/dup-only.log\"\n"
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("same file twice");
+        assert!(err.to_string().contains("declared more than once"), "{err}");
+    }
+
+    #[test]
+    fn the_same_path_may_be_collected_on_different_platforms() {
+        // 同一路径在 macOS / Linux 各采一次不算重复：它们不是同一批机器上的两个 input。
+        let catalog = format!(
+            "{CATALOG}\n\
+             [[units]]\n\
+             unit_id = \"mac-shared\"\n\
+             family = \"MiscSystem\"\n\
+             capability = \"collect_logs\"\n\
+             platform = \"macos\"\n\
+             match = \"\"\n\
+             rule_ref = \"\"\n\
+             requires_privilege = \"root\"\n\
+             status = \"active\"\n\n\
+             [[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/shared.log\"\n\n\
+             [[units]]\n\
+             unit_id = \"linux-shared\"\n\
+             family = \"MiscSystem\"\n\
+             capability = \"collect_logs\"\n\
+             platform = \"linux\"\n\
+             match = \"\"\n\
+             rule_ref = \"\"\n\
+             requires_privilege = \"root\"\n\
+             status = \"active\"\n\n\
+             [[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/shared.log\"\n"
+        );
+        parse_with(&catalog, PACKS, TEMPLATES).expect("different platforms may share a path");
+    }
+
+    #[test]
+    fn probe_paths_dedupes_a_path_that_is_both_a_condition_and_a_source() {
+        // `path_exists` 与来源写同一路径时只探一次（BTreeSet 去重）。
+        let catalog = CATALOG.replacen(
+            "match = \"installed:postgresql\"",
+            "match = \"path_exists:/var/log/postgresql.log\"",
+            1,
+        );
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("parses");
+        assert_eq!(
+            set.probe_paths(),
+            vec!["/var/log/postgresql.log".to_string()]
+        );
     }
 }

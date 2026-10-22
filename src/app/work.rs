@@ -11,9 +11,11 @@
 //!   * 一次性工作只有「可中断 + 正在跑」才允许暂停 —— 不可中断的**拒绝**，
 //!     而不是「尽力暂停」（挂起半个升级进程比不暂停更危险）。
 
-use crate::app::content::ContentSet;
+use std::collections::BTreeSet;
+
+use crate::app::content::{ContentSet, UnitSource};
 use crate::infra::{StoredAgentFactSummary, StoredOneShotWork};
-use wist_contracts::work::{OneShotWork, WorkSpec, WorkSpecSource, WorkSpecUnit};
+use wist_contracts::work::{OneShotWork, WorkSpec, WorkSpecSource, WorkSpecUnit, is_explicit_path};
 
 /// 授权/撤回被拒的原因。映射成 HTTP 状态码是 api 层的事。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,7 +125,8 @@ pub fn derive_spec(
         };
         return Err(WorkRejection::Conflict(detail));
     };
-    materialize_spec(content, &work.selected_units).map(|spec| (spec, work.catalog_version))
+    materialize_spec(content, &work.selected_units, Some(facts))
+        .map(|spec| (spec, work.catalog_version))
 }
 
 /// 把选中的单元**物化**成工作参数（`spec` 的内容）。
@@ -131,8 +134,16 @@ pub fn derive_spec(
 /// 为什么要物化而不是只存一串 `unit_id`：agentd 拿到工作要能直接照做，
 /// 而「采什么（来源）」与「用什么规则解析（`rule_ref`）」只存在网关的采集目录里。
 /// 详见 `wist_contracts::work::WorkSpec` 的注释。
-fn materialize_spec(content: &ContentSet, unit_ids: &[String]) -> Result<String, WorkRejection> {
+///
+/// `facts` 有值时按「已探测且不存在」裁剪显式路径来源；`None` 用于人工手写 spec
+/// （运维显式点名，应当看得见失败，而不是被网关静默删掉）。
+fn materialize_spec(
+    content: &ContentSet,
+    unit_ids: &[String],
+    facts: Option<&StoredAgentFactSummary>,
+) -> Result<String, WorkRejection> {
     let mut units = Vec::with_capacity(unit_ids.len());
+    let mut absent: BTreeSet<String> = BTreeSet::new();
     for unit_id in unit_ids {
         let Some(unit) = content.units().find(|unit| unit.unit_id == *unit_id) else {
             // 展开出来的单元不在目录里 —— 这是网关自己的不变式被破坏，
@@ -141,27 +152,67 @@ fn materialize_spec(content: &ContentSet, unit_ids: &[String]) -> Result<String,
                 "selected unit {unit_id:?} is not in the collection catalog"
             )));
         };
+        let mut sources = Vec::with_capacity(unit.sources.len());
+        for source in &unit.sources {
+            if source_is_absent_on_this_machine(source, facts) {
+                absent.insert(source.target.clone());
+                continue;
+            }
+            sources.push(WorkSpecSource {
+                kind: source.kind.clone(),
+                target: source.target.clone(),
+                // 「怎么读这条来源」跟工作内容一起发出去：agentd 不该自己去猜文件格式，
+                // 策展在目录里已经知道并声明了。
+                multiline: source.multiline.clone(),
+            });
+        }
+        if sources.is_empty() {
+            // 整条单元都被裁掉：不把「零来源的单元」发下去
+            // （agentd 会建一个永远空转、每轮报路径不存在的 input）。
+            continue;
+        }
         units.push(WorkSpecUnit {
             unit_id: unit.unit_id.clone(),
             capability: unit.capability.clone(),
             rule_ref: unit.rule_ref.clone(),
             requires_privilege: unit.requires_privilege.clone(),
-            sources: unit
-                .sources
-                .iter()
-                .map(|source| WorkSpecSource {
-                    kind: source.kind.clone(),
-                    target: source.target.clone(),
-                    // 「怎么读这条来源」跟工作内容一起发出去：agentd 不该自己去猜文件格式，
-                    // 策展在目录里已经知道并声明了。
-                    multiline: source.multiline.clone(),
-                })
-                .collect(),
+            sources,
         });
+    }
+    if units.is_empty() {
+        let detail = if absent.is_empty() {
+            "no source".to_string()
+        } else {
+            absent.into_iter().collect::<Vec<_>>().join(", ")
+        };
+        return Err(WorkRejection::Conflict(format!(
+            "no collectable source for units {unit_ids:?}: explicit paths absent on this agent ({detail})"
+        )));
     }
     WorkSpec { units }
         .encode()
         .map_err(|err| WorkRejection::Conflict(format!("failed to encode work spec: {err}")))
+}
+
+/// 这条来源在这台机器上是否**已被探测且确认不存在**。
+///
+/// 只看显式文件路径：`没探测过 ≠ 不存在`（三态语义）；通配与导出器都不参与裁剪。
+fn source_is_absent_on_this_machine(
+    source: &UnitSource,
+    facts: Option<&StoredAgentFactSummary>,
+) -> bool {
+    let Some(facts) = facts else {
+        return false;
+    };
+    if source.kind != "FileGlob" || !is_explicit_path(&source.target) {
+        return false;
+    }
+    let probed = facts.probed_paths.iter().any(|path| path == &source.target);
+    let present = facts
+        .present_paths
+        .iter()
+        .any(|path| path == &source.target);
+    probed && !present
 }
 
 /// 校验人工给定的 `spec`：**逐条**必须是该面在该平台上的目录单元。
@@ -198,7 +249,7 @@ pub fn validate_spec(
             "spec must name at least one collection unit (或留空，由网关按事实展开)".to_string(),
         ));
     }
-    materialize_spec(content, &selected).map(|spec| (spec, content.catalog_version))
+    materialize_spec(content, &selected, None).map(|spec| (spec, content.catalog_version))
 }
 
 /// 定出这次授权的期望版本。
@@ -673,10 +724,34 @@ status = "active"
         crate::app::content::parse_content(CATALOG, PACKS, TEMPLATES).expect("fixture parses")
     }
 
+    fn real_content() -> ContentSet {
+        crate::app::content::load_content(
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
+        )
+        .expect("load checked-in content")
+    }
+
     fn facts(packages: &[&str]) -> StoredAgentFactSummary {
         StoredAgentFactSummary {
             os: "linux".to_string(),
             packages: packages.iter().map(|value| value.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn facts_with_paths(
+        os: &str,
+        packages: &[&str],
+        probed: &[&str],
+        present: &[&str],
+    ) -> StoredAgentFactSummary {
+        StoredAgentFactSummary {
+            os: os.to_string(),
+            packages: packages.iter().map(|value| value.to_string()).collect(),
+            probed_paths: probed.iter().map(|value| value.to_string()).collect(),
+            present_paths: present.iter().map(|value| value.to_string()).collect(),
             ..Default::default()
         }
     }
@@ -818,5 +893,208 @@ status = "active"
         // 空 spec：交给调用方去走「按事实展开」那条路。
         let err = validate_spec(&content, "macos", "HostMetrics", "  ").unwrap_err();
         assert!(matches!(err, WorkRejection::BadRequest(_)));
+    }
+
+    // ── W0：按事实裁剪不存在的显式路径 ─────────────────────────────
+
+    #[test]
+    fn an_absent_explicit_path_is_not_dispatched() {
+        // tcc 单元还有一条 UnifiedLogPredicate；文件被确认不存在时只裁掉文件来源。
+        let content = content();
+        let (spec, _) = derive_spec(
+            &content,
+            "MacDaily",
+            "macos",
+            "PrivacyTcc",
+            &facts_with_paths("macos", &[], &["/var/log/tcc.log"], &[]),
+        )
+        .unwrap();
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert_eq!(spec.units.len(), 1);
+        assert_eq!(spec.units[0].sources.len(), 1);
+        assert_eq!(spec.units[0].sources[0].kind, "UnifiedLogPredicate");
+    }
+
+    #[test]
+    fn an_unprobed_path_is_not_treated_as_absent() {
+        // 没探测过 ≠ 不存在：宁可先派下去（失败了看得见），也不悄悄删掉一条来源。
+        let content = content();
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts_with_paths("linux", &["postgresql"], &[], &[]),
+        )
+        .unwrap();
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert_eq!(spec.units[0].sources.len(), 1);
+        assert_eq!(spec.units[0].sources[0].target, "/var/log/postgresql.log");
+    }
+
+    #[test]
+    fn a_unit_whose_only_source_is_absent_is_not_dispatched() {
+        let content = content();
+        let err = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts_with_paths("linux", &["postgresql"], &["/var/log/postgresql.log"], &[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, WorkRejection::Conflict(_)));
+        assert!(err.message().contains("explicit paths absent"), "{err:?}");
+        assert!(err.message().contains("/var/log/postgresql.log"), "{err:?}");
+    }
+
+    #[test]
+    fn only_the_absent_sources_are_dropped_from_a_multi_source_unit() {
+        let catalog = CATALOG.replacen(
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"\n\n\
+             [[units.sources]]\nkind = \"FileGlob\"\ntarget = \"/var/log/postgresql-extra.log\"",
+            1,
+        );
+        let content =
+            crate::app::content::parse_content(&catalog, PACKS, TEMPLATES).expect("fixture parses");
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts_with_paths(
+                "linux",
+                &["postgresql"],
+                &["/var/log/postgresql.log", "/var/log/postgresql-extra.log"],
+                &["/var/log/postgresql.log"],
+            ),
+        )
+        .unwrap();
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        let targets: Vec<&str> = spec.units[0]
+            .sources
+            .iter()
+            .map(|source| source.target.as_str())
+            .collect();
+        assert_eq!(targets, vec!["/var/log/postgresql.log"]);
+        // 裁剪不改变单元的解析规则与权限声明。
+        assert_eq!(spec.units[0].rule_ref, "linux/db");
+        assert_eq!(spec.units[0].requires_privilege, "root");
+    }
+
+    #[test]
+    fn a_hand_written_spec_is_not_filtered_by_path_facts() {
+        // 人工点名是运维的显式动作：不过滤，失败了也要看得见。
+        let content = content();
+        let (spec, _) = validate_spec(&content, "linux", "DatabaseService", "linux-db").unwrap();
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert_eq!(spec.units[0].sources.len(), 1);
+        assert_eq!(spec.units[0].sources[0].target, "/var/log/postgresql.log");
+    }
+
+    #[test]
+    fn the_real_catalog_dispatches_only_the_auth_file_that_exists() {
+        // 真实目录 + 真实事实：Debian 系（auth.log 在、secure 不在）只应派 auth.log。
+        // 这是 W0 要修的那个具体问题：旧行为会把 secure 一起派下去，每轮报路径不存在。
+        let content = real_content();
+        let facts = facts_with_paths(
+            "linux",
+            &[],
+            &["/var/log/auth.log", "/var/log/secure"],
+            &["/var/log/auth.log"],
+        );
+        let (spec, _) =
+            derive_spec(&content, "LinuxHost", "linux", "LoginSession", &facts).expect("derives");
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert_eq!(spec.units.len(), 1);
+        assert_eq!(spec.units[0].unit_id, "linux-auth-session");
+        let targets: Vec<&str> = spec.units[0]
+            .sources
+            .iter()
+            .map(|source| source.target.as_str())
+            .collect();
+        assert_eq!(targets, vec!["/var/log/auth.log"]);
+    }
+
+    #[test]
+    fn a_secure_only_host_dispatches_only_secure() {
+        // RHEL 系：secure 在、auth.log 不在 —— 反向也要成立。
+        let content = real_content();
+        let facts = facts_with_paths(
+            "linux",
+            &[],
+            &["/var/log/auth.log", "/var/log/secure"],
+            &["/var/log/secure"],
+        );
+        let (spec, _) =
+            derive_spec(&content, "LinuxHost", "linux", "LoginSession", &facts).expect("derives");
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        let targets: Vec<&str> = spec.units[0]
+            .sources
+            .iter()
+            .map(|source| source.target.as_str())
+            .collect();
+        assert_eq!(targets, vec!["/var/log/secure"]);
+    }
+
+    #[test]
+    fn a_host_with_neither_auth_file_does_not_get_a_login_work() {
+        // 两条都不在：面在展开阶段就被 `path_exists` 门控排除，不是派一份空活。
+        let content = real_content();
+        let facts = facts_with_paths("linux", &[], &["/var/log/auth.log", "/var/log/secure"], &[]);
+        let err = derive_spec(&content, "LinuxHost", "linux", "LoginSession", &facts).unwrap_err();
+        assert!(
+            err.message().contains("no unit selected for LoginSession"),
+            "{err:?}"
+        );
+        assert!(err.message().contains("linux-auth-session"), "{err:?}");
+    }
+
+    #[test]
+    fn ubuntu_package_logs_dispatch_only_the_existing_files() {
+        // 顺带修掉的那个问题：Ubuntu 不再派 dnf.log / yum.log 两条永远失败的输入。
+        let content = real_content();
+        let facts = facts_with_paths(
+            "linux",
+            &[],
+            &[
+                "/var/log/dpkg.log",
+                "/var/log/apt/history.log",
+                "/var/log/dnf.log",
+                "/var/log/yum.log",
+            ],
+            &["/var/log/dpkg.log", "/var/log/apt/history.log"],
+        );
+        let (spec, _) =
+            derive_spec(&content, "LinuxHost", "linux", "SoftwareChange", &facts).expect("derives");
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        let targets: Vec<&str> = spec.units[0]
+            .sources
+            .iter()
+            .map(|source| source.target.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            vec!["/var/log/dpkg.log", "/var/log/apt/history.log"]
+        );
+    }
+
+    #[test]
+    fn globs_and_exporters_are_never_filtered_by_path_facts() {
+        // 裁剪只针对**显式文件路径**：通配与导出器不参与（即使事实里出现同名串）。
+        let facts = facts_with_paths("linux", &[], &["/var/log/misc/*", "dmesg:panic"], &[]);
+        let glob = UnitSource {
+            kind: "FileGlob".to_string(),
+            target: "/var/log/misc/*".to_string(),
+            multiline: "none".to_string(),
+        };
+        let exporter = UnitSource {
+            kind: "Exporter".to_string(),
+            target: "dmesg:panic".to_string(),
+            multiline: "none".to_string(),
+        };
+        assert!(!source_is_absent_on_this_machine(&glob, Some(&facts)));
+        assert!(!source_is_absent_on_this_machine(&exporter, Some(&facts)));
     }
 }
