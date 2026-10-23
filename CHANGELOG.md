@@ -3,6 +3,33 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.20.0-alpha] - 2026-10-23
+
+### 新增
+
+- **容器选源可以用结构化过滤器（W2）**：`[[units.sources]]` 支持 `filters = { namespace_in, pod_not_in }`，
+  随工作参数下发；装载期校验（只允许 `FileGlob`、值必须是精确名字、目标必须在 `/var/log/containers` 下）。
+  管理面 `sources[]` 一并返回（空不输出，旧响应字节不变）。
+- **派活按 agent 自报的日志能力裁剪（D7）**：agent 上报自己能采的 `file_inputs` /
+  `multiline_modes` / `exporters` 后，网关不再把「这台机器接不了的来源」派下去，
+  而是直接不派、并说明了缺什么。**旧 agentd（不报清单）行为不变**。
+- 主机列表带出 `logs_capabilities`（页面暂未渲染）。
+
+### 变更
+
+- 采集目录里 `linux-kernel-system` 改走 `journalctl-kernel` 后，网关无需改动：
+  `EXPORTER_IDS` 跟随契约自动认识它。
+- 部分裁剪不再静默：单元仍在、但某条来源因能力被剔时记
+  `event=WorkSourceDropped reason=capability`。
+
+### 升级提示
+
+- **依赖 `wist-contracts` 0.9.4 / `wist-api` 0.9.1**；发布顺序 contracts → api → 本仓。
+- ⚠ 本仓必须**先于 agentd** 升级：`AgentStatusReport` 是 `deny_unknown_fields`，
+  旧网关收到 `logs_capabilities` 会**整份拒收**，agentd 会一直报 400。
+- 知识库 `0.5.0`（内核面改走 journald）必须等**本版部署后**再推送：
+  旧网关不认识 `journalctl-kernel`，会把「active 但无可执行来源」当成装载错误。
+
 ## [0.19.0-alpha] - 2026-10-22
 
 ### 新增
