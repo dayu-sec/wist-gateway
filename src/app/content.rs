@@ -21,7 +21,10 @@ use std::path::Path;
 use orion_error::conversion::ToStructError;
 use orion_error::prelude::*;
 use serde::Deserialize;
-use wist_contracts::work::{EXECUTABLE_SOURCE_KINDS, is_executable_source, is_explicit_path};
+use wist_contracts::work::{
+    CONTAINER_LOG_ROOT, ContainerFilters, EXECUTABLE_SOURCE_KINDS, is_executable_source,
+    is_explicit_path,
+};
 use wist_error::{ConfigError, ConfigReason, ConfigResult};
 
 use crate::infra::StoredAgentFactSummary;
@@ -170,6 +173,9 @@ struct SourceRow {
     /// 从文件族匹配集里剔掉的绝对路径 glob（默认空，只对 `FileGlob` 有意义）。
     #[serde(default)]
     exclude_globs: Vec<String>,
+    /// 容器选源的结构化过滤器（默认空，只对容器选源有意义）。
+    #[serde(default)]
+    filters: ContainerFilters,
 }
 
 fn default_multiline() -> String {
@@ -265,6 +271,8 @@ pub struct UnitSource {
     pub multiline: String,
     /// 从匹配集里剔掉的绝对路径 glob；空 = 不排除。
     pub exclude_globs: Vec<String>,
+    /// 容器选源的结构化过滤器（namespace / pod）；空 = 不过滤。
+    pub filters: ContainerFilters,
 }
 
 impl Unit {
@@ -432,6 +440,7 @@ fn build_content(
                         target: source.target,
                         multiline: source.multiline,
                         exclude_globs: source.exclude_globs,
+                        filters: source.filters,
                     })
                     .collect(),
             };
@@ -690,6 +699,30 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
             return Err(invalid(format!(
                 "unit {id}: exclude_globs expects absolute paths, got {bad:?}"
             )));
+        }
+        // 容器过滤器（W2）：结构化选源，只对**容器选源根**下的来源有意义。
+        //
+        // 为什么卡目标：过滤器求值靠文件名 `<pod>_<ns>_<container>-<id>.log`。写在别的路径
+        // 上只会得到「一个都匹配不上」。与其让它在运行时静默采不到，不如在装载期拒掉。
+        if !source.filters.is_empty() {
+            if source.kind != "FileGlob" {
+                return Err(invalid(format!(
+                    "unit {id}: source {} cannot declare filters (只对 FileGlob 有意义)",
+                    source.kind
+                )));
+            }
+            if let Err(reason) = source.filters.validate() {
+                return Err(invalid(format!("unit {id}: filters {reason}")));
+            }
+            let root = CONTAINER_LOG_ROOT;
+            let under_root =
+                source.target == root || source.target.starts_with(&format!("{root}/"));
+            if !under_root {
+                return Err(invalid(format!(
+                    "unit {id}: filters 只能用在 {root} 下的来源（当前 {}）",
+                    source.target
+                )));
+            }
         }
         // 多行归并只对可 tail 的文件来源有意义。写在别的 kind 上不是“多一个无害的字段”，
         // 而是对人误导读它的人 —— 要么策展想表达别的意思，要么放错了位置。
@@ -1700,6 +1733,7 @@ target = "/var/log/x.log"
             requires_privilege: "none".to_string(),
             status: "draft".to_string(),
             sources: vec![SourceRow {
+                filters: Default::default(),
                 kind: "FileGlob".to_string(),
                 target: "/var/log/x.log".to_string(),
                 multiline: "none".to_string(),
@@ -2261,6 +2295,139 @@ target = "/var/log/x.log"
             err.to_string()
                 .contains("exclude_globs expects absolute paths"),
             "{err}"
+        );
+    }
+
+    // ── W2：容器选源的结构化过滤器 ──────────────────────────────
+
+    /// 一条挂在 `/var/log/containers` 下的容器单元（`filters` 由调用方拼）。
+    fn container_unit_with(sources: &str) -> String {
+        format!(
+            "{CATALOG}\n\
+             [[units]]\n\
+             unit_id = \"linux-container-stdout\"\n\
+             family = \"DatabaseService\"\n\
+             capability = \"collect_logs\"\n\
+             platform = \"linux\"\n\
+             match = \"\"\n\
+             rule_ref = \"\"\n\
+             requires_privilege = \"root\"\n\
+             status = \"active\"\n\n\
+             {sources}"
+        )
+    }
+
+    #[test]
+    fn loads_container_filters_on_a_container_source() {
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/containers/*.log\"\n\
+             filters = { namespace_in = [\"prod\"], pod_not_in = [\"debug-pod\"] }\n",
+        );
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("filters accepted");
+        let unit = set
+            .units()
+            .find(|unit| unit.unit_id == "linux-container-stdout")
+            .expect("container unit");
+        assert_eq!(
+            unit.sources[0].filters.namespace_in,
+            vec!["prod".to_string()]
+        );
+        assert_eq!(
+            unit.sources[0].filters.pod_not_in,
+            vec!["debug-pod".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_filters_on_a_non_container_source() {
+        // 过滤器靠文件名 `<pod>_<ns>_<container>-<id>.log` 求值；写在别的路径上
+        // 只会得到“一个都匹配不上”——与其运行时静默采不到，不如装载期拒掉。
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/postgresql/*.log\"\n\
+             filters = { namespace_in = [\"prod\"] }\n",
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("filters off container root");
+        assert!(err.to_string().contains("filters 只能用在"), "{err}");
+    }
+
+    #[test]
+    fn rejects_filters_on_a_non_file_glob_source() {
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"Exporter\"\n\
+             target = \"journalctl-kernel\"\n\
+             filters = { namespace_in = [\"prod\"] }\n",
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("filters on exporter");
+        assert!(err.to_string().contains("cannot declare filters"), "{err}");
+    }
+
+    #[test]
+    fn rejects_filter_values_that_can_never_match() {
+        // 过滤器存的是**精确名字**：通配符 / 空白永远对不上。
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/containers/*.log\"\n\
+             filters = { namespace_in = [\"pro*\"] }\n",
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("wildcard filter");
+        assert!(err.to_string().contains("含通配符"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_misspelled_filter_key() {
+        // `filters` 内部是 `deny_unknown_fields`：拼错的键不能静默变成「不过滤」——
+        // 那会让策展人以为只采 prod，实际整个集群都采。
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/containers/*.log\"\n\
+             filters = { namespaces = [\"prod\"] }\n",
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("typo in filters");
+        // 报错只能看到「目录解析失败」这一层（serde 的 `unknown field` 细节被包装吃掉了）；
+        // 关键是**必须拒绝**，不能静默按空过滤器装载。
+        assert!(!err.to_string().is_empty(), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_path_that_merely_shares_the_container_root_prefix() {
+        // `/var/log/containers-backup` 不是容器目录：只拿 `starts_with` 判会把它的文件
+        // 当成容器日志（结果一个都解析不出名字 → 静默全丢）。
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/containers-backup/*.log\"\n\
+             filters = { namespace_in = [\"prod\"] }\n",
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("prefix lookalike");
+        assert!(err.to_string().contains("filters 只能用在"), "{err}");
+    }
+
+    #[test]
+    fn filters_do_not_affect_collect_readiness() {
+        // 就绪度只问「agentd 能不能采这条来源」；选哪些 pod 是策展选择，不是执行能力。
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/containers/*.log\"\n\
+             filters = { namespace_in = [\"prod\"] }\n",
+        );
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("parses");
+        let unit = set
+            .units()
+            .find(|unit| unit.unit_id == "linux-container-stdout")
+            .expect("container unit");
+        assert!(unit.collect_ready(), "带 filters 的 active 单元仍然可采");
+        assert!(
+            !set.probe_paths()
+                .contains(&"/var/log/containers/*.log".to_string()),
+            "文件族不参与探测白名单（同 W1）"
         );
     }
 

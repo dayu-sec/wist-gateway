@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use wist_contracts::work::is_executable_source;
+use wist_contracts::work::{ContainerFilters, is_executable_source};
 
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 
@@ -77,6 +77,9 @@ struct UnitSourceView {
     /// 选源排除项（空则不输出，保持旧响应的字节不变）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     exclude_globs: Vec<String>,
+    /// 容器选源过滤器（空则不输出，与 `exclude_globs` 同一纪律）。
+    #[serde(skip_serializing_if = "ContainerFilters::is_empty")]
+    filters: ContainerFilters,
     /// agentd 今天能不能执行这条来源（与网关派活闸门**同一判据**）。
     executable: bool,
 }
@@ -158,6 +161,7 @@ pub async fn view_content(
                     target: source.target.clone(),
                     multiline: source.multiline.clone(),
                     exclude_globs: source.exclude_globs.clone(),
+                    filters: source.filters.clone(),
                     executable: is_executable_source(&source.kind, &source.target),
                 })
                 .collect();
@@ -219,4 +223,51 @@ pub async fn view_content(
         readiness,
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(filters: ContainerFilters, exclude_globs: Vec<String>) -> UnitSourceView {
+        UnitSourceView {
+            kind: "FileGlob".to_string(),
+            target: "/var/log/containers/*.log".to_string(),
+            multiline: "none".to_string(),
+            exclude_globs,
+            filters,
+            executable: true,
+        }
+    }
+
+    #[test]
+    fn unit_source_view_keeps_old_response_bytes_when_nothing_is_selected() {
+        // 老响应里没有这两个键；空的时候必须一个都不多出来（页面与旧客户端都按缺省处理）。
+        let json = serde_json::to_value(source(ContainerFilters::default(), Vec::new()))
+            .expect("serialize");
+        assert!(json.get("filters").is_none(), "{json}");
+        assert!(json.get("exclude_globs").is_none(), "{json}");
+    }
+
+    #[test]
+    fn unit_source_view_serializes_filters_and_omits_empty_lists() {
+        let json = serde_json::to_value(source(
+            ContainerFilters {
+                namespace_in: vec!["prod".to_string()],
+                pod_not_in: Vec::new(),
+            },
+            vec!["/var/log/containers/*_kube-system_*.log".to_string()],
+        ))
+        .expect("serialize");
+        assert_eq!(json["filters"]["namespace_in"][0], "prod");
+        assert!(
+            json["filters"].get("pod_not_in").is_none(),
+            "空列表不输出：{}",
+            json["filters"]
+        );
+        assert_eq!(
+            json["exclude_globs"][0],
+            "/var/log/containers/*_kube-system_*.log"
+        );
+    }
 }

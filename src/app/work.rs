@@ -166,6 +166,8 @@ fn materialize_spec(
                 multiline: source.multiline.clone(),
                 // 选源排除项同样属于「这份采集面不该采什么」，跟着单元走。
                 exclude_globs: source.exclude_globs.clone(),
+                // W2 的结构化选源同理：namespace / pod 的选择是策展结论，不是 agent 本地偏好。
+                filters: source.filters.clone(),
             });
         }
         if sources.is_empty() {
@@ -1016,6 +1018,40 @@ status = "active"
         );
     }
 
+    // ── W2：容器选源过滤器跟着单元走 ───────────────────────
+
+    #[test]
+    fn container_filters_are_dispatched_with_the_unit() {
+        // 过滤器不在网关求值（网关没有文件系统事实），它只是把**策展结论**传到 agentd：
+        // agentd 在发现阶段按文件名里的 pod / namespace 求值。
+        let catalog = CATALOG.replacen(
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/containers/*.log\"\n\
+             filters = { namespace_in = [\"prod\"], pod_not_in = [\"debug-pod\"] }",
+            1,
+        );
+        let content =
+            crate::app::content::parse_content(&catalog, PACKS, TEMPLATES).expect("fixture parses");
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts_with_paths("linux", &["postgresql"], &[], &[]),
+        )
+        .unwrap();
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert_eq!(spec.units[0].sources[0].target, "/var/log/containers/*.log");
+        assert_eq!(
+            spec.units[0].sources[0].filters.namespace_in,
+            vec!["prod".to_string()]
+        );
+        assert_eq!(
+            spec.units[0].sources[0].filters.pod_not_in,
+            vec!["debug-pod".to_string()]
+        );
+    }
+
     #[test]
     fn a_hand_written_spec_is_not_filtered_by_path_facts() {
         // 人工点名是运维的显式动作：不过滤，失败了也要看得见。
@@ -1118,12 +1154,14 @@ status = "active"
         // 裁剪只针对**显式文件路径**：通配与导出器不参与（即使事实里出现同名串）。
         let facts = facts_with_paths("linux", &[], &["/var/log/misc/*", "dmesg:panic"], &[]);
         let glob = UnitSource {
+            filters: Default::default(),
             kind: "FileGlob".to_string(),
             target: "/var/log/misc/*".to_string(),
             multiline: "none".to_string(),
             exclude_globs: Vec::new(),
         };
         let exporter = UnitSource {
+            filters: Default::default(),
             kind: "Exporter".to_string(),
             target: "dmesg:panic".to_string(),
             multiline: "none".to_string(),
