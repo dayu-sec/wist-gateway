@@ -41,7 +41,7 @@ const AGENT_PROJECTION: &str = "SELECT a.agent_id, a.tenant_id, a.environment_id
      COALESCE(i.last_seen_at, '') AS last_seen_at, \
      COALESCE(i.started_at, '') AS started_at, \
      i.memory_bytes, i.cpu_percent, i.cpu_cores, i.admin_latency_ms, i.work_state_changes, \
-     i.discovery_policy_version, i.local_work, i.uplink_state, \
+     i.discovery_policy_version, i.local_work, i.uplink_state, i.logs_capabilities, \
      COALESCE(a.current_credential_id, '') AS credential_id, \
      COALESCE(c.token_hash, '') AS credential_token_hash, \
      COALESCE(c.issued_at, '') AS credential_issued_at, \
@@ -400,6 +400,33 @@ fn deserialize_uplink_state(
     }
 }
 
+/// 日志能力清单落一个 TEXT 列（只留最近一份），与 `serialize_uplink_state` 同形。
+///
+/// 为什么整块存 JSON 而不是拆列：能力桶会随演进加（`file_inputs` / `multiline_modes` /
+/// `exporters` …），拆成固定列每加一种能力就是一次迁移；而网关**只消费**它，
+/// 不按桶建索引。
+fn serialize_logs_capabilities(
+    value: Option<wist_contracts::capability_report::LogsCapabilities>,
+) -> StoreResult<Option<String>> {
+    match value {
+        Some(value) => serde_json::to_string(&value)
+            .map(Some)
+            .source_err(StoreReason::Json, "serialize agent logs capabilities"),
+        None => Ok(None),
+    }
+}
+
+/// 与 `deserialize_local_work` 同一条取舍：读到坏 JSON 就当「没报过」（`None`）——
+/// 效果是退回契约判据（不多派新能力，也不拿坏数据当依据）。
+fn deserialize_logs_capabilities(
+    raw: Option<String>,
+) -> Option<wist_contracts::capability_report::LogsCapabilities> {
+    match raw.as_deref() {
+        Some(value) if !value.is_empty() => serde_json::from_str(value).ok(),
+        _ => None,
+    }
+}
+
 /// 网卡地址列表：存的是 JSON 数组文本；空串 / 解析失败都当空表 —— 这是展示信息，坏值不该影响整行读取。
 fn deserialize_ip_addresses(raw: Option<String>) -> Vec<String> {
     match raw.as_deref() {
@@ -522,6 +549,7 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
     let work_state_changes: Option<String> = column!(row, "work_state_changes");
     let local_work: Option<String> = column!(row, "local_work");
     let uplink_state: Option<String> = column!(row, "uplink_state");
+    let logs_capabilities: Option<String> = column!(row, "logs_capabilities");
     let ip_addresses: Option<String> = column!(row, "ip_addresses");
     Ok(StoredAgentRegistration {
         agent_id: column!(row, "agent_id"),
@@ -549,6 +577,7 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
         work_state_changes: deserialize_work_state_changes(work_state_changes),
         local_work: deserialize_local_work(local_work),
         uplink_state: deserialize_uplink_state(uplink_state),
+        logs_capabilities: deserialize_logs_capabilities(logs_capabilities),
     })
 }
 
@@ -1644,12 +1673,14 @@ impl Store for SqliteStore {
                 serialize_work_state_changes(update.work_state_changes.clone())?;
             let local_work = serialize_local_work(update.local_work.clone())?;
             let uplink_state = serialize_uplink_state(update.uplink_state.clone())?;
+            let logs_capabilities = serialize_logs_capabilities(update.logs_capabilities.clone())?;
             // 实例行不存在则新建（Agentd 重启换 boot_id / instance_id 时保留历史）。
             sqlx::query(
                 "INSERT INTO agent_instances (instance_id, agent_id, boot_id, version, \
                  started_at, last_seen_at, memory_bytes, cpu_percent, cpu_cores, admin_latency_ms, \
-                 work_state_changes, discovery_policy_version, local_work, uplink_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                 work_state_changes, discovery_policy_version, local_work, uplink_state, \
+                 logs_capabilities) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
                  ON CONFLICT (instance_id) DO UPDATE SET version = excluded.version, \
                  boot_id = CASE WHEN excluded.boot_id = '' THEN agent_instances.boot_id \
                  ELSE excluded.boot_id END, \
@@ -1662,7 +1693,9 @@ impl Store for SqliteStore {
                  local_work = CASE WHEN excluded.local_work IS NULL \
                  THEN agent_instances.local_work ELSE excluded.local_work END, \
                  uplink_state = CASE WHEN excluded.uplink_state IS NULL \
-                 THEN agent_instances.uplink_state ELSE excluded.uplink_state END",
+                 THEN agent_instances.uplink_state ELSE excluded.uplink_state END, \
+                 logs_capabilities = CASE WHEN excluded.logs_capabilities IS NULL \
+                 THEN agent_instances.logs_capabilities ELSE excluded.logs_capabilities END",
             )
             .bind(&instance_id)
             .bind(update.agent_id)
@@ -1677,6 +1710,7 @@ impl Store for SqliteStore {
             .bind(update.discovery_policy_version)
             .bind(local_work)
             .bind(uplink_state)
+            .bind(logs_capabilities)
             .execute(&mut *tx)
             .await
             .map_err(|err| sql_error(err, "upsert agent instance"))?;
@@ -3395,6 +3429,7 @@ mod tests {
         // 未知 Agent 不再静默成功。
         let missing = store
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-unknown",
                 instance_id: "inst-x",
                 boot_id: "",
@@ -3420,6 +3455,7 @@ mod tests {
         ] {
             let recorded = store
                 .record_agent_status(&AgentStatusUpdate {
+                    logs_capabilities: None,
                     agent_id: "agent-1",
                     instance_id,
                     boot_id: "boot-1",
@@ -3495,6 +3531,22 @@ mod tests {
                 .unwrap();
         assert!(
             columns.iter().any(|name| name == "local_work"),
+            "{columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_adds_agent_logs_capabilities_column() {
+        // 迁移 0031 同样是 ALTER TABLE ADD COLUMN（SQLite 不支持 ADD COLUMN IF NOT EXISTS），
+        // 直接查 pragma 确认列真存在 —— “能插不能读”这类错要靠这条拦住。
+        let store = store().await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('agent_instances')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            columns.iter().any(|name| name == "logs_capabilities"),
             "{columns:?}"
         );
     }
@@ -3713,6 +3765,7 @@ mod tests {
         // 旧 agent（没带这个字段）：写入不失败，读出为 None。
         store
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -3735,6 +3788,7 @@ mod tests {
         // 上报本机工作视图：读写一致（standing.tasks 与手工输入都在）。
         store
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -3759,6 +3813,7 @@ mod tests {
         // 的最后一份可信快照擦掉。
         store
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -3777,6 +3832,63 @@ mod tests {
             .unwrap();
         let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
         assert_eq!(agent.local_work, Some(local_work_view()));
+    }
+
+    /// D7：能力清单的落库与回读 + “没带就不清”（与 `local_work` 同一条取舍）。
+    #[tokio::test]
+    async fn stores_and_reads_back_the_logs_capabilities() {
+        fn caps(exporters: &[&str]) -> wist_contracts::capability_report::LogsCapabilities {
+            wist_contracts::capability_report::LogsCapabilities {
+                file_inputs: vec!["absolute-path".to_string(), "glob".to_string()],
+                multiline_modes: vec!["none".to_string(), "indented".to_string()],
+                exporters: exporters.iter().map(|id| id.to_string()).collect(),
+                ..Default::default()
+            }
+        }
+
+        let store = store().await;
+        register(&store, "hash-c", "agent-1", "inst-1").await;
+        let update = |capabilities, version: &'static str| AgentStatusUpdate {
+            agent_id: "agent-1",
+            instance_id: "inst-1",
+            boot_id: "boot-1",
+            version,
+            last_seen_at: "2026-01-02T00:00:00+00:00",
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+            logs_capabilities: capabilities,
+        };
+
+        // 旧 agentd（不报）：读出 None —— 网关据此退回契约判据（不做能力裁剪）。
+        store
+            .record_agent_status(&update(None, "0.8.0"))
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert!(agent.logs_capabilities.is_none());
+
+        // 报了：读写一致（含 `exporters` 这个新桶）。
+        let reported = caps(&["journalctl-kernel"]);
+        store
+            .record_agent_status(&update(Some(reported.clone()), "0.9.0"))
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.logs_capabilities, Some(reported.clone()));
+
+        // 关键语义：一次没带（旧版心跳）不该把最后一次可信的能力清单擦掉。
+        store
+            .record_agent_status(&update(None, "0.9.0"))
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.logs_capabilities, Some(reported));
     }
 
     fn uplink_state(
@@ -3802,6 +3914,7 @@ mod tests {
         // 旧 agent（没带这个字段）：写入不失败，读出为 None。
         store
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -3824,6 +3937,7 @@ mod tests {
         // 上报实际生效的上送状态：读写一致（target / source / 失败标志逐项对得上）。
         store
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -3850,6 +3964,7 @@ mod tests {
         // 不清成 NULL —— 否则「这台为什么不上送」的最后一份可信答案会被一次旧版心跳擦掉。
         store
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -3881,6 +3996,7 @@ mod tests {
         // 旧 agent（没带新字段）：写入必须不失败，且留 NULL。
         let legacy = store
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -3904,6 +4020,7 @@ mod tests {
         // 上报实际生效的版本：读写一致。
         let recorded = store
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -3927,6 +4044,7 @@ mod tests {
         // 版本 0 是一个真实版本，必须与 None（还没拉到）区分开。
         store
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",

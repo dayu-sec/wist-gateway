@@ -78,6 +78,9 @@ pub async fn submit_agent_status(
                     local_work: input.local_work.clone(),
                     // 与 local_work 同口径：`None`（旧版本 agentd 没带）落库时保持上一次的值。
                     uplink_state: input.uplink_state.clone(),
+                    // D7 能力清单：同样“没带就不清”。旧 agentd 一直不报，网关就一直按
+                    // “不知道”处理（不做能力裁剪），不会因为某次老报文把清单擦掉。
+                    logs_capabilities: input.logs_capabilities.clone(),
                 })
                 .await;
             match status_result {

@@ -79,6 +79,11 @@ pub struct AgentListEntry {
     /// 整机口径的 CPU 占比（0..100），由 `cpu_percent / cpu_cores` 派生；算不出时为 null。
     pub cpu_percent_of_machine: Option<f64>,
     pub admin_latency_ms: Option<i64>,
+    /// 这台机器自报的日志能力清单（D7）；`null` = 还没报过（旧版本 agentd）。
+    ///
+    /// 列表页暂不渲染，但接口先把事实带出来：运维查「为什么这个面没派给这台机器」时，
+    /// 第一步就是看它到底声明了什么。
+    pub logs_capabilities: Option<wist_contracts::capability_report::LogsCapabilities>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -794,12 +799,27 @@ async fn grant_standing_work(
             )
             .into_response();
         };
+        // D7：这台机器自报的日志能力。`None`（旧 agentd 没报）时不做能力裁剪 ——
+        // “不知道”不等于“不会”，退回契约判据。
+        let capabilities = match state.store.get_agent(agent_id).await {
+            Ok(Some(agent)) => agent.logs_capabilities,
+            Ok(None) => None,
+            Err(err) => {
+                return ApiError::internal(
+                    codes::AGENT_FACT_SUMMARY_UNAVAILABLE,
+                    "failed to load agent capabilities",
+                    err,
+                )
+                .into_response();
+            }
+        };
         work_rules::derive_spec(
             content,
             &classification.machine_class,
             platform,
             family,
             &facts,
+            capabilities.as_ref(),
         )
     } else {
         work_rules::validate_spec(content, platform, family, requested_spec)
@@ -1924,6 +1944,7 @@ fn agent_list_entry(agent: &crate::infra::StoredAgentRegistration) -> AgentListE
             agent.last_cpu_cores,
         ),
         admin_latency_ms: agent.last_admin_latency_ms.map(|value| value as i64),
+        logs_capabilities: agent.logs_capabilities.clone(),
     }
 }
 

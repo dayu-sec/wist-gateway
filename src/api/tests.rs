@@ -1690,6 +1690,7 @@ async fn agent_status_route_requires_a_client_certificate() {
         "/api/v1/agent/status",
         Some(&agent_id),
         &AgentStatusReport {
+            logs_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -1714,6 +1715,7 @@ async fn agent_status_route_requires_a_client_certificate() {
         "/api/v1/agent/status",
         None,
         &AgentStatusReport {
+            logs_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -1744,6 +1746,7 @@ async fn agent_status_route_persists_reported_metrics() {
         "/api/v1/agent/status",
         Some(&agent_id),
         &AgentStatusReport {
+            logs_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -1787,6 +1790,7 @@ async fn post_agent_status_cpu(
         "/api/v1/agent/status",
         Some(agent_id),
         &AgentStatusReport {
+            logs_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -3387,6 +3391,7 @@ async fn post_agent_status(
     let agent_id = format!("agent-{instance_id}");
     let body = match policy_version {
         Some(version) => serde_json::to_value(AgentStatusReport {
+            logs_capabilities: None,
             agent_id,
             instance_id: instance_id.to_string(),
             version: "v0.2.0".to_string(),
@@ -3883,6 +3888,7 @@ async fn agent_status_route_persists_work_state_changes() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            logs_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -3962,6 +3968,7 @@ async fn the_work_view_exposes_the_agents_local_work_report() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            logs_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -4011,6 +4018,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            logs_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -4049,6 +4057,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            logs_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -4081,6 +4090,7 @@ async fn a_status_report_with_a_machine_profile_backfills_the_registry() {
     let credential = enroll_agent_credential(&env).await;
 
     let report = |profile: Option<wist_contracts::enrollment::HostProfile>| AgentStatusReport {
+        logs_capabilities: None,
         machine_profile: profile,
         agent_id: "agent-node-a".to_string(),
         instance_id: "node-a".to_string(),
@@ -4144,6 +4154,7 @@ async fn a_status_report_with_a_machine_profile_backfills_the_registry() {
 async fn enroll_agent_with_machine_profile(env: &TestEnv, ip_addresses: Vec<String>) {
     let credential = enroll_agent_credential(env).await;
     let report = AgentStatusReport {
+        logs_capabilities: None,
         machine_profile: Some(wist_contracts::enrollment::HostProfile {
             node_id: "node-1".to_string(),
             hostname: "host-1".to_string(),
@@ -5216,6 +5227,7 @@ async fn admin_agent_list_marks_stale_agents_offline() {
     let recorded = env
         .store_handle
         .record_agent_status(&AgentStatusUpdate {
+            logs_capabilities: None,
             agent_id: "agent-node-a",
             instance_id: "node-a",
             boot_id: "",
@@ -5241,6 +5253,7 @@ async fn admin_agent_list_marks_stale_agents_offline() {
     let fresh = chrono::Utc::now().to_rfc3339();
     env.store_handle
         .record_agent_status(&AgentStatusUpdate {
+            logs_capabilities: None,
             agent_id: "agent-node-a",
             instance_id: "node-a",
             boot_id: "",
@@ -5275,6 +5288,7 @@ async fn admin_agent_runtime_status_shares_the_online_verdict_with_the_list() {
     assert!(
         env.store_handle
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-node-a",
                 instance_id: "node-a",
                 boot_id: "",
@@ -5302,6 +5316,7 @@ async fn admin_agent_runtime_status_shares_the_online_verdict_with_the_list() {
     let fresh = chrono::Utc::now().to_rfc3339();
     env.store_handle
         .record_agent_status(&AgentStatusUpdate {
+            logs_capabilities: None,
             agent_id: "agent-node-a",
             instance_id: "node-a",
             boot_id: "",
@@ -5334,6 +5349,7 @@ async fn delete_agent_refuses_an_online_agent() {
     assert!(
         env.store_handle
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-node-a",
                 instance_id: "node-a",
                 boot_id: "",
@@ -5379,6 +5395,7 @@ async fn delete_agent_removes_an_offline_agent_and_its_credential() {
     assert!(
         env.store_handle
             .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
                 agent_id: "agent-node-a",
                 instance_id: "node-a",
                 boot_id: "",

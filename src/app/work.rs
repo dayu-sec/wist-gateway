@@ -87,6 +87,7 @@ pub fn derive_spec(
     platform: &str,
     family: &str,
     facts: &StoredAgentFactSummary,
+    capabilities: Option<&wist_contracts::capability_report::LogsCapabilities>,
 ) -> Result<(String, i64), WorkRejection> {
     let Some(template) = content.template_for_machine_class(machine_class) else {
         return Err(WorkRejection::Conflict(format!(
@@ -125,7 +126,7 @@ pub fn derive_spec(
         };
         return Err(WorkRejection::Conflict(detail));
     };
-    materialize_spec(content, &work.selected_units, Some(facts))
+    materialize_spec(content, &work.selected_units, Some(facts), capabilities)
         .map(|spec| (spec, work.catalog_version))
 }
 
@@ -137,13 +138,20 @@ pub fn derive_spec(
 ///
 /// `facts` 有值时按「已探测且不存在」裁剪显式路径来源；`None` 用于人工手写 spec
 /// （运维显式点名，应当看得见失败，而不是被网关静默删掉）。
+///
+/// `capabilities` 有值时（agent 报过能力清单，D7）再按「这台机器真能不能采」裁剪：
+/// 没声明的形态/导出器会被剔掉，并在拒绝文案里点名缺了什么 —— 否则就是「派下去 → agent 报
+/// unsupported → 这个面静默没数据」。`None`（旧 agentd 没报）**不做能力裁剪**：
+/// 那时“不知道”不等于“不会”，退回契约判据（与 D7 之前一致）。
 fn materialize_spec(
     content: &ContentSet,
     unit_ids: &[String],
     facts: Option<&StoredAgentFactSummary>,
+    capabilities: Option<&wist_contracts::capability_report::LogsCapabilities>,
 ) -> Result<String, WorkRejection> {
     let mut units = Vec::with_capacity(unit_ids.len());
     let mut absent: BTreeSet<String> = BTreeSet::new();
+    let mut unsupported: BTreeSet<String> = BTreeSet::new();
     for unit_id in unit_ids {
         let Some(unit) = content.units().find(|unit| unit.unit_id == *unit_id) else {
             // 展开出来的单元不在目录里 —— 这是网关自己的不变式被破坏，
@@ -156,6 +164,21 @@ fn materialize_spec(
         for source in &unit.sources {
             if source_is_absent_on_this_machine(source, facts) {
                 absent.insert(source.target.clone());
+                continue;
+            }
+            // D7：agent 报了能力清单就按它裁剪；没报（None）就退回契约判据。
+            if let Some(capabilities) = capabilities
+                && let Some(missing) = wist_contracts::work::missing_log_capabilities(
+                    &source.kind,
+                    &source.target,
+                    &source.multiline,
+                    capabilities,
+                )
+                && !missing.is_empty()
+            {
+                // 文案形状：`<来源>: <缺的能力>`。外层统一加“这台 agent 没声明能力”的帽子，
+                // 避免“agent 未声明 …”这种中英混排套在英文句子里的双层括号。
+                unsupported.insert(format!("{}: {}", source.target, missing.join(", ")));
                 continue;
             }
             sources.push(WorkSpecSource {
@@ -184,14 +207,38 @@ fn materialize_spec(
         });
     }
     if units.is_empty() {
-        let detail = if absent.is_empty() {
-            "no source".to_string()
-        } else {
-            absent.into_iter().collect::<Vec<_>>().join(", ")
-        };
+        // 两种“没来源”的原因分开写：一个是“这台机器上确实没有”（探测过且不存在），
+        // 另一个是“这台机器的 agent 不会采”（能力清单里没声明）。合并成一句话
+        // 会让人把后者当成前者去查文件。
+        let mut reasons = Vec::new();
+        if !absent.is_empty() {
+            reasons.push(format!(
+                "explicit paths absent on this agent ({})",
+                absent.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !unsupported.is_empty() {
+            reasons.push(format!(
+                "agent does not declare capabilities for [{}]",
+                unsupported.into_iter().collect::<Vec<_>>().join("; ")
+            ));
+        }
+        if reasons.is_empty() {
+            reasons.push("no source".to_string());
+        }
         return Err(WorkRejection::Conflict(format!(
-            "no collectable source for units {unit_ids:?}: explicit paths absent on this agent ({detail})"
+            "no collectable source for units {unit_ids:?}: {}",
+            reasons.join("; ")
         )));
+    }
+    // 部分裁剪不能静默：单元还在，但其中某条来源被剔了 —— 不记一行，
+    // 运维只会看到“这个面怎么少了一半数据”。探测裁剪（absent）是既有行为，这里只补 D7 这条。
+    if !unsupported.is_empty() {
+        log::info!(
+            "event=WorkSourceDropped reason=capability units={:?} sources={:?}",
+            unit_ids,
+            unsupported
+        );
     }
     WorkSpec { units }
         .encode()
@@ -253,7 +300,9 @@ pub fn validate_spec(
             "spec must name at least one collection unit (或留空，由网关按事实展开)".to_string(),
         ));
     }
-    materialize_spec(content, &selected, None).map(|spec| (spec, content.catalog_version))
+    // 人工手写的 spec 不按能力裁剪：运维显式点名的单元要“看得见失败”，
+    // 而不是被网关静默删成一份更小的 spec（第三个 `None` 是 facts，第四个是 capabilities）。
+    materialize_spec(content, &selected, None, None).map(|spec| (spec, content.catalog_version))
 }
 
 /// 定出这次授权的期望版本。
@@ -404,6 +453,8 @@ pub fn overdue_terminal_status(work: &OneShotWork, now_ms: i64) -> Option<&'stat
 mod tests {
     use super::*;
     use crate::infra::StoredOneShotWork;
+    use wist_contracts::capability_report::LogsCapabilities;
+    use wist_contracts::work::{FILE_INPUT_ABSOLUTE_PATH, FILE_INPUT_GLOB};
 
     fn one_shot(status: &str, interruptible: bool) -> StoredOneShotWork {
         StoredOneShotWork {
@@ -798,6 +849,7 @@ status = "active"
             "linux",
             "DatabaseService",
             &facts(&["postgresql"]),
+            None,
         )
         .unwrap();
         // spec 是**物化**的工作参数：agentd 要能拿着它直接采（含来源与规则标识）。
@@ -831,6 +883,7 @@ status = "active"
             "linux",
             "DatabaseService",
             &facts(&["postgresql"]),
+            None,
         )
         .expect("derives");
         let spec = WorkSpec::parse(&spec).expect("parse");
@@ -847,6 +900,7 @@ status = "active"
             "linux",
             "DatabaseService",
             &facts(&["nginx"]),
+            None,
         )
         .unwrap_err();
         assert!(err.message().contains("match_unsatisfied"), "{err:?}");
@@ -858,6 +912,7 @@ status = "active"
             "linux",
             "DatabaseService",
             &facts(&[]),
+            None,
         )
         .unwrap_err();
         assert!(err.message().contains("fact_not_collected"), "{err:?}");
@@ -873,6 +928,7 @@ status = "active"
             "linux",
             "DatabaseService",
             &facts(&["postgresql"]),
+            None,
         )
         .unwrap_err();
         assert!(err.message().contains("does not include family"), "{err:?}");
@@ -911,6 +967,7 @@ status = "active"
             "macos",
             "PrivacyTcc",
             &facts_with_paths("macos", &[], &["/var/log/tcc.log"], &[]),
+            None,
         )
         .unwrap();
         let spec = WorkSpec::parse(&spec).expect("spec");
@@ -929,6 +986,7 @@ status = "active"
             "linux",
             "DatabaseService",
             &facts_with_paths("linux", &["postgresql"], &[], &[]),
+            None,
         )
         .unwrap();
         let spec = WorkSpec::parse(&spec).expect("spec");
@@ -945,11 +1003,136 @@ status = "active"
             "linux",
             "DatabaseService",
             &facts_with_paths("linux", &["postgresql"], &["/var/log/postgresql.log"], &[]),
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, WorkRejection::Conflict(_)));
         assert!(err.message().contains("explicit paths absent"), "{err:?}");
         assert!(err.message().contains("/var/log/postgresql.log"), "{err:?}");
+    }
+
+    // ── D7：按 agent 自报的能力裁剪 ──
+
+    fn logs_caps(file_inputs: &[&str], exporters: &[&str]) -> LogsCapabilities {
+        LogsCapabilities {
+            file_inputs: file_inputs.iter().map(|v| v.to_string()).collect(),
+            exporters: exporters.iter().map(|v| v.to_string()).collect(),
+            ..LogsCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn a_source_the_agent_cannot_collect_is_not_dispatched() {
+        let content = content();
+        // 这台 agent 只声明了 glob（没声明“显式路径”）：目录里的 DB 单元是显式路径 → 不派。
+        let caps = logs_caps(&[FILE_INPUT_GLOB], &[]);
+        let err = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts(&["postgresql"]),
+            Some(&caps),
+        )
+        .unwrap_err();
+        assert!(matches!(err, WorkRejection::Conflict(_)));
+        assert!(
+            err.message().contains("does not declare capabilities"),
+            "{err:?}"
+        );
+        // 形状钉住：`<来源>: <缺的能力>` —— 运维要能直接把这两段拿去对照目录与 agent 版本。
+        assert!(
+            err.message().contains(&format!(
+                "/var/log/postgresql.log: file_inputs:{FILE_INPUT_ABSOLUTE_PATH}"
+            )),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_declared_capability_keeps_the_source_and_an_unknown_agent_keeps_legacy_behaviour() {
+        let content = content();
+        let facts = facts(&["postgresql"]);
+
+        // 声明齐了 → 照常派生。
+        let full = logs_caps(&[FILE_INPUT_ABSOLUTE_PATH, FILE_INPUT_GLOB], &[]);
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts,
+            Some(&full),
+        )
+        .expect("declared capability derives");
+        assert!(spec.contains("/var/log/postgresql.log"), "{spec}");
+
+        // 旧 agentd（没报能力清单）→ **不做能力裁剪**，与 D7 之前一致。
+        let (legacy, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts,
+            None,
+        )
+        .expect("unknown capabilities still derive");
+        assert!(legacy.contains("/var/log/postgresql.log"), "{legacy}");
+    }
+
+    #[test]
+    fn an_exporter_the_agent_does_not_have_blocks_the_unit() {
+        // 内核面唯一的来源是 `Exporter journalctl-kernel`；旧 agent 不认识它（词表里没有）。
+        // 目录里把它改成 active 后，网关必须在**派活时**就拦住，而不是派下去等 unsupported。
+        let catalog = CATALOG.replacen(
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+            "kind = \"Exporter\"\ntarget = \"journalctl-kernel\"",
+            1,
+        );
+        let content =
+            crate::app::content::parse_content(&catalog, PACKS, TEMPLATES).expect("fixture parses");
+        let caps = logs_caps(
+            &[FILE_INPUT_ABSOLUTE_PATH, FILE_INPUT_GLOB],
+            &["nft-ruleset"],
+        );
+        let err = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts(&["postgresql"]),
+            Some(&caps),
+        )
+        .unwrap_err();
+        assert!(
+            err.message().contains("exporters:journalctl-kernel"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_partially_supported_unit_keeps_the_sources_it_can_collect() {
+        // 同一单元里两条来源：一条 agent 会采、一条不会 → 只剔后者，不把整个单元丢掉。
+        let catalog = CATALOG.replacen(
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"\n\n\
+             [[units.sources]]\nkind = \"Exporter\"\ntarget = \"journalctl-kernel\"",
+            1,
+        );
+        let content =
+            crate::app::content::parse_content(&catalog, PACKS, TEMPLATES).expect("fixture parses");
+        let caps = logs_caps(&[FILE_INPUT_ABSOLUTE_PATH], &[]);
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts(&["postgresql"]),
+            Some(&caps),
+        )
+        .expect("the collectable source survives");
+        assert!(spec.contains("/var/log/postgresql.log"), "{spec}");
+        assert!(!spec.contains("journalctl-kernel"), "{spec}");
     }
 
     #[test]
@@ -973,6 +1156,7 @@ status = "active"
                 &["/var/log/postgresql.log", "/var/log/postgresql-extra.log"],
                 &["/var/log/postgresql.log"],
             ),
+            None,
         )
         .unwrap();
         let spec = WorkSpec::parse(&spec).expect("spec");
@@ -1008,6 +1192,7 @@ status = "active"
             "linux",
             "DatabaseService",
             &facts_with_paths("linux", &["postgresql"], &[], &[]),
+            None,
         )
         .unwrap();
         let spec = WorkSpec::parse(&spec).expect("spec");
@@ -1038,6 +1223,7 @@ status = "active"
             "linux",
             "DatabaseService",
             &facts_with_paths("linux", &["postgresql"], &[], &[]),
+            None,
         )
         .unwrap();
         let spec = WorkSpec::parse(&spec).expect("spec");
@@ -1073,8 +1259,8 @@ status = "active"
             &["/var/log/auth.log", "/var/log/secure"],
             &["/var/log/auth.log"],
         );
-        let (spec, _) =
-            derive_spec(&content, "LinuxHost", "linux", "LoginSession", &facts).expect("derives");
+        let (spec, _) = derive_spec(&content, "LinuxHost", "linux", "LoginSession", &facts, None)
+            .expect("derives");
         let spec = WorkSpec::parse(&spec).expect("spec");
         assert_eq!(spec.units.len(), 1);
         assert_eq!(spec.units[0].unit_id, "linux-auth-session");
@@ -1096,8 +1282,8 @@ status = "active"
             &["/var/log/auth.log", "/var/log/secure"],
             &["/var/log/secure"],
         );
-        let (spec, _) =
-            derive_spec(&content, "LinuxHost", "linux", "LoginSession", &facts).expect("derives");
+        let (spec, _) = derive_spec(&content, "LinuxHost", "linux", "LoginSession", &facts, None)
+            .expect("derives");
         let spec = WorkSpec::parse(&spec).expect("spec");
         let targets: Vec<&str> = spec.units[0]
             .sources
@@ -1112,7 +1298,8 @@ status = "active"
         // 两条都不在：面在展开阶段就被 `path_exists` 门控排除，不是派一份空活。
         let content = real_content();
         let facts = facts_with_paths("linux", &[], &["/var/log/auth.log", "/var/log/secure"], &[]);
-        let err = derive_spec(&content, "LinuxHost", "linux", "LoginSession", &facts).unwrap_err();
+        let err =
+            derive_spec(&content, "LinuxHost", "linux", "LoginSession", &facts, None).unwrap_err();
         assert!(
             err.message().contains("no unit selected for LoginSession"),
             "{err:?}"
@@ -1135,8 +1322,15 @@ status = "active"
             ],
             &["/var/log/dpkg.log", "/var/log/apt/history.log"],
         );
-        let (spec, _) =
-            derive_spec(&content, "LinuxHost", "linux", "SoftwareChange", &facts).expect("derives");
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxHost",
+            "linux",
+            "SoftwareChange",
+            &facts,
+            None,
+        )
+        .expect("derives");
         let spec = WorkSpec::parse(&spec).expect("spec");
         let targets: Vec<&str> = spec.units[0]
             .sources

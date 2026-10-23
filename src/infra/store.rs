@@ -174,6 +174,12 @@ pub struct StoredAgentRegistration {
     /// 一个说「要它怎样」，一个说「它实际成了怎样」）。
     /// `None` = 这台 agent 还没报过（旧版本 agentd 不发这个字段）。
     pub uplink_state: Option<wist_contracts::agent_uplink::AgentUplinkState>,
+    /// 最近一次上报的**日志能力清单**（D7）。`None` = 还没报过 / 旧版本 agentd 不发。
+    ///
+    /// 派活时用它判「这台机器真能不能采」（见 `work_rules::derive_spec`）：
+    /// `None` 不等于「什么都不会采」，而是「**不知道**」—— 那时不做能力裁剪，
+    /// 退回契约判据（与 D7 之前的行为一致）。
+    pub logs_capabilities: Option<wist_contracts::capability_report::LogsCapabilities>,
 }
 
 /// Agent 的**机器身份**读投影：只含「这是哪台机器」需要的列，不读 `local_work` / `uplink_state`
@@ -935,6 +941,10 @@ pub struct AgentStatusUpdate<'a> {
     /// （旧版本 agentd）—— 落库后**保持上一次的值**，不清空。运维问的是「这台为什么不上送」，
     /// 一次没带就把最后一次可信的生效状态擦掉，反而会让原因从页面上消失。
     pub uplink_state: Option<wist_contracts::agent_uplink::AgentUplinkState>,
+    /// 本机**能承接的日志能力**（D7）：`None` = 这次没带（D7 之前的 agentd）——
+    /// 落库后保持上一次的值（与 `local_work` / `uplink_state` 同口径：一次老报文
+    /// 不该把最后一次可信的能力清单擦掉）。
+    pub logs_capabilities: Option<wist_contracts::capability_report::LogsCapabilities>,
 }
 
 /// 机器画像回填（agentd 状态上报携带的 `HostProfile`）。
