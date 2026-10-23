@@ -1875,9 +1875,9 @@ target = "/var/log/x.log"
         let tcc = by_family("PrivacyTcc");
         assert!(!tcc.collect_ready());
 
-        // Linux 侧现在 10 个面全开：4 个**显式路径**日志面（auth.log/secure、sudo.log、
-        //   dpkg/apt/dnf/yum、kern.log/messages）+ 4 个**导出器**面
-        //   （ServiceLifecycle/CrashPanic/NetworkFirewall/RebootPower/StorageHealth）+ 指标面。
+        // Linux 侧现在 10 个面全开：文件来源（auth/secure、sudo.log、dpkg/apt/dnf/yum、
+        //   audit.log 整文件）+ 导出器（ServiceLifecycle/CrashPanic/NetworkFirewall/RebootPower/
+        //   KernelSystem/StorageHealth）+ 指标面。
         //   日志面 `rule_ref` 为空 = **可采但解析未就绪**（原文照收，只归在泛化 agent.log）。
         for family in [
             "LoginSession",
@@ -2014,9 +2014,9 @@ target = "/var/log/x.log"
 
     #[test]
     fn linux_host_expands_the_collect_ready_families() {
-        // LinuxHost 模板（`linux-base` 包）10 个面全采集就绪：5 个显式路径日志面
-        // （auth/secure、sudo.log、dpkg/apt/dnf/yum、kern.log/messages、audit.log）
-        // + 4 个导出器面 + 指标面。别让「Linux 只能采指标」的旧状态悄悄回来。
+        // LinuxHost 模板（`linux-base` 包）10 个面全采集就绪：文件来源 + 导出器
+        // （含 W3 的内核日志 `journalctl-kernel`）+ 指标面。
+        // 别让「Linux 只能采指标」的旧状态悄悄回来。
         let set = load_content(
             &crate::test_support::knowledge_file("catalog.toml"),
             &crate::test_support::knowledge_file("packs.toml"),
@@ -2024,11 +2024,13 @@ target = "/var/log/x.log"
         )
         .expect("load checked-in content");
         let mut host_facts = facts("linux", &[]);
-        // 路径门控要“探测过且存在”才命中；这里模拟 Debian 系（auth.log、sudo.log、audit.log 都在）。
+        // 路径门控要“探测过且存在”才命中；这里模拟 Debian 系（auth.log、sudo.log、audit.log 都在）
+        // 且本机是 systemd（内核日志面才展开）。
         host_facts.probed_paths = vec![
             "/var/log/auth.log".to_string(),
             "/var/log/sudo.log".to_string(),
             "/var/log/audit/audit.log".to_string(),
+            "/run/systemd/journal".to_string(),
         ];
         host_facts.present_paths = host_facts.probed_paths.clone();
         let expansion = set.expand("linux-host", &host_facts).expect("expand");
