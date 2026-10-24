@@ -491,7 +491,7 @@ pub struct AgentStatusMetricSample {
 /// 幂等键是 `content_digest`（不是 `revision`：后者每轮无条件 +1）。
 /// **它是网关自己算的**（`wist_contracts::fact_summary`），不是照抄 agent 的声明 ——
 /// 用 agent 声明判重的话，agent 侧算法一退化就会把所有上报当重复、静默停在旧内容上。
-/// 去重前的进程条数单独留一个 `process_count`，因为去重会毁掉基数。
+/// 去重前的**用户态**进程条数单独留一个 `process_count`，因为去重会毁掉基数。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StoredAgentFactSummary {
@@ -502,9 +502,10 @@ pub struct StoredAgentFactSummary {
     pub os: String,
     pub arch: String,
     pub process_count: i64,
-    /// 去重后的进程可执行标识（macOS 是完整路径，Linux 是 basename）。
+    /// 去重后的进程可执行标识（两侧都是**绝对路径**，Linux 取自 `/proc/<pid>/exe`）。
     pub process_executables: Vec<String>,
     pub packages: Vec<String>,
+    /// 稳定的服务端口，形如 `tcp:5432`（已滤掉内核临时端口区间 `>= 32768`）。
     pub listen_ports: Vec<String>,
     /// 网关下发、agent **实际探测过**的路径白名单（来自发现策略）。
     pub probed_paths: Vec<String>,

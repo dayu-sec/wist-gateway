@@ -13,6 +13,7 @@ use std::path::Path;
 use orion_error::conversion::ToStructError;
 use orion_error::prelude::*;
 use serde::Deserialize;
+use wist_contracts::fact_summary::EPHEMERAL_PORT_START;
 use wist_error::{ConfigError, ConfigReason, ConfigResult};
 
 use crate::infra::{StoredAgentFactSummary, StoredPurposeSignal, StoredPurposeSuggestion};
@@ -207,6 +208,26 @@ fn validate_rule(rule_set_id: &str, rule: &mut PurposeRule) -> ConfigResult<()> 
             rule.rule_id
         )));
     }
+    // 端口规则只能指**稳定服务端口**：临时区间不进摘要（见 `FactContent::listen_ports`），
+    // 写成那里就是一条永远不命中的死规则。同时也要求纯数字：端口匹配已经是精确比对。
+    if rule.kind == "listen_port" {
+        match rule.pattern.trim().parse::<u16>() {
+            Ok(port) if port < EPHEMERAL_PORT_START => {}
+            Ok(port) => {
+                return Err(invalid(format!(
+                    "rule {}: listen_port pattern {port} is in the ephemeral range \
+                     (>= {EPHEMERAL_PORT_START}), which is deliberately not collected",
+                    rule.rule_id
+                )));
+            }
+            Err(_) => {
+                return Err(invalid(format!(
+                    "rule {}: listen_port pattern {:?} is not a port number",
+                    rule.rule_id, rule.pattern
+                )));
+            }
+        }
+    }
     let class = rule.machine_class.take();
     rule.machine_class = normalize_machine_class(
         class,
@@ -241,12 +262,27 @@ fn normalize_machine_class(
     }
 }
 
-/// 命中判定：大小写不敏感子串。
+/// 命中判定：文本类信号（进程 / 路径 / 包）走**大小写不敏感子串**，端口走**精确相等**。
+///
+/// 端口是数值集合：子串匹配会让 `35432` 命中 `5432` —— 一台机器上随机临时端口
+/// 几十上百个时这是必然事件，不是小概率。事实里的端口形如 `tcp:5432`，
+/// 规则册里写的是裸端口，所以比较前先剥掉协议前缀（旧 agent 的裸端口也认得）。
 ///
 /// 排除是按**值**判的，不是按机器：`/Applications/WorkBuddy.app/…/node_modules`
 /// 这条路径既含 `node_modules` 也含 `/Applications/`，于是不算开发特征 ——
 /// 它是「装了应用」，不是「在开发」。
-fn value_matches(value: &str, pattern: &str, exclude_pattern: Option<&str>) -> bool {
+fn value_matches(kind: &str, value: &str, pattern: &str, exclude_pattern: Option<&str>) -> bool {
+    if kind == "listen_port" {
+        // 按**数值**比，不按字符串：`05432` 与 `5432` 是同一个端口，而字符串比对会把它判成
+        // 一条永不命中的死规则（装载期已要求 pattern 是数字，这里再守一层）。
+        return match (
+            listen_port_of(value).parse::<u16>(),
+            pattern.trim().parse::<u16>(),
+        ) {
+            (Ok(fact), Ok(expected)) => fact == expected,
+            _ => listen_port_of(value).eq_ignore_ascii_case(pattern.trim()),
+        };
+    }
     let haystack = value.to_lowercase();
     if !haystack.contains(&pattern.to_lowercase()) {
         return false;
@@ -255,6 +291,11 @@ fn value_matches(value: &str, pattern: &str, exclude_pattern: Option<&str>) -> b
         Some(exclude) if !exclude.is_empty() => !haystack.contains(&exclude.to_lowercase()),
         _ => true,
     }
+}
+
+/// 剥掉 `tcp:` / `udp:` 前缀，只留端口号（没有前缀就原样返回）。
+fn listen_port_of(value: &str) -> &str {
+    value.split_once(':').map_or(value, |(_, port)| port).trim()
 }
 
 /// 某类规则在哪个信号集合上匹配。
@@ -305,10 +346,14 @@ pub fn infer(
         let Some(values) = signals_for(rule, summary) else {
             continue;
         };
-        let Some(matched) = values
-            .iter()
-            .find(|value| value_matches(value, &rule.pattern, rule.exclude_pattern.as_deref()))
-        else {
+        let Some(matched) = values.iter().find(|value| {
+            value_matches(
+                &rule.kind,
+                value,
+                &rule.pattern,
+                rule.exclude_pattern.as_deref(),
+            )
+        }) else {
             continue;
         };
         // 只留依据不加分的规则（machine_class 为空）也要进依据列表。
@@ -640,6 +685,52 @@ weight = 40
     }
 
     #[test]
+    fn port_rules_match_exactly_not_by_substring() {
+        // 端口是数值：`tcp:35432` 不该命中 `5432`。一台机器上几十上百个随机临时端口时，
+        // 4 位 pattern 被撞中是必然事件（实测就撞上了）。
+        let table = parse_rule_table(
+            r#"
+purpose_version = 1
+
+[[rule_set]]
+rule_set_id = "linux-v1"
+platform = "linux"
+weak_score = 20
+min_support = 2
+
+[[rule_set.rules]]
+rule_id = "linux-data-port-postgres"
+kind = "listen_port"
+pattern = "5432"
+machine_class = "LinuxData"
+weight = 20
+"#,
+        )
+        .expect("parse rule table");
+
+        let mut facts = summary("linux", &[]);
+        facts.listen_ports = vec!["tcp:35432".to_string()];
+        assert!(
+            infer(&facts, &table, "s", "t").is_none(),
+            "35432 is not 5432"
+        );
+
+        facts.listen_ports = vec!["tcp:5432".to_string()];
+        let suggestion = infer(&facts, &table, "s", "t").expect("hit");
+        assert_eq!(suggestion.suggested_class, "LinuxData");
+        assert_eq!(suggestion.signals[0].value, "tcp:5432");
+
+        // 旧 agent 报的裸端口形状也要能命中（升级过渡期两边共存）。
+        facts.listen_ports = vec!["5432".to_string()];
+        assert_eq!(
+            infer(&facts, &table, "s", "t")
+                .expect("hit")
+                .suggested_class,
+            "LinuxData"
+        );
+    }
+
+    #[test]
     fn parses_the_checked_in_rule_table() {
         // 真实策展数据必须能解析（防止手改 TOML 后网关静默不推断）。
         let path = crate::test_support::knowledge_file("purpose-rules.toml");
@@ -684,6 +775,23 @@ weak_score = 20
         ))
         .expect_err("empty pattern must be rejected");
         assert!(err.to_string().contains("empty pattern"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_port_rule_outside_the_collected_range() {
+        // 临时端口区间不进摘要 → 写在那里的端口规则是死规则，必须在装载期报错。
+        let err = parse_rule_table(&table_with_rule(
+            "rule_id = \"r1\"\nkind = \"listen_port\"\npattern = \"40000\"\nmachine_class = \"LinuxData\"\nweight = 20",
+        ))
+        .expect_err("ephemeral port pattern must be rejected");
+        assert!(err.to_string().contains("ephemeral range"), "{err}");
+
+        // 端口匹配早已是精确比对，`5432x` 这类写法只会让人以为能命中。
+        let err = parse_rule_table(&table_with_rule(
+            "rule_id = \"r1\"\nkind = \"listen_port\"\npattern = \"5432x\"\nmachine_class = \"LinuxData\"\nweight = 20",
+        ))
+        .expect_err("non-numeric port pattern must be rejected");
+        assert!(err.to_string().contains("not a port number"), "{err}");
     }
 
     #[test]

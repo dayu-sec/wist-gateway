@@ -21,6 +21,7 @@ use std::path::Path;
 use orion_error::conversion::ToStructError;
 use orion_error::prelude::*;
 use serde::Deserialize;
+use wist_contracts::fact_summary::EPHEMERAL_PORT_START;
 use wist_contracts::work::{
     CONTAINER_LOG_ROOT, ContainerFilters, EXECUTABLE_SOURCE_KINDS, is_executable_source,
     is_explicit_path,
@@ -79,8 +80,11 @@ pub const SOURCE_KINDS: &[&str] = &[
     "UnifiedLogPredicate",
     "MetricInterval",
 ];
-/// 来源的读法闭集（与 agentd `MultilineMode` 一致）。
-pub const MULTILINE_MODES: &[&str] = &["none", "indented"];
+/// 来源的读法闭集：**直接复用契约词表**（与 agentd `MultilineMode` 同源）。
+///
+/// 以前这里是手抄的一份数组 —— 加一种读法（W4 的 `mysql_slow` / `postgres_csv`）
+/// 就得两处改，忘一处就是“目录写了、网关说不认识”。
+pub use wist_contracts::work::MULTILINE_MODES;
 /// 权限闭集。
 pub const PRIVILEGES: &[&str] = &["none", "root", "fda"];
 /// 单元**采集就绪度**（能不能派下去采原文；与解析规则无关）。
@@ -176,6 +180,9 @@ struct SourceRow {
     /// 容器选源的结构化过滤器（默认空，只对容器选源有意义）。
     #[serde(default)]
     filters: ContainerFilters,
+    /// 噪音行丢弃的**精确子串**（默认空，只对 `FileGlob` 有意义）。
+    #[serde(default)]
+    drop_if_contains: Vec<String>,
 }
 
 fn default_multiline() -> String {
@@ -267,12 +274,15 @@ pub struct Unit {
 pub struct UnitSource {
     pub kind: String,
     pub target: String,
-    /// `none`（一行一条）| `indented`（行首缩进是上一条的续行）。
+    /// `none`（一行一条）| `indented`（行首缩进是上一条的续行）|
+    /// `mysql_slow` / `postgres_csv`（W4；词表见 `wist_contracts::work::MULTILINE_MODES`）。
     pub multiline: String,
     /// 从匹配集里剔掉的绝对路径 glob；空 = 不排除。
     pub exclude_globs: Vec<String>,
     /// 容器选源的结构化过滤器（namespace / pod）；空 = 不过滤。
     pub filters: ContainerFilters,
+    /// 含这些子串的记录整条丢弃；空 = 不丢。
+    pub drop_if_contains: Vec<String>,
 }
 
 impl Unit {
@@ -441,6 +451,7 @@ fn build_content(
                         multiline: source.multiline,
                         exclude_globs: source.exclude_globs,
                         filters: source.filters,
+                        drop_if_contains: source.drop_if_contains,
                     })
                     .collect(),
             };
@@ -722,6 +733,20 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
                     "unit {id}: filters 只能用在 {root} 下的来源（当前 {}）",
                     source.target
                 )));
+            }
+        }
+        // 噪音行丢弃（W4）：只对可读文件有意义，且必须是**精确子串**（不是正则 / pattern）。
+        if !source.drop_if_contains.is_empty() {
+            if source.kind != "FileGlob" {
+                return Err(invalid(format!(
+                    "unit {id}: source {} cannot declare drop_if_contains (只对 FileGlob 有意义)",
+                    source.kind
+                )));
+            }
+            if let Err(reason) =
+                wist_contracts::work::validate_drop_if_contains(&source.drop_if_contains)
+            {
+                return Err(invalid(format!("unit {id}: {reason}")));
             }
         }
         // 多行归并只对可 tail 的文件来源有意义。写在别的 kind 上不是“多一个无害的字段”，
@@ -1108,8 +1133,10 @@ impl ContentSet {
     /// 按模板把一台机器展开成「一面一份」的常驻工作（**未落库**，纯计算）。
     ///
     /// 规则：
-    ///   - **采集就绪**的面才展开成工作；未就绪的面（没有 `active` 单元）的单元进
-    ///     `excluded_units(collect_not_ready)`；
+    ///   - **采集就绪**的**单元**（`status = active`）才参与 `match` 求值；
+    ///     同一面里的 `draft` 单元即使条件命中也不展开（进 `excluded_units(collect_not_ready)`）——
+    ///     面就绪（至少一条 active）不等于面里每个单元都已就绪；
+    ///   - 面没有任何 `active` 单元时整面不展开（其所有单元进 `collect_not_ready`）；
     ///   - 就绪面里，`match` 三态过滤：命中 → 选中；不命中 → `match_unsatisfied`；
     ///     无法判定（事实没采到）→ `fact_not_collected`；
     ///   - 选中集为空的面不产生工作（但排除项仍留痕）。
@@ -1148,6 +1175,17 @@ impl ContentSet {
 
             let mut selected = Vec::new();
             for unit in units {
+                // **单元自己的采集就绪度是派活闸门**：一个面里可能同时有一条 active
+                // （容器 stdout）和一条 draft（slurm/nvidia）。面级就绪不能把 draft 单元一起放下去 ——
+                // 那会派下 agentd 还不保证能执行的来源。
+                if !unit.collect_ready() {
+                    excluded.push(ExcludedUnit {
+                        unit_id: unit.unit_id.clone(),
+                        reason_code: "collect_not_ready".to_string(),
+                        condition: None,
+                    });
+                    continue;
+                }
                 match eval_match(&unit.match_expr, facts) {
                     Truth::Yes => selected.push(unit.unit_id.clone()),
                     Truth::No => excluded.push(ExcludedUnit {
@@ -1305,11 +1343,15 @@ fn eval_condition(condition: &Condition, facts: &StoredAgentFactSummary) -> Trut
         return eval_path_exists(condition, facts);
     }
 
+    // 端口是**数值**集合，包名是**文本**：两者共用不了 `contains`。
+    // 端口用子串匹配会把 `tcp:35432` 判成命中 `5432`（临时端口撞 4 位 pattern 是常态）。
+    if condition.kind == "port" {
+        return eval_port_condition(condition, facts);
+    }
+
     let haystack: &[String] = match condition.kind.as_str() {
         // 已装包清单：探针没实现时**恒空** → 空表示“没采”，不是“没装”。
         "installed" => &facts.packages,
-        // 监听端口。
-        "port" => &facts.listen_ports,
         // 设备 / 服务单元 / 资源量：摘要里**没有**这些事实 → 恒为“无法判定”。
         "device" | "service" | "resource" => return Truth::Unknown,
         // 未知 kind 也按“无法判定”，不冒充否定。
@@ -1326,6 +1368,48 @@ fn eval_condition(condition: &Condition, facts: &StoredAgentFactSummary) -> Trut
             .any(|fact| fact.to_lowercase().contains(&needle))
     });
     if matched { Truth::Yes } else { Truth::No }
+}
+
+/// `port:` 的求值（三态）。
+///
+/// 事实里只采**稳定服务端口**：`>= EPHEMERAL_PORT_START` 的监听被有意过滤掉了。
+/// 所以「没命中」有两种不同含义，不能都答 `No`：
+/// - 条件端口在采集区间内（`< EPHEMERAL_PORT_START`）→ `No`：那个区间是完整的，没命中就是没监听。
+/// - 条件端口落在被过滤的区间 → `Unknown`：我们没采，不等于没监听。
+///   真把高端口条件写进目录时，它应该表现为「无法判定」并被审计看到，而不是静默变成「不满足」。
+/// - 端口事实整体为空（旧 agent / 没采到）→ `Unknown`。
+///
+/// 语义是 **OR**：任一条命中即 `Yes`，命中优先于「无法判定」。
+fn eval_port_condition(condition: &Condition, facts: &StoredAgentFactSummary) -> Truth {
+    if condition.values.is_empty() || facts.listen_ports.is_empty() {
+        // 事实缺位（或条件没写值）：不是“不满足”，是“无法判定”。
+        return Truth::Unknown;
+    }
+    let mut saw_uncollected = false;
+    for value in &condition.values {
+        if facts
+            .listen_ports
+            .iter()
+            .any(|fact| listen_port_equals(fact, value))
+        {
+            return Truth::Yes;
+        }
+        match value.trim().parse::<u16>() {
+            Ok(port) if port < EPHEMERAL_PORT_START => {}
+            // 数字但落在被过滤的区间，或根本不是数字：都答不了「没有」。
+            _ => saw_uncollected = true,
+        }
+    }
+    if saw_uncollected {
+        Truth::Unknown
+    } else {
+        Truth::No
+    }
+}
+
+/// 事实里的端口是 `<proto>:<port>`（旧 agent 可能只有裸端口），条件里写的是裸端口。
+fn listen_port_equals(fact: &str, expected: &str) -> bool {
+    fact.split_once(':').map_or(fact, |(_, port)| port).trim() == expected.trim()
 }
 
 /// `path_exists:/a|/b` 的求值。
@@ -1738,6 +1822,7 @@ target = "/var/log/x.log"
                 target: "/var/log/x.log".to_string(),
                 multiline: "none".to_string(),
                 exclude_globs: Vec::new(),
+                drop_if_contains: Vec::new(),
             }],
         }
     }
@@ -1875,9 +1960,9 @@ target = "/var/log/x.log"
         let tcc = by_family("PrivacyTcc");
         assert!(!tcc.collect_ready());
 
-        // Linux 侧现在 10 个面全开：文件来源（auth/secure、sudo.log、dpkg/apt/dnf/yum、
-        //   audit.log 整文件）+ 导出器（ServiceLifecycle/CrashPanic/NetworkFirewall/RebootPower/
-        //   KernelSystem/StorageHealth）+ 指标面。
+        // Linux 侧现在 12 个面全开：文件来源（auth/secure、sudo.log、dpkg/apt/dnf/yum、
+        //   audit.log 整文件、容器 stdout、DB csvlog/slow）+ 导出器（ServiceLifecycle/CrashPanic/
+        //   NetworkFirewall/RebootPower/KernelSystem/StorageHealth）+ 指标面。
         //   日志面 `rule_ref` 为空 = **可采但解析未就绪**（原文照收，只归在泛化 agent.log）。
         for family in [
             "LoginSession",
@@ -1890,15 +1975,14 @@ target = "/var/log/x.log"
             "KernelSystem",
             "StorageHealth",
             "HostMetrics",
+            "ComputeWorkload",
+            "DatabaseService",
         ] {
             assert!(
                 set.is_family_ready("linux", family),
                 "linux {family} 应当采集就绪"
             );
         }
-        // DB 服务面（`/var/log/postgresql/*` 这类目录族）仍是 `draft`：glob 本身已可执行（W1），
-        // 但按发布纪律等机队验证后再翻 `active`。
-        assert!(!set.is_family_ready("linux", "DatabaseService"));
         let linux_readiness = set.family_readiness("linux");
         let linux_by_family = |family: &str| {
             linux_readiness
@@ -2433,6 +2517,78 @@ target = "/var/log/x.log"
         );
     }
 
+    // ── W4：噪音行丢弃（`drop_if_contains`）────────────────────────
+
+    #[test]
+    fn loads_drop_if_contains_on_a_file_source() {
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/containers/*.log\"\n\
+             drop_if_contains = [\"pam_unix(cron:session)\", \"systemd-logind\"]\n",
+        );
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("drop_if_contains accepted");
+        let unit = set
+            .units()
+            .find(|unit| unit.unit_id == "linux-container-stdout")
+            .expect("container unit");
+        assert_eq!(
+            unit.sources[0].drop_if_contains,
+            vec![
+                "pam_unix(cron:session)".to_string(),
+                "systemd-logind".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_drop_if_contains_on_a_non_file_source() {
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"Exporter\"\n\
+             target = \"journalctl-kernel\"\n\
+             drop_if_contains = [\"noise\"]\n",
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("drop on exporter");
+        assert!(
+            err.to_string().contains("cannot declare drop_if_contains"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_noise_needles_that_are_not_exact_substrings() {
+        // 首尾空白 / 重复都得拒：它们看上去能匹配，实际永远不命中（或只命中一半），
+        // 而现场看到的表现是“明明配了却还在采”。
+        for values in ["[\" lead\"]", "[\"trail \"]", "[\"dup\", \"dup\"]"] {
+            let catalog = container_unit_with(&format!(
+                "[[units.sources]]\nkind = \"FileGlob\"\ntarget = \"/var/log/containers/*.log\"\ndrop_if_contains = {values}\n"
+            ));
+            let err =
+                parse_with(&catalog, PACKS, TEMPLATES).expect_err("needle shape must be rejected");
+            assert!(err.to_string().contains("drop_if_contains"), "{err}");
+        }
+    }
+
+    #[test]
+    fn drop_if_contains_does_not_affect_collect_readiness() {
+        // 丢噪音是读法的一部分，不是新的采集能力 —— 但**旧 agentd 不认识这个字段**，
+        // 所以它在 D7 里是单独的能力轴（`drop_if_contains:substring`），
+        // 而不是拿来卡 `active`。
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/containers/*.log\"\n\
+             drop_if_contains = [\"noise\"]\n",
+        );
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("parses");
+        let unit = set
+            .units()
+            .find(|unit| unit.unit_id == "linux-container-stdout")
+            .expect("container unit");
+        assert!(unit.collect_ready());
+    }
+
     #[test]
     fn rejects_exclude_globs_on_a_non_file_source() {
         // 写在别的 kind 上不是“多一个无害的字段”：要么策展想表达别的意思，要么放错了位置。
@@ -2748,5 +2904,42 @@ target = "/var/log/x.log"
             set.probe_paths(),
             vec!["/var/log/postgresql.log".to_string()]
         );
+    }
+
+    #[test]
+    fn port_conditions_match_exactly_ignoring_the_protocol_prefix() {
+        // 端口是数值：`tcp:35432` 不得命中 `5432`。用 contains 时，机器上几十个随机
+        // 临时端口几乎必然撞上 4 位 pattern。
+        let mut facts = StoredAgentFactSummary {
+            listen_ports: vec!["tcp:35432".to_string(), "tcp:8080".to_string()],
+            ..StoredAgentFactSummary::default()
+        };
+
+        assert_eq!(eval_match("port:5432", &facts), Truth::No);
+        assert_eq!(eval_match("port:8080", &facts), Truth::Yes);
+        assert_eq!(eval_match("port:8080|8443", &facts), Truth::Yes);
+
+        // 旧 agent 报的裸端口形状也要能判（升级过渡期两边共存）。
+        facts.listen_ports = vec!["5432".to_string()];
+        assert_eq!(eval_match("port:5432", &facts), Truth::Yes);
+
+        // 空清单 = “没采”，不是“没有”：不能冒充否定。
+        facts.listen_ports.clear();
+        assert_eq!(eval_match("port:5432", &facts), Truth::Unknown);
+    }
+
+    #[test]
+    fn port_conditions_separate_not_listening_from_not_collected() {
+        let facts = StoredAgentFactSummary {
+            listen_ports: vec!["tcp:8080".to_string()],
+            ..StoredAgentFactSummary::default()
+        };
+
+        // 采集区间完整：没命中就是没监听。
+        assert_eq!(eval_match("port:9999", &facts), Truth::No);
+        // 临时区间被有意过滤：答「无法判定」，不冒充「没监听」。
+        assert_eq!(eval_match("port:40000", &facts), Truth::Unknown);
+        // 一组里既有命中、又有没采的区间 → 命中优先。
+        assert_eq!(eval_match("port:40000|8080", &facts), Truth::Yes);
     }
 }

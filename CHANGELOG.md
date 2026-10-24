@@ -3,6 +3,34 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.20.1-alpha] - 2026-10-24
+
+### 新增
+
+- **能力轴补全（G1 / G3）**：`materialize_spec` 除了 `file_inputs` / `multiline_modes` /
+  `exporters`，还按 `filters:<维度>` 与 `drop_if_contains:substring` 裁剪来源。
+  带这些字段的 spec 落到旧 agentd 会被 `deny_unknown_fields` **整份拒收** —— 现在在派活时
+  就点名缺什么，不把坏参数发下去。
+- **目录装载期新增 `drop_if_contains` 校验**（只许 `FileGlob`；精确子串、限条数 / 长度），
+  与管理面 `sources[].drop_if_contains` 输出。
+- 读法词表改为**直接复用契约** `MULTILINE_MODES`：新增 `mysql_slow` / `postgres_csv` 时
+  不再需要两处手抄。
+
+### 变更
+
+- 能力判定改为看**即将发出去的 wire 来源**（先拼 `WorkSpecSource`，再按它判能力），
+  避免“按目录字段判、发出去却多带一个字段”的偏差。
+- **`drop_if_contains` 改为降级而不是裁源**：agent 不支持/没报能力时去掉该字段继续采
+  （`event=WorkSourceDegraded`）。裁源会让 `linux-auth-session` 这种两条来源都带过滤器的面
+  在老 agent 上直接不可授权，且“少采”变成“不采”。
+- **就绪不再把同面的 `draft` 单元一起派**：`expand()` 先按 `unit.status = active` 过滤
+  （未就绪单元进 `collect_not_ready`）。以前只要面就绪，同面的 draft 单元也会被出发。
+- **人工 `spec=` 也做能力裁剪**（不再只看事实）：能力不匹配会导致 agentd 整份拒收，
+  不是“这个文件采不到”，不该被当作可见失败放过去。
+- **用途规则册跟上 `fact-v3`**：`listen_port` 规则要求稳定服务端口（装载期拒掉临时区间的
+  端口，否则是一条永远不命中的死规则），且端口按**数值**比对 —— 字符串包含会让 `35432`
+  命中 `5432`，一台机器上百个临时端口时这是必然事件。
+
 ## [0.20.0-alpha] - 2026-10-23
 
 ### 新增

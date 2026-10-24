@@ -15,7 +15,11 @@ use std::collections::BTreeSet;
 
 use crate::app::content::{ContentSet, UnitSource};
 use crate::infra::{StoredAgentFactSummary, StoredOneShotWork};
-use wist_contracts::work::{OneShotWork, WorkSpec, WorkSpecSource, WorkSpecUnit, is_explicit_path};
+use wist_contracts::capability_report::LogsCapabilities;
+use wist_contracts::work::{
+    DROP_IF_CONTAINS_SUBSTRING, OneShotWork, WorkSpec, WorkSpecSource, WorkSpecUnit,
+    is_explicit_path,
+};
 
 /// 授权/撤回被拒的原因。映射成 HTTP 状态码是 api 层的事。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +147,15 @@ pub fn derive_spec(
 /// 没声明的形态/导出器会被剔掉，并在拒绝文案里点名缺了什么 —— 否则就是「派下去 → agent 报
 /// unsupported → 这个面静默没数据」。`None`（旧 agentd 没报）**不做能力裁剪**：
 /// 那时“不知道”不等于“不会”，退回契约判据（与 D7 之前一致）。
+///
+/// 例外（“减法”字段不需要裁源）：`drop_if_contains` 不支持/未上报时**去掉字段继续采**
+/// （上送量变大，而不是面消失）。其余新增**字段**仍裁源：旧 agentd 收到未知字段会
+/// `deny_unknown_fields` 拒收整份 spec，宁可不派那条来源。
+///
+/// 两个例外（都是“减法”，不需要裁源）：
+///   * `drop_if_contains`：不支持/未上报时**去掉字段继续采**（上送量变大，而不是面消失）；
+///   * 其余新增**字段**（如 `filters`）仍按上面的规则处理：旧 agentd 收到未知字段会
+///     `deny_unknown_fields` 拒收整份 spec，所以宁可不派那条来源。
 fn materialize_spec(
     content: &ContentSet,
     unit_ids: &[String],
@@ -152,6 +165,7 @@ fn materialize_spec(
     let mut units = Vec::with_capacity(unit_ids.len());
     let mut absent: BTreeSet<String> = BTreeSet::new();
     let mut unsupported: BTreeSet<String> = BTreeSet::new();
+    let mut degraded: BTreeSet<String> = BTreeSet::new();
     for unit_id in unit_ids {
         let Some(unit) = content.units().find(|unit| unit.unit_id == *unit_id) else {
             // 展开出来的单元不在目录里 —— 这是网关自己的不变式被破坏，
@@ -166,22 +180,9 @@ fn materialize_spec(
                 absent.insert(source.target.clone());
                 continue;
             }
-            // D7：agent 报了能力清单就按它裁剪；没报（None）就退回契约判据。
-            if let Some(capabilities) = capabilities
-                && let Some(missing) = wist_contracts::work::missing_log_capabilities(
-                    &source.kind,
-                    &source.target,
-                    &source.multiline,
-                    capabilities,
-                )
-                && !missing.is_empty()
-            {
-                // 文案形状：`<来源>: <缺的能力>`。外层统一加“这台 agent 没声明能力”的帽子，
-                // 避免“agent 未声明 …”这种中英混排套在英文句子里的双层括号。
-                unsupported.insert(format!("{}: {}", source.target, missing.join(", ")));
-                continue;
-            }
-            sources.push(WorkSpecSource {
+            // 先拼成 wire 形态：能力判据看的就是**将要发出去的那条来源**
+            // （字段一字不差，避免“按目录字段判、发出去却多带一个字段”）。
+            let mut candidate = WorkSpecSource {
                 kind: source.kind.clone(),
                 target: source.target.clone(),
                 // 「怎么读这条来源」跟工作内容一起发出去：agentd 不该自己去猜文件格式，
@@ -191,7 +192,30 @@ fn materialize_spec(
                 exclude_globs: source.exclude_globs.clone(),
                 // W2 的结构化选源同理：namespace / pod 的选择是策展结论，不是 agent 本地偏好。
                 filters: source.filters.clone(),
-            });
+                // W4 的噪音行子串：同属“这份采集面不该采什么”，跟单元一起走。
+                drop_if_contains: source.drop_if_contains.clone(),
+            };
+            // `drop_if_contains` 是**减法**（只减少上送量）：agent 不认识时**去掉这个字段**
+            // 继续采，而不是把整条来源裁掉 —— 后者会让 `linux-auth-session` 这种
+            // “两条来源都带过滤器”的面在老 agent 上直接不可授权（少采变成不采）。
+            if !candidate.drop_if_contains.is_empty()
+                && !declares_noise_filter(capabilities, DROP_IF_CONTAINS_SUBSTRING)
+            {
+                candidate.drop_if_contains.clear();
+                degraded.insert(source.target.clone());
+            }
+            // D7：agent 报了能力清单就按它裁剪；没报（None）就退回契约判据。
+            if let Some(capabilities) = capabilities
+                && let Some(missing) =
+                    wist_contracts::work::missing_log_capabilities(&candidate, capabilities)
+                && !missing.is_empty()
+            {
+                // 文案形状：`<来源>: <缺的能力>`。外层统一加“这台 agent 没声明能力”的帽子，
+                // 避免“agent 未声明 …”这种中英混排套在英文句子里的双层括号。
+                unsupported.insert(format!("{}: {}", source.target, missing.join(", ")));
+                continue;
+            }
+            sources.push(candidate);
         }
         if sources.is_empty() {
             // 整条单元都被裁掉：不把「零来源的单元」发下去
@@ -240,9 +264,25 @@ fn materialize_spec(
             unsupported
         );
     }
+    // 降级也不能静默：来源还在、但噪音过滤被去掉了 —— 上送量会变大，运维要能对账。
+    if !degraded.is_empty() {
+        log::info!(
+            "event=WorkSourceDegraded reason=drop_if_contains units={:?} sources={:?}",
+            unit_ids,
+            degraded
+        );
+    }
     WorkSpec { units }
         .encode()
         .map_err(|err| WorkRejection::Conflict(format!("failed to encode work spec: {err}")))
+}
+
+/// 这台 agent 是否声明了某项噪音行丢弃能力。
+///
+/// `None`（没报能力清单）时按**不支持**处理：这个字段是减法、忽略它只会多采，
+/// 而发过去会让 pre-D7 的 agentd 因 `deny_unknown_fields` **整份拒收**（连别的面一起停）。
+fn declares_noise_filter(capabilities: Option<&LogsCapabilities>, mode: &str) -> bool {
+    capabilities.is_some_and(|caps| caps.drop_if_contains.iter().any(|value| value == mode))
 }
 
 /// 这条来源在这台机器上是否**已被探测且确认不存在**。
@@ -275,6 +315,7 @@ pub fn validate_spec(
     platform: &str,
     family: &str,
     requested_spec: &str,
+    capabilities: Option<&LogsCapabilities>,
 ) -> Result<(String, i64), WorkRejection> {
     let mut selected = Vec::new();
     for token in requested_spec
@@ -300,9 +341,11 @@ pub fn validate_spec(
             "spec must name at least one collection unit (或留空，由网关按事实展开)".to_string(),
         ));
     }
-    // 人工手写的 spec 不按能力裁剪：运维显式点名的单元要“看得见失败”，
-    // 而不是被网关静默删成一份更小的 spec（第三个 `None` 是 facts，第四个是 capabilities）。
-    materialize_spec(content, &selected, None, None).map(|spec| (spec, content.catalog_version))
+    // 人工手写的 spec **不按事实裁剪**（运维显式点名的路径要“看得见失败”，`facts` 传 None）；
+    // 但**能力裁剪照做**：能力不匹配的后果不是“这个文件采不到”，而是 agentd
+    // `deny_unknown_fields` **整份拒收**（连没点名的那几个面一起停）。
+    materialize_spec(content, &selected, None, capabilities)
+        .map(|spec| (spec, content.catalog_version))
 }
 
 /// 定出这次授权的期望版本。
@@ -937,21 +980,22 @@ status = "active"
     #[test]
     fn hand_written_spec_must_name_units_of_that_family_on_that_platform() {
         let content = content();
-        let (spec, _) = validate_spec(&content, "macos", "HostMetrics", " mac-metrics ").unwrap();
+        let (spec, _) =
+            validate_spec(&content, "macos", "HostMetrics", " mac-metrics ", None).unwrap();
         let spec = WorkSpec::parse(&spec).expect("spec 是可解析的工作参数");
         assert_eq!(spec.units.len(), 1);
         assert_eq!(spec.units[0].unit_id, "mac-metrics");
         assert_eq!(spec.metric_interval_seconds(), Some(15));
 
-        let err = validate_spec(&content, "macos", "HostMetrics", "nope").unwrap_err();
+        let err = validate_spec(&content, "macos", "HostMetrics", "nope", None).unwrap_err();
         assert!(err.message().contains("not in the collection catalog"));
 
         // 单元存在但属于别的面：也得报错，不能默默收下。
-        let err = validate_spec(&content, "macos", "HostMetrics", "mac-tcc").unwrap_err();
+        let err = validate_spec(&content, "macos", "HostMetrics", "mac-tcc", None).unwrap_err();
         assert!(err.message().contains("not to HostMetrics on macos"));
 
         // 空 spec：交给调用方去走「按事实展开」那条路。
-        let err = validate_spec(&content, "macos", "HostMetrics", "  ").unwrap_err();
+        let err = validate_spec(&content, "macos", "HostMetrics", "  ", None).unwrap_err();
         assert!(matches!(err, WorkRejection::BadRequest(_)));
     }
 
@@ -1239,10 +1283,112 @@ status = "active"
     }
 
     #[test]
+    fn container_filters_are_dropped_when_the_agent_does_not_declare_them() {
+        // G1：带 `filters` 的 spec 落到不认识的 agentd 上会被 `deny_unknown_fields`
+        // **整份拒收** —— 所以网关必须在派活时就按能力轴裁掉这条来源，而不是发下去等报错。
+        let catalog = CATALOG.replacen(
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/containers/*.log\"\n\
+             filters = { namespace_in = [\"prod\"] }",
+            1,
+        );
+        let content =
+            crate::app::content::parse_content(&catalog, PACKS, TEMPLATES).expect("fixture parses");
+        let caps = logs_caps(&[FILE_INPUT_ABSOLUTE_PATH, FILE_INPUT_GLOB], &[]);
+        let err = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts_with_paths("linux", &["postgresql"], &[], &[]),
+            Some(&caps),
+        )
+        .unwrap_err();
+        assert!(err.message().contains("filters:namespace_in"), "{err:?}");
+    }
+
+    #[test]
+    fn noise_needles_travel_from_the_catalog_into_the_spec() {
+        // W4：子串丢弃是**读法的一部分**，跟单元一起发下去；agentd 不自己猜该丢什么。
+        let catalog = CATALOG.replacen(
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"\n\
+             drop_if_contains = [\"pam_unix(cron:session)\"]",
+            1,
+        );
+        let content =
+            crate::app::content::parse_content(&catalog, PACKS, TEMPLATES).expect("fixture parses");
+        // 只有**声明了这条能力**的 agent 才拿到子串；不声明/未报的走降级（见下一个用例）。
+        let capable = LogsCapabilities {
+            drop_if_contains: vec!["substring".to_string()],
+            ..logs_caps(&[FILE_INPUT_ABSOLUTE_PATH, FILE_INPUT_GLOB], &[])
+        };
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts(&["postgresql"]),
+            Some(&capable),
+        )
+        .unwrap();
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert_eq!(
+            spec.units[0].sources[0].drop_if_contains,
+            vec!["pam_unix(cron:session)".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_source_with_noise_needles_is_degraded_when_the_agent_lacks_that_capability() {
+        // `drop_if_contains` 是**减法**：旧 agentd 不认识时去掉这个字段继续采（上送量变大），
+        // 而不是把整条来源裁掉 —— `linux-auth-session` 两条来源都带过滤器，
+        // 裁源会让整个面不可授权（少采变成不采）。也不得发下去：会把整份 spec 拒收。
+        let catalog = CATALOG.replacen(
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+            "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"\n\
+             drop_if_contains = [\"noise\"]",
+            1,
+        );
+        let content =
+            crate::app::content::parse_content(&catalog, PACKS, TEMPLATES).expect("fixture parses");
+        let old = logs_caps(&[FILE_INPUT_ABSOLUTE_PATH, FILE_INPUT_GLOB], &[]);
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts(&["postgresql"]),
+            Some(&old),
+        )
+        .expect("the source survives without the noise filter");
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert_eq!(spec.units[0].sources.len(), 1);
+        assert!(
+            spec.units[0].sources[0].drop_if_contains.is_empty(),
+            "{spec:?}"
+        );
+
+        // 没报能力清单（pre-D7）：同样去掉字段（发过去会整份拒收）。
+        let (legacy, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts(&["postgresql"]),
+            None,
+        )
+        .expect("legacy agents still get the source");
+        let legacy = WorkSpec::parse(&legacy).expect("spec");
+        assert!(legacy.units[0].sources[0].drop_if_contains.is_empty());
+    }
+
+    #[test]
     fn a_hand_written_spec_is_not_filtered_by_path_facts() {
         // 人工点名是运维的显式动作：不过滤，失败了也要看得见。
         let content = content();
-        let (spec, _) = validate_spec(&content, "linux", "DatabaseService", "linux-db").unwrap();
+        let (spec, _) =
+            validate_spec(&content, "linux", "DatabaseService", "linux-db", None).unwrap();
         let spec = WorkSpec::parse(&spec).expect("spec");
         assert_eq!(spec.units[0].sources.len(), 1);
         assert_eq!(spec.units[0].sources[0].target, "/var/log/postgresql.log");
@@ -1270,6 +1416,121 @@ status = "active"
             .map(|source| source.target.as_str())
             .collect();
         assert_eq!(targets, vec!["/var/log/auth.log"]);
+    }
+
+    #[test]
+    fn the_real_catalog_dispatches_container_stdout_only_where_the_symlink_root_exists() {
+        // G2 验收：容器单元靠 `path_exists:/var/log/containers` 做事实门。
+        // 有目录 → 派 `/var/log/containers/*.log`；没目录 → 面在展开阶段就不展开。
+        let content = real_content();
+        let present = facts_with_paths(
+            "linux",
+            &["postgresql"],
+            &["/var/log/containers"],
+            &["/var/log/containers"],
+        );
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "ComputeWorkload",
+            &present,
+            None,
+        )
+        .expect("derives");
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert!(
+            spec.units.iter().any(|unit| {
+                unit.unit_id == "linux-container-stdout"
+                    && unit
+                        .sources
+                        .iter()
+                        .any(|source| source.target == "/var/log/containers/*.log")
+            }),
+            "{spec:?}"
+        );
+
+        let absent = facts_with_paths("linux", &["postgresql"], &["/var/log/containers"], &[]);
+        let err = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "ComputeWorkload",
+            &absent,
+            None,
+        )
+        .expect_err("no container root and the slurm/nvidia unit is still draft");
+        assert!(
+            err.message()
+                .contains("no unit selected for ComputeWorkload"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_ready_family_does_not_dispatch_its_draft_units() {
+        // 面就绪（至少一条 active）不等于面里每个单元都已就绪。
+        // `ComputeWorkload` 现在有 active 的容器单元 + draft 的 slurm/nvidia 单元 ——
+        // 后者即使 `match` 命中也不能派（否则会派下 agentd 不保证能执行的来源）。
+        let content = real_content();
+        let facts = facts_with_paths(
+            "linux",
+            &["slurm", "kubelet"],
+            &["/var/log/containers"],
+            &["/var/log/containers"],
+        );
+        let expansion = content.expand("linux-compute", &facts).expect("expand");
+        let compute = expansion
+            .works
+            .iter()
+            .find(|work| work.family == "ComputeWorkload")
+            .expect("ComputeWorkload work");
+        assert_eq!(
+            compute.selected_units,
+            vec!["linux-container-stdout".to_string()]
+        );
+        assert!(
+            expansion.excluded_units.iter().any(|unit| {
+                unit.unit_id == "linux-compute-workload" && unit.reason_code == "collect_not_ready"
+            }),
+            "{:?}",
+            expansion.excluded_units
+        );
+    }
+
+    #[test]
+    fn the_real_catalog_dispatches_the_db_unit_from_its_log_directories() {
+        // G3 验收：DB 单元的事实门必须是 `path_exists` —— 包清单探针还没实现
+        // （`packages` 恒空），用 `installed:` 做门会让这个面永远展不开。
+        let content = real_content();
+        let present = facts_with_paths(
+            "linux",
+            &[],
+            &["/var/log/postgresql", "/var/log/mysql"],
+            &["/var/log/postgresql"],
+        );
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxData",
+            "linux",
+            "DatabaseService",
+            &present,
+            None,
+        )
+        .expect("derives");
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert_eq!(spec.units.len(), 1);
+        let sources = &spec.units[0].sources;
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.target == "/var/log/postgresql/*.csv"
+                    && source.multiline == "postgres_csv"),
+            "{sources:?}"
+        );
+        assert!(sources.iter().any(|source| {
+            source.target == "/var/log/mysql/*slow*.log" && source.multiline == "mysql_slow"
+        }));
     }
 
     #[test]
@@ -1353,6 +1614,7 @@ status = "active"
             target: "/var/log/misc/*".to_string(),
             multiline: "none".to_string(),
             exclude_globs: Vec::new(),
+            drop_if_contains: Vec::new(),
         };
         let exporter = UnitSource {
             filters: Default::default(),
@@ -1360,6 +1622,7 @@ status = "active"
             target: "dmesg:panic".to_string(),
             multiline: "none".to_string(),
             exclude_globs: Vec::new(),
+            drop_if_contains: Vec::new(),
         };
         assert!(!source_is_absent_on_this_machine(&glob, Some(&facts)));
         assert!(!source_is_absent_on_this_machine(&exporter, Some(&facts)));

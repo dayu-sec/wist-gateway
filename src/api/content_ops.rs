@@ -80,6 +80,9 @@ struct UnitSourceView {
     /// 容器选源过滤器（空则不输出，与 `exclude_globs` 同一纪律）。
     #[serde(skip_serializing_if = "ContainerFilters::is_empty")]
     filters: ContainerFilters,
+    /// 噪音行丢弃子串（空则不输出）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    drop_if_contains: Vec<String>,
     /// agentd 今天能不能执行这条来源（与网关派活闸门**同一判据**）。
     executable: bool,
 }
@@ -162,6 +165,7 @@ pub async fn view_content(
                     multiline: source.multiline.clone(),
                     exclude_globs: source.exclude_globs.clone(),
                     filters: source.filters.clone(),
+                    drop_if_contains: source.drop_if_contains.clone(),
                     executable: is_executable_source(&source.kind, &source.target),
                 })
                 .collect();
@@ -236,6 +240,7 @@ mod tests {
             multiline: "none".to_string(),
             exclude_globs,
             filters,
+            drop_if_contains: Vec::new(),
             executable: true,
         }
     }
@@ -247,6 +252,15 @@ mod tests {
             .expect("serialize");
         assert!(json.get("filters").is_none(), "{json}");
         assert!(json.get("exclude_globs").is_none(), "{json}");
+        assert!(json.get("drop_if_contains").is_none(), "{json}");
+    }
+
+    #[test]
+    fn unit_source_view_serializes_drop_if_contains() {
+        let mut view = source(ContainerFilters::default(), Vec::new());
+        view.drop_if_contains = vec!["pam_unix(cron:session)".to_string()];
+        let json = serde_json::to_value(view).expect("serialize");
+        assert_eq!(json["drop_if_contains"][0], "pam_unix(cron:session)");
     }
 
     #[test]

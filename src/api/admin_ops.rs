@@ -778,6 +778,20 @@ async fn grant_standing_work(
         }
     };
     let requested_spec = input.spec.trim();
+    // D7：这台机器自报的日志能力。`None`（旧 agentd 没报）时**能力裁剪**仍走保守路径
+    // （见 `materialize_spec` 里 `drop_if_contains` 的降级）。
+    let capabilities = match state.store.get_agent(agent_id).await {
+        Ok(Some(agent)) => agent.logs_capabilities,
+        Ok(None) => None,
+        Err(err) => {
+            return ApiError::internal(
+                codes::AGENT_FACT_SUMMARY_UNAVAILABLE,
+                "failed to load agent capabilities",
+                err,
+            )
+            .into_response();
+        }
+    };
     let spec_result = if requested_spec.is_empty() {
         let facts = match state.store.get_agent_fact_summary(agent_id).await {
             Ok(facts) => facts,
@@ -799,20 +813,6 @@ async fn grant_standing_work(
             )
             .into_response();
         };
-        // D7：这台机器自报的日志能力。`None`（旧 agentd 没报）时不做能力裁剪 ——
-        // “不知道”不等于“不会”，退回契约判据。
-        let capabilities = match state.store.get_agent(agent_id).await {
-            Ok(Some(agent)) => agent.logs_capabilities,
-            Ok(None) => None,
-            Err(err) => {
-                return ApiError::internal(
-                    codes::AGENT_FACT_SUMMARY_UNAVAILABLE,
-                    "failed to load agent capabilities",
-                    err,
-                )
-                .into_response();
-            }
-        };
         work_rules::derive_spec(
             content,
             &classification.machine_class,
@@ -822,7 +822,13 @@ async fn grant_standing_work(
             capabilities.as_ref(),
         )
     } else {
-        work_rules::validate_spec(content, platform, family, requested_spec)
+        work_rules::validate_spec(
+            content,
+            platform,
+            family,
+            requested_spec,
+            capabilities.as_ref(),
+        )
     };
     let (spec, catalog_version) = match spec_result {
         Ok(pair) => pair,

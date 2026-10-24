@@ -1120,7 +1120,7 @@ const MAX_LISTEN_PORTS: usize = 1_000;
 /// 待探测路径条数上限：目录里的 `path_exists` 条件是人工策展的，不会多到几百。
 const MAX_PROBE_PATHS: usize = 512;
 const MAX_ELEMENT_BYTES: usize = 4096;
-/// `content_digest` 是固定格式的标识符（`fact-v2:sha256:<64 hex>`）。
+/// `content_digest` 是固定格式的标识符（`fact-v3:sha256:<64 hex>`）。
 /// 封顶是必要的：它会进告警日志，不限长就能让一条上报写出几 MB 的单行日志。
 const MAX_CONTENT_DIGEST_BYTES: usize = 128;
 /// 单个展示字段（`host_id` / `host_name`）的字节上限。主机名按 DNS 上限（253）留余量，
