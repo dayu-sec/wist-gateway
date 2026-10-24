@@ -1484,6 +1484,70 @@ status = "active"
     }
 
     #[test]
+    fn the_real_catalog_dispatches_docker_stdout_only_where_the_docker_root_exists() {
+        // M0 验收：纯 Docker 主机的容器单元靠 `path_exists:/var/lib/docker/containers` 做事实门。
+        let content = real_content();
+        // 白名单必须包含 docker 根目录 —— 否则 agent 根本不探测它，`path_exists` 永远是
+        // 「无法判定」（`fact_not_collected`），这个面永远授不了权（就是 agentd 0.9.2 修的那类 bug）。
+        assert!(
+            content
+                .probe_paths()
+                .iter()
+                .any(|path| path == "/var/lib/docker/containers"),
+            "探测白名单缺 docker 根目录：{:?}",
+            content.probe_paths()
+        );
+        let present = facts_with_paths(
+            "linux",
+            &["postgresql"],
+            &["/var/lib/docker/containers"],
+            &["/var/lib/docker/containers"],
+        );
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "ComputeWorkload",
+            &present,
+            None,
+        )
+        .expect("derives");
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert!(
+            spec.units.iter().any(|unit| {
+                unit.unit_id == "linux-docker-container-stdout"
+                    && unit.sources.iter().any(|source| {
+                        source.target == "/var/lib/docker/containers/*/*-json.log*"
+                            && source.multiline == "none"
+                    })
+            }),
+            "{spec:?}"
+        );
+
+        // 没有 docker 目录 → 该单元不派（`linux-compute-workload` 仍是 draft）。
+        let absent = facts_with_paths(
+            "linux",
+            &["postgresql"],
+            &["/var/lib/docker/containers"],
+            &[],
+        );
+        let err = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "ComputeWorkload",
+            &absent,
+            None,
+        )
+        .expect_err("no docker root");
+        assert!(
+            err.message()
+                .contains("linux-docker-container-stdout=match_unsatisfied"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn a_ready_family_does_not_dispatch_its_draft_units() {
         // 面就绪（至少一条 active）不等于面里每个单元都已就绪。
         // `ComputeWorkload` 现在有 active 的容器单元 + draft 的 slurm/nvidia 单元 ——
