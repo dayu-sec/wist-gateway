@@ -1497,10 +1497,20 @@ status = "active"
             "探测白名单缺 docker 根目录：{:?}",
             content.probe_paths()
         );
+        // 否条件同样要靠探测才能判定：不探 `/var/log/containers` 的话，纯 Docker 主机上
+        // `not_path_exists` 永远 Unknown，单元反而展不开。
+        assert!(
+            content
+                .probe_paths()
+                .iter()
+                .any(|path| path == "/var/log/containers"),
+            "探测白名单缺 k8s 容器根目录：{:?}",
+            content.probe_paths()
+        );
         let present = facts_with_paths(
             "linux",
             &["postgresql"],
-            &["/var/lib/docker/containers"],
+            &["/var/lib/docker/containers", "/var/log/containers"],
             &["/var/lib/docker/containers"],
         );
         let (spec, _) = derive_spec(
@@ -1524,11 +1534,41 @@ status = "active"
             "{spec:?}"
         );
 
+        // k8s + cri-dockerd：两个根目录都在，容器面只交给 k8s 单元，不再重复采。
+        let both = facts_with_paths(
+            "linux",
+            &["postgresql"],
+            &["/var/lib/docker/containers", "/var/log/containers"],
+            &["/var/lib/docker/containers", "/var/log/containers"],
+        );
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "ComputeWorkload",
+            &both,
+            None,
+        )
+        .expect("derives");
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert!(
+            spec.units
+                .iter()
+                .any(|unit| unit.unit_id == "linux-container-stdout"),
+            "{spec:?}"
+        );
+        assert!(
+            spec.units
+                .iter()
+                .all(|unit| unit.unit_id != "linux-docker-container-stdout"),
+            "k8s 节点上 docker 单元不应该再命中：{spec:?}"
+        );
+
         // 没有 docker 目录 → 该单元不派（`linux-compute-workload` 仍是 draft）。
         let absent = facts_with_paths(
             "linux",
             &["postgresql"],
-            &["/var/lib/docker/containers"],
+            &["/var/lib/docker/containers", "/var/log/containers"],
             &[],
         );
         let err = derive_spec(

@@ -3,6 +3,24 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.20.3-alpha] - 2026-10-24
+
+### 新增
+
+- **`match` 支持否定条件 `not_path_exists:<绝对路径>`**：三态求值 —— 任一路径探测到且存在
+  → 不满足；全部探测过且都不存在 → 满足；有路径没探过 → 无法判定（不拿“没探”冒充“不存在”）。
+  否定条件里的路径也进**探测白名单**（`probe_paths`），否则单元永远展不开；装载期要求
+  绝对路径（与 `path_exists` 同口径）。用途：`k8s + cri-dockerd` 主机上把纯 Docker 容器
+  单元排除掉，避免同一份日志被 `/var/log/containers` 与 docker 目录各采一遍。
+- **`filters.name_in` / `name_not_in` 的装载校验按维度分开**：
+  `namespace_in` / `pod_not_in` 仍要求来源在 `/var/log/containers` 下；
+  `name_in` / `name_not_in` 放宽到目标含 `containers/` 的来源（不写死 data-root）。
+  能力轴随 `CONTAINER_FILTERS` 自动扩到 4 维，旧 agentd 未声明的维度照旧裁源。
+
+### 依赖
+
+- `wist-contracts` 0.9.7。
+
 ## [0.20.2-alpha] - 2026-10-24
 
 ### 变更

@@ -269,6 +269,8 @@ mod tests {
             ContainerFilters {
                 namespace_in: vec!["prod".to_string()],
                 pod_not_in: Vec::new(),
+                name_in: Vec::new(),
+                name_not_in: Vec::new(),
             },
             vec!["/var/log/containers/*_kube-system_*.log".to_string()],
         ))

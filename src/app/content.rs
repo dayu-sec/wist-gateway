@@ -653,14 +653,17 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
             unit.family, unit.platform, meta.platforms
         )));
     }
-    // `path_exists` 的值必须是绝对路径：相对路径的结果取决于进程 cwd，
+    // `path_exists` / `not_path_exists` 的值必须是绝对路径：相对路径的结果取决于进程 cwd，
     // 同一台机器换一种启动方式就翻面，不能当事实（agentd 侧也会丢弃）。
     for condition in parse_conditions(&unit.match_expr) {
-        if condition.kind != "path_exists" {
+        if condition.kind != "path_exists" && condition.kind != "not_path_exists" {
             continue;
         }
         if condition.values.is_empty() {
-            return Err(invalid(format!("unit {id}: path_exists has no path")));
+            return Err(invalid(format!(
+                "unit {id}: {} has no path",
+                condition.kind
+            )));
         }
         if let Some(bad) = condition
             .values
@@ -668,7 +671,8 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
             .find(|value| !value.starts_with('/'))
         {
             return Err(invalid(format!(
-                "unit {id}: path_exists expects absolute paths, got {bad:?}"
+                "unit {id}: {} expects absolute paths, got {bad:?}",
+                condition.kind
             )));
         }
     }
@@ -725,12 +729,29 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
             if let Err(reason) = source.filters.validate() {
                 return Err(invalid(format!("unit {id}: filters {reason}")));
             }
-            let root = CONTAINER_LOG_ROOT;
-            let under_root =
-                source.target == root || source.target.starts_with(&format!("{root}/"));
-            if !under_root {
+            // 维度决定目标形态（两类载体的信息位置不同）：
+            //   * `namespace_in` / `pod_not_in` 靠**文件名** `<pod>_<ns>_<container>-<id>.log`
+            //     解析 → 只能在 k8s 的 `/var/log/containers` 下；
+            //   * `name_in` / `name_not_in` 也支持纯 Docker（文件名只有容器 id，名字在同目录
+            //     `config.v2.json`）→ 只要求目标里真的有 `containers/` 这一段（不写死 data-root）。
+            let k8s_shape =
+                !source.filters.namespace_in.is_empty() || !source.filters.pod_not_in.is_empty();
+            let name_shape =
+                !source.filters.name_in.is_empty() || !source.filters.name_not_in.is_empty();
+            if k8s_shape {
+                let root = CONTAINER_LOG_ROOT;
+                let under_root =
+                    source.target == root || source.target.starts_with(&format!("{root}/"));
+                if !under_root {
+                    return Err(invalid(format!(
+                        "unit {id}: filters 只能用在 {root} 下的来源（当前 {}）",
+                        source.target
+                    )));
+                }
+            }
+            if name_shape && !source.target.contains("/containers/") {
                 return Err(invalid(format!(
-                    "unit {id}: filters 只能用在 {root} 下的来源（当前 {}）",
+                    "unit {id}: filters name_in / name_not_in 要求来源在容器日志目录下（当前 {}）",
                     source.target
                 )));
             }
@@ -1056,7 +1077,8 @@ impl ContentSet {
         let mut paths: BTreeSet<String> = BTreeSet::new();
         for unit in self.units.values() {
             for condition in parse_conditions(&unit.match_expr) {
-                if condition.kind != "path_exists" {
+                // 否定条件也要探：不探就永远是「无法判定」，那个单元永远展不开。
+                if condition.kind != "path_exists" && condition.kind != "not_path_exists" {
                     continue;
                 }
                 for value in condition.values {
@@ -1337,10 +1359,13 @@ fn first_non_yes_condition(
 }
 
 fn eval_condition(condition: &Condition, facts: &StoredAgentFactSummary) -> Truth {
-    // `path_exists` 需要的是「探测过才判得出来」，与其它 kind 的「空事实 = 无法判定」不同，
-    // 所以单独走一条分支。
+    // `path_exists` / `not_path_exists` 需要的是「探测过才判得出来」，与其它 kind 的
+    // 「空事实 = 无法判定」不同，所以单独走分支。
     if condition.kind == "path_exists" {
         return eval_path_exists(condition, facts);
+    }
+    if condition.kind == "not_path_exists" {
+        return eval_not_path_exists(condition, facts);
     }
 
     // 端口是**数值**集合，包名是**文本**：两者共用不了 `contains`。
@@ -1432,6 +1457,38 @@ fn eval_path_exists(condition: &Condition, facts: &StoredAgentFactSummary) -> Tr
     }
     if all_probed {
         Truth::No
+    } else {
+        Truth::Unknown
+    }
+}
+
+/// `not_path_exists:` 的三态求值（否定条件）。
+///
+/// 语义与 [`eval_path_exists`] 镜像但**方向相反**：
+/// - 任一个值**探测到且存在** → `No`（否定条件不成立）；
+/// - 所有值都探测过且都不存在 → `Yes`；
+/// - 有値没探测过 → `Unknown`（不拿“没探”冒充“不存在”）。
+///
+/// 用途：纯 Docker 主机的容器单元。`k8s + cri-dockerd` 的机器上 kubelet 会把 pod 日志
+/// 指向 docker 的 json 文件，两个单元会同时命中 → 用 `not_path_exists:/var/log/containers`
+/// 把这个单元排除掉，不重复采集。
+fn eval_not_path_exists(condition: &Condition, facts: &StoredAgentFactSummary) -> Truth {
+    if condition.values.is_empty() {
+        return Truth::Unknown;
+    }
+    let mut all_probed = true;
+    for value in &condition.values {
+        let probed = facts.probed_paths.iter().any(|path| path == value);
+        if !probed {
+            all_probed = false;
+            continue;
+        }
+        if facts.present_paths.iter().any(|path| path == value) {
+            return Truth::No;
+        }
+    }
+    if all_probed {
+        Truth::Yes
     } else {
         Truth::Unknown
     }
@@ -2205,6 +2262,68 @@ target = "/var/log/x.log"
     }
 
     #[test]
+    fn not_path_exists_is_the_mirror_image_in_three_states() {
+        // 用途：`k8s + cri-dockerd` 的机器上，kubelet 把 pod 日志指向 docker 的 json 文件，
+        // 两个容器单元会同时命中 —— 用否定条件把 docker 单元排除掉。
+        let expr = "not_path_exists:/var/log/containers";
+        let facts_with = |probed: &[&str], present: &[&str]| StoredAgentFactSummary {
+            probed_paths: probed.iter().map(|value| value.to_string()).collect(),
+            present_paths: present.iter().map(|value| value.to_string()).collect(),
+            ..Default::default()
+        };
+
+        // 没探过 → 无法判定（不拿“没探”冒充“不存在”）。
+        assert_eq!(eval_match(expr, &facts_with(&[], &[])), Truth::Unknown);
+        // 探过、不存在 → 满足（纯 Docker 主机）。
+        assert_eq!(
+            eval_match(expr, &facts_with(&["/var/log/containers"], &[])),
+            Truth::Yes
+        );
+        // 探过、存在 → 不满足（k8s 节点）。
+        assert_eq!(
+            eval_match(
+                expr,
+                &facts_with(&["/var/log/containers"], &["/var/log/containers"])
+            ),
+            Truth::No
+        );
+
+        // 与肯定条件用 `;` 组合是 AND：两个都得成立。
+        let both = "path_exists:/var/lib/docker/containers; not_path_exists:/var/log/containers";
+        assert_eq!(
+            eval_match(
+                both,
+                &facts_with(
+                    &["/var/lib/docker/containers", "/var/log/containers"],
+                    &["/var/lib/docker/containers"]
+                )
+            ),
+            Truth::Yes
+        );
+        assert_eq!(
+            eval_match(
+                both,
+                &facts_with(
+                    &["/var/lib/docker/containers", "/var/log/containers"],
+                    &["/var/lib/docker/containers", "/var/log/containers"]
+                )
+            ),
+            Truth::No
+        );
+        // 否定条件自身没探过 → 整条无法判定。
+        assert_eq!(
+            eval_match(
+                both,
+                &facts_with(
+                    &["/var/lib/docker/containers"],
+                    &["/var/lib/docker/containers"]
+                )
+            ),
+            Truth::Unknown
+        );
+    }
+
+    #[test]
     fn probe_paths_cover_match_conditions_and_explicit_sources() {
         let catalog = CATALOG.replacen(
             "match = \"\"",
@@ -2223,6 +2342,20 @@ target = "/var/log/x.log"
         assert_eq!(
             minimal().probe_paths(),
             vec!["/var/log/postgresql.log".to_string()]
+        );
+
+        // 否定条件的路径**也必须**进白名单：不探就永远是「无法判定」，单元永远展不开。
+        let negated = CATALOG.replacen(
+            "match = \"\"",
+            "match = \"not_path_exists:/var/log/containers\"",
+            1,
+        );
+        let set = parse_with(&negated, PACKS, TEMPLATES).expect("parses");
+        assert!(
+            set.probe_paths()
+                .contains(&"/var/log/containers".to_string()),
+            "{:?}",
+            set.probe_paths()
         );
     }
 
@@ -2463,6 +2596,47 @@ target = "/var/log/x.log"
         );
         let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("wildcard filter");
         assert!(err.to_string().contains("含通配符"), "{err}");
+    }
+
+    #[test]
+    fn validates_not_path_exists_the_same_way_as_path_exists() {
+        // 两种条件共用一套要求：绝对路径、至少一个值。
+        // 相对路径的探测结果依赖进程 cwd，不能当事实；而“没探过”会被当作无法判定，
+        // 于是写错的否条件不会报错、只会让单元永远展不开 —— 装载期拦下来更省事。
+        let with_match = |expr: &str| {
+            let catalog = format!(
+                "{CATALOG}\n\
+                 [[units]]\n\
+                 unit_id = \"linux-docker-container-stdout\"\n\
+                 family = \"DatabaseService\"\n\
+                 capability = \"collect_logs\"\n\
+                 platform = \"linux\"\n\
+                 match = \"{expr}\"\n\
+                 rule_ref = \"\"\n\
+                 requires_privilege = \"root\"\n\
+                 status = \"active\"\n\n\
+                 [[units.sources]]\n\
+                 kind = \"FileGlob\"\n\
+                 target = \"/var/lib/docker/containers/*/*-json.log\"\n"
+            );
+            parse_with(&catalog, PACKS, TEMPLATES)
+        };
+
+        with_match("path_exists:/var/lib/docker/containers;not_path_exists:/var/log/containers")
+            .expect("absolute paths are accepted");
+
+        let err = with_match("not_path_exists:var/log/containers").expect_err("relative path");
+        assert!(
+            err.to_string()
+                .contains("not_path_exists expects absolute paths"),
+            "{err}"
+        );
+
+        let err = with_match("not_path_exists:").expect_err("no path");
+        assert!(
+            err.to_string().contains("not_path_exists has no path"),
+            "{err}"
+        );
     }
 
     #[test]
