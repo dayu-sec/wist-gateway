@@ -3,6 +3,19 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.20.2-alpha] - 2026-10-24
+
+### 变更
+
+- **`work_conflict` 文案带上“卡在哪条条件”**：
+  `linux-db-service=fact_not_collected` →
+  `linux-db-service=fact_not_collected(path_exists:/var/log/postgresql)`。
+  只有原因码时，看不出是 `path_exists:`（等探测白名单）还是 `installed:`（装包 / 等包清单
+  探针）—— 两者的处置完全不同。
+- **管理面 `GET /api/v1/admin/discovery-policies` 回网关实际会下发的那一份**：
+  `probe_paths` 不再恒为空，与 agent 的 poll 接口同源（都从采集目录的 `path_exists:` 推导）。
+  以前回策略表原样，运维无法自证“网关到底让 agent 探了什么”。
+
 ## [0.20.1-alpha] - 2026-10-24
 
 ### 新增

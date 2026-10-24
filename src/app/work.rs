@@ -118,7 +118,17 @@ pub fn derive_spec(
                     .units()
                     .any(|unit| unit.unit_id == excluded.unit_id && unit.family == family)
             })
-            .map(|excluded| format!("{}={}", excluded.unit_id, excluded.reason_code))
+            .map(|excluded| {
+                // 带上**卡在哪条条件**上：只有 `fact_not_collected` 时，运维看得出
+                // “事实没采到”，却不知道是哪一条（`path_exists:` 的还是 `installed:` 的）——
+                // 前者要等探测白名单下来，后者要装包或等包清单探针，处置完全不同。
+                match &excluded.condition {
+                    Some(condition) => {
+                        format!("{}={}({condition})", excluded.unit_id, excluded.reason_code)
+                    }
+                    None => format!("{}={}", excluded.unit_id, excluded.reason_code),
+                }
+            })
             .collect();
         let detail = if reasons.is_empty() {
             format!(
@@ -959,6 +969,12 @@ status = "active"
         )
         .unwrap_err();
         assert!(err.message().contains("fact_not_collected"), "{err:?}");
+        // 文案要指出**卡在哪条条件**：只说 `fact_not_collected`，没人知道是 `installed:`
+        // 还是 `path_exists:` —— 而这两者的处置完全不同。
+        assert!(
+            err.message().contains("installed:postgresql"),
+            "缺少条件详情：{err:?}"
+        );
     }
 
     #[test]

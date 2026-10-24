@@ -3520,6 +3520,55 @@ async fn admin_discovery_view_reports_configured() {
 }
 
 #[tokio::test]
+async fn admin_discovery_view_shows_the_probe_paths_agents_actually_get() {
+    // 管理面与 Agent 的 poll 必须回**同一份**白名单。
+    // 以前管理面回的是策略表原样（`probe_paths` 恒空）：运维看到“网关什么都没让探”，
+    // 真机上却可能是另一回事 —— 而这一项恰好决定了 `path_exists:` 的面能不能授权。
+    let mut env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+    // 夹具目录只有 metrics 单元（`match = ""`），`probe_paths()` 必然为空 ——
+    // 要验“白名单确实从目录推导出来了”，必须换成真实知识目录。
+    // `test_support::knowledge_file` 在缺同级仓时直接 panic（CI 会 checkout），不会假绿。
+    env.config.content_catalog_file = Some(crate::test_support::knowledge_file("catalog.toml"));
+    env.config.content_packs_file = Some(crate::test_support::knowledge_file("packs.toml"));
+    env.config.content_templates_file = Some(crate::test_support::knowledge_file("templates.toml"));
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_discovery_poll(
+        &env.config,
+        &env.store_handle,
+        Some(&credential),
+        &discovery_poll_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned: DiscoveryPoliciesReturned = decode_json_response(response).await;
+
+    let view: serde_json::Value =
+        decode_json_response(get_discovery_view(&env, Some(TEST_ADMIN_API_TOKEN)).await).await;
+
+    assert!(
+        !returned.probe_paths.is_empty(),
+        "真实目录应推导出非空白名单：{returned:?}"
+    );
+    let actual: Vec<String> = serde_json::from_value(view["policy"]["probe_paths"].clone())
+        .expect("admin 视图里的 probe_paths 应是字符串数组");
+    assert_eq!(
+        actual, returned.probe_paths,
+        "管理面与 Agent 必须看到同一份"
+    );
+    // 钉住一项有业务含义的：数据库面的路径条件必须进白名单，
+    // 否则 agent 不探测，那个面永远 `fact_not_collected`。
+    assert!(
+        returned
+            .probe_paths
+            .iter()
+            .any(|path| path == "/var/log/postgresql"),
+        "{:?}",
+        returned.probe_paths
+    );
+}
+
+#[tokio::test]
 async fn admin_discovery_view_reports_unconfigured() {
     let env = TestEnv::new().await;
 

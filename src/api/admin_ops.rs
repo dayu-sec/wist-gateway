@@ -2386,13 +2386,25 @@ pub async fn view_discovery_policies(
     agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
     let knowledge = state.knowledge();
     match knowledge.discovery_policies.as_deref() {
-        Some(set) => Json(DiscoveryPoliciesView {
-            configured: true,
-            policy: Some(set.clone()),
-            agents,
-            generated_at: DateTime::now(),
-        })
-        .into_response(),
+        Some(set) => {
+            // 回**网关实际会下发的那一份**：`probe_paths` 不属于策略表本身，是装载采集
+            // 目录后从 `path_exists:` 条件推导出来、随表拼上去的（agent 的 poll 接口同源）。
+            // 以前这里回原表 —— 运维看到空列表，会以为“网关什么都没让探”，而真机上
+            // 恰恰可能是另一回事。
+            let mut effective = set.clone();
+            effective.probe_paths = knowledge
+                .content
+                .as_deref()
+                .map(|content| content.probe_paths())
+                .unwrap_or_default();
+            Json(DiscoveryPoliciesView {
+                configured: true,
+                policy: Some(effective),
+                agents,
+                generated_at: DateTime::now(),
+            })
+            .into_response()
+        }
         None => Json(DiscoveryPoliciesView {
             configured: false,
             policy: None,
