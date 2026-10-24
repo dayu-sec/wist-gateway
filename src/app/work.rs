@@ -144,6 +144,18 @@ pub fn derive_spec(
         .map(|spec| (spec, work.catalog_version))
 }
 
+/// 容器过滤器的**减法维度**：缺能力时去掉该维度是安全的（只会多采，不会少采）。
+///
+/// 入参是 `missing_log_capabilities` 的形状（`filters:<维度名>`）。
+/// 与包含式维度相对：去掉 `*_in` 等于全收，与策展意图相反，所以仍然裁源。
+fn is_subtractive_filter_dimension(missing: &str) -> bool {
+    let Some(dimension) = missing.strip_prefix("filters:") else {
+        return false;
+    };
+    dimension == wist_contracts::work::FILTER_POD_NOT_IN
+        || dimension == wist_contracts::work::FILTER_NAME_NOT_IN
+}
+
 /// 把选中的单元**物化**成工作参数（`spec` 的内容）。
 ///
 /// 为什么要物化而不是只存一串 `unit_id`：agentd 拿到工作要能直接照做，
@@ -158,14 +170,13 @@ pub fn derive_spec(
 /// unsupported → 这个面静默没数据」。`None`（旧 agentd 没报）**不做能力裁剪**：
 /// 那时“不知道”不等于“不会”，退回契约判据（与 D7 之前一致）。
 ///
-/// 例外（“减法”字段不需要裁源）：`drop_if_contains` 不支持/未上报时**去掉字段继续采**
-/// （上送量变大，而不是面消失）。其余新增**字段**仍裁源：旧 agentd 收到未知字段会
-/// `deny_unknown_fields` 拒收整份 spec，宁可不派那条来源。
+/// 两类**减法**不裁源（去掉只会多采，不会少采）：
+///   * `drop_if_contains` 不支持/未上报 → 去掉字段继续采（上送量变大，而不是面消失）；
+///   * 容器过滤器的 `pod_not_in` / `name_not_in` 维度缺失 → 去掉该维度继续采
+///     （见 [`is_subtractive_filter_dimension`]）。
 ///
-/// 两个例外（都是“减法”，不需要裁源）：
-///   * `drop_if_contains`：不支持/未上报时**去掉字段继续采**（上送量变大，而不是面消失）；
-///   * 其余新增**字段**（如 `filters`）仍按上面的规则处理：旧 agentd 收到未知字段会
-///     `deny_unknown_fields` 拒收整份 spec，所以宁可不派那条来源。
+/// 其余新增**字段/维度**仍裁源：旧 agentd 收到未知字段会 `deny_unknown_fields` 拒收整份 spec；
+/// 包含式维度（`namespace_in` / `name_in`）去掉等于全采 —— 两种都不能替策展做决定。
 fn materialize_spec(
     content: &ContentSet,
     unit_ids: &[String],
@@ -220,10 +231,29 @@ fn materialize_spec(
                     wist_contracts::work::missing_log_capabilities(&candidate, capabilities)
                 && !missing.is_empty()
             {
-                // 文案形状：`<来源>: <缺的能力>`。外层统一加“这台 agent 没声明能力”的帽子，
-                // 避免“agent 未声明 …”这种中英混排套在英文句子里的双层括号。
-                unsupported.insert(format!("{}: {}", source.target, missing.join(", ")));
-                continue;
+                // 缺的**全是减法维度**（`pod_not_in` / `name_not_in`）→ 去掉这些维度继续采。
+                // 有任一包含式维度缺失 → 仍然裁源（去掉等于全收，不能替策展做这个决定）。
+                if missing
+                    .iter()
+                    .any(|dimension| !is_subtractive_filter_dimension(dimension))
+                {
+                    // 文案形状：`<来源>: <缺的能力>`。外层统一加“这台 agent 没声明能力”的帽子，
+                    // 避免“agent 未声明 …”这种中英混排套在英文句子里的双层括号。
+                    unsupported.insert(format!("{}: {}", source.target, missing.join(", ")));
+                    continue;
+                }
+                for dimension in &missing {
+                    match dimension.strip_prefix("filters:") {
+                        Some(wist_contracts::work::FILTER_POD_NOT_IN) => {
+                            candidate.filters.pod_not_in.clear();
+                        }
+                        Some(wist_contracts::work::FILTER_NAME_NOT_IN) => {
+                            candidate.filters.name_not_in.clear();
+                        }
+                        _ => {}
+                    }
+                }
+                degraded.insert(source.target.clone());
             }
             sources.push(candidate);
         }
@@ -1400,6 +1430,57 @@ status = "active"
     }
 
     #[test]
+    fn subtractive_filter_dimensions_are_dropped_instead_of_dropping_the_source() {
+        // `pod_not_in` / `name_not_in` 是**减法**维度：旧 agent 不认识时去掉该维度继续采
+        // （上送量变大），而不是把整条来源裁掉 —— 单来源单元裁掉就等于“少采变成不采”。
+        let with_filters = |expr: &str| {
+            let catalog = CATALOG.replacen(
+                "kind = \"FileGlob\"\ntarget = \"/var/log/postgresql.log\"",
+                &format!(
+                    "kind = \"FileGlob\"\ntarget = \"/var/log/containers/*.log\"\nfilters = {{ {expr} }}"
+                ),
+                1,
+            );
+            crate::app::content::parse_content(&catalog, PACKS, TEMPLATES).expect("fixture parses")
+        };
+        // 只声明文件能力、一个 filters 维度都不声明（= 0.9.4 及以前）。
+        let old = logs_caps(&[FILE_INPUT_ABSOLUTE_PATH, FILE_INPUT_GLOB], &[]);
+
+        let content = with_filters("pod_not_in = [\"debug-pod\"], name_not_in = [\"fluent-bit\"]");
+        let (spec, _) = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts(&["postgresql"]),
+            Some(&old),
+        )
+        .expect("the source survives without subtractive filters");
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        assert_eq!(spec.units[0].sources.len(), 1);
+        assert!(
+            spec.units[0].sources[0].filters.is_empty(),
+            "减法维度应当被去掉：{spec:?}"
+        );
+
+        // 包含式维度不能降级：去掉 `name_in` 就是全收，与策展意图相反 → 仍然裁源。
+        let content = with_filters("name_in = [\"mysql\"]");
+        let err = derive_spec(
+            &content,
+            "LinuxCompute",
+            "linux",
+            "DatabaseService",
+            &facts(&["postgresql"]),
+            Some(&old),
+        )
+        .expect_err("inclusive dimension still crops the source");
+        assert!(
+            err.message().contains("does not declare capabilities"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn a_hand_written_spec_is_not_filtered_by_path_facts() {
         // 人工点名是运维的显式动作：不过滤，失败了也要看得见。
         let content = content();
@@ -1497,8 +1578,23 @@ status = "active"
             "探测白名单缺 docker 根目录：{:?}",
             content.probe_paths()
         );
-        // 否条件同样要靠探测才能判定：不探 `/var/log/containers` 的话，纯 Docker 主机上
+        // 否定条件同样要靠探测才能判定：不探 `/var/log/containers` 的话，纯 Docker 主机上
         // `not_path_exists` 永远 Unknown，单元反而展不开。
+        //
+        // 光断言“白名单里有这条路径”证明不了什么 —— k8s 单元的正条件也会把它带进来。
+        // 所以先钉住“真实目录里的 docker 单元**确实带了**这条否定条件”，再验白名单
+        // （否定条件的白名单推导本身由 content.rs 的 fixture 用例覆盖）。
+        let docker = content
+            .units()
+            .find(|unit| unit.unit_id == "linux-docker-container-stdout")
+            .expect("docker container unit");
+        assert!(
+            docker
+                .match_expr
+                .contains("not_path_exists:/var/log/containers"),
+            "docker 单元缺去重条件：{}",
+            docker.match_expr
+        );
         assert!(
             content
                 .probe_paths()

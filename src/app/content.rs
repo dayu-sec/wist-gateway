@@ -23,8 +23,8 @@ use orion_error::prelude::*;
 use serde::Deserialize;
 use wist_contracts::fact_summary::EPHEMERAL_PORT_START;
 use wist_contracts::work::{
-    CONTAINER_LOG_ROOT, ContainerFilters, EXECUTABLE_SOURCE_KINDS, is_executable_source,
-    is_explicit_path,
+    CONTAINER_LOG_ROOT, ContainerFilters, EXECUTABLE_SOURCE_KINDS, is_container_log_target,
+    is_executable_source, is_explicit_path,
 };
 use wist_error::{ConfigError, ConfigReason, ConfigResult};
 
@@ -87,6 +87,21 @@ pub const SOURCE_KINDS: &[&str] = &[
 pub use wist_contracts::work::MULTILINE_MODES;
 /// 权限闭集。
 pub const PRIVILEGES: &[&str] = &["none", "root", "fda"];
+/// `match` 条件 kind 闭集（与 [`eval_condition`] 认识的分支一致）。
+///
+/// 装载期必须校验：`parse_conditions` 会**静默丢弃**没有 `:` 的片段，而空表达式等于
+/// “平台基线必采”。所以写坏的表达式（漏冒号 / 漏分号 / 拼错 kind）在求值层有两种
+/// 相反的静默后果：要么条件整个消失（双采），要么单元永不展开（少采）——
+/// 两种都只能靠装载期报错才能被发现。
+pub const MATCH_KINDS: &[&str] = &[
+    "installed",
+    "port",
+    "path_exists",
+    "not_path_exists",
+    "device",
+    "service",
+    "resource",
+];
 /// 单元**采集就绪度**（能不能派下去采原文；与解析规则无关）。
 pub const UNIT_STATUSES: &[&str] = &["active", "draft", "deprecated"];
 /// 包的性质。
@@ -653,26 +668,51 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
             unit.family, unit.platform, meta.platforms
         )));
     }
-    // `path_exists` / `not_path_exists` 的值必须是绝对路径：相对路径的结果取决于进程 cwd，
-    // 同一台机器换一种启动方式就翻面，不能当事实（agentd 侧也会丢弃）。
-    for condition in parse_conditions(&unit.match_expr) {
-        if condition.kind != "path_exists" && condition.kind != "not_path_exists" {
-            continue;
-        }
-        if condition.values.is_empty() {
+    // `match` 的形状校验（装载期，fail-closed）：
+    //   * 每个**非空片段**必须有 `kind:values` —— 漏冒号会被静默丢弃，而空表达式 = 必采；
+    //   * kind 必须在闭集里 —— 写错/新 kind 在求值层只会得到 `Unknown`，单元永远展不开；
+    //   * `path_exists` / `not_path_exists` 的值必须是绝对路径：相对路径的结果取决于进程
+    //     cwd，同一台机器换一种启动方式就翻面，不能当事实（agentd 侧也会丢弃）。
+    for raw in unit
+        .match_expr
+        .split(';')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let Some((kind, rest)) = raw.split_once(':') else {
             return Err(invalid(format!(
-                "unit {id}: {} has no path",
-                condition.kind
+                "unit {id}: match 条件 {raw:?} 缺少 ':'（形如 kind:value）"
+            )));
+        };
+        let kind = kind.trim();
+        if !MATCH_KINDS.contains(&kind) {
+            return Err(invalid(format!(
+                "unit {id}: match 条件 {raw:?} 的 kind 未知（允许：{MATCH_KINDS:?}）"
             )));
         }
-        if let Some(bad) = condition
-            .values
+        let values: Vec<&str> = rest
+            .split('|')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect();
+        if values.is_empty() {
+            return Err(invalid(format!("unit {id}: match 条件 {raw:?} 没有值")));
+        }
+        // 值里不能有空白：漏写 `;` 会把下一个条件并进前一个值
+        // （`path_exists:/a not_path_exists:/b` —— 它以 `/` 开头，能骗过绝对路径校验）。
+        if let Some(bad) = values
             .iter()
-            .find(|value| !value.starts_with('/'))
+            .find(|value| value.contains(char::is_whitespace))
         {
             return Err(invalid(format!(
-                "unit {id}: {} expects absolute paths, got {bad:?}",
-                condition.kind
+                "unit {id}: match 条件 {raw:?} 的值 {bad:?} 含空白（是不是漏写了 ';'？）"
+            )));
+        }
+        if (kind == "path_exists" || kind == "not_path_exists")
+            && let Some(bad) = values.iter().find(|value| !value.starts_with('/'))
+        {
+            return Err(invalid(format!(
+                "unit {id}: {kind} expects absolute paths, got {bad:?}"
             )));
         }
     }
@@ -749,7 +789,7 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
                     )));
                 }
             }
-            if name_shape && !source.target.contains("/containers/") {
+            if name_shape && !is_container_log_target(&source.target) {
                 return Err(invalid(format!(
                     "unit {id}: filters name_in / name_not_in 要求来源在容器日志目录下（当前 {}）",
                     source.target
@@ -2560,6 +2600,47 @@ target = "/var/log/x.log"
     }
 
     #[test]
+    fn accepts_name_filters_on_docker_and_directory_shaped_targets() {
+        // name 维度不靠 k8s 文件名：纯 Docker 载体与目录形态都必须能过装载。
+        // （旧的 `contains("/containers/")` 会把 `…/containers` 这种目录形态错拒；
+        //   agentd 的显式目录来源是允许的，两边口径必须一致。）
+        for target in [
+            "/var/lib/docker/containers/*/*-json.log*",
+            "/var/lib/docker/containers",
+            "/var/log/containers",
+            "/var/log/containers/*.log",
+        ] {
+            let catalog = container_unit_with(&format!(
+                "[[units.sources]]\n\
+                 kind = \"FileGlob\"\n\
+                 target = \"{target}\"\n\
+                 filters = {{ name_in = [\"mysql\"], name_not_in = [\"fluent-bit\"] }}\n"
+            ));
+            parse_with(&catalog, PACKS, TEMPLATES).unwrap_or_else(|err| panic!("{target}: {err}"));
+        }
+
+        // 非容器路径仍然要拒：过滤器写在别处只会“一个都匹配不上”。
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/log/mysql/*.log\"\n\
+             filters = { name_in = [\"mysql\"] }\n",
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("non-container target");
+        assert!(err.to_string().contains("name_in / name_not_in"), "{err}");
+
+        // k8s 维仍限定在 `/var/log/containers` 下（docker 根目录上写 namespace 没有意义）。
+        let catalog = container_unit_with(
+            "[[units.sources]]\n\
+             kind = \"FileGlob\"\n\
+             target = \"/var/lib/docker/containers/*/*-json.log*\"\n\
+             filters = { namespace_in = [\"prod\"] }\n",
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("k8s dimension on docker root");
+        assert!(err.to_string().contains("filters 只能用在"), "{err}");
+    }
+
+    #[test]
     fn rejects_filters_on_a_non_container_source() {
         // 过滤器靠文件名 `<pod>_<ns>_<container>-<id>.log` 求值；写在别的路径上
         // 只会得到“一个都匹配不上”——与其运行时静默采不到，不如装载期拒掉。
@@ -2599,6 +2680,53 @@ target = "/var/log/x.log"
     }
 
     #[test]
+    fn rejects_malformed_match_conditions() {
+        // 装载期必须 fail-closed：写坏的表达式在求值层是**静默**的两种相反后果——
+        // 条件整个消失（→ 双采）或单元永不展开（→ 少采）。
+        let with_match = |expr: &str| {
+            let catalog = format!(
+                "{CATALOG}\n\
+                 [[units]]\n\
+                 unit_id = \"linux-docker-container-stdout\"\n\
+                 family = \"DatabaseService\"\n\
+                 capability = \"collect_logs\"\n\
+                 platform = \"linux\"\n\
+                 match = \"{expr}\"\n\
+                 rule_ref = \"\"\n\
+                 requires_privilege = \"root\"\n\
+                 status = \"active\"\n\n\
+                 [[units.sources]]\n\
+                 kind = \"FileGlob\"\n\
+                 target = \"/var/lib/docker/containers/*/*-json.log*\"\n"
+            );
+            parse_with(&catalog, PACKS, TEMPLATES)
+        };
+
+        // 漏冒号：`parse_conditions` 会直接丢掉这个片段 → 空表达式 = 平台基线必采。
+        let err = with_match("not_path_exists").expect_err("missing colon");
+        assert!(err.to_string().contains("缺少 ':'"), "{err}");
+
+        // 拼错 kind：求值层只会得到 `Unknown`（单元永远展不开），装载期应当报错。
+        let err = with_match("not_path_exist:/var/log/containers").expect_err("unknown kind");
+        assert!(err.to_string().contains("kind 未知"), "{err}");
+
+        // 漏分号：第二个条件会被并进第一个值，且以 `/` 开头能骗过绝对路径校验。
+        let err = with_match(
+            "path_exists:/var/lib/docker/containers not_path_exists:/var/log/containers",
+        )
+        .expect_err("missing semicolon");
+        assert!(err.to_string().contains("漏写了 ';'"), "{err}");
+
+        // 只有 kind、没有值。
+        let err = with_match("not_path_exists:").expect_err("no value");
+        assert!(err.to_string().contains("没有值"), "{err}");
+
+        // 正常组合还是要通过。
+        with_match("path_exists:/var/lib/docker/containers; not_path_exists:/var/log/containers")
+            .expect("well-formed expression");
+    }
+
+    #[test]
     fn validates_not_path_exists_the_same_way_as_path_exists() {
         // 两种条件共用一套要求：绝对路径、至少一个值。
         // 相对路径的探测结果依赖进程 cwd，不能当事实；而“没探过”会被当作无法判定，
@@ -2633,10 +2761,7 @@ target = "/var/log/x.log"
         );
 
         let err = with_match("not_path_exists:").expect_err("no path");
-        assert!(
-            err.to_string().contains("not_path_exists has no path"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("没有值"), "{err}");
     }
 
     #[test]

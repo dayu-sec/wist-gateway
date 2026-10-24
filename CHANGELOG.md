@@ -3,6 +3,29 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.20.4-alpha] - 2026-10-24
+
+### 修复
+
+- **`match` 装载期改为 fail-closed 校验**。以前写坏的表达式会在求值层**静默**变成两种相反后果：
+  * 漏冒号（如 `not_path_exists`）会被 `parse_conditions` 丢弃 → 空表达式 = 平台基线必采
+    → cri-dockerd 主机上两个容器单元**双采**；
+  * 漏分号（`path_exists:/a not_path_exists:/b`）会把第二个条件并进第一个值，以 `/` 开头
+    骗过绝对路径校验 → 单元**永不展开**，报错还指向一条假路径。
+
+  现在装载期逐片段校验：必须有 `kind:value`、kind 必须在闭集里（`MATCH_KINDS`）、
+  值不能为空或含空白（含空白 = 几乎肯定是漏了 `;`）。
+- **减法过滤维度缺能力时不再整条裁源**：`pod_not_in` / `name_not_in` 只减不增，
+  旧 agentd 不认识时**去掉该维度继续采**（与 `drop_if_contains` 同一档）。
+  包含式维度（`namespace_in` / `name_in`）仍然裁源 —— 去掉等于全收。
+  以前单来源容器单元碰到这种情况会直接“面不可授权”（少采变成不采）。
+- `filters` 的目标校验改用契约共享的 `is_container_log_target`：接受目录形态
+  （`…/containers`），不再只认字面 `contains("/containers/")`。
+
+### 依赖
+
+- `wist-contracts` 0.9.8。
+
 ## [0.20.3-alpha] - 2026-10-24
 
 ### 新增

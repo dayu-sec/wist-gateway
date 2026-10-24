@@ -12319,7 +12319,7 @@ fn knowledge_package_row(package_id: &str, dir: &std::path::Path) -> StoredKnowl
         catalog_version: Some(crate::test_support::real_catalog_version()),
         template_version: Some(1),
         policy_version: Some(1),
-        purpose_version: Some(2),
+        purpose_version: Some(crate::test_support::real_purpose_version()),
         parser_abi: 1,
         signed_by: String::new(),
         cached_path: dir.display().to_string(),
@@ -12370,8 +12370,8 @@ async fn knowledge_loads_from_the_active_package_in_the_store() {
         loaded
             .purpose_rules
             .as_deref()
-            .map(|table| table.purpose_version),
-        Some(2)
+            .map(|table| i64::from(table.purpose_version)),
+        Some(crate::test_support::real_purpose_version())
     );
     assert!(loaded.discovery_policies.is_some());
 }
@@ -12609,7 +12609,10 @@ async fn knowledge_endpoints_record_then_activate_without_a_restart() {
     assert_eq!(knowledge["source"], "package");
     assert_eq!(knowledge["generation"], 1);
     assert_eq!(knowledge["package_id"], package_id);
-    assert_eq!(knowledge["purpose_version"], 2);
+    assert_eq!(
+        knowledge["purpose_version"],
+        crate::test_support::real_purpose_version()
+    );
     assert_eq!(knowledge["policy_version"], 1);
     assert!(knowledge["hint"].is_null(), "有内容时不该再提示空载");
     assert_eq!(knowledge["activations"][0]["reason"], "activate");

@@ -789,8 +789,8 @@ mod tests {
             loaded
                 .purpose_rules
                 .as_deref()
-                .map(|table| table.purpose_version),
-            Some(2)
+                .map(|table| i64::from(table.purpose_version)),
+            Some(crate::test_support::real_purpose_version())
         );
         assert!(loaded.discovery_policies.is_some());
         // 这份还只是"装好了"：来源与世代由 `resolve` 在登记之后填上。
@@ -928,7 +928,10 @@ mod tests {
             row.catalog_version,
             Some(crate::test_support::real_catalog_version())
         );
-        assert_eq!(row.purpose_version, Some(2));
+        assert_eq!(
+            row.purpose_version,
+            Some(crate::test_support::real_purpose_version())
+        );
         assert_eq!(row.policy_version, Some(1));
         assert_eq!(row.template_version, Some(1));
         assert_eq!(row.version, PACKAGE_NAME_SUFFIX);

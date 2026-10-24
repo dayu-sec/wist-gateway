@@ -65,6 +65,22 @@ pub(crate) fn real_catalog_version() -> i64 {
         .catalog_version
 }
 
+/// 知识库**当前用途规则版本**（读真实 `purpose-rules.toml` 顶层 `purpose_version`）。
+///
+/// 同 [`real_catalog_version`]：拿文件里声明的值当期望值，不写死数字 ——
+/// 规则册只要改内容就必须抬版本，写死只会让网关用例每次跟着假红。
+pub(crate) fn real_purpose_version() -> i64 {
+    #[derive(serde::Deserialize)]
+    struct Head {
+        purpose_version: i64,
+    }
+    let text = std::fs::read_to_string(knowledge_file("purpose-rules.toml"))
+        .expect("read purpose-rules.toml");
+    toml::from_str::<Head>(&text)
+        .expect("parse purpose-rules.toml head")
+        .purpose_version
+}
+
 /// jumo 模型仓（`wist-design`）里的一份模型文件。
 pub(crate) fn model_file(relative: &str) -> PathBuf {
     require_file(locate_repo("wist-design", DESIGN_DIRS).join(relative))
@@ -104,7 +120,7 @@ pub(crate) fn knowledge_package_tarball(root: &Path, tamper_catalog: bool) -> Pa
             "catalog_version": real_catalog_version(),
             "template_version": [1],
             "policy_version": 1,
-            "purpose_version": 2,
+            "purpose_version": real_purpose_version(),
         },
         "files": digests,
     });
