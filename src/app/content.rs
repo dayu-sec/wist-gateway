@@ -55,6 +55,7 @@ pub const FAMILIES: &[&str] = &[
     "KernelSystem",
     "DatabaseService",
     "StorageHealth",
+    "ContainerWorkload",
     "ComputeWorkload",
     "BackupJob",
     "NetworkService",
@@ -67,6 +68,7 @@ const LINUX_ONLY_FAMILIES: &[&str] = &[
     "KernelSystem",
     "DatabaseService",
     "StorageHealth",
+    "ContainerWorkload",
     "ComputeWorkload",
     "BackupJob",
     "NetworkService",
@@ -2058,9 +2060,10 @@ target = "/var/log/x.log"
         assert!(!tcc.collect_ready());
 
         // Linux 侧现在 12 个面全开：文件来源（auth/secure、sudo.log、dpkg/apt/dnf/yum、
-        //   audit.log 整文件、容器 stdout、DB csvlog/slow）+ 导出器（ServiceLifecycle/CrashPanic/
-        //   NetworkFirewall/RebootPower/KernelSystem/StorageHealth）+ 指标面。
+        //   audit.log 整文件、**容器 stdout（独立面 ContainerWorkload）**、DB csvlog/slow）+ 导出器
+        //   （ServiceLifecycle/CrashPanic/NetworkFirewall/RebootPower/KernelSystem/StorageHealth）+ 指标面。
         //   日志面 `rule_ref` 为空 = **可采但解析未就绪**（原文照收，只归在泛化 agent.log）。
+        //   `ComputeWorkload`（作业/加速卡）**不在这个名单里**：它只剩一个 draft 单元，面未就绪。
         for family in [
             "LoginSession",
             "PrivilegeExecution",
@@ -2072,7 +2075,7 @@ target = "/var/log/x.log"
             "KernelSystem",
             "StorageHealth",
             "HostMetrics",
-            "ComputeWorkload",
+            "ContainerWorkload",
             "DatabaseService",
         ] {
             assert!(
@@ -2080,6 +2083,8 @@ target = "/var/log/x.log"
                 "linux {family} 应当采集就绪"
             );
         }
+        // 作业/加速卡仍是 draft（单位一个都没 active）——这是诚实状态，不是遗漏。
+        assert!(!set.is_family_ready("linux", "ComputeWorkload"));
         let linux_readiness = set.family_readiness("linux");
         let linux_by_family = |family: &str| {
             linux_readiness
@@ -2238,12 +2243,17 @@ target = "/var/log/x.log"
             expansion.works[0].selected_units,
             vec!["linux-auth-session"]
         );
-        // 全部采集就绪 → 没有被排除的单元。
+        // 容器单元现在在**基线包**里（LinuxHost 也有 ContainerWorkload 面）：
+        // 这台机的两条容器根都不存在 → 两个单元被事实门排除，面本身不展开。
         assert!(
-            expansion.excluded_units.is_empty(),
-            "{:?}",
+            expansion
+                .excluded_units
+                .iter()
+                .all(|unit| unit.unit_id.contains("container")),
+            "LinuxHost 只应排除容器单元（没有容器根）：{:?}",
             expansion.excluded_units
         );
+        assert_eq!(expansion.excluded_units.len(), 2);
     }
 
     #[test]

@@ -3,6 +3,18 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.20.5-alpha] - 2026-10-25
+
+### 变更
+
+- **面词表新增 `ContainerWorkload`**（`FAMILIES` 与 `LINUX_ONLY_FAMILIES`）。带 `[[families]]` 的
+  知识包本来就按**数据**装载面词表，这一步只为两件事保持一致：旧包回落、以及
+  “面闭集 vs 模型”的测试与授权校验。
+- **测试跟上面拆分**：两个容器单元的派活用例改到 `ContainerWorkload`；
+  新增“`LinuxHost` + docker 根存在也能展开容器面”的验收位（面拆分要解决的正是这个：
+  容器 stdout 是主机普遍能力，不该由机器用途决定）。
+- `ComputeWorkload` 现在只有 draft 单元，断言从“可采就绪”改为“未就绪”（诚实状态）。
+
 ## [0.20.4-alpha] - 2026-10-24
 
 ### 修复

@@ -1530,7 +1530,7 @@ status = "active"
             &content,
             "LinuxCompute",
             "linux",
-            "ComputeWorkload",
+            "ContainerWorkload",
             &present,
             None,
         )
@@ -1552,14 +1552,14 @@ status = "active"
             &content,
             "LinuxCompute",
             "linux",
-            "ComputeWorkload",
+            "ContainerWorkload",
             &absent,
             None,
         )
         .expect_err("no container root and the slurm/nvidia unit is still draft");
         assert!(
             err.message()
-                .contains("no unit selected for ComputeWorkload"),
+                .contains("no unit selected for ContainerWorkload"),
             "{err:?}"
         );
     }
@@ -1613,7 +1613,7 @@ status = "active"
             &content,
             "LinuxCompute",
             "linux",
-            "ComputeWorkload",
+            "ContainerWorkload",
             &present,
             None,
         )
@@ -1641,7 +1641,7 @@ status = "active"
             &content,
             "LinuxCompute",
             "linux",
-            "ComputeWorkload",
+            "ContainerWorkload",
             &both,
             None,
         )
@@ -1671,7 +1671,7 @@ status = "active"
             &content,
             "LinuxCompute",
             "linux",
-            "ComputeWorkload",
+            "ContainerWorkload",
             &absent,
             None,
         )
@@ -1684,10 +1684,37 @@ status = "active"
     }
 
     #[test]
+    fn a_pure_docker_host_on_the_baseline_class_still_gets_the_container_face() {
+        // B2 验收（面拆分后）：容器 stdout 是**主机普遍能力**，不按机器用途分发。
+        // 只跑业务容器的机器落 `LinuxHost`（模板只有基线包）也必须能拿到这个面 ——
+        // 以前容器单元挂在 `linux-workload`（只属于 compute/data 模板），这类机器根本没有面。
+        let content = real_content();
+        let facts = facts_with_paths(
+            "linux",
+            &[],
+            // 否定条件也要“探测过”才能判定：只探 docker 根的话，
+            // `not_path_exists:/var/log/containers` 会落 Unknown，单元反而不展开。
+            &["/var/lib/docker/containers", "/var/log/containers"],
+            &["/var/lib/docker/containers"],
+        );
+        let expansion = content.expand("linux-host", &facts).expect("expand");
+        let containers = expansion
+            .works
+            .iter()
+            .find(|work| work.family == "ContainerWorkload")
+            .expect("LinuxHost 也应当有 ContainerWorkload 面");
+        assert_eq!(
+            containers.selected_units,
+            vec!["linux-docker-container-stdout".to_string()]
+        );
+    }
+
+    #[test]
     fn a_ready_family_does_not_dispatch_its_draft_units() {
         // 面就绪（至少一条 active）不等于面里每个单元都已就绪。
-        // `ComputeWorkload` 现在有 active 的容器单元 + draft 的 slurm/nvidia 单元 ——
-        // 后者即使 `match` 命中也不能派（否则会派下 agentd 不保证能执行的来源）。
+        // 容器面（`ContainerWorkload`）有两条 active 单元；作业/加速卡面（`ComputeWorkload`）
+        // 只剩 draft 的 slurm/nvidia 单元 —— 后者即使 `match` 命中也不能派
+        // （否则会派下 agentd 不保证能执行的来源）。
         let content = real_content();
         let facts = facts_with_paths(
             "linux",
@@ -1696,15 +1723,16 @@ status = "active"
             &["/var/log/containers"],
         );
         let expansion = content.expand("linux-compute", &facts).expect("expand");
-        let compute = expansion
+        let containers = expansion
             .works
             .iter()
-            .find(|work| work.family == "ComputeWorkload")
-            .expect("ComputeWorkload work");
+            .find(|work| work.family == "ContainerWorkload")
+            .expect("ContainerWorkload work");
         assert_eq!(
-            compute.selected_units,
+            containers.selected_units,
             vec!["linux-container-stdout".to_string()]
         );
+        // slurm 装了、kubelet 也跑了（`match` 命中），但单元还是 draft。
         assert!(
             expansion.excluded_units.iter().any(|unit| {
                 unit.unit_id == "linux-compute-workload" && unit.reason_code == "collect_not_ready"
