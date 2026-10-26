@@ -550,6 +550,35 @@ pub struct StoredAgentFactSummary {
     pub received_at: String,
 }
 
+/// 采集预检的**本机路径实测**结果（一台一条，覆盖式）。
+///
+/// 与 [`StoredAgentFactSummary`] 分开存（见 `migrations/sqlite/0034_agent_path_probe.sql`）：
+/// 这份只覆盖路径维度，而且有自己的观测时刻 —— 它可能比摘要新几分钟，
+/// 预检的全部意义就是把这 [几分钟] 拿出来。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredAgentPathProbe {
+    pub agent_id: String,
+    /// agent 侧探完的时刻（RFC3339）。
+    pub observed_at: String,
+    /// 本次实际探过的绝对路径。
+    pub probed_paths: Vec<String>,
+    /// 其中存在的路径（`probed_paths` 的子集）。
+    pub present_paths: Vec<String>,
+    /// 探不了（权限 / IO）。**不在** `probed_paths` 里 —— 否则「不知道」会伪装成「确认没有」。
+    pub unreadable_paths: Vec<UnreadablePath>,
+    pub received_at: String,
+}
+
+/// 一条探不了的路径 + 原始错误（`permission denied` 之类）。
+///
+/// 原始错误必须带上来：预检要回答「该去改权限还是该换机器」，只有错误文本能区分。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreadablePath {
+    pub path: String,
+    pub error: String,
+}
+
 /// 一条命中依据（对应模型 `PurposeSignal`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredPurposeSignal {
@@ -1286,6 +1315,15 @@ pub trait Store: Send + Sync + fmt::Debug {
         agent_id: &str,
         marks: &AgentFactSummaryMarks,
     ) -> StoreResult<bool>;
+
+    /// 读取最近一次采集预检的本机路径实测；没预检过返回 `None`。
+    async fn get_agent_path_probe(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<StoredAgentPathProbe>>;
+
+    /// 写入/覆盖一次预检的路径实测（一台一条）。无条件覆盖：新的实测就是权威。
+    async fn upsert_agent_path_probe(&self, probe: &StoredAgentPathProbe) -> StoreResult<()>;
 
     /// 用这台机器的清单**替换**它此前全部行（覆盖式重建），返回写入的行数。
     ///

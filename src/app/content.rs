@@ -1118,22 +1118,22 @@ impl ContentSet {
     pub fn probe_paths(&self) -> Vec<String> {
         let mut paths: BTreeSet<String> = BTreeSet::new();
         for unit in self.units.values() {
-            for condition in parse_conditions(&unit.match_expr) {
-                // 否定条件也要探：不探就永远是「无法判定」，那个单元永远展不开。
-                if condition.kind != "path_exists" && condition.kind != "not_path_exists" {
-                    continue;
-                }
-                for value in condition.values {
-                    if value.starts_with('/') {
-                        paths.insert(value);
-                    }
-                }
-            }
-            for source in &unit.sources {
-                if source.kind == "FileGlob" && is_explicit_path(&source.target) {
-                    paths.insert(source.target.clone());
-                }
-            }
+            collect_unit_probe_paths(unit, &mut paths);
+        }
+        paths.into_iter().collect()
+    }
+
+    /// 只取**某个平台**上需要的探测路径。
+    ///
+    /// 与 [`Self::probe_paths`] 的区别：那个是下发给 agent 的**全局**白名单（同一个人探所有平台），
+    /// 这个是「这台机器该探什么」。预检必须用后者：
+    ///   * Linux 机器不该去探 `/Users/…/Library/…`（永远不存在，白跑一趟）；
+    ///   * 更重要的是，拿全局名单算「没探到的路径」会永远非空 —— 那会让
+    ///     「证据不完整就自动重探」变成每次 409 都发命令。
+    pub fn probe_paths_for_platform(&self, platform: &str) -> Vec<String> {
+        let mut paths: BTreeSet<String> = BTreeSet::new();
+        for unit in self.units.values().filter(|unit| unit.platform == platform) {
+            collect_unit_probe_paths(unit, &mut paths);
         }
         paths.into_iter().collect()
     }
@@ -1282,6 +1282,27 @@ impl ContentSet {
             works,
             excluded_units: excluded,
         })
+    }
+}
+
+/// 把一个单元要求探的路径收进集合：`path_exists` / `not_path_exists` 的值，
+/// 以及**显式文件来源**的目标（派活时按「探测过但不存在」裁掉，判据必须同源）。
+fn collect_unit_probe_paths(unit: &Unit, paths: &mut BTreeSet<String>) {
+    for condition in parse_conditions(&unit.match_expr) {
+        // 否定条件也要探：不探就永远是「无法判定」，那个单元永远展不开。
+        if condition.kind != "path_exists" && condition.kind != "not_path_exists" {
+            continue;
+        }
+        for value in condition.values {
+            if value.starts_with('/') {
+                paths.insert(value);
+            }
+        }
+    }
+    for source in &unit.sources {
+        if source.kind == "FileGlob" && is_explicit_path(&source.target) {
+            paths.insert(source.target.clone());
+        }
     }
 }
 
@@ -2370,6 +2391,37 @@ target = "/var/log/x.log"
                 )
             ),
             Truth::Unknown
+        );
+    }
+
+    #[test]
+    fn platform_scoped_probe_paths_exclude_the_other_platform() {
+        // 预检要的是「这台机器该探什么」。拿全平台名单算，Linux 机器永远有
+        // 「没探到的路径」（那些是 macOS 的）—— 「证据不完整就自动重探」会
+        // 退化成「每次 409 都发命令」。
+        let catalog = CATALOG.replacen(
+            "match = \"\"",
+            "match = \"path_exists:/Users/Shared/agent.log\"",
+            1,
+        );
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("parses");
+
+        // 全局名单两个平台都有（发给 agent 的那份不看平台）。
+        assert_eq!(
+            set.probe_paths(),
+            vec![
+                "/Users/Shared/agent.log".to_string(),
+                "/var/log/postgresql.log".to_string()
+            ]
+        );
+        // 按平台收窄之后各自只剩自己的。
+        assert_eq!(
+            set.probe_paths_for_platform("linux"),
+            vec!["/var/log/postgresql.log".to_string()]
+        );
+        assert_eq!(
+            set.probe_paths_for_platform("macos"),
+            vec!["/Users/Shared/agent.log".to_string()]
         );
     }
 

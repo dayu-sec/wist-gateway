@@ -59,6 +59,7 @@ mod tests {
             "/action-results",
             "/discovery-policies:poll",
             "/discovery-snapshot:poll",
+            "/collection-preflight",
             "/work:poll",
             "/uplink:poll",
             "/work:ack",

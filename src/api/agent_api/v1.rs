@@ -11,6 +11,7 @@ use super::super::agent_ops::{
     submit_agent_status, submit_work_result,
 };
 use super::super::enrollment::enroll_agent;
+use super::super::preflight::agent_preflight;
 use super::ApiState;
 
 pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
@@ -34,6 +35,9 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         // 原文快照上送的控制面设置（周期按机器不同）。独立端点的理由同上：
         // 旧 agentd 从不调它；新 agentd 遇旧网关得 404，回落本机 `[discovery]`。
         ("/discovery-snapshot:poll", post(poll_discovery_snapshot)),
+        // 采集预检：agentd 把本机**实测**的路径结果带上来，网关用授权同一条链求值。
+        // 独立端点而不是给已有报文加字段 —— 旧网关没有它，旧 agentd 也不会调。
+        ("/collection-preflight", post(agent_preflight)),
         // 确认收到某份工作（常驻工作带生效版本）。
         ("/work:ack", post(ack_work)),
         // 一次性工作的执行结果（进度/终态）。与 ack 分开：确认回答「我收到了」，结果回答

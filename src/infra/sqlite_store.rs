@@ -70,6 +70,7 @@ const DELETE_AGENT_TABLES: &[(&str, &str)] = &[
         "delete agent purpose suggestion",
     ),
     ("agent_fact_summary", "delete agent fact summary"),
+    ("agent_path_probe", "delete agent path probe"),
     ("agent_classification", "delete agent classification"),
     (
         "agent_software_inventory",
@@ -2012,6 +2013,58 @@ impl Store for SqliteStore {
         row.as_ref().map(fact_summary_from_row).transpose()
     }
 
+    async fn get_agent_path_probe(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<StoredAgentPathProbe>> {
+        let row = sqlx::query(
+            "SELECT agent_id, observed_at, probed_paths, present_paths, unreadable_paths, \
+             received_at FROM agent_path_probe WHERE agent_id = ?1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select agent path probe"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let probed_raw: String = column!(row, "probed_paths");
+        let present_raw: String = column!(row, "present_paths");
+        let unreadable_raw: String = column!(row, "unreadable_paths");
+        Ok(Some(StoredAgentPathProbe {
+            agent_id: column!(row, "agent_id"),
+            observed_at: column!(row, "observed_at"),
+            probed_paths: deserialize_json_array(&probed_raw, "parse probed paths")?,
+            present_paths: deserialize_json_array(&present_raw, "parse present paths")?,
+            unreadable_paths: deserialize_json_array(&unreadable_raw, "parse unreadable paths")?,
+            received_at: column!(row, "received_at"),
+        }))
+    }
+
+    async fn upsert_agent_path_probe(&self, probe: &StoredAgentPathProbe) -> StoreResult<()> {
+        let probed_paths = serialize_json_array(&probe.probed_paths, "serialize probed paths")?;
+        let present_paths = serialize_json_array(&probe.present_paths, "serialize present paths")?;
+        let unreadable_paths = serde_json::to_string(&probe.unreadable_paths)
+            .map_err(|err| sql_error(err, "serialize unreadable paths"))?;
+        sqlx::query(
+            "INSERT INTO agent_path_probe (agent_id, observed_at, probed_paths, present_paths, \
+             unreadable_paths, received_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (agent_id) DO UPDATE SET observed_at = excluded.observed_at, \
+             probed_paths = excluded.probed_paths, present_paths = excluded.present_paths, \
+             unreadable_paths = excluded.unreadable_paths, received_at = excluded.received_at",
+        )
+        .bind(&probe.agent_id)
+        .bind(&probe.observed_at)
+        .bind(probed_paths)
+        .bind(present_paths)
+        .bind(unreadable_paths)
+        .bind(&probe.received_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert agent path probe"))?;
+        Ok(())
+    }
+
     async fn get_agent_fact_summary_digest(&self, agent_id: &str) -> StoreResult<Option<String>> {
         let row = sqlx::query("SELECT content_digest FROM agent_fact_summary WHERE agent_id = ?1")
             .bind(agent_id)
@@ -3530,6 +3583,15 @@ mod tests {
         .execute(&store.pool)
         .await
         .expect("seed agent command");
+        // 采集预检的本机实测：同样是 per-agent、同样没有外键。
+        sqlx::query(
+            "INSERT INTO agent_path_probe \
+             (agent_id, observed_at, probed_paths, present_paths, unreadable_paths, received_at) \
+             VALUES ('agent-del', '2026-01-01T00:00:00Z', '[]', '[]', '[]', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("seed path probe");
 
         assert!(store.delete_agent("agent-del").await.expect("delete"));
 
@@ -3537,6 +3599,7 @@ mod tests {
             "agent_work_sequence",
             "agent_classification",
             "agent_commands",
+            "agent_path_probe",
             "agent_instances",
             "agent_credentials",
         ] {
@@ -4705,6 +4768,57 @@ mod tests {
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    /// 采集预检的本机实测：一台一条、覆盖式，且 `unreadable` 要能完整来回。
+    #[tokio::test]
+    async fn upserts_and_reads_the_agent_path_probe() {
+        let store = store().await;
+        assert!(
+            store
+                .get_agent_path_probe("agent-a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let first = StoredAgentPathProbe {
+            agent_id: "agent-a".to_string(),
+            observed_at: "2026-10-26T00:00:00Z".to_string(),
+            probed_paths: vec![
+                "/var/log/containers".to_string(),
+                "/var/lib/docker/containers".to_string(),
+            ],
+            present_paths: vec!["/var/lib/docker/containers".to_string()],
+            unreadable_paths: vec![UnreadablePath {
+                path: "/var/log/pods".to_string(),
+                error: "permission denied".to_string(),
+            }],
+            received_at: "2026-10-26T00:00:01Z".to_string(),
+        };
+        store.upsert_agent_path_probe(&first).await.unwrap();
+        // 原始错误必须原样回来 —— 它是「该去改权限还是该换机器」的唯一依据。
+        assert_eq!(
+            store.get_agent_path_probe("agent-a").await.unwrap(),
+            Some(first.clone())
+        );
+
+        // 再探一次即覆盖（旧的实测不该与新的合并）。
+        let second = StoredAgentPathProbe {
+            observed_at: "2026-10-26T00:10:00Z".to_string(),
+            probed_paths: vec![
+                "/var/log/containers".to_string(),
+                "/var/lib/docker/containers".to_string(),
+            ],
+            present_paths: vec!["/var/log/containers".to_string()],
+            unreadable_paths: Vec::new(),
+            ..first
+        };
+        store.upsert_agent_path_probe(&second).await.unwrap();
+        assert_eq!(
+            store.get_agent_path_probe("agent-a").await.unwrap(),
+            Some(second)
         );
     }
 

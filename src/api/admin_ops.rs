@@ -818,6 +818,7 @@ pub struct GrantWorkRequest {
 /// `work_kind` 决定哪些字段必填 —— 这层校验必须在实现里，且要报得清楚：
 /// 「派一份常驻工作」与「派一件升级」需要的东西不一样，共用一个模糊的接口只会
 /// 让人对着 400 猜自己漏了什么。
+#[allow(clippy::result_large_err)]
 pub async fn grant_work(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -833,13 +834,34 @@ pub async fn grant_work(
         return response;
     }
     match input.work_kind.trim() {
-        "Standing" => grant_standing_work(&state, &agent_id, &input).await,
-        "OneShot" => grant_one_shot_work(&state, &agent_id, &input).await,
+        "Standing" => {
+            let response = grant_standing_work(&state, &agent_id, &input).await;
+            auto_probe_on_conflict(&state, &agent_id, response.status()).await;
+            response
+        }
+        "OneShot" => {
+            let response = grant_one_shot_work(&state, &agent_id, &input).await;
+            auto_probe_on_conflict(&state, &agent_id, response.status()).await;
+            response
+        }
         other => ApiError::bad_request(
             codes::UNKNOWN_WORK_KIND,
             format!("unknown work_kind {other:?} (Standing | OneShot)"),
         )
         .into_response(),
+    }
+}
+
+/// 授权被拒（409）时顺手让机器再探一次 —— **只在证据缺失时**。
+///
+/// 为什么放在 409 上：这是现场唯一的入口（人点了授权、被拒了）。让他再去点一次「预检」
+/// 是多余的一步；探针是只读、毫秒级的，代价可以忽略。页面下一次重试（≥3s）就拿到实测了。
+async fn auto_probe_on_conflict(state: &ApiState, agent_id: &str, status: StatusCode) {
+    if status != StatusCode::CONFLICT {
+        return;
+    }
+    if crate::api::preflight::enqueue_if_evidence_missing(state, agent_id).await {
+        log::info!("event=CollectionPreflightAutoEnqueued agent_id={agent_id}");
     }
 }
 
@@ -930,7 +952,9 @@ async fn grant_standing_work(
         }
     };
     let spec_result = if requested_spec.is_empty() {
-        let facts = match state.store.get_agent_fact_summary(agent_id).await {
+        // 与预检**同一份**事实：摘要 + 路径维度被本机实测覆盖。两边不同源就会出现
+        // 「预检说可以、授权却拒绝」。
+        let facts = match crate::api::preflight::evaluation_facts(state, agent_id).await {
             Ok(facts) => facts,
             Err(err) => {
                 return ApiError::internal(
@@ -3147,7 +3171,7 @@ fn normalize_sha256(value: &str) -> Result<String, String> {
     Ok(format!("sha256:{}", hex.to_ascii_lowercase()))
 }
 
-async fn agent_not_found_response(state: &ApiState, agent_id: &str) -> Option<Response> {
+pub(super) async fn agent_not_found_response(state: &ApiState, agent_id: &str) -> Option<Response> {
     match state.store.agent_exists(agent_id).await {
         Ok(true) => None,
         Ok(false) => Some(

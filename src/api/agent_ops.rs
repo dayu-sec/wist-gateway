@@ -1448,7 +1448,7 @@ pub(super) async fn ensure_fresh_suggestion(
 /// 没带证书时按网关是否配了 agent CA 区分措辞：配了 = `certificate_required`（该带而没带），
 /// 没配 = `missing_credential`（这台网关压根没开 mTLS）。两者都可自愈/可重装，都不是终态。
 #[allow(clippy::result_large_err)]
-async fn authenticate_agent(
+pub(super) async fn authenticate_agent(
     state: &ApiState,
     agent_id: &str,
     instance_id: &str,

@@ -13886,3 +13886,983 @@ async fn gateway_loopback_face_accepts_the_container_gateway_peer() {
         .expect("response");
     assert_eq!(sibling.status(), StatusCode::FORBIDDEN);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 采集预检（collection preflight）：网关发起 → 机器自己探 → 网关给结论
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 预检用例的内容目录：容器面在 Linux 上的**两个互斥单元**（k8s 节点 / 纯 Docker）。
+///
+/// 与真实知识库同形（`wist-knowledge/catalog.toml` 里那两条），但不依赖跨仓数据：
+/// 这里要钉的是**求值链与视图**，不是策展内容本身。
+const PREFLIGHT_CATALOG: &str = r#"
+catalog_version = 3
+origin = "Gateway"
+published_at = "2026-10-01T00:00:00Z"
+
+[[units]]
+unit_id = "mac-metrics"
+family = "HostMetrics"
+capability = "collect_metrics"
+platform = "macos"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "none"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+
+[[units]]
+unit_id = "linux-container-stdout"
+family = "ContainerWorkload"
+capability = "collect_logs"
+platform = "linux"
+match = "path_exists:/var/log/containers"
+rule_ref = ""
+requires_privilege = "root"
+status = "active"
+
+[[units.sources]]
+kind = "FileGlob"
+target = "/var/log/containers/*.log"
+
+[[units]]
+unit_id = "linux-docker-container-stdout"
+family = "ContainerWorkload"
+capability = "collect_logs"
+platform = "linux"
+match = "path_exists:/var/lib/docker/containers;not_path_exists:/var/log/containers"
+rule_ref = ""
+requires_privilege = "root"
+status = "active"
+
+[[units.sources]]
+kind = "FileGlob"
+target = "/var/lib/docker/containers/*/*-json.log*"
+"#;
+
+const PREFLIGHT_PACKS: &str = r#"
+[[pack]]
+pack_id = "macos-base"
+platform = "macos"
+kind = "Baseline"
+families = ["HostMetrics"]
+unit_refs = ["mac-metrics"]
+catalog_version = 3
+status = "active"
+
+[[pack]]
+pack_id = "linux-containers"
+platform = "linux"
+kind = "Baseline"
+families = ["ContainerWorkload"]
+unit_refs = ["linux-container-stdout", "linux-docker-container-stdout"]
+catalog_version = 3
+status = "active"
+"#;
+
+const PREFLIGHT_TEMPLATES: &str = r#"
+[[template]]
+template_id = "linux-host"
+machine_class = "LinuxHost"
+platform = "linux"
+pack_refs = ["linux-containers"]
+catalog_version = 3
+template_version = 1
+status = "active"
+"#;
+
+const DOCKER_ROOT: &str = "/var/lib/docker/containers";
+const K8S_LOG_DIR: &str = "/var/log/containers";
+
+impl TestEnv {
+    /// 容器面的内容目录（预检用例专用）。
+    async fn new_with_container_content() -> Self {
+        let mut env = Self::new().await;
+        let dir = env._root.join("content");
+        std::fs::create_dir_all(&dir).expect("create content dir");
+        let catalog = dir.join("catalog.toml");
+        std::fs::write(&catalog, PREFLIGHT_CATALOG).expect("write catalog");
+        let packs = dir.join("packs.toml");
+        std::fs::write(&packs, PREFLIGHT_PACKS).expect("write packs");
+        let templates = dir.join("templates.toml");
+        std::fs::write(&templates, PREFLIGHT_TEMPLATES).expect("write templates");
+        env.config.content_catalog_file = Some(catalog);
+        env.config.content_packs_file = Some(packs);
+        env.config.content_templates_file = Some(templates);
+        env
+    }
+}
+
+/// 一台 Linux 机器：注册 + 上报 linux 事实 + 人工判定（分类必须与事实平台一致）。
+async fn linux_agent_classified(env: &TestEnv, machine_class: &str) {
+    enroll_agent_credential(env).await;
+    assert_eq!(
+        post_facts(
+            env,
+            &fact_report_for("agent-node-a", "node-a", "linux", "x86_64", &[])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": machine_class }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// 模拟 agentd 回传的路径实测（网关落库的那一条）。
+async fn seed_path_probe(
+    env: &TestEnv,
+    observed_at: &str,
+    probed: &[&str],
+    present: &[&str],
+) -> crate::infra::StoredAgentPathProbe {
+    let probe = crate::infra::StoredAgentPathProbe {
+        agent_id: "agent-node-a".to_string(),
+        observed_at: observed_at.to_string(),
+        probed_paths: probed.iter().map(|value| value.to_string()).collect(),
+        present_paths: present.iter().map(|value| value.to_string()).collect(),
+        unreadable_paths: Vec::new(),
+        received_at: observed_at.to_string(),
+    };
+    env.store
+        .upsert_agent_path_probe(&probe)
+        .await
+        .expect("store path probe");
+    probe
+}
+
+async fn get_preflight(env: &TestEnv, agent_id: &str) -> serde_json::Value {
+    let response = get_admin(
+        env,
+        &format!("/api/v1/admin/agents/{agent_id}/collection-preflight"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+async fn run_preflight(env: &TestEnv, agent_id: &str) -> serde_json::Value {
+    // 无 body 的 POST（「让机器再探一次」不需要参数）。
+    let response = router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/admin/agents/{agent_id}/collection-preflight"
+                ))
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+async fn post_preflight_report(
+    env: &TestEnv,
+    identity: Option<&str>,
+    body: &serde_json::Value,
+) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/collection-preflight",
+        identity,
+        body,
+    )
+    .await
+}
+
+fn family_state(view: &serde_json::Value) -> &str {
+    view["families"][0]["state"].as_str().expect("family state")
+}
+
+fn unit_result<'a>(view: &'a serde_json::Value, unit_id: &str) -> &'a serde_json::Value {
+    view["families"][0]["units"]
+        .as_array()
+        .expect("units")
+        .iter()
+        .find(|unit| unit["unit_id"] == unit_id)
+        .unwrap_or_else(|| panic!("missing unit {unit_id}: {view}"))
+}
+
+#[tokio::test]
+async fn collection_preflight_selects_the_docker_unit_when_only_the_docker_root_exists() {
+    // 现场那两台机器就是这个形状：docker/containerd 在跑、没有 k8s。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    seed_path_probe(
+        &env,
+        "2026-10-26T00:00:00Z",
+        &[K8S_LOG_DIR, DOCKER_ROOT],
+        &[DOCKER_ROOT],
+    )
+    .await;
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["verdict"], "grantable", "{view}");
+    assert_eq!(view["machine_class"], "LinuxHost");
+    assert_eq!(view["platform"], "linux");
+    assert!(view["undetermined_reason"].is_null(), "{view}");
+    assert!(
+        view["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("都可授权")
+    );
+    // 结论来自**本机实测**，不是那份可能过期的摘要。
+    assert_eq!(view["probe"]["source"], "probe");
+    assert_eq!(view["probe"]["pending"], false);
+    assert_eq!(
+        view["probe"]["probed_paths"],
+        serde_json::json!([K8S_LOG_DIR, DOCKER_ROOT])
+    );
+    assert!(view["probe"]["not_probed_paths"].is_null(), "{view}");
+
+    assert_eq!(family_state(&view), "grantable");
+    assert!(view["families"][0]["reason"].is_null());
+    assert_eq!(
+        view["families"][0]["selected_units"],
+        serde_json::json!(["linux-docker-container-stdout"])
+    );
+
+    // 证据：每个单元都给出结论与实测值，而不是只报一个「没命中」。
+    let k8s = unit_result(&view, "linux-container-stdout");
+    assert_eq!(k8s["result"], "match_unsatisfied");
+    assert_eq!(k8s["paths"][0]["path"], K8S_LOG_DIR);
+    assert_eq!(k8s["paths"][0]["state"], "absent");
+
+    let docker = unit_result(&view, "linux-docker-container-stdout");
+    assert_eq!(docker["result"], "selected");
+    assert_eq!(docker["paths"][0]["path"], DOCKER_ROOT);
+    assert_eq!(docker["paths"][0]["state"], "present");
+}
+
+#[tokio::test]
+async fn collection_preflight_reports_absent_when_both_directories_were_probed_and_missing() {
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    seed_path_probe(
+        &env,
+        "2026-10-26T00:00:00Z",
+        &[K8S_LOG_DIR, DOCKER_ROOT],
+        &[],
+    )
+    .await;
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["verdict"], "blocked", "{view}");
+    assert_eq!(family_state(&view), "absent");
+    // 一句话里说清「哪条路径没有」——这是现场唯一要拿去核对的事实。
+    assert!(
+        view["families"][0]["reason"]
+            .as_str()
+            .expect("reason")
+            .contains(K8S_LOG_DIR),
+        "{view}"
+    );
+    assert_eq!(
+        unit_result(&view, "linux-docker-container-stdout")["result"],
+        "match_unsatisfied"
+    );
+}
+
+#[tokio::test]
+async fn collection_preflight_reports_unprobed_when_nothing_was_probed() {
+    // 「不知道」必须与「确认没有」分开：前者要再探一次，后者要换机器/换面。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["verdict"], "blocked", "{view}");
+    assert_eq!(view["probe"]["source"], "reported");
+    assert_eq!(family_state(&view), "unprobed");
+    assert!(
+        view["families"][0]["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("还没探过"),
+        "{view}"
+    );
+    // 目录要探的路径一条都没探到 —— 这就是「该再探一次」的判据。
+    assert_eq!(
+        view["probe"]["not_probed_paths"],
+        serde_json::json!([DOCKER_ROOT, K8S_LOG_DIR])
+    );
+    assert_eq!(
+        unit_result(&view, "linux-container-stdout")["paths"][0]["state"],
+        "unprobed"
+    );
+}
+
+#[tokio::test]
+async fn collection_preflight_reports_unreadable_apart_from_unprobed() {
+    // 探不了（权限）与没探过是两件事：前者该去要权限，后者再点一次就行。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    env.store
+        .upsert_agent_path_probe(&crate::infra::StoredAgentPathProbe {
+            agent_id: "agent-node-a".to_string(),
+            observed_at: "2026-10-26T00:00:00Z".to_string(),
+            probed_paths: vec![K8S_LOG_DIR.to_string()],
+            present_paths: vec![],
+            unreadable_paths: vec![crate::infra::UnreadablePath {
+                path: DOCKER_ROOT.to_string(),
+                error: "permission denied".to_string(),
+            }],
+            received_at: "2026-10-26T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("store path probe");
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(family_state(&view), "unreadable", "{view}");
+    let reason = view["families"][0]["reason"].as_str().expect("reason");
+    assert!(reason.contains("探不了"), "{reason}");
+    assert!(reason.contains("permission denied"), "{reason}");
+    assert_eq!(
+        unit_result(&view, "linux-docker-container-stdout")["result"],
+        "unreadable"
+    );
+    // 探不了的路径不算「没探到」——否则永远在重试同一个不可能成功的探测。
+    assert!(view["probe"]["not_probed_paths"].is_null(), "{view}");
+}
+
+#[tokio::test]
+async fn collection_preflight_falls_back_to_the_reported_summary_before_a_probe() {
+    // 没预检过也能答（用事实证明里的路径），只是会标 `source = reported` 且可能过期。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let mut report = fact_report_for("agent-node-a", "node-a", "linux", "x86_64", &[]);
+    report.probed_paths = vec![K8S_LOG_DIR.to_string(), DOCKER_ROOT.to_string()];
+    report.present_paths = vec![DOCKER_ROOT.to_string()];
+    report.content_digest = digest_of(&report);
+    assert_eq!(
+        post_facts(&env, &report).await.status(),
+        StatusCode::ACCEPTED
+    );
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["verdict"], "grantable", "{view}");
+    assert_eq!(view["probe"]["source"], "reported");
+    // 2026-09-22 上报、今天才看 —— 必须标过期，否则人会以为「刚探过」。
+    assert_eq!(view["probe"]["stale"], true);
+}
+
+#[tokio::test]
+async fn collection_preflight_flags_paths_the_catalog_added_after_the_probe() {
+    // 目录换版新增了路径，实测结果还是旧的：如实标进 `not_probed_paths`，不假装探过。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    seed_path_probe(&env, "2026-10-26T00:00:00Z", &[DOCKER_ROOT], &[DOCKER_ROOT]).await;
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(
+        view["probe"]["not_probed_paths"],
+        serde_json::json!([K8S_LOG_DIR])
+    );
+    // 没探到的那条路径上，单元只能是「不知道」。
+    assert_eq!(
+        unit_result(&view, "linux-container-stdout")["result"],
+        "fact_not_collected"
+    );
+}
+
+#[tokio::test]
+async fn collection_preflight_undetermined_reasons_are_machine_readable() {
+    // 答不了的时候，页面要能分别给出「去判定 / 等上报 / 找管理员」三种完全不同的 CTA。
+    let no_content = TestEnv::new_without_content().await;
+    enroll_agent_credential(&no_content).await;
+    let view = get_preflight(&no_content, "agent-node-a").await;
+    assert_eq!(view["verdict"], "undetermined");
+    assert_eq!(view["undetermined_reason"], "no_content");
+
+    let unclassified = TestEnv::new_with_container_content().await;
+    enroll_agent_credential(&unclassified).await;
+    let view = get_preflight(&unclassified, "agent-node-a").await;
+    assert_eq!(view["verdict"], "undetermined");
+    assert_eq!(view["undetermined_reason"], "unclassified");
+
+    let no_facts = TestEnv::new_with_container_content().await;
+    enroll_agent_credential(&no_facts).await;
+    no_facts
+        .store_handle
+        .upsert_agent_classification(&crate::infra::StoredAgentClassification {
+            agent_id: "agent-node-a".to_string(),
+            machine_class: "LinuxHost".to_string(),
+            suggestion_id: None,
+            note: None,
+            decided_by: "test".to_string(),
+            decided_at: "2026-09-22T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("store classification");
+    let view = get_preflight(&no_facts, "agent-node-a").await;
+    assert_eq!(view["verdict"], "undetermined");
+    assert_eq!(view["undetermined_reason"], "no_facts");
+    // 没事实也照样给探测白名单：点一下就能探，不用登录。
+    assert_eq!(
+        view["probe"]["not_probed_paths"],
+        serde_json::Value::Null,
+        "source = none 时不谈「没探到」"
+    );
+}
+
+#[tokio::test]
+async fn collection_preflight_requires_admin_bearer() {
+    let env = TestEnv::new_with_container_content().await;
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/collection-preflight",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn collection_preflight_reports_unknown_agents_as_not_found() {
+    // 打错 agent_id 不该得到一个看起来正常的「未分类」结论。
+    let env = TestEnv::new_with_container_content().await;
+
+    let response = get_admin(&env, "/api/v1/admin/agents/agent-typo/collection-preflight").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "agent_not_found");
+}
+
+#[tokio::test]
+async fn running_a_preflight_enqueues_a_probe_command_with_the_catalog_paths() {
+    // 「点一下」的全部效果：一条待认领命令 + `probe.pending = true`。
+    // 不需要任何人登录 —— agentd 会在下一个状态上报里认领。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let view = run_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["probe"]["pending"], true, "{view}");
+    assert!(
+        view["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("已下发本机探测"),
+        "{view}"
+    );
+
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert_eq!(pending.len(), 1);
+    // 复用 `refresh_facts`：老 agentd 不认识 params 时会退化成整轮重采，仍然能用。
+    assert_eq!(
+        pending[0].kind,
+        wist_api::status::command_kind::REFRESH_FACTS
+    );
+    let params: serde_json::Value = serde_json::from_str(&pending[0].params).expect("params json");
+    assert_eq!(params["scope"], "paths");
+    assert_eq!(
+        params["paths"],
+        serde_json::json!([DOCKER_ROOT, K8S_LOG_DIR])
+    );
+}
+
+#[tokio::test]
+async fn repeated_preflight_requests_supersede_the_pending_one() {
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    run_preflight(&env, "agent-node-a").await;
+    run_preflight(&env, "agent-node-a").await;
+
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert_eq!(pending.len(), 1, "重复点击只保留最后一次");
+}
+
+#[tokio::test]
+async fn a_preflight_report_turns_into_a_conclusion_without_any_login() {
+    // 端到端（去掉网络）：入队 → agent 回传实测 → 页面读到结论。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    assert_eq!(
+        get_preflight(&env, "agent-node-a").await["probe"]["source"],
+        "reported"
+    );
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "observed_at": "2026-10-26T00:00:00Z",
+            "probed_paths": [K8S_LOG_DIR, DOCKER_ROOT],
+            "present_paths": [DOCKER_ROOT],
+            "unreadable_paths": []
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reported: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(reported["verdict"], "grantable", "{reported}");
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["verdict"], "grantable", "{view}");
+    assert_eq!(view["probe"]["source"], "probe");
+    assert_eq!(
+        view["families"][0]["selected_units"],
+        serde_json::json!(["linux-docker-container-stdout"])
+    );
+}
+
+#[tokio::test]
+async fn a_preflight_report_keeps_the_reported_packages() {
+    // 探针只覆盖**路径**维度：`installed:` 类条件必须继续用事实证明里的软件清单，
+    // 否则一次预检就把它们全变成「无法判定」。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "probed_paths": [K8S_LOG_DIR, DOCKER_ROOT],
+            "present_paths": [K8S_LOG_DIR],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+
+    // 选中 k8s 单元；docker 单元被否条件排除 —— 说明只有路径维度被替换。
+    assert_eq!(view["verdict"], "grantable", "{view}");
+    assert_eq!(
+        view["families"][0]["selected_units"],
+        serde_json::json!(["linux-container-stdout"])
+    );
+}
+
+#[tokio::test]
+async fn a_preflight_report_rejects_inconsistent_results() {
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "probed_paths": [K8S_LOG_DIR],
+            "present_paths": [DOCKER_ROOT]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "invalid_preflight_request");
+}
+
+#[tokio::test]
+async fn a_preflight_report_requires_a_certificate_identity() {
+    let env = TestEnv::new_with_container_content().await;
+
+    let response = post_preflight_report(
+        &env,
+        None,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_preflight_report_rejects_a_wrong_kind() {
+    let env = TestEnv::new_with_container_content().await;
+    enroll_agent_credential(&env).await;
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "status_report",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "invalid_preflight_request");
+}
+
+#[tokio::test]
+async fn a_rejected_grant_auto_enqueues_a_probe() {
+    // 现场唯一的入口就是「点了授权、被拒」。这一步顺手把探测命令发下去，
+    // 人下一次重试（≥3s）就拿到实测 —— 不用自己去点预检，更不用登录客户机。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "ContainerWorkload" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert!(
+        pending[0].params.contains("\"scope\":\"paths\""),
+        "{pending:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_grant_does_not_reprobe_when_the_evidence_is_complete() {
+    // 证据已经完整（两条路径都探过、都不在）→ 重探不会改变结论，白跑一趟。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    seed_path_probe(
+        &env,
+        "2026-10-26T00:00:00Z",
+        &[K8S_LOG_DIR, DOCKER_ROOT],
+        &[],
+    )
+    .await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "ContainerWorkload" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert!(pending.is_empty(), "{pending:?}");
+}
+
+#[tokio::test]
+async fn a_grant_uses_the_same_facts_as_the_preflight() {
+    // 预检的全部意义是「先告诉你能不能授」。两边不同源就会出现
+    // 「预检说可以、授权却拒绝」—— 那比没有预检更让人失去信任。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    seed_path_probe(
+        &env,
+        "2026-10-26T00:00:00Z",
+        &[K8S_LOG_DIR, DOCKER_ROOT],
+        &[DOCKER_ROOT],
+    )
+    .await;
+
+    assert_eq!(
+        get_preflight(&env, "agent-node-a").await["verdict"],
+        "grantable"
+    );
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "ContainerWorkload" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // 选中的是 docker 单元 —— 与预检的 `selected_units` 一致。
+    let works = env
+        .store
+        .list_standing_work("agent-node-a")
+        .await
+        .expect("list standing work");
+    assert_eq!(works.len(), 1, "{works:?}");
+    assert!(
+        works[0].spec.contains("linux-docker-container-stdout"),
+        "{}",
+        works[0].spec
+    );
+}
+
+#[tokio::test]
+async fn a_reported_probe_clears_pending_before_the_command_ack_arrives() {
+    // agentd 是「先回传实测、回执跟在下一拍状态上报里（≤3s）」。不区分的话，
+    // 页面会明明已经拿到结论、却还显示「探测中」。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let queued = run_preflight(&env, "agent-node-a").await;
+    assert_eq!(queued["probe"]["pending"], true, "{queued}");
+    assert!(queued["probe"]["pending_since"].is_string(), "{queued}");
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "probed_paths": [K8S_LOG_DIR, DOCKER_ROOT],
+            "present_paths": [DOCKER_ROOT],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 命令还没被 ack（测试里没有状态上报通道），但结果已经回来了。
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["probe"]["pending"], false, "{view}");
+    assert!(view["probe"]["pending_since"].is_null(), "{view}");
+    assert_eq!(view["verdict"], "grantable", "{view}");
+}
+
+#[tokio::test]
+async fn an_out_of_order_probe_does_not_overwrite_a_newer_one() {
+    // 重试 / 双发 / 连点两次都可能让结果乱序到达。谁是“更新”的只有观测时刻能回答。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let newer = serde_json::json!({
+        "api_version": "v1",
+        "kind": "collection_preflight",
+        "agent_id": "agent-node-a",
+        "instance_id": "node-a",
+        "observed_at": "2026-10-26T12:00:00Z",
+        "probed_paths": [K8S_LOG_DIR, DOCKER_ROOT],
+        "present_paths": [DOCKER_ROOT],
+    });
+    assert_eq!(
+        post_preflight_report(&env, Some("agent-node-a"), &newer)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let older = serde_json::json!({
+        "api_version": "v1",
+        "kind": "collection_preflight",
+        "agent_id": "agent-node-a",
+        "instance_id": "node-a",
+        "observed_at": "2026-10-26T11:00:00Z",
+        "probed_paths": [K8S_LOG_DIR, DOCKER_ROOT],
+        "present_paths": [K8S_LOG_DIR],
+    });
+    let response = post_preflight_report(&env, Some("agent-node-a"), &older).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(
+        view["probe"]["observed_at"], "2026-10-26T12:00:00+00:00",
+        "旧的实测不能盖掉新的：{view}"
+    );
+    assert_eq!(
+        view["families"][0]["selected_units"],
+        serde_json::json!(["linux-docker-container-stdout"]),
+        "{view}"
+    );
+}
+
+#[tokio::test]
+async fn a_probe_report_without_observed_at_uses_the_gateway_clock() {
+    // 空时间戳不能变成一个“1970 年探过”的假事实。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "probed_paths": [K8S_LOG_DIR],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["probe"]["stale"], false, "{view}");
+}
+
+#[tokio::test]
+async fn a_preflight_on_a_host_with_no_path_conditions_enqueues_nothing() {
+    // 目录里这个平台没有任何 `path_exists` 条件 → 探了也不会改变任何结论。
+    // 下发一条命令只会让页面显示「探测中」然后什么也不发生 —— 那是最差的反馈。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let view = run_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["probe"]["pending"], false, "{view}");
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert!(pending.is_empty(), "{pending:?}");
+}
+
+#[tokio::test]
+async fn running_a_preflight_for_an_unclassified_agent_enqueues_nothing() {
+    // 没判定就没有「当前面」可谈：探完也还是 `unclassified`，不该发命令。
+    let env = TestEnv::new_with_container_content().await;
+    enroll_agent_credential(&env).await;
+
+    let view = run_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["verdict"], "undetermined", "{view}");
+    assert_eq!(view["undetermined_reason"], "unclassified", "{view}");
+    assert_eq!(view["probe"]["pending"], false, "{view}");
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert!(pending.is_empty(), "{pending:?}");
+}
+
+#[tokio::test]
+async fn running_a_preflight_for_an_unknown_agent_is_404() {
+    let env = TestEnv::new_with_container_content().await;
+
+    let response = router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/agents/agent-typo/collection-preflight")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_preflight_report_with_too_many_paths_is_rejected() {
+    // 上限是防畸形/恶意客户端撑大存储，不是业务约束（目录里通常只有十几个）。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let paths: Vec<String> = (0..600).map(|index| format!("/probe/{index}")).collect();
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "probed_paths": paths,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_preflight_report_from_a_different_agent_is_rejected() {
+    // 证书身份是权威：不接受「证书说是 A、请求体说是 B」。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-other",
+            "instance_id": "node-a",
+            "probed_paths": [K8S_LOG_DIR],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_pending_full_refresh_is_not_replaced_by_a_path_probe() {
+    // 用户点了「重采事实」（整轮）后授权被拒：自动预检不能把它顶掉 ——
+    // 整轮重采会连路径一起刷新，而路径探测拿不到进程/端口。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/fact-refresh",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let view = run_preflight(&env, "agent-node-a").await;
+    // 仍然显示「有命令在路上」：确实在采，只是采的不是只有路径。
+    assert_eq!(view["probe"]["pending"], true, "{view}");
+
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert_eq!(pending.len(), 1, "整轮重采不能被顶成两条：{pending:?}");
+    assert_eq!(pending[0].params, "", "留在队列里的应该是那条整轮重采");
+}

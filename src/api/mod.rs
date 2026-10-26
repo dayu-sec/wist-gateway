@@ -52,6 +52,11 @@ mod software_ops;
 // 计划是编排层，批准/推进时才物化成 OneShotWork；与 agent_ops 的 submit_work_result
 // 通过 reconcile_rollout_entry 回填条目。重新生成控制面代码时需回补本模块与下方路由。
 mod rollout_ops;
+// NOTE(hand-added): 采集预检（collection preflight）——「这台机器现在能不能授权某个采集面，
+// 为什么不能」。复用授权同一条求值链（`ContentSet::expand`），Agent（mTLS）/ 管理面
+// （admin bearer）两个入口。不在 jumo 静态模型 binding.mju 的声明里，重新生成控制面代码时
+// 需回补本模块与下方路由。见 api/preflight.rs 顶部说明。
+mod preflight;
 // NOTE(hand-added): 网关自述面（环回；CR-003）。对应 jumo 模型 Control.GatewayApp.SelfInterface
 // 的 QuerySelfState（模型 bind 未定、环回鉴权未决），故路由手加。供 host 侧 wist-gwlinkd 消费。
 mod self_state;
@@ -113,6 +118,7 @@ use knowledge_ops::{
 use logs::{MAX_LOG_INGEST_BODY_BYTES, ingest_agent_logs, view_agent_logs};
 use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
 use pipeline::get_pipeline_topology;
+use preflight::{run_agent_preflight, view_agent_preflight};
 use rollout_ops::{
     advance_rollout_plan, approve_rollout_plan, create_rollout_plan, list_rollout_plans,
     retry_rollout_plan, view_rollout_plan,
@@ -399,6 +405,15 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agents/{agent_id}/work/{work_id}/resume",
             post(resume_work),
+        )
+        // NOTE(hand-added): 采集预检（见 api/preflight.rs）。回答「为什么这个面授权不了」：
+        //   * GET  读结论（不需要任何人登录）；
+        //   * POST 让**机器自己**再探一次（入队一条带路径白名单的命令，agentd 在下一个
+        //     状态上报里认领 → 回传 `/api/v1/agent/collection-preflight`）。
+        // 求值复用授权同一条链，因此不会出现「预检说可以、授权却拒绝」。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/collection-preflight",
+            get(view_agent_preflight).post(run_agent_preflight),
         )
         .route(
             "/api/v1/admin/agents/{agent_id}/host-metrics",
