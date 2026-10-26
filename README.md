@@ -24,6 +24,9 @@ collects status and host metrics, issues control commands, and aggregates execut
 - **Status & metrics** — accepts agent status reports and host/process metrics, with
   per-client rate limiting.
 - **Control commands** — queues `ActionPlan`s for agents to poll and receives `ActionResult`s back.
+- **Agent commands** — one-shot maintenance commands delivered on the status ack
+  (`AgentStatusAck.commands`); results come back as `command_acks`. First command:
+  `POST /api/v1/admin/agents/{agent_id}/fact-refresh` (re-scan + re-report facts now).
 - **Admin API** — fleet overview, per-agent runtime status, pipeline topology.
 - **TLS-first** — serves HTTPS with rustls and injects the real peer address for rate limiting.
 

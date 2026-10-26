@@ -14,19 +14,23 @@ use wist_api::enrollment::{
     AgentIdentityStatus, CredentialRenewal, CredentialRenewed, EnrollmentEnvelope,
     EnrollmentRequest, EnrollmentStatus,
 };
-use wist_api::status::{AgentStatusReport, AgentWorkState, AgentWorkStateChange};
+use wist_api::status::{AgentStatusAck, AgentStatusReport, AgentWorkState, AgentWorkStateChange};
 
 use crate::app::knowledge::{KnowledgeSource, LoadedKnowledge};
 use crate::infra::{
     AdminConfig, AgentStatusUpdate, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
-    KnowledgeActivation, LocalPeers, SqliteStore, Store, StoredAgentInstallPackage,
-    StoredAgentInstallPackageAddress, StoredAgentRevocation, StoredAgentUplinkAddress,
-    StoredCredentialStatus, StoredEnrollmentTokenStatus, StoredKnowledgePackage,
-    VerifiedAgentIdentity, bytes_sha256_hex, sha256_hex,
+    KnowledgeActivation, LocalPeers, SqliteStore, Store, StoredAgentCommand,
+    StoredAgentInstallPackage, StoredAgentInstallPackageAddress, StoredAgentRevocation,
+    StoredAgentUplinkAddress, StoredCredentialStatus, StoredEnrollmentTokenStatus,
+    StoredKnowledgePackage, VerifiedAgentIdentity, bytes_sha256_hex, sha256_hex,
 };
 use wist_api::action_result::{ReportActionResult, ResultAttestation};
 use wist_api::discovery_policies::{
     DiscoveryPoliciesReturned, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
+};
+use wist_api::discovery_snapshot::{
+    APPLIED_SOURCE_LOCAL_CONFIG, AppliedDiscoverySnapshot, DiscoverySnapshotGrant,
+    GRANT_SOURCE_AGENT, GRANT_SOURCE_GLOBAL, POLL_DISCOVERY_SNAPSHOT_KIND,
 };
 use wist_api::facts::ReportAgentFactSummary;
 use wist_api::uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND};
@@ -1704,6 +1708,7 @@ async fn agent_status_route_requires_a_client_certificate() {
             local_work: None,
             uplink_state: None,
             certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
@@ -1729,6 +1734,7 @@ async fn agent_status_route_requires_a_client_certificate() {
             local_work: None,
             uplink_state: None,
             certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
@@ -1760,6 +1766,7 @@ async fn agent_status_route_persists_reported_metrics() {
             local_work: None,
             uplink_state: None,
             certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
@@ -1804,6 +1811,7 @@ async fn post_agent_status_cpu(
             local_work: None,
             uplink_state: None,
             certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await
@@ -3404,6 +3412,7 @@ async fn post_agent_status(
             local_work: None,
             uplink_state: None,
             certificate_status: None,
+            command_acks: Vec::new(),
             machine_profile: None,
         })
         .expect("serialize status"),
@@ -3603,6 +3612,273 @@ async fn agent_status_persists_the_applied_discovery_policy_version() {
         .expect("store read")
         .expect("agent");
     assert_eq!(stored.last_discovery_policy_version, Some(2));
+}
+
+#[tokio::test]
+async fn admin_fact_refresh_is_delivered_on_the_status_ack_and_cleared_by_the_agent_result() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    // 1) 管理面发起命令。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/fact-refresh",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let command_id = body["command_id"].as_str().expect("command id").to_string();
+    assert_eq!(body["kind"], "refresh_facts");
+    assert!(body["requested_at"].is_string());
+    assert!(body["acknowledged_at"].is_null());
+    assert!(body["outcome"].is_null());
+
+    let status_report = |acks: serde_json::Value| {
+        serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.9.11",
+            "command_acks": acks,
+        })
+    };
+
+    // 2) 下一次状态上报的回执把命令带给 agent。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_report(serde_json::json!([])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(ack.commands.len(), 1);
+    assert_eq!(ack.commands[0].command_id, command_id);
+    assert_eq!(ack.commands[0].kind, "refresh_facts");
+
+    // 3) agent 回传结果后不再下发，管理面看到结果。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_report(serde_json::json!([{
+            "command_id": command_id,
+            "outcome": "succeeded",
+            "detail": "probes=6 failed=0",
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert!(ack.commands.is_empty());
+
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/fact-refresh").await,
+    )
+    .await;
+    assert_eq!(view["command_id"], command_id);
+    assert_eq!(view["outcome"], "succeeded");
+    assert!(view["acknowledged_at"].is_string());
+    assert_eq!(view["detail"], "probes=6 failed=0");
+}
+
+#[tokio::test]
+async fn repeated_fact_refresh_requests_supersede_the_pending_one() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let first: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-node-a/fact-refresh",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({}),
+        )
+        .await,
+    )
+    .await;
+    let second: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-node-a/fact-refresh",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({}),
+        )
+        .await,
+    )
+    .await;
+    let first_id = first["command_id"].as_str().expect("first id");
+    let second_id = second["command_id"].as_str().expect("second id");
+    assert_ne!(first_id, second_id);
+
+    // 只下发最新的一条（旧的被标成 superseded，不再排队）。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.9.11",
+            "command_acks": [],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(ack.commands.len(), 1);
+    assert_eq!(ack.commands[0].command_id, second_id);
+
+    // 管理面看到的也是最近一条。
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/fact-refresh").await,
+    )
+    .await;
+    assert_eq!(view["command_id"], second_id);
+}
+
+#[tokio::test]
+async fn stale_fact_refresh_commands_are_expired_instead_of_delivered_forever() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    // 旧 agent 不解析回执、或机器长期离线：命令一直不确认。
+    // 必须有一个收口，否则每次 3s 心跳都把同一条重发一遍，永不结束。
+    env.store
+        .enqueue_agent_command(
+            &StoredAgentCommand {
+                command_id: "cmd-stale".to_string(),
+                agent_id: "agent-node-a".to_string(),
+                kind: "refresh_facts".to_string(),
+                params: String::new(),
+                requested_at_ms: chrono::Utc::now().timestamp_millis() - 2 * 60 * 60 * 1000,
+                acked_at: None,
+                outcome: None,
+                detail: None,
+            },
+            false,
+        )
+        .await
+        .expect("enqueue command");
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.9.11",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert!(ack.commands.is_empty(), "过期命令不应再下发");
+
+    // 管理面能看到「为什么没执行」，而不是永远停在「待认领」。
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/fact-refresh").await,
+    )
+    .await;
+    assert_eq!(view["command_id"], "cmd-stale");
+    assert_eq!(view["outcome"], "expired");
+    assert!(view["acknowledged_at"].is_string());
+}
+
+#[tokio::test]
+async fn a_fresh_fact_refresh_command_survives_the_expiry_sweep() {
+    // 与上一条成对：收口只吃「超出窗口」的，正常下达的命令不能被误杀。
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let posted: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-node-a/fact-refresh",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({}),
+        )
+        .await,
+    )
+    .await;
+    let command_id = posted["command_id"].as_str().expect("command id");
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.9.11",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(ack.commands.len(), 1);
+    assert_eq!(ack.commands[0].command_id, command_id);
+}
+
+#[tokio::test]
+async fn viewing_a_fact_refresh_sweeps_commands_of_an_agent_that_never_reports() {
+    // 状态上报里的收口只发生在「这台机器还在上报」时。一台长期离线的机器
+    // 不能在页面上永远显示「等待认领」。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+
+    env.store
+        .enqueue_agent_command(
+            &StoredAgentCommand {
+                command_id: "cmd-abandoned".to_string(),
+                agent_id: "agent-node-a".to_string(),
+                kind: "refresh_facts".to_string(),
+                params: String::new(),
+                requested_at_ms: chrono::Utc::now().timestamp_millis() - 2 * 60 * 60 * 1000,
+                acked_at: None,
+                outcome: None,
+                detail: None,
+            },
+            false,
+        )
+        .await
+        .expect("enqueue command");
+
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/fact-refresh").await,
+    )
+    .await;
+    assert_eq!(view["command_id"], "cmd-abandoned");
+    assert_eq!(view["outcome"], "expired");
+    assert!(view["acknowledged_at"].is_string());
+}
+
+#[tokio::test]
+async fn admin_fact_refresh_requires_admin_bearer() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/fact-refresh",
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -3956,6 +4232,7 @@ async fn agent_status_route_persists_work_state_changes() {
             local_work: None,
             uplink_state: None,
             certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
@@ -4031,6 +4308,7 @@ async fn the_work_view_exposes_the_agents_local_work_report() {
             local_work: Some(local_work),
             uplink_state: None,
             certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
@@ -4087,6 +4365,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
                 output_write_failing: true,
             }),
             certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
@@ -4120,6 +4399,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
             local_work: None,
             uplink_state: None,
             certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
@@ -4153,6 +4433,7 @@ async fn a_status_report_with_a_machine_profile_backfills_the_registry() {
         local_work: None,
         uplink_state: None,
         certificate_status: None,
+        command_acks: Vec::new(),
     };
     let profile = wist_contracts::enrollment::HostProfile {
         node_id: "node-1".to_string(),
@@ -4226,6 +4507,7 @@ async fn enroll_agent_with_machine_profile(env: &TestEnv, ip_addresses: Vec<Stri
         local_work: None,
         uplink_state: None,
         certificate_status: None,
+        command_acks: Vec::new(),
     };
     let status = post_agent_json_to_router(
         &env.config,
@@ -9856,6 +10138,149 @@ async fn uplink_poll_derives_the_target_from_the_deployment_config() {
         grant.target(),
         Some(("127.0.0.1", DEFAULT_AGENT_UPLINK_PORT))
     );
+}
+
+async fn poll_discovery_snapshot(
+    env: &TestEnv,
+    credential: Option<&str>,
+    applied: Option<AppliedDiscoverySnapshot>,
+) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/discovery-snapshot:poll",
+        credential,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": POLL_DISCOVERY_SNAPSHOT_KIND,
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "requested_at": "2026-10-26T00:00:00Z",
+            "applied": applied,
+        }),
+    )
+    .await
+}
+
+async fn set_discovery_snapshot(env: &TestEnv, uri: &str, body: serde_json::Value) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &body,
+    )
+    .await
+}
+
+/// 网关**没有设置**时回 204：Agent 继续用本机 `[discovery]`。
+///
+/// 不能「按内置默认值下发」——那会把本机配置永久压掉，而本机配置是离线 / 旧网关 /
+/// 未入网时唯一的来源。
+#[tokio::test]
+async fn discovery_snapshot_poll_returns_no_content_when_the_gateway_has_no_setting() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+
+    let response = poll_discovery_snapshot(&env, Some(&credential), None).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+/// 优先级：单机覆盖 > 全局；清掉覆盖回落到全局。
+#[tokio::test]
+async fn discovery_snapshot_prefers_the_agent_override_then_falls_back_to_global() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+
+    let set = set_discovery_snapshot(
+        &env,
+        "/api/v1/admin/discovery/snapshot",
+        serde_json::json!({ "enabled": true, "interval_seconds": 3600 }),
+    )
+    .await;
+    assert_eq!(set.status(), StatusCode::OK);
+
+    let grant: DiscoverySnapshotGrant =
+        decode_json_response(poll_discovery_snapshot(&env, Some(&credential), None).await).await;
+    assert!(grant.enabled);
+    assert_eq!(grant.interval_seconds, 3600);
+    assert_eq!(grant.source, GRANT_SOURCE_GLOBAL);
+
+    let set = set_discovery_snapshot(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/discovery/snapshot",
+        serde_json::json!({ "enabled": true, "interval_seconds": 300 }),
+    )
+    .await;
+    assert_eq!(set.status(), StatusCode::OK);
+
+    let grant: DiscoverySnapshotGrant =
+        decode_json_response(poll_discovery_snapshot(&env, Some(&credential), None).await).await;
+    assert_eq!(grant.interval_seconds, 300);
+    assert_eq!(grant.source, GRANT_SOURCE_AGENT);
+
+    let cleared = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/discovery/snapshot",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+
+    let grant: DiscoverySnapshotGrant =
+        decode_json_response(poll_discovery_snapshot(&env, Some(&credential), None).await).await;
+    assert_eq!(grant.interval_seconds, 3600);
+    assert_eq!(grant.source, GRANT_SOURCE_GLOBAL);
+}
+
+/// 请求里搭车的 `applied` 会落库，管理面能看到「配置 vs 实际生效」分叉。
+#[tokio::test]
+async fn discovery_snapshot_applied_echo_is_visible_to_the_admin_view() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+
+    let applied = AppliedDiscoverySnapshot {
+        enabled: true,
+        interval_seconds: 300,
+        source: APPLIED_SOURCE_LOCAL_CONFIG.to_string(),
+    };
+    let response = poll_discovery_snapshot(&env, Some(&credential), Some(applied)).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let view = get_admin(&env, "/api/v1/admin/discovery/snapshot").await;
+    assert_eq!(view.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(view).await;
+    let agents = body["agents"].as_array().expect("agents");
+    let row = agents
+        .iter()
+        .find(|agent| agent["agent_id"] == "agent-node-a")
+        .expect("row for the polling agent");
+    assert_eq!(row["applied"]["interval_seconds"], 300);
+    assert_eq!(row["applied"]["source"], APPLIED_SOURCE_LOCAL_CONFIG);
+    assert!(
+        row["override_setting"].is_null(),
+        "没设过单机覆盖时必须回 null（页面据此显示「继承全局」）"
+    );
+}
+
+/// 周期低于下限一律 400：保存时不静默夹取 —— 否则页面显示成功，Agent 却收到另一个值。
+#[tokio::test]
+async fn discovery_snapshot_rejects_a_too_short_interval() {
+    let env = TestEnv::new().await;
+
+    for uri in [
+        "/api/v1/admin/discovery/snapshot",
+        "/api/v1/admin/agents/agent-node-a/discovery/snapshot",
+    ] {
+        let response = set_discovery_snapshot(
+            &env,
+            uri,
+            serde_json::json!({ "enabled": true, "interval_seconds": 30 }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    }
 }
 
 /// 派生不出目标（对外基址里取不出主机名）时**仍然不猜**：有工作也只能待命。

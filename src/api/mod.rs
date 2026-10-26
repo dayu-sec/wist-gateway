@@ -89,12 +89,15 @@ pub mod wist_agentd_online_registration_interface;
 pub use wist_agentd_online_registration_interface::WistAgentdOnlineRegistrationInterface;
 
 use admin_ops::{
-    admin_resolve_cos_path, admin_resolve_github_release, classify_agent, delete_agent,
+    admin_resolve_cos_path, admin_resolve_github_release, classify_agent,
+    clear_agent_discovery_snapshot, clear_discovery_snapshot_global, delete_agent,
     get_agent_runtime_status, grant_work, lift_agent_revocation, list_agent_install_packages,
-    list_agent_revocations, list_agents, pause_work, resume_work, revoke_agent,
-    revoke_agent_credential, revoke_work, set_agent_advertise_url, set_agent_install_package,
-    set_agent_uplink, view_agent_advertise_url, view_agent_install_package, view_agent_purpose,
-    view_agent_uplink, view_agent_work, view_discovery_policies, view_purpose_coverage,
+    list_agent_revocations, list_agents, pause_work, request_agent_fact_refresh, resume_work,
+    revoke_agent, revoke_agent_credential, revoke_work, set_agent_advertise_url,
+    set_agent_discovery_snapshot, set_agent_install_package, set_agent_uplink,
+    set_discovery_snapshot_global, view_agent_advertise_url, view_agent_fact_refresh,
+    view_agent_install_package, view_agent_purpose, view_agent_uplink, view_agent_work,
+    view_discovery_policies, view_discovery_snapshot, view_purpose_coverage,
 };
 use content_ops::view_content;
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
@@ -375,6 +378,12 @@ pub fn router_with_state(state: ApiState) -> Router {
         // NOTE(hand-added): 工作授权／撤回／暂停／继续 + 查看（jumo 模型
         // WistGatewayManagementInterface 的 AdminGrantWork / AdminRevokeWork /
         // AdminPauseWork / AdminResumeWork）。查看了模型里没有，是为了“看得到才能控制”。
+        // NOTE(hand-added): 手动「重采 + 重报」命令。POST 写一条待执行命令，agent 在
+        // 下一个状态上报回执里认领（≤3s）；GET 供页面轮询“认领了没有”。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/fact-refresh",
+            get(view_agent_fact_refresh).post(request_agent_fact_refresh),
+        )
         .route(
             "/api/v1/admin/agents/{agent_id}/work",
             get(view_agent_work).post(grant_work),
@@ -457,6 +466,19 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agent/uplink",
             get(view_agent_uplink).post(set_agent_uplink),
+        )
+        // NOTE(hand-added): 原文快照（DSNAP）上送的控制面设置。周期必须能**按机器不同**
+        // （资产变化快的主机更密），所以是「全局 + 单机覆盖」两层；Agent 通过
+        // `agent/discovery-snapshot:poll` 拉取，没有设置时回落本机 `[discovery]`。
+        .route(
+            "/api/v1/admin/discovery/snapshot",
+            get(view_discovery_snapshot)
+                .post(set_discovery_snapshot_global)
+                .delete(clear_discovery_snapshot_global),
+        )
+        .route(
+            "/api/v1/admin/agents/{agent_id}/discovery/snapshot",
+            post(set_agent_discovery_snapshot).delete(clear_agent_discovery_snapshot),
         )
         // NOTE(hand-added): 网关对外地址的读取/设置。它是控制平台对 agent 宣告的地址：
         // 新签发 Agent 初始配置里的 [control_plane] endpoint，以及安装命令 / install.sh /

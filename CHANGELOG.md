@@ -3,6 +3,47 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.21.0-alpha] - 2026-10-26
+
+### 新增（原文快照上送：按机器设置）
+
+- **Agent 端点** `POST /api/v1/agent/discovery-snapshot:poll`：下发解析后的快照上送设置
+  （单机覆盖 > 全局；两层都没有则 `204`，由 agent 用本机 `[discovery]`）。
+  新端点而不是给既有契约加字段，理由见 `agent_api/v1.rs` 里 `uplink:poll` 同一段注释。
+- **管理面 API**（web「Gateway 信息 → 原文快照上送」使用）：
+  `GET/POST/DELETE /api/v1/admin/discovery/snapshot`（全局）、
+  `POST/DELETE /api/v1/admin/agents/{agent_id}/discovery/snapshot`（单机覆盖）。
+  周期 < 60s 一律 400（不静默夹取 —— 页面显示成功、agent 收到另一个值最难查）。
+- **实际生效回显**：agent 在 poll 请求里搭车回传当前生效值，管理面据此标出「配了 1 小时、
+  实际还是 5 分钟」这类分叉（典型原因：旧 agentd、或单机覆盖没清）。
+- **存储**：迁移 `0032_agent_discovery_snapshot.sql`。一张表、三种 scope
+  （`global` / `agent` / `applied`）；`applied` 行只在值变化时写，不把心跳放大成写事务。
+
+### 新增（通用的一次性命令通道）
+
+- **模型**：命令是**通用信封**（`command_id` / `kind` / `params` / `requested_at_ms`），不是
+  每条命令一个字段。新增一种命令只加 `kind` 词表值 + agentd 一个执行分支。
+- **管理面接口**（admin bearer，首个命令 `refresh_facts`）：
+  - `POST /api/v1/admin/agents/{agent_id}/fact-refresh`：入队一条命令（同 kind 未执行的旧命令
+    标成 `superseded`，重复点击不会排出一串）；返回 `command_id` / `kind` / `requested_at`。
+  - `GET /api/v1/admin/agents/{agent_id}/fact-refresh`：查最近一条与结果
+    （`acknowledged_at` / `outcome` / `detail`）。
+- **下发通道**：命令搭在 agent 状态上报的回执里（`AgentStatusAck.commands`）。agent 每 3s
+  上报一次，所以**≤3s 到达**；不需要给 agent 加入站监听，也不改工作快照。
+- **结果**：agent 在下一次上报里带 `command_acks`（`succeeded` / `failed` / `no_uplink` /
+  `throttled` / `stale` / `unsupported`），网关按 `command_id` 落库；未确认前每次回执都重发。
+- **收口**：未确认的命令只保留 **1 小时**（`PENDING_COMMAND_TTL_MS`），超过就不再下发、标 `expired`。
+  两个入口都会扫：状态上报（下发前）与管理面 `GET`（一台不再上报的 Agent 不会在页面上
+  永远显示「等待认领」）。与 agentd 的 `stale`（10 分钟）刻意错开：给机器短暂离线留一次
+  真正的执行机会。
+- **存储**：迁移 `0033_agent_commands.sql`（`agent_commands`，一台多行；命令不因网关重启丢失）。
+
+### 升级提示
+
+- 依赖 `wist-api` 的 `AgentCommand` / `AgentCommandAck`；`AgentStatusReport` 是
+  `deny_unknown_fields`，所以 **本网关必须先于 agentd 升级**：旧网关收到带 `command_acks`
+  的新报文会整份 400。没有结果时 agentd 不发该字段，未升级的 agent 也不受影响。
+
 ## [0.20.5-alpha] - 2026-10-25
 
 ### 变更

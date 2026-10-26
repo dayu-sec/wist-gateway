@@ -3508,9 +3508,9 @@ dependencies = [
 
 [[package]]
 name = "wist-api"
-version = "0.9.1"
+version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86388400bc6377bcc39207cffd066727834e149c61f29d65573e2fcb6a0e8d7d"
+checksum = "bb2c3e36705af706f9564bbbef2eb4bee9bd38126bf607410cc1aa8ab7be33bf"
 dependencies = [
  "serde",
  "wist-contracts",
@@ -3572,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "wist-gateway"
-version = "0.20.5"
+version = "0.21.0"
 dependencies = [
  "async-trait",
  "axum",

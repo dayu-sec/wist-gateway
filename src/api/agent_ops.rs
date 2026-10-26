@@ -7,15 +7,21 @@ use axum::{
 };
 
 use crate::infra::{
-    AgentFactSummaryMarks, AgentStatusUpdate, CertificateRegistration, RenewCredential,
+    AgentFactSummaryMarks, AgentStatusUpdate, CertificateRegistration,
+    DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS, DISCOVERY_SNAPSHOT_SCOPE_AGENT,
+    DISCOVERY_SNAPSHOT_SCOPE_APPLIED, DISCOVERY_SNAPSHOT_SCOPE_GLOBAL, RenewCredential,
     StoredAgentCertificateStatus, StoredAgentFactSummary, StoredAgentRegistration,
-    StoredPurposeSuggestion, StoredWorkResult, VerifiedAgentIdentity, effective_standing,
-    new_secret_token, outstanding_one_shot,
+    StoredDiscoverySnapshotSetting, StoredPurposeSuggestion, StoredWorkResult,
+    VerifiedAgentIdentity, effective_standing, new_secret_token, outstanding_one_shot,
     victoria_metrics::{import_lines, metric_line},
 };
 use wist_api::action_result::{ActionResultAck, ReportActionResult};
 use wist_api::discovery_policies::{
     DiscoveryPoliciesReturned, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
+};
+use wist_api::discovery_snapshot::{
+    DiscoverySnapshotGrant, GRANT_SOURCE_AGENT, GRANT_SOURCE_GLOBAL, POLL_DISCOVERY_SNAPSHOT_KIND,
+    PollDiscoverySnapshot,
 };
 use wist_api::enrollment::{
     CredentialBundle, CredentialRenewal, CredentialRenewed, RENEW_AGENT_CREDENTIAL_KIND,
@@ -24,7 +30,7 @@ use wist_api::facts::{
     FactSummaryAccepted, FactSummaryAckStatus, REPORT_AGENT_FACT_SUMMARY_KIND,
     ReportAgentFactSummary,
 };
-use wist_api::status::{AgentStatusAck, AgentStatusReport};
+use wist_api::status::{AgentCommand, AgentStatusAck, AgentStatusReport};
 use wist_api::uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND, PollAgentUplink};
 use wist_api::work::{
     ACK_WORK_KIND, AckWork, POLL_WORK_KIND, PollWork, REPORT_WORK_RESULT_KIND, ReportWorkResult,
@@ -38,6 +44,21 @@ use wist_control::{AgentControlCommandsReturned, PollControlCommands};
 
 use super::ApiState;
 use super::error::ApiError;
+
+/// 一次状态回执最多下发多少条待执行命令。
+///
+/// 命令是低频维护动作，回执是 3s 心跳；设上限是为了不让一条畸形队列把响应体撑大。
+/// 超出的部分留在库里，下一次上报继续下发。
+const MAX_PENDING_COMMANDS_PER_ACK: usize = 8;
+
+/// 未确认命令的待执行窗口。
+///
+/// 超过就不再下发：旧 agent 根本不解析回执，没有这个收口就会每 3s 重发一次、永不结束。
+/// 与 agentd 自己的 stale 窗口（10 分钟）错开：给「机器短暂离线」留一次真正的执行机会。
+///
+/// 两处收口都要用这个值：状态上报的回执（下发前扫一遍）、管理面查询（否则一台
+/// 长期不上报的 Agent 会永远显示「等待认领」）。
+pub(crate) const PENDING_COMMAND_TTL_MS: i64 = 60 * 60 * 1000;
 
 pub async fn submit_agent_status(
     State(state): State<ApiState>,
@@ -164,12 +185,72 @@ pub async fn submit_agent_status(
                     agent.instance_id
                 );
             }
+            // 一次性命令：先把 agent 回传的结果落库（条件更新），再取待下发的。
+            // 顺序不能反 —— 反了会把刚回传结果的命令又下发一次（agent 会去重，但白一个来回）。
+            for ack in &input.command_acks {
+                match state
+                    .store
+                    .ack_agent_command(
+                        &agent.agent_id,
+                        &ack.command_id,
+                        &last_seen_at,
+                        &ack.outcome,
+                        &ack.detail,
+                    )
+                    .await
+                {
+                    // `false` = 命令已被覆盖 / 已确认过（正常竞态），不报错。
+                    Ok(_) => {}
+                    Err(err) => log::warn!(
+                        "event=AgentCommandAckFailed agent_id={} command_id={} detail=\"{err}\"",
+                        agent.agent_id,
+                        ack.command_id
+                    ),
+                }
+            }
+            if let Err(err) = state
+                .store
+                .expire_pending_agent_commands(
+                    &agent.agent_id,
+                    now_utc.timestamp_millis() - PENDING_COMMAND_TTL_MS,
+                    &last_seen_at,
+                )
+                .await
+            {
+                log::warn!(
+                    "event=AgentCommandExpireFailed agent_id={} detail=\"{err}\"",
+                    agent.agent_id
+                );
+            }
+            let commands = match state
+                .store
+                .list_pending_agent_commands(&agent.agent_id, MAX_PENDING_COMMANDS_PER_ACK)
+                .await
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| AgentCommand {
+                        command_id: row.command_id,
+                        requested_at_ms: row.requested_at_ms,
+                        kind: row.kind,
+                        params: row.params,
+                    })
+                    .collect(),
+                Err(err) => {
+                    log::warn!(
+                        "event=AgentCommandLoadFailed agent_id={} detail=\"{err}\"",
+                        agent.agent_id
+                    );
+                    Vec::new()
+                }
+            };
             (
                 StatusCode::ACCEPTED,
                 Json(AgentStatusAck {
                     agent_id: input.agent_id,
                     instance_id: input.instance_id,
                     acknowledged_at: now_utc.to_rfc3339(),
+                    commands,
                 }),
             )
                 .into_response()
@@ -413,6 +494,105 @@ pub async fn poll_agent_uplink(
         )
         .into_response(),
     }
+}
+
+/// agentd → 网关：拉取「原文发现快照上送」的控制面设置。
+///
+/// **没有设置时回 204**，而不是「按默认值下发」：网关对周期没有意见时，Agent 应当继续用
+/// 本机 `[discovery]` —— 本机配置是离线 / 旧网关 / 未入网时唯一的来源，不能被一个空设置
+/// 永久压掉（与 `agent_uplink` 的「未设置就不下发上送段」同一取舍）。
+///
+/// 请求里搭车的 `applied` 回传是**尽力而为**：写库失败只 warn，不影响本次下发。
+/// 反过来（因为展示信息写失败而拒绝下发周期）会把小故障放大成采集周期不更新。
+pub async fn poll_discovery_snapshot(
+    State(state): State<ApiState>,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
+    Json(input): Json<PollDiscoverySnapshot>,
+) -> Response {
+    if input.api_version != API_VERSION_V1 || input.kind != POLL_DISCOVERY_SNAPSHOT_KIND {
+        return ApiError::bad_request(
+            codes::INVALID_DISCOVERY_SNAPSHOT_POLL,
+            "invalid discovery snapshot poll",
+        )
+        .into_response();
+    }
+    if let Err(response) = authenticate_agent(
+        &state,
+        &input.agent_id,
+        &input.instance_id,
+        client_identity.as_ref().map(|identity| &identity.0),
+    )
+    .await
+    {
+        return response;
+    }
+
+    if let Some(applied) = input.applied.as_ref() {
+        let row = StoredDiscoverySnapshotSetting {
+            scope: DISCOVERY_SNAPSHOT_SCOPE_APPLIED.to_string(),
+            agent_id: input.agent_id.clone(),
+            enabled: applied.enabled,
+            interval_seconds: applied
+                .interval_seconds
+                .max(DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS),
+            source: applied.source.clone(),
+            updated_by: String::new(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Err(err) = state.store.upsert_discovery_snapshot_applied(&row).await {
+            // 只影响管理面的「实际生效」展示，不影响本次下发。
+            log::warn!("failed to record applied discovery snapshot state: {err}");
+        }
+    }
+
+    match effective_discovery_snapshot(&state, &input.agent_id).await {
+        Ok(Some(setting)) => {
+            let source = if setting.scope == DISCOVERY_SNAPSHOT_SCOPE_AGENT {
+                GRANT_SOURCE_AGENT
+            } else {
+                GRANT_SOURCE_GLOBAL
+            };
+            Json(DiscoverySnapshotGrant {
+                enabled: setting.enabled,
+                interval_seconds: setting
+                    .interval_seconds
+                    .max(DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS),
+                source: source.to_string(),
+                granted_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .into_response()
+        }
+        // 「没有意见」：Agent 继续用本机配置。
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        // 读库失败不能按「没有设置」处理：那会让一台本该 1 小时一帧的机器悄悄变回本机值。
+        // 宁可不回（Agent 保留上一次的期望），也不要在读库失败时替它做决定。
+        Err(err) => ApiError::internal(
+            codes::DISCOVERY_SNAPSHOT_GRANT_BUILD_FAILED,
+            "failed to build discovery snapshot grant",
+            err,
+        )
+        .into_response(),
+    }
+}
+
+/// 解析某 Agent 的原文快照上送设置：**单机覆盖 > 全局**；两者都没有 = 没有意见（`None`）。
+///
+/// 与 `effective_agent_uplink` 的差别就在这里：上送地址是**部署级单例**，而快照周期要能
+/// 按机器不同（这正是本特性存在的理由），所以这里多一层单机覆盖。
+pub async fn effective_discovery_snapshot(
+    state: &ApiState,
+    agent_id: &str,
+) -> Result<Option<StoredDiscoverySnapshotSetting>, crate::infra::StoreError> {
+    let rows = state.store.list_discovery_snapshot_settings().await?;
+    let global = rows
+        .iter()
+        .find(|row| row.scope == DISCOVERY_SNAPSHOT_SCOPE_GLOBAL)
+        .cloned();
+    let per_agent = rows
+        .iter()
+        .find(|row| row.scope == DISCOVERY_SNAPSHOT_SCOPE_AGENT && row.agent_id == agent_id)
+        .cloned();
+    Ok(per_agent.or(global))
 }
 
 /// 组装某 Agent 的授权快照（下发与查看共用同一份口径）。

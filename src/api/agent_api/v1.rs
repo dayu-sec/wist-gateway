@@ -6,8 +6,9 @@
 use axum::routing::{MethodRouter, post};
 
 use super::super::agent_ops::{
-    ack_work, poll_agent_uplink, poll_control_commands, poll_discovery_policies, poll_work,
-    renew_agent_credential, report_action_result, submit_agent_status, submit_work_result,
+    ack_work, poll_agent_uplink, poll_control_commands, poll_discovery_policies,
+    poll_discovery_snapshot, poll_work, renew_agent_credential, report_action_result,
+    submit_agent_status, submit_work_result,
 };
 use super::super::enrollment::enroll_agent;
 use super::ApiState;
@@ -30,6 +31,9 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         // 都 `deny_unknown_fields`，加字段会让「新网关 + 旧 agentd」解析失败（舰队级停摆）。
         // 旧 agentd 不调它，新 agentd 遇旧网关得 404 后回落本机配置。
         ("/uplink:poll", post(poll_agent_uplink)),
+        // 原文快照上送的控制面设置（周期按机器不同）。独立端点的理由同上：
+        // 旧 agentd 从不调它；新 agentd 遇旧网关得 404，回落本机 `[discovery]`。
+        ("/discovery-snapshot:poll", post(poll_discovery_snapshot)),
         // 确认收到某份工作（常驻工作带生效版本）。
         ("/work:ack", post(ack_work)),
         // 一次性工作的执行结果（进度/终态）。与 ack 分开：确认回答「我收到了」，结果回答

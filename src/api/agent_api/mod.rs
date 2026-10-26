@@ -58,6 +58,7 @@ mod tests {
             "/control-commands:poll",
             "/action-results",
             "/discovery-policies:poll",
+            "/discovery-snapshot:poll",
             "/work:poll",
             "/uplink:poll",
             "/work:ack",

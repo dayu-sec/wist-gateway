@@ -23,6 +23,7 @@ use sqlx::sqlite::{
     SqliteRow, SqliteSynchronous,
 };
 use sqlx::{QueryBuilder, Row, Sqlite};
+use wist_api::status::command_outcome;
 use wist_error::StoreReason;
 
 use super::store::*;
@@ -75,6 +76,7 @@ const DELETE_AGENT_TABLES: &[(&str, &str)] = &[
         "delete agent software inventory",
     ),
     ("agent_work_result", "delete agent work result"),
+    ("agent_commands", "delete agent commands"),
     ("work_ack", "delete agent work ack"),
     ("one_shot_work", "delete agent one-shot work"),
     ("standing_work", "delete agent standing work"),
@@ -588,6 +590,22 @@ fn agent_install_package_address_from_row(
         address_id: column!(row, "address_id"),
         package_url: column!(row, "package_url"),
         package_sha256: column!(row, "package_sha256"),
+        updated_by: column!(row, "updated_by"),
+        updated_at: column!(row, "updated_at"),
+    })
+}
+
+fn discovery_snapshot_from_row(row: &SqliteRow) -> StoreResult<StoredDiscoverySnapshotSetting> {
+    // `enabled` 显式按 `i64` 读再判零：不依赖驱动对 bool ⇄ INTEGER 的隐式映射
+    // （与 `get_agent_uplink` 同一口径）。
+    let enabled: i64 = column!(row, "enabled");
+    let interval_seconds: i64 = column!(row, "interval_seconds");
+    Ok(StoredDiscoverySnapshotSetting {
+        scope: column!(row, "scope"),
+        agent_id: column!(row, "agent_id"),
+        enabled: enabled != 0,
+        interval_seconds: interval_seconds.max(0) as u64,
+        source: column!(row, "source"),
         updated_by: column!(row, "updated_by"),
         updated_at: column!(row, "updated_at"),
     })
@@ -1191,6 +1209,89 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(|err| sql_error(err, "upsert agent uplink"))?;
+        Ok(())
+    }
+
+    async fn list_discovery_snapshot_settings(
+        &self,
+    ) -> StoreResult<Vec<StoredDiscoverySnapshotSetting>> {
+        let rows = sqlx::query(
+            "SELECT scope, agent_id, enabled, interval_seconds, source, updated_by, updated_at \
+             FROM agent_discovery_snapshot ORDER BY scope, agent_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list discovery snapshot settings"))?;
+        rows.iter().map(discovery_snapshot_from_row).collect()
+    }
+
+    async fn upsert_discovery_snapshot_setting(
+        &self,
+        setting: &StoredDiscoverySnapshotSetting,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO agent_discovery_snapshot \
+               (scope, agent_id, enabled, interval_seconds, source, updated_by, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT (scope, agent_id) DO UPDATE SET enabled = excluded.enabled, \
+             interval_seconds = excluded.interval_seconds, source = excluded.source, \
+             updated_by = excluded.updated_by, updated_at = excluded.updated_at",
+        )
+        .bind(&setting.scope)
+        .bind(&setting.agent_id)
+        .bind(i64::from(setting.enabled))
+        .bind(setting.interval_seconds as i64)
+        .bind(&setting.source)
+        .bind(&setting.updated_by)
+        .bind(&setting.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert discovery snapshot setting"))?;
+        Ok(())
+    }
+
+    async fn delete_discovery_snapshot_setting(
+        &self,
+        scope: &str,
+        agent_id: &str,
+    ) -> StoreResult<()> {
+        sqlx::query("DELETE FROM agent_discovery_snapshot WHERE scope = ?1 AND agent_id = ?2")
+            .bind(scope)
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "delete discovery snapshot setting"))?;
+        Ok(())
+    }
+
+    async fn upsert_discovery_snapshot_applied(
+        &self,
+        setting: &StoredDiscoverySnapshotSetting,
+    ) -> StoreResult<()> {
+        // 值未变就不写：这条路径每轮 poll（≤30s）都会被调，无条件 upsert 会把
+        // 「一台机器一次心跳」放大成持续的写事务。`updated_at` 因此表示
+        // 「这个生效值自何时起就是它」——不是「最近一次上报时间」。
+        sqlx::query(
+            "INSERT INTO agent_discovery_snapshot \
+               (scope, agent_id, enabled, interval_seconds, source, updated_by, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT (scope, agent_id) DO UPDATE SET enabled = excluded.enabled, \
+             interval_seconds = excluded.interval_seconds, source = excluded.source, \
+             updated_at = excluded.updated_at \
+             WHERE agent_discovery_snapshot.enabled != excluded.enabled \
+                OR agent_discovery_snapshot.interval_seconds != excluded.interval_seconds \
+                OR agent_discovery_snapshot.source != excluded.source",
+        )
+        .bind(&setting.scope)
+        .bind(&setting.agent_id)
+        .bind(i64::from(setting.enabled))
+        .bind(setting.interval_seconds as i64)
+        .bind(&setting.source)
+        .bind(&setting.updated_by)
+        .bind(&setting.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert discovery snapshot applied"))?;
         Ok(())
     }
 
@@ -2253,6 +2354,136 @@ impl Store for SqliteStore {
         })
     }
 
+    async fn enqueue_agent_command(
+        &self,
+        command: &StoredAgentCommand,
+        replace_pending_same_kind: bool,
+    ) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin enqueue agent command"))?;
+        if replace_pending_same_kind {
+            // 同一个 kind 只保留最新一条未执行的：重复点击不该排出一串重采。
+            // `command_id <> ?6`：重复提交（同一个 id 重试）时不能把它自己标成 superseded ——
+            // 后面的 INSERT 是 `ON CONFLICT DO NOTHING`，一旦自己先被 superseded 就永远不会下发。
+            sqlx::query(
+                "UPDATE agent_commands SET acked_at = ?3, outcome = ?4, detail = ?5 \
+                 WHERE agent_id = ?1 AND kind = ?2 AND acked_at IS NULL AND command_id <> ?6",
+            )
+            .bind(&command.agent_id)
+            .bind(&command.kind)
+            .bind(now_rfc3339())
+            .bind(command_outcome::SUPERSEDED)
+            .bind("被同 kind 的新命令覆盖，未执行")
+            .bind(&command.command_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| sql_error(err, "supersede pending agent commands"))?;
+        }
+        sqlx::query(
+            "INSERT INTO agent_commands \
+             (command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL) \
+             ON CONFLICT (command_id) DO NOTHING",
+        )
+        .bind(&command.command_id)
+        .bind(&command.agent_id)
+        .bind(&command.kind)
+        .bind(&command.params)
+        .bind(command.requested_at_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "insert agent command"))?;
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit enqueue agent command"))?;
+        Ok(())
+    }
+
+    async fn list_pending_agent_commands(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredAgentCommand>> {
+        let rows = sqlx::query(
+            "SELECT command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail \
+             FROM agent_commands WHERE agent_id = ?1 AND acked_at IS NULL \
+             ORDER BY requested_at_ms ASC, command_id ASC LIMIT ?2",
+        )
+        .bind(agent_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select pending agent commands"))?;
+        rows.iter().map(agent_command_from_row).collect()
+    }
+
+    async fn expire_pending_agent_commands(
+        &self,
+        agent_id: &str,
+        requested_before_ms: i64,
+        expired_at: &str,
+    ) -> StoreResult<u64> {
+        let result = sqlx::query(
+            "UPDATE agent_commands SET acked_at = ?3, outcome = ?4, detail = ?5 \
+             WHERE agent_id = ?1 AND acked_at IS NULL AND requested_at_ms < ?2",
+        )
+        .bind(agent_id)
+        .bind(requested_before_ms)
+        .bind(expired_at)
+        .bind(command_outcome::EXPIRED)
+        .bind("超过待执行窗口，网关不再下发")
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "expire pending agent commands"))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn ack_agent_command(
+        &self,
+        agent_id: &str,
+        command_id: &str,
+        acked_at: &str,
+        outcome: &str,
+        detail: &str,
+    ) -> StoreResult<bool> {
+        // 条件更新：只认「仍属于该 Agent 且未确认」的那一条 —— 迟到/伪造的确认
+        // 不会改写已覆盖或被新命令替代的记录。
+        let result = sqlx::query(
+            "UPDATE agent_commands SET acked_at = ?3, outcome = ?4, detail = ?5 \
+             WHERE agent_id = ?1 AND command_id = ?2 AND acked_at IS NULL",
+        )
+        .bind(agent_id)
+        .bind(command_id)
+        .bind(acked_at)
+        .bind(outcome)
+        .bind(detail)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "ack agent command"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn get_latest_agent_command(
+        &self,
+        agent_id: &str,
+        kind: &str,
+    ) -> StoreResult<Option<StoredAgentCommand>> {
+        let row = sqlx::query(
+            "SELECT command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail \
+             FROM agent_commands WHERE agent_id = ?1 AND kind = ?2 \
+             ORDER BY requested_at_ms DESC, command_id DESC LIMIT 1",
+        )
+        .bind(agent_id)
+        .bind(kind)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select latest agent command"))?;
+        row.as_ref().map(agent_command_from_row).transpose()
+    }
+
     async fn save_standing_work(&self, work: &StandingWork) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO standing_work (work_id, agent_id, family, spec, catalog_version, \
@@ -2939,6 +3170,19 @@ fn fact_summary_from_row(row: &SqliteRow) -> StoreResult<StoredAgentFactSummary>
     })
 }
 
+fn agent_command_from_row(row: &SqliteRow) -> StoreResult<StoredAgentCommand> {
+    Ok(StoredAgentCommand {
+        command_id: column!(row, "command_id"),
+        agent_id: column!(row, "agent_id"),
+        kind: column!(row, "kind"),
+        params: column!(row, "params"),
+        requested_at_ms: column!(row, "requested_at_ms"),
+        acked_at: column!(row, "acked_at"),
+        outcome: column!(row, "outcome"),
+        detail: column!(row, "detail"),
+    })
+}
+
 fn classification_from_row(row: &SqliteRow) -> StoreResult<StoredAgentClassification> {
     Ok(StoredAgentClassification {
         agent_id: column!(row, "agent_id"),
@@ -3278,12 +3522,21 @@ mod tests {
         .execute(&store.pool)
         .await
         .expect("seed classification");
+        sqlx::query(
+            "INSERT INTO agent_commands \
+             (command_id, agent_id, kind, params, requested_at_ms) \
+             VALUES ('cmd-1', 'agent-del', 'refresh_facts', '', 1)",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("seed agent command");
 
         assert!(store.delete_agent("agent-del").await.expect("delete"));
 
         for table in [
             "agent_work_sequence",
             "agent_classification",
+            "agent_commands",
             "agent_instances",
             "agent_credentials",
         ] {
@@ -4277,6 +4530,182 @@ mod tests {
         assert!(!store.import_legacy_json(&legacy_path).await.unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn enqueues_acks_and_supersedes_agent_commands() {
+        let store = store().await;
+        assert!(
+            store
+                .list_pending_agent_commands("agent-a", 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let first = StoredAgentCommand {
+            command_id: "cmd-1".to_string(),
+            agent_id: "agent-a".to_string(),
+            kind: "refresh_facts".to_string(),
+            params: String::new(),
+            requested_at_ms: 1_700_000_000_000,
+            acked_at: None,
+            outcome: None,
+            detail: None,
+        };
+        store.enqueue_agent_command(&first, true).await.unwrap();
+        assert_eq!(
+            store
+                .list_pending_agent_commands("agent-a", 8)
+                .await
+                .unwrap(),
+            vec![first.clone()]
+        );
+
+        // 同一个 id 重提：不能把自己标成 superseded（INSERT 是 DO NOTHING，
+        // 一旦先被 superseded 就永远不会下发）。
+        store.enqueue_agent_command(&first, true).await.unwrap();
+        let pending = store
+            .list_pending_agent_commands("agent-a", 8)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].command_id, "cmd-1");
+        assert!(pending[0].acked_at.is_none());
+
+        // 确认是条件更新：同一 id 只生效一次，旧 id 不影响当前命令。
+        assert!(
+            store
+                .ack_agent_command("agent-a", "cmd-1", "t1", "succeeded", "ok")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .ack_agent_command("agent-a", "cmd-1", "t2", "failed", "late")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .ack_agent_command("agent-a", "cmd-old", "t2", "failed", "unknown")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_pending_agent_commands("agent-a", 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // 同 kind 覆盖：旧命令标成 superseded，只剩最新一条待下发。
+        let second = StoredAgentCommand {
+            command_id: "cmd-2".to_string(),
+            requested_at_ms: 1_700_000_000_100,
+            ..first.clone()
+        };
+        store.enqueue_agent_command(&second, true).await.unwrap();
+        let third = StoredAgentCommand {
+            command_id: "cmd-3".to_string(),
+            requested_at_ms: 1_700_000_000_200,
+            ..first.clone()
+        };
+        store.enqueue_agent_command(&third, true).await.unwrap();
+
+        let pending = store
+            .list_pending_agent_commands("agent-a", 8)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].command_id, "cmd-3");
+
+        let latest = store
+            .get_latest_agent_command("agent-a", "refresh_facts")
+            .await
+            .unwrap()
+            .expect("latest");
+        assert_eq!(latest.command_id, "cmd-3");
+        let superseded = store
+            .get_latest_agent_command("agent-a", "refresh_facts")
+            .await
+            .unwrap()
+            .expect("latest");
+        assert!(superseded.acked_at.is_none(), "最新一条仍是待执行");
+    }
+
+    #[tokio::test]
+    async fn expires_pending_agent_commands_outside_the_window() {
+        let store = store().await;
+        let base = StoredAgentCommand {
+            command_id: "cmd-old".to_string(),
+            agent_id: "agent-a".to_string(),
+            kind: "refresh_facts".to_string(),
+            params: String::new(),
+            requested_at_ms: 1_700_000_000_000,
+            acked_at: None,
+            outcome: None,
+            detail: None,
+        };
+        store.enqueue_agent_command(&base, false).await.unwrap();
+        let fresh = StoredAgentCommand {
+            command_id: "cmd-fresh".to_string(),
+            requested_at_ms: 1_700_000_900_000,
+            ..base.clone()
+        };
+        store.enqueue_agent_command(&fresh, false).await.unwrap();
+        // 另一台 Agent 的同龄旧命令不能被别人的一次收口带走。
+        let other = StoredAgentCommand {
+            command_id: "cmd-other".to_string(),
+            agent_id: "agent-b".to_string(),
+            ..base.clone()
+        };
+        store.enqueue_agent_command(&other, false).await.unwrap();
+
+        let expired = store
+            .expire_pending_agent_commands("agent-a", 1_700_000_500_000, "2026-10-26T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(expired, 1);
+
+        let pending = store
+            .list_pending_agent_commands("agent-a", 8)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].command_id, "cmd-fresh");
+        // 被收口的那条已经终结：迟到的 agent 确认不能再改写它。
+        assert!(
+            !store
+                .ack_agent_command("agent-a", "cmd-old", "t2", "succeeded", "late")
+                .await
+                .unwrap()
+        );
+        let latest = store
+            .get_latest_agent_command("agent-a", "refresh_facts")
+            .await
+            .unwrap()
+            .expect("latest");
+        assert_eq!(latest.command_id, "cmd-fresh");
+        assert!(latest.acked_at.is_none());
+
+        assert_eq!(
+            store
+                .list_pending_agent_commands("agent-b", 8)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // 幂等：已收口的不再计数。
+        assert_eq!(
+            store
+                .expire_pending_agent_commands("agent-a", 1_700_000_500_000, "t2")
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

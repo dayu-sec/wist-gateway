@@ -15,11 +15,13 @@ use crate::app::work as work_rules;
 use crate::app::work::WorkRejection;
 use crate::infra::{
     AgentQuery, DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID, DEFAULT_AGENT_UPLINK_PORT,
-    DEFAULT_AGENT_UPLINK_SETTING_ID, StoredAgentAdvertiseUrl, StoredAgentClassification,
-    StoredAgentFactSummary, StoredAgentInstallPackage, StoredAgentInstallPackageAddress,
-    StoredAgentRevocation, StoredAgentUplinkAddress, StoredOneShotWork, StoredPurposeSuggestion,
-    StoredWorkAck, StoredWorkResult, contains_shell_metacharacters, effective_standing,
-    outstanding_one_shot,
+    DEFAULT_AGENT_UPLINK_SETTING_ID, DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS,
+    DISCOVERY_SNAPSHOT_SCOPE_AGENT, DISCOVERY_SNAPSHOT_SCOPE_APPLIED,
+    DISCOVERY_SNAPSHOT_SCOPE_GLOBAL, StoredAgentAdvertiseUrl, StoredAgentClassification,
+    StoredAgentCommand, StoredAgentFactSummary, StoredAgentInstallPackage,
+    StoredAgentInstallPackageAddress, StoredAgentRevocation, StoredAgentUplinkAddress,
+    StoredDiscoverySnapshotSetting, StoredOneShotWork, StoredPurposeSuggestion, StoredWorkAck,
+    StoredWorkResult, contains_shell_metacharacters, effective_standing, outstanding_one_shot,
 };
 use wist_contracts::work::{OneShotWork, StandingWork, WorkKind, WorkReceipt};
 
@@ -619,6 +621,141 @@ pub async fn classify_agent(
         .into_response();
     }
     Json(classification).into_response()
+}
+
+/// 管理面视图：某台 Agent 的最近一条命令（当前用于 `refresh_facts`）。
+#[derive(Debug, Serialize)]
+pub struct AgentCommandResponse {
+    agent_id: String,
+    command_id: Option<String>,
+    kind: Option<String>,
+    /// RFC3339（展示用）：由 `requested_at_ms` 渲染。
+    requested_at: Option<String>,
+    /// agent 回传结果的时刻；`None` = 还没被认领。
+    acknowledged_at: Option<String>,
+    /// 见 `wist_api::status::command_outcome`（网关侧含 `superseded`）。
+    outcome: Option<String>,
+    detail: Option<String>,
+}
+
+fn agent_command_response(
+    agent_id: &str,
+    command: Option<StoredAgentCommand>,
+) -> AgentCommandResponse {
+    match command {
+        Some(command) => AgentCommandResponse {
+            agent_id: agent_id.to_string(),
+            command_id: Some(command.command_id),
+            kind: Some(command.kind),
+            requested_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                command.requested_at_ms,
+            )
+            .map(|at| at.to_rfc3339()),
+            acknowledged_at: command.acked_at,
+            outcome: command.outcome,
+            detail: command.detail,
+        },
+        None => AgentCommandResponse {
+            agent_id: agent_id.to_string(),
+            command_id: None,
+            kind: None,
+            requested_at: None,
+            acknowledged_at: None,
+            outcome: None,
+            detail: None,
+        },
+    }
+}
+
+/// 查看某台 Agent 最近一次「重采 + 重报」命令（管理面按钮的轮询）。
+///
+/// 读之前先扫一遍过期：状态上报里也有同样的收口，但那只发生在「这台机器还在上报」时。
+/// 一台长期离线 / 旧 agent 的命令不在这里收口，就会在页面上永远显示「等待认领」——
+/// 运维看到的是一个停不下来的状态，而不是「下不去了」。
+pub async fn view_agent_fact_refresh(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    let now = chrono::Utc::now();
+    if let Err(err) = state
+        .store
+        .expire_pending_agent_commands(
+            &agent_id,
+            now.timestamp_millis() - super::agent_ops::PENDING_COMMAND_TTL_MS,
+            &now.to_rfc3339(),
+        )
+        .await
+    {
+        // 收口失败不能把「查看」变成 500：页面还能显示已确认的结果。
+        log::warn!(
+            "event=AgentCommandExpireFailed agent_id={} detail=\"{err}\"",
+            agent_id
+        );
+    }
+    match state
+        .store
+        .get_latest_agent_command(&agent_id, wist_api::status::command_kind::REFRESH_FACTS)
+        .await
+    {
+        Ok(command) => Json(agent_command_response(&agent_id, command)).into_response(),
+        Err(err) => ApiError::internal(
+            codes::AGENT_COMMAND_LOAD_FAILED,
+            "failed to load agent command",
+            err,
+        )
+        .into_response(),
+    }
+}
+
+/// 发起一次「重采 + 重报」。
+///
+/// 命令不直接推下去：agent 没有入站监听面，它在**下一个状态上报的回执**里认领
+/// （`AgentStatusAck.commands`，上报间隔 3s）；认领后在本地全量重采并立即上报事实。
+/// 重复发起会覆盖上一条未执行的同 kind 命令（`superseded`）。
+pub async fn request_agent_fact_refresh(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    let now = chrono::Utc::now();
+    let requested_at_ms = now.timestamp_millis();
+    // 用微秒做 id：同一毫秒内的两次提交也不能撞成一个 id（撞了会被 `DO NOTHING` 吞掉）。
+    let command = StoredAgentCommand {
+        command_id: format!("cmd_{}_refresh_{}", agent_id, now.timestamp_micros()),
+        agent_id: agent_id.clone(),
+        kind: wist_api::status::command_kind::REFRESH_FACTS.to_string(),
+        params: String::new(),
+        requested_at_ms,
+        acked_at: None,
+        outcome: None,
+        detail: None,
+    };
+    match state.store.enqueue_agent_command(&command, true).await {
+        Ok(()) => Json(agent_command_response(&agent_id, Some(command))).into_response(),
+        Err(err) => ApiError::internal(
+            codes::AGENT_COMMAND_STORE_FAILED,
+            "failed to enqueue agent command",
+            err,
+        )
+        .into_response(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2413,6 +2550,300 @@ pub async fn view_discovery_policies(
         })
         .into_response(),
     }
+}
+
+/// 查看原文快照（DSNAP）上送的设置：全局默认 + 各 Agent 的单机覆盖 + 实际生效值。
+///
+/// 一次拉全表、不分页：这一屏要看的是「哪些机器与全局不一致」，漏一页就是漏一批机器
+/// （与 [`view_discovery_policies`] 同一取舍）。
+pub async fn view_discovery_snapshot(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let settings = match state.store.list_discovery_snapshot_settings().await {
+        Ok(rows) => rows,
+        Err(err) => {
+            return ApiError::internal(
+                codes::DISCOVERY_SNAPSHOT_STORE_FAILED,
+                "failed to load discovery snapshot settings",
+                err,
+            )
+            .into_response();
+        }
+    };
+    // 机器列表从 `agents` 取（注册过就有一行），不依赖设置表 —— 一台都没设置过时
+    // 页面仍然要能把「所有机器都在用本机配置」这件事列出来。
+    let registered = match state.store.list_agents(&AgentQuery::default()).await {
+        Ok(agents) => agents,
+        Err(err) => {
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
+            )
+            .into_response();
+        }
+    };
+
+    let global = settings
+        .iter()
+        .find(|row| row.scope == DISCOVERY_SNAPSHOT_SCOPE_GLOBAL)
+        .map(setting_view);
+
+    let mut agent_ids: Vec<String> = registered
+        .iter()
+        .map(|agent| agent.agent_id.clone())
+        .collect();
+    // Agent 可能已从 `agents` 里消失（吊销/清理）但设置行/生效行还在：一并列出，否则
+    // 「删不掉的旧覆盖」在页面上根本看不见。
+    for row in &settings {
+        if row.scope != DISCOVERY_SNAPSHOT_SCOPE_GLOBAL && !agent_ids.contains(&row.agent_id) {
+            agent_ids.push(row.agent_id.clone());
+        }
+    }
+    agent_ids.sort();
+    agent_ids.dedup();
+
+    let agents = agent_ids
+        .into_iter()
+        .map(|agent_id| {
+            let override_setting = settings
+                .iter()
+                .find(|row| row.scope == DISCOVERY_SNAPSHOT_SCOPE_AGENT && row.agent_id == agent_id)
+                .map(setting_view);
+            let applied = settings
+                .iter()
+                .find(|row| {
+                    row.scope == DISCOVERY_SNAPSHOT_SCOPE_APPLIED && row.agent_id == agent_id
+                })
+                .map(|row| DiscoverySnapshotAppliedView {
+                    enabled: row.enabled,
+                    interval_seconds: row.interval_seconds,
+                    source: row.source.clone(),
+                    // `updated_at` 是「这个生效值自何时起就是它」（值未变不写库）。
+                    since: row.updated_at.clone(),
+                });
+            DiscoverySnapshotAgentView {
+                agent_id,
+                override_setting,
+                applied,
+            }
+        })
+        .collect();
+
+    Json(DiscoverySnapshotView {
+        global,
+        agents,
+        min_interval_seconds: DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS,
+        generated_at: DateTime::now(),
+    })
+    .into_response()
+}
+
+/// 设置**全局**的原文快照上送（本网关所有 Agent 的默认）。
+///
+/// 对已在网的 Agent **立即生效**（下一个 poll ≤ 30s）—— 与上送地址同一个运行期语义，
+/// 不需要重装或重启。
+pub async fn set_discovery_snapshot_global(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Json(input): Json<SetDiscoverySnapshotRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let row = match discovery_snapshot_setting_row(DISCOVERY_SNAPSHOT_SCOPE_GLOBAL, "", &input) {
+        Ok(row) => row,
+        Err(message) => {
+            return ApiError::bad_request(codes::DISCOVERY_SNAPSHOT_INVALID, message)
+                .into_response();
+        }
+    };
+    match state.store.upsert_discovery_snapshot_setting(&row).await {
+        Ok(()) => Json(setting_view(&row)).into_response(),
+        Err(err) => ApiError::internal(
+            codes::DISCOVERY_SNAPSHOT_STORE_FAILED,
+            "failed to store discovery snapshot setting",
+            err,
+        )
+        .into_response(),
+    }
+}
+
+/// 清除全局设置：之后网关对该项**不再下发**（Agent 回落本机 `[discovery]`）。
+pub async fn clear_discovery_snapshot_global(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    match state
+        .store
+        .delete_discovery_snapshot_setting(DISCOVERY_SNAPSHOT_SCOPE_GLOBAL, "")
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => ApiError::internal(
+            codes::DISCOVERY_SNAPSHOT_STORE_FAILED,
+            "failed to clear discovery snapshot setting",
+            err,
+        )
+        .into_response(),
+    }
+}
+
+/// 设置**单台** Agent 的覆盖值（优先于全局）。
+pub async fn set_agent_discovery_snapshot(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Path(agent_id): Path<String>,
+    Json(input): Json<SetDiscoverySnapshotRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if agent_id.trim().is_empty() {
+        return ApiError::bad_request(
+            codes::DISCOVERY_SNAPSHOT_INVALID,
+            "agent_id must not be empty",
+        )
+        .into_response();
+    }
+    let row =
+        match discovery_snapshot_setting_row(DISCOVERY_SNAPSHOT_SCOPE_AGENT, &agent_id, &input) {
+            Ok(row) => row,
+            Err(message) => {
+                return ApiError::bad_request(codes::DISCOVERY_SNAPSHOT_INVALID, message)
+                    .into_response();
+            }
+        };
+    match state.store.upsert_discovery_snapshot_setting(&row).await {
+        Ok(()) => Json(setting_view(&row)).into_response(),
+        Err(err) => ApiError::internal(
+            codes::DISCOVERY_SNAPSHOT_STORE_FAILED,
+            "failed to store discovery snapshot setting",
+            err,
+        )
+        .into_response(),
+    }
+}
+
+/// 清除单台 Agent 的覆盖：回落到全局设置（没有全局则回落本机配置）。
+pub async fn clear_agent_discovery_snapshot(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Path(agent_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    match state
+        .store
+        .delete_discovery_snapshot_setting(DISCOVERY_SNAPSHOT_SCOPE_AGENT, &agent_id)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => ApiError::internal(
+            codes::DISCOVERY_SNAPSHOT_STORE_FAILED,
+            "failed to clear discovery snapshot override",
+            err,
+        )
+        .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetDiscoverySnapshotRequest {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscoverySnapshotSettingView {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub updated_by: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscoverySnapshotAppliedView {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    /// `control_plane` / `local_config`
+    pub source: String,
+    /// 这个生效值自何时起就是它（值未变不刷库，所以不是「最近一次上报」。）
+    pub since: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscoverySnapshotAgentView {
+    pub agent_id: String,
+    /// `null` = 没有单机覆盖，继承全局（全局也没有则用本机配置）。
+    pub override_setting: Option<DiscoverySnapshotSettingView>,
+    /// `null` = 这台 Agent 还没回传过生效值（旧 agentd / 未入网 / 还没 poll）。
+    pub applied: Option<DiscoverySnapshotAppliedView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscoverySnapshotView {
+    pub global: Option<DiscoverySnapshotSettingView>,
+    pub agents: Vec<DiscoverySnapshotAgentView>,
+    /// 下限（秒）：页面用它校验输入，与 agentd 侧的夹取同值。
+    pub min_interval_seconds: u64,
+    pub generated_at: DateTime,
+}
+
+fn setting_view(row: &StoredDiscoverySnapshotSetting) -> DiscoverySnapshotSettingView {
+    DiscoverySnapshotSettingView {
+        enabled: row.enabled,
+        interval_seconds: row
+            .interval_seconds
+            .max(DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS),
+        updated_by: row.updated_by.clone(),
+        updated_at: row.updated_at.clone(),
+    }
+}
+
+/// 校验并组装一行设置（两侧共用：输入不合规一律 400，不做「猜一个值」）。
+fn discovery_snapshot_setting_row(
+    scope: &str,
+    agent_id: &str,
+    input: &SetDiscoverySnapshotRequest,
+) -> Result<StoredDiscoverySnapshotSetting, String> {
+    if input.interval_seconds < DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS {
+        return Err(format!(
+            "interval_seconds must be >= {DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS}"
+        ));
+    }
+    Ok(StoredDiscoverySnapshotSetting {
+        scope: scope.to_string(),
+        agent_id: agent_id.to_string(),
+        enabled: input.enabled,
+        interval_seconds: input.interval_seconds,
+        source: String::new(),
+        updated_by: input
+            .requested_by
+            .clone()
+            .unwrap_or_else(|| "platform-maintenance-engineer".to_string()),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    })
 }
 
 /// 查看当前生效的 Agent 数据面上送地址。

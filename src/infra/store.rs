@@ -245,6 +245,33 @@ pub struct StoredAgentUplinkAddress {
     pub updated_at: String,
 }
 
+/// 原文发现快照（DSNAP）上送的设置行 / Agent 自报的生效值（`0032_agent_discovery_snapshot.sql`）。
+///
+/// 同一张表三种 `scope`：`global`（本网关默认）、`agent`（单机覆盖）、`applied`（Agent 自报）。
+/// 优先级：`agent` > `global` > Agent 本机 `[discovery]` 配置（网关没有设置时不下发）。
+pub const DISCOVERY_SNAPSHOT_SCOPE_GLOBAL: &str = "global";
+pub const DISCOVERY_SNAPSHOT_SCOPE_AGENT: &str = "agent";
+pub const DISCOVERY_SNAPSHOT_SCOPE_APPLIED: &str = "applied";
+
+/// 上送周期下限（秒）。与 agentd 侧的 `DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECS` 同值：
+/// 一块全量快照（百 KB 级）不能因手滑配置打到秒级。两边都夹，是因为任一侧都可能被单独改。
+pub const DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS: u64 = 60;
+
+/// 原文快照上送的设置 / 生效值。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoredDiscoverySnapshotSetting {
+    /// `global` / `agent` / `applied`。
+    pub scope: String,
+    /// `global` 行为空串；`agent` / `applied` 行为 agent_id。
+    pub agent_id: String,
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    /// `applied` 行专用：`control_plane` / `local_config`。设置行为空串。
+    pub source: String,
+    pub updated_by: String,
+    pub updated_at: String,
+}
+
 /// 网关侧「gwlinkd 状态」：host 侧 gwlinkd **周期心跳**推来、网关 Web 读展示。
 ///
 /// gwlinkd 纯出站（无入站面），页面拉不到它，所以状态只能由它推。载荷**无密钥**（admin 可原样回显）。
@@ -580,6 +607,27 @@ pub struct PurposeCoverageCounts {
     pub classified_agents: i64,
     /// `(machine_class, agent_count)`，按类别名排序。
     pub by_class: Vec<(String, i64)>,
+}
+
+/// 网关主动发起的「重采 + 重报」命令（一台一条，覆盖式）。
+///
+/// 与工作授权分开：它不改采集范围，只让 agent **执行一次动作**；也不进工作快照
+/// （那会让每台机器的期望状态多出一条与采集无关的记录）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredAgentCommand {
+    pub command_id: String,
+    pub agent_id: String,
+    /// 命令词表（`wist_api::status::command_kind`）。
+    pub kind: String,
+    /// 命令参数（JSON 文本；空 = 无参数）。
+    pub params: String,
+    /// 墙钟毫秒（与 [`wist_api::status::AgentCommand`] 同口径）。
+    pub requested_at_ms: i64,
+    /// agent 回传结果的时刻；`None` = 还没被认领。
+    pub acked_at: Option<String>,
+    /// 见 `wist_api::status::command_outcome`（网关侧另有 `superseded`）。
+    pub outcome: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// Agent 的工作确认回执（网关侧留痕，模型里没有对应元素）。
@@ -1099,6 +1147,33 @@ pub trait Store: Send + Sync + fmt::Debug {
     /// 写入/覆盖 Agent 数据面上送地址设置。
     async fn upsert_agent_uplink(&self, setting: &StoredAgentUplinkAddress) -> StoreResult<()>;
 
+    /// 列出原文快照上送的全部行（global / 单机覆盖 / applied 各一份来源）。
+    ///
+    /// 不分页：这一屏要看的是「哪些机器与全局不一致」，漏一页就是漏一批机器
+    /// （与 `view_discovery_policies` 同一取舍）。行数 = 机器数 × 2，量级可控。
+    async fn list_discovery_snapshot_settings(
+        &self,
+    ) -> StoreResult<Vec<StoredDiscoverySnapshotSetting>>;
+
+    /// 写入/覆盖一条**设置**行（`global` 或 `agent`）。
+    async fn upsert_discovery_snapshot_setting(
+        &self,
+        setting: &StoredDiscoverySnapshotSetting,
+    ) -> StoreResult<()>;
+
+    /// 删除一条**设置**行（清掉单机覆盖后回落到全局 / 本机配置）。
+    async fn delete_discovery_snapshot_setting(
+        &self,
+        scope: &str,
+        agent_id: &str,
+    ) -> StoreResult<()>;
+
+    /// 写入 Agent 自报的生效值；**值未变化时不写库**（每轮 poll 都会调，30s 一次）。
+    async fn upsert_discovery_snapshot_applied(
+        &self,
+        setting: &StoredDiscoverySnapshotSetting,
+    ) -> StoreResult<()>;
+
     /// 读取 gwlinkd 状态（最近一次心跳）；从未上报过返回 `None`。
     async fn get_gateway_linkd_status(&self) -> StoreResult<Option<StoredGatewayLinkdStatus>>;
 
@@ -1372,6 +1447,52 @@ pub trait Store: Send + Sync + fmt::Debug {
     async fn list_agent_ids(&self) -> StoreResult<Vec<String>>;
 
     async fn list_agent_instances(&self, agent_id: &str) -> StoreResult<Vec<StoredAgentInstance>>;
+
+    /// 入队一条命令；返回后它就在待下发集里（除非立刻被覆盖）。
+    ///
+    /// `replace_pending_same_kind = true` 时，同 `(agent, kind)` 的未确认命令会被标成
+    /// `superseded` —— 用于「重复点击只保留最后一次」的幂等命令（如重采）。
+    async fn enqueue_agent_command(
+        &self,
+        command: &StoredAgentCommand,
+        replace_pending_same_kind: bool,
+    ) -> StoreResult<()>;
+
+    /// 待下发（未确认）的命令，按 `requested_at_ms` 升序。
+    async fn list_pending_agent_commands(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredAgentCommand>>;
+
+    /// 把超过待执行窗口、仍未确认的命令标成 `expired`（不再下发）。
+    ///
+    /// 只靠 agent 侧 stale 不够：旧 agent 根本不解析回执，命令会每 3s 被重发一次、永不结束。
+    async fn expire_pending_agent_commands(
+        &self,
+        agent_id: &str,
+        requested_before_ms: i64,
+        expired_at: &str,
+    ) -> StoreResult<u64>;
+
+    /// 记录 agent 回传的执行结果；只在该 `command_id` 仍属于该 Agent 时生效。
+    ///
+    /// 返回 `false` = 命令已被覆盖 / 已确认过（正常竞态，不报错）。
+    async fn ack_agent_command(
+        &self,
+        agent_id: &str,
+        command_id: &str,
+        acked_at: &str,
+        outcome: &str,
+        detail: &str,
+    ) -> StoreResult<bool>;
+
+    /// 某类命令最近一条（管理面回显：执行结果 / 是否已确认）。
+    async fn get_latest_agent_command(
+        &self,
+        agent_id: &str,
+        kind: &str,
+    ) -> StoreResult<Option<StoredAgentCommand>>;
 
     /// 写入最近一次状态上报；返回 `false` 表示该 Agent 不存在（不再静默丢弃）。
     async fn record_agent_status(&self, update: &AgentStatusUpdate<'_>) -> StoreResult<bool>;
