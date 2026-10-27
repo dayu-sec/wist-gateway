@@ -3,6 +3,22 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.24.0-alpha] - 2026-10-28
+
+### 新增
+
+- **Agent 总览：最近上线 Agent 带 `hostname` / `ip_addresses`**：页面主标题用机器名、第二行用 IP，
+  `agent_id` 退为底部次级标识（排障 / 日志关联用）。旧 agentd 不报网卡地址时为空，
+  前端回落 `agentId`。
+
+### 修复
+
+- 同 0.23.1-alpha：日志接入兼容当前模型的字段名（`agent` / `ts` / `log_type` 别名）与可选 `raw`。
+
+### 配套
+
+- 页面：`wist-gateway-web v0.19.0-alpha`（与本版的 hostname / IP 卡片配套）。
+
 ## [0.23.1-alpha] - 2026-10-28
 
 ### 修复
