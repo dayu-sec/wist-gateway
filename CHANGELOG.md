@@ -3,6 +3,36 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.23.0-alpha] - 2026-10-27
+
+### 新增（日志源动态定位：服务装在非标准目录也能采到）
+
+- **日志源候选**：agentd 上报「本机看到的数据库实例 → 它的日志目录」，网关逐条校验后落库
+  （新端点 `POST /api/v1/agent/log-sources`，新表 `agent_log_source`）。
+  支持多实例、容器（`/proc/<pid>/root` → 宿主可见路径），以及「看得见实例但找不到目录」的占位 ——
+  预检因此能说「2 个实例，其中 1 个未定位」。
+- **人工覆盖（仅 API，不做界面）**：`GET/PUT/DELETE /api/v1/admin/agents/{id}/log-sources`。
+  写入时校验 `allowed_source_roots`（人也不能越权）；删除即回落到解析值；覆盖与解析值并存。
+- **受限搜索的生效范围下发**：`POST /api/v1/agent/source-search-policy:poll`。
+  生效值 = 知识库 `[[units]] search_roots` ∩ `[collection] allowed_source_roots`（在网关算好，
+  被裁掉的留一行日志）。agentd 侧没有配置，拿不到就不搜索。
+- **最低 agentd 版本**：知识库可声明包级 / 单元级 `min_agentd_version`（取高者）。不达标的机器
+  预检给 `agent_too_old`（「需要 ≥ X（当前 Y），升级后自动恢复」）、授权被拒；**已在跑的工作不自动停**。
+- **采集面视图**：`GET /api/v1/admin/content` 的单元增加 `search_roots` 与 `min_agentd_version`。
+
+### 变更（预检状态更诚实）
+
+- 新增面状态 `source_unresolved`（服务在、找不到日志目录）与 `agent_too_old`（agentd 太旧），
+  与原有的「本机没有」分开报 —— 三者处置完全不同（配覆盖 / 升级 / 换机器）。
+- `absent` 的文案不再断言「这台机器没有」，改为「目录约定的位置没有（服务可能装在非标准目录）」。
+
+### 升级注意
+
+- 新表由迁移 `0035_agent_log_source.sql` 自动建。
+- 知识库里的 `search_roots` / `min_agentd_version` 是**新字段**：**网关必须先升级**，
+  否则旧网关会拒绝加载整份知识包。
+- 新状态值需要配套 `wist-gateway-web >= 0.18.0`（页面遇到未知枚举值会整页报错）。
+
 ## [0.22.0-alpha] - 2026-10-26
 
 ### 新增（采集预检：为什么这台机器授权不了）

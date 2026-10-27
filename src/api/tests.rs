@@ -6516,6 +6516,16 @@ async fn install_package_set_rejects_unfetchable_source() {
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // 失败正文要能直接看懂：「哪个平台、哪个来源、为什么」。
+    // 这条消息会被 gwlinkd 原样摆进中心的任务日志，只写一句
+    // `failed to fetch agent install package from source` 等于什么都没说。
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8 body");
+    assert!(
+        body.contains("install_package_source_unavailable"),
+        "{body}"
+    );
+    assert!(body.contains(TEST_PLATFORM), "要带平台：{body}");
+    assert!(body.contains("gone"), "要带来源：{body}");
     assert!(
         env.store
             .get_agent_install_package(TEST_PLATFORM)
@@ -8693,6 +8703,7 @@ impl TestEnv {
             tls_key_file: root.join("admin-tls.key.pem"),
             admin_api_token_hash: sha256_hex(TEST_ADMIN_API_TOKEN),
             self_face_allow: Vec::new(),
+            allowed_source_roots: crate::infra::config::default_allowed_source_roots(),
             bootstrap_token_ttl_seconds: 900,
             credential_ttl_seconds: 30 * 24 * 60 * 60,
             store_file,
@@ -14865,4 +14876,750 @@ async fn a_pending_full_refresh_is_not_replaced_by_a_path_probe() {
         .expect("list commands");
     assert_eq!(pending.len(), 1, "整轮重采不能被顶成两条：{pending:?}");
     assert_eq!(pending[0].params, "", "留在队列里的应该是那条整轮重采");
+}
+
+// ── L1：日志源人工覆盖（仅 API） ─────────────────────────────────────────────
+
+/// 管理面请求（任意方法）：GET 无 body，PUT/DELETE 按需带 JSON。
+async fn send_admin(
+    env: &TestEnv,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> Response {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"));
+    let request = match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request"),
+        None => {
+            builder = builder.header("content-type", "application/json");
+            builder.body(Body::empty()).expect("request")
+        }
+    };
+    router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(request)
+        .await
+        .expect("route response")
+}
+
+#[tokio::test]
+async fn a_log_source_override_is_stored_listed_and_deleted() {
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let uri = "/api/v1/admin/agents/agent-node-a/log-sources";
+
+    // 多实例：两条覆盖各自落在自己的实例上。
+    for (source_ref, dir) in [
+        ("port:5432", "/data/pg1/log"),
+        ("port:5433", "/data/pg2/log"),
+    ] {
+        let response = send_admin(
+            &env,
+            "PUT",
+            &format!("{uri}/postgresql"),
+            Some(serde_json::json!({ "source_ref": source_ref, "dir": dir })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = send_admin(&env, "GET", uri, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    let sources = view["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 2, "{view}");
+    assert!(
+        sources
+            .iter()
+            .all(|source| source["origin"] == "override" && source["evidence"] == "human"),
+        "{view}"
+    );
+    // roots 一并返回：人填之前就能看到允许的范围。
+    assert!(view["allowed_source_roots"].as_array().is_some(), "{view}");
+
+    // 删一个实例：另一条不受影响。
+    let response = send_admin(&env, "DELETE", &format!("{uri}/postgresql/port:5432"), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send_admin(&env, "GET", uri, None).await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["sources"].as_array().map(Vec::len), Some(1), "{view}");
+    assert_eq!(view["sources"][0]["source_ref"], "port:5433");
+
+    // 删服务级：全清。
+    let response = send_admin(&env, "DELETE", &format!("{uri}/postgresql"), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send_admin(&env, "GET", uri, None).await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["sources"].as_array().map(Vec::len), Some(0), "{view}");
+}
+
+#[tokio::test]
+async fn a_log_source_override_outside_roots_is_rejected() {
+    // 人是好意也不行：roots 是**策略**，要放开就改网关配置（策略级变更 + 留痕）。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let response = send_admin(
+        &env,
+        "PUT",
+        "/api/v1/admin/agents/agent-node-a/log-sources/postgresql",
+        Some(serde_json::json!({ "source_ref": "port:5432", "dir": "/etc/pg/log" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "log_source_invalid", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("allowed_source_roots")),
+        "{body}"
+    );
+
+    let response = send_admin(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/log-sources",
+        None,
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["sources"].as_array().map(Vec::len), Some(0), "{view}");
+}
+
+#[tokio::test]
+async fn a_log_source_override_rejects_bad_service_or_source_ref() {
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let uri = "/api/v1/admin/agents/agent-node-a/log-sources";
+
+    let response = send_admin(
+        &env,
+        "PUT",
+        &format!("{uri}/postgres"),
+        Some(serde_json::json!({ "source_ref": "port:5432", "dir": "/data/pg/log" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = send_admin(
+        &env,
+        "PUT",
+        &format!("{uri}/postgresql"),
+        Some(serde_json::json!({ "source_ref": "5432", "dir": "/data/pg/log" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 相对路径 / 含 `..`：同样 400（不是“尽力修”）。
+    for dir in ["data/pg/log", "/data/../etc/pg"] {
+        let response = send_admin(
+            &env,
+            "PUT",
+            &format!("{uri}/postgresql"),
+            Some(serde_json::json!({ "source_ref": "port:5432", "dir": dir })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "dir={dir}");
+    }
+}
+
+/// agentd 上报日志源候选（agent 面入口）。
+async fn post_log_source_report(
+    env: &TestEnv,
+    identity: Option<&str>,
+    body: &serde_json::Value,
+) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/log-sources",
+        identity,
+        body,
+    )
+    .await
+}
+
+fn log_source_report(sources: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "api_version": "v1",
+        "kind": "log_sources",
+        "agent_id": "agent-node-a",
+        "instance_id": "node-a",
+        "observed_at": "2026-10-26T02:00:00Z",
+        "sources": sources,
+    })
+}
+
+#[tokio::test]
+async fn an_agent_log_source_report_replaces_auto_rows_but_keeps_overrides() {
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let admin_uri = "/api/v1/admin/agents/agent-node-a/log-sources";
+
+    // 人工覆盖：它是人的显式意图，agent 上报不能把它抹掉。
+    let response = send_admin(
+        &env,
+        "PUT",
+        &format!("{admin_uri}/postgresql"),
+        Some(serde_json::json!({ "source_ref": "port:5432", "dir": "/opt/pg/log" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 一条合法 + 一条不成立（相对路径）。不成立那条逐条丢弃，不拖垮整份报告。
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([
+            {
+                "service": "postgresql",
+                "source_ref": "port:5432",
+                "dir": "/data/pg/log",
+                "evidence": "cmdline_datadir",
+                "detail": "-D /data/pg",
+                "confidence": 90
+            },
+            {
+                "service": "mysql",
+                "source_ref": "port:3306",
+                "dir": "data/mysql",
+                "evidence": "cmdline_datadir"
+            }
+        ])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 1, "{ack}");
+    assert_eq!(ack["rejected"], 1, "{ack}");
+
+    let response = send_admin(&env, "GET", admin_uri, None).await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    let sources = view["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 2, "{view}");
+    // 覆盖在前（它赢），解析值在后 —— 两者并存，删覆盖即回落。
+    assert_eq!(sources[0]["origin"], "override");
+    assert_eq!(sources[0]["dir"], "/opt/pg/log");
+    assert_eq!(sources[1]["origin"], "agent");
+    assert_eq!(sources[1]["dir"], "/data/pg/log");
+
+    // 下一轮**什么都没解析到**：agent 行清空，覆盖仍在（覆盖不是「最后一轮解析结果」）。
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send_admin(&env, "GET", admin_uri, None).await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    let sources = view["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 1, "只该剩覆盖：{view}");
+    assert_eq!(sources[0]["origin"], "override");
+}
+
+#[tokio::test]
+async fn an_agent_cannot_claim_a_human_override() {
+    // `human` 是人工覆盖的标记：agent 自称它等于把「人指定」冒充成「机器解析」。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([{
+            "service": "postgresql",
+            "source_ref": "port:5432",
+            "dir": "/data/pg/log",
+            "evidence": "human"
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 0, "{ack}");
+    assert_eq!(ack["rejected"], 1, "{ack}");
+}
+
+#[tokio::test]
+async fn a_stale_log_source_report_is_ignored() {
+    // 替换语义下，一份乱序到达的旧报告会把新候选清成旧的 —— 只比 agent 自己的 observed_at。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let fresh = serde_json::json!([{
+        "service": "postgresql",
+        "source_ref": "port:5432",
+        "dir": "/data/pg/new-log",
+        "evidence": "cmdline_datadir"
+    }]);
+    let response =
+        post_log_source_report(&env, Some("agent-node-a"), &log_source_report(fresh)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut stale = log_source_report(serde_json::json!([{
+        "service": "postgresql",
+        "source_ref": "port:5432",
+        "dir": "/data/pg/old-log",
+        "evidence": "cmdline_datadir"
+    }]));
+    stale["observed_at"] = serde_json::json!("2026-10-26T01:00:00Z");
+    let response = post_log_source_report(&env, Some("agent-node-a"), &stale).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 0, "旧报告不该生效：{ack}");
+    assert_eq!(ack["rejected"], 0, "它不是坏数据，只是过期：{ack}");
+
+    let response = send_admin(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/log-sources",
+        None,
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["sources"][0]["dir"], "/data/pg/new-log", "{view}");
+}
+
+#[tokio::test]
+async fn a_log_source_report_with_too_many_entries_is_rejected() {
+    // 超量说明 agent 侧上限失灵：宁可让它重来，也别悄悄截断。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let entries: Vec<serde_json::Value> = (0..65)
+        .map(|index| {
+            serde_json::json!({
+                "service": "postgresql",
+                "source_ref": format!("pid:{}", index + 1),
+                "dir": format!("/data/pg{index}/log"),
+                "evidence": "cmdline_datadir"
+            })
+        })
+        .collect();
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::Value::Array(entries)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn an_unknown_evidence_is_rejected_per_entry() {
+    // 证据词表是「为什么认为是它」的唯一记法：拼错一个就该被点名，而不是当成功存下去。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([
+            {
+                "service": "postgresql",
+                "source_ref": "port:5432",
+                "dir": "/data/pg/log",
+                "evidence": "cmdline"          // 词表里是 cmdline_datadir
+            },
+            {
+                "service": "postgresql",
+                "source_ref": "port:5433",
+                "dir": "/data/pg2/log",
+                "evidence": "env_datadir"
+            }
+        ])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 1, "{ack}");
+    assert_eq!(ack["rejected"], 1, "{ack}");
+
+    let response = send_admin(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/log-sources",
+        None,
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    let sources = view["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 1, "{view}");
+    assert_eq!(sources[0]["source_ref"], "port:5433");
+}
+
+#[tokio::test]
+async fn reporting_the_same_set_twice_is_idempotent() {
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let report = log_source_report(serde_json::json!([{
+        "service": "postgresql",
+        "source_ref": "port:5432",
+        "dir": "/data/pg/log",
+        "evidence": "cmdline_datadir"
+    }]));
+    for _ in 0..2 {
+        let response = post_log_source_report(&env, Some("agent-node-a"), &report).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let ack: serde_json::Value = decode_json_response(response).await;
+        assert_eq!(ack["accepted"], 1, "{ack}");
+    }
+    let response = send_admin(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/log-sources",
+        None,
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["sources"].as_array().map(Vec::len), Some(1), "{view}");
+}
+
+// ── L2a：agentd 解析出的目录要真的进到 spec 里 ──────────────────────────────
+
+const PREFLIGHT_DB_CATALOG: &str = r#"
+catalog_version = 4
+
+[[units]]
+unit_id = "mac-metrics"
+family = "HostMetrics"
+capability = "collect_metrics"
+platform = "macos"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "none"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+
+[[units]]
+unit_id = "linux-db"
+family = "DatabaseService"
+capability = "collect_logs"
+platform = "linux"
+match = "any:port:5432|path_exists:/var/log/postgresql"
+rule_ref = ""
+requires_privilege = "root"
+status = "active"
+
+# 标准目录：解析不到时的兜底
+[[units.sources]]
+kind = "FileGlob"
+target = "/var/log/postgresql/*.csv"
+multiline = "postgres_csv"
+
+# 非标准目录：由 agentd 解析 / 人工覆盖得出
+[[units.sources]]
+kind = "FileGlob"
+from_dir = "log_source:postgresql"
+pattern = "*.csv"
+multiline = "postgres_csv"
+"#;
+
+const PREFLIGHT_DB_PACKS: &str = r#"
+[[pack]]
+pack_id = "macos-base"
+platform = "macos"
+kind = "Baseline"
+families = ["HostMetrics"]
+unit_refs = ["mac-metrics"]
+catalog_version = 4
+status = "active"
+
+[[pack]]
+pack_id = "linux-db"
+platform = "linux"
+kind = "Baseline"
+families = ["DatabaseService"]
+unit_refs = ["linux-db"]
+catalog_version = 4
+status = "active"
+"#;
+
+const PREFLIGHT_DB_TEMPLATES: &str = r#"
+[[template]]
+template_id = "macos-daily"
+machine_class = "MacDaily"
+platform = "macos"
+pack_refs = ["macos-base"]
+catalog_version = 4
+template_version = 1
+status = "active"
+
+[[template]]
+template_id = "linux-data"
+machine_class = "LinuxData"
+platform = "linux"
+pack_refs = ["linux-db"]
+catalog_version = 4
+template_version = 1
+status = "active"
+"#;
+
+impl TestEnv {
+    /// 数据库面的内容目录（`from_dir` 用例专用）。
+    async fn new_with_db_content() -> Self {
+        let mut env = Self::new().await;
+        let dir = env._root.join("content");
+        std::fs::create_dir_all(&dir).expect("create content dir");
+        let catalog = dir.join("catalog.toml");
+        std::fs::write(&catalog, PREFLIGHT_DB_CATALOG).expect("write catalog");
+        let packs = dir.join("packs.toml");
+        std::fs::write(&packs, PREFLIGHT_DB_PACKS).expect("write packs");
+        let templates = dir.join("templates.toml");
+        std::fs::write(&templates, PREFLIGHT_DB_TEMPLATES).expect("write templates");
+        env.config.content_catalog_file = Some(catalog);
+        env.config.content_packs_file = Some(packs);
+        env.config.content_templates_file = Some(templates);
+        env
+    }
+}
+
+#[tokio::test]
+async fn an_agent_resolved_log_dir_reaches_the_work_spec() {
+    // 端到端（去掉网络）：agent 上报 → 预检可授权 → 授权 → spec 里就是那个目录。
+    let env = TestEnv::new_with_db_content().await;
+    linux_agent_classified(&env, "LinuxData").await;
+    // 端口在听：`port:` 条件才判得出来（空 listen_ports = 没采，不是没开）。
+    let mut summary = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("load facts")
+        .expect("facts");
+    summary.listen_ports = vec!["tcp:5432".to_string()];
+    env.store
+        .upsert_agent_fact_summary(&summary)
+        .await
+        .expect("store facts");
+
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([{
+            "service": "postgresql",
+            "source_ref": "port:5432",
+            "dir": "/data/pg/log",
+            "evidence": "cmdline_datadir",
+            "detail": "-D /data/pg",
+            "confidence": 90
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["verdict"], "grantable", "{view}");
+    assert_eq!(view["families"][0]["state"], "grantable", "{view}");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "work_kind": "Standing",
+            "family": "DatabaseService",
+            "spec": ""
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let work = env
+        .store
+        .list_standing_work("agent-node-a")
+        .await
+        .expect("list standing work")
+        .into_iter()
+        .find(|work| work.family == "DatabaseService")
+        .expect("DatabaseService granted");
+    assert!(
+        work.spec.contains("/data/pg/log/*.csv"),
+        "解析出来的目录必须进 spec：{}",
+        work.spec
+    );
+}
+
+#[tokio::test]
+async fn without_a_resolved_log_dir_the_family_is_source_unresolved() {
+    // 现场原型：PG 在 5432 上监听，但 /var/log/postgresql 不存在、也没人配覆盖。
+    // 页面必须说「服务在、找不到日志」，而不是「这台机器没有数据库」。
+    let env = TestEnv::new_with_db_content().await;
+    linux_agent_classified(&env, "LinuxData").await;
+    let mut summary = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("load facts")
+        .expect("facts");
+    summary.listen_ports = vec!["tcp:5432".to_string()];
+    summary.probed_paths = vec!["/var/log/postgresql".to_string()];
+    summary.present_paths = Vec::new();
+    env.store
+        .upsert_agent_fact_summary(&summary)
+        .await
+        .expect("store facts");
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["verdict"], "blocked", "{view}");
+    assert_eq!(view["families"][0]["state"], "source_unresolved", "{view}");
+    assert_eq!(
+        view["families"][0]["units"][0]["result"], "source_not_resolved",
+        "{view}"
+    );
+    // 点名是哪个服务没找到 —— 否则人得从第一个服务开始猜。
+    assert_eq!(
+        view["families"][0]["units"][0]["unresolved_sources"][0], "postgresql",
+        "{view}"
+    );
+    let reason = view["families"][0]["reason"]
+        .as_str()
+        .expect("reason for non-grantable family");
+    assert!(reason.contains("postgresql"), "{reason}");
+
+    // 授权同样是 409，且文案里带得上原因（不会「预检说不行、授权说不清」）。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "work_kind": "Standing",
+            "family": "DatabaseService",
+            "spec": ""
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("source_not_resolved")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_family_reports_how_many_instances_it_saw_and_located() {
+    // 分母：agent 报 1 个已定位 + 1 个「看得见但没找到目录」→ 「2 个实例，其中 1 个未定位」。
+    let env = TestEnv::new_with_db_content().await;
+    linux_agent_classified(&env, "LinuxData").await;
+    let mut summary = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("load facts")
+        .expect("facts");
+    summary.listen_ports = vec!["tcp:5432".to_string(), "tcp:5433".to_string()];
+    env.store
+        .upsert_agent_fact_summary(&summary)
+        .await
+        .expect("store facts");
+
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([
+            {
+                "service": "postgresql",
+                "source_ref": "port:5432",
+                "dir": "/data/pg/log",
+                "evidence": "cmdline_datadir"
+            },
+            {
+                "service": "postgresql",
+                "source_ref": "port:5433",
+                "dir": "",
+                "evidence": "unresolved",
+                "detail": "-D /data/pg2"
+            }
+        ])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 2, "占位行也要入库（分母靠它）：{ack}");
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["families"][0]["state"], "grantable", "{view}");
+    assert_eq!(
+        view["families"][0]["instances"],
+        serde_json::json!({ "resolved": 1, "total": 2 }),
+        "{view}"
+    );
+    // 能授权、但没授全 —— 必须说出来，否则人以为两个实例都在采。
+    assert!(
+        view["families"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("1 个未定位")),
+        "{view}"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_directory_outside_roots_is_stored_but_never_collected() {
+    // 容器里的 PG 常把数据目录放在 named volume（`/var/lib/docker/volumes/...`）：
+    // 目录**找到了**，只是不在默认 roots 里。要能告诉人「放宽 roots」，而不是把它丢掉。
+    let env = TestEnv::new_with_db_content().await;
+    linux_agent_classified(&env, "LinuxData").await;
+    let mut summary = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("load facts")
+        .expect("facts");
+    summary.listen_ports = vec!["tcp:5432".to_string()];
+    summary.probed_paths = vec!["/var/log/postgresql".to_string()];
+    summary.present_paths = Vec::new();
+    env.store
+        .upsert_agent_fact_summary(&summary)
+        .await
+        .expect("store facts");
+
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([{
+            "service": "postgresql",
+            "source_ref": "port:5432",
+            "dir": "/var/lib/docker/volumes/pgdata/_data/log",
+            "evidence": "cmdline_datadir",
+            "detail": "-D /var/lib/postgresql/data（container a55a）"
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 1, "越界不是坏数据，要存下来：{ack}");
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["families"][0]["state"], "source_unresolved", "{view}");
+    assert_eq!(
+        view["families"][0]["instances"],
+        serde_json::json!({ "resolved": 0, "total": 1 }),
+        "分母含越界那个实例：{view}"
+    );
+    let reason = view["families"][0]["reason"]
+        .as_str()
+        .expect("reason for source_unresolved");
+    assert!(
+        reason.contains("allowed_source_roots"),
+        "要说清是 roots 的问题，不是没装库 / logging_collector：{reason}"
+    );
+    // 越界目录**绝不能**进 spec：授权必须 409（roots 过滤在求值时做）。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "DatabaseService", "spec": "" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }

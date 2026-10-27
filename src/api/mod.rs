@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 
 use crate::app::knowledge::LoadedKnowledge;
@@ -57,6 +57,18 @@ mod rollout_ops;
 // （admin bearer）两个入口。不在 jumo 静态模型 binding.mju 的声明里，重新生成控制面代码时
 // 需回补本模块与下方路由。见 api/preflight.rs 顶部说明。
 mod preflight;
+// NOTE(hand-added): 日志源候选的管理面 API（人工覆盖，**仅 API、不做界面**）。
+// 「服务在、但找不到日志」时的应急锚点：写入时校验 roots，删除即回落到解析值。
+// 见 api/log_sources.rs 与设计 `doc/design/edge/log-source-resolution.md` §6.2。
+mod log_sources;
+// NOTE(hand-added): agentd 上报**本机解析出来的**日志源候选（`POST /api/v1/agent/log-sources`）。
+// 独立端点而不是给已有报文加字段：两侧契约都是 `deny_unknown_fields`。
+// 见 api/agent_log_sources.rs 与设计 `doc/design/edge/log-source-resolution.md` §6.1。
+mod agent_log_sources;
+// NOTE(hand-added): L3 搜索根的下发（`POST /api/v1/agent/source-search-policy:poll`）。
+// 生效值 = 知识库 `[[units]] search_roots` ∩ `[collection] allowed_source_roots`；
+// agentd 侧不留配置，拿不到策略就不搜索。见 api/source_search_policy.rs 与设计 §6.1.1。
+mod source_search_policy;
 // NOTE(hand-added): 网关自述面（环回；CR-003）。对应 jumo 模型 Control.GatewayApp.SelfInterface
 // 的 QuerySelfState（模型 bind 未定、环回鉴权未决），故路由手加。供 host 侧 wist-gwlinkd 消费。
 mod self_state;
@@ -114,6 +126,9 @@ use install::{
 use knowledge_ops::{
     activate_knowledge_package, list_knowledge_packages, record_knowledge_package, view_knowledge,
     view_knowledge_locks, view_knowledge_package,
+};
+use log_sources::{
+    delete_agent_log_source, delete_agent_log_sources, list_agent_log_sources, put_agent_log_source,
 };
 use logs::{MAX_LOG_INGEST_BODY_BYTES, ingest_agent_logs, view_agent_logs};
 use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
@@ -414,6 +429,22 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agents/{agent_id}/collection-preflight",
             get(view_agent_preflight).post(run_agent_preflight),
+        )
+        // NOTE(hand-added): 日志源候选（见 api/log_sources.rs）。**仅 API、不做界面**：
+        //   * GET    列出全部候选（含覆盖，覆盖在前）；
+        //   * PUT    写一条人工覆盖（`dir` 必须在 allowed_source_roots 内，否则 400）；
+        //   * DELETE 删一条（回落到解析值）或删该服务全部。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/log-sources",
+            get(list_agent_log_sources),
+        )
+        .route(
+            "/api/v1/admin/agents/{agent_id}/log-sources/{service}",
+            put(put_agent_log_source).delete(delete_agent_log_sources),
+        )
+        .route(
+            "/api/v1/admin/agents/{agent_id}/log-sources/{service}/{source_ref}",
+            delete(delete_agent_log_source),
         )
         .route(
             "/api/v1/admin/agents/{agent_id}/host-metrics",

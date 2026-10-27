@@ -939,9 +939,10 @@ async fn grant_standing_work(
     let requested_spec = input.spec.trim();
     // D7：这台机器自报的日志能力。`None`（旧 agentd 没报）时**能力裁剪**仍走保守路径
     // （见 `materialize_spec` 里 `drop_if_contains` 的降级）。
-    let capabilities = match state.store.get_agent(agent_id).await {
-        Ok(Some(agent)) => agent.logs_capabilities,
-        Ok(None) => None,
+    // 同一行把 agentd 版本带出来：知识库可能声明「本单元要求 ≥ X」（包级与单元级取高者）。
+    let (capabilities, agent_version) = match state.store.get_agent(agent_id).await {
+        Ok(Some(agent)) => (agent.logs_capabilities, agent.version),
+        Ok(None) => (None, String::new()),
         Err(err) => {
             return ApiError::internal(
                 codes::AGENT_FACT_SUMMARY_UNAVAILABLE,
@@ -950,6 +951,23 @@ async fn grant_standing_work(
             )
             .into_response();
         }
+    };
+    // 日志源候选：与预检**同一份**输入（否则会出现「预检说可以、授权却拒绝」）。
+    let log_sources = match state.store.list_agent_log_sources(agent_id).await {
+        Ok(sources) => sources,
+        Err(err) => {
+            return ApiError::internal(
+                codes::STANDING_WORK_UNAVAILABLE,
+                "failed to load agent log sources",
+                err,
+            )
+            .into_response();
+        }
+    };
+    let source_context = crate::app::log_source::SourceContext {
+        log_sources: &log_sources,
+        roots: &state.config.allowed_source_roots,
+        agent_version: Some(agent_version.as_str()).filter(|value| !value.is_empty()),
     };
     let spec_result = if requested_spec.is_empty() {
         // 与预检**同一份**事实：摘要 + 路径维度被本机实测覆盖。两边不同源就会出现
@@ -981,6 +999,7 @@ async fn grant_standing_work(
             family,
             &facts,
             capabilities.as_ref(),
+            source_context,
         )
     } else {
         work_rules::validate_spec(
@@ -989,6 +1008,7 @@ async fn grant_standing_work(
             family,
             requested_spec,
             capabilities.as_ref(),
+            source_context,
         )
     };
     let (spec, catalog_version) = match spec_result {
@@ -2243,17 +2263,21 @@ pub(crate) async fn apply_agent_install_package(
         {
             Ok(cached) => cached,
             Err(err) => {
+                // 失败正文必须带**哪个平台、哪个来源、为什么**。
+                // 这条消息会被 gwlinkd 原样摆进中心的任务日志（`configs/gwlinkd/state/tasks/…`），
+                // 以前只写一句 `failed to fetch agent install package from source` ——
+                // 现场看到它既不知道是哪个 URL，也分不出是拒连、证书、还是 404。
                 let (status, code, message) = match &err {
                     PackageFetchError::DigestMismatch(_) => (
                         StatusCode::BAD_REQUEST,
                         codes::INSTALL_PACKAGE_DIGEST_MISMATCH,
-                        "package digest does not match the declared sha256",
+                        format!("agent install package for {platform}: {err}"),
                     ),
                     // 超限归「来源侧的问题」这一档（与「拿不到」同一回执，不改既有状态码）。
                     PackageFetchError::SourceUnavailable(_) | PackageFetchError::TooLarge(_) => (
                         StatusCode::BAD_GATEWAY,
                         codes::INSTALL_PACKAGE_SOURCE_UNAVAILABLE,
-                        "failed to fetch agent install package from source",
+                        format!("agent install package for {platform} ({package_url}): {err}"),
                     ),
                 };
                 return ApiError::internal_with(status, code, message, err).into_response();

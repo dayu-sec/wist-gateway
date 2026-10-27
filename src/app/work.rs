@@ -13,12 +13,11 @@
 
 use std::collections::BTreeSet;
 
-use crate::app::content::{ContentSet, UnitSource};
+use crate::app::content::ContentSet;
 use crate::infra::{StoredAgentFactSummary, StoredOneShotWork};
 use wist_contracts::capability_report::LogsCapabilities;
 use wist_contracts::work::{
     DROP_IF_CONTAINS_SUBSTRING, OneShotWork, WorkSpec, WorkSpecSource, WorkSpecUnit,
-    is_explicit_path,
 };
 
 /// 授权/撤回被拒的原因。映射成 HTTP 状态码是 api 层的事。
@@ -92,6 +91,7 @@ pub fn derive_spec(
     family: &str,
     facts: &StoredAgentFactSummary,
     capabilities: Option<&wist_contracts::capability_report::LogsCapabilities>,
+    log_sources: crate::app::log_source::SourceContext<'_>,
 ) -> Result<(String, i64), WorkRejection> {
     let Some(template) = content.template_for_machine_class(machine_class) else {
         return Err(WorkRejection::Conflict(format!(
@@ -105,7 +105,7 @@ pub fn derive_spec(
         )));
     }
     let expansion = content
-        .expand(&template.template_id, facts)
+        .expand(&template.template_id, facts, log_sources)
         .map_err(WorkRejection::Conflict)?;
     let Some(work) = expansion.works.iter().find(|work| work.family == family) else {
         // 展开里没有这个面：要么它没进模板，要么选中集为空（事实不满足 / 事实没采到）。
@@ -140,8 +140,14 @@ pub fn derive_spec(
         };
         return Err(WorkRejection::Conflict(detail));
     };
-    materialize_spec(content, &work.selected_units, Some(facts), capabilities)
-        .map(|spec| (spec, work.catalog_version))
+    materialize_spec(
+        content,
+        &work.selected_units,
+        Some(facts),
+        capabilities,
+        log_sources,
+    )
+    .map(|spec| (spec, work.catalog_version))
 }
 
 /// 容器过滤器的**减法维度**：缺能力时去掉该维度是安全的（只会多采，不会少采）。
@@ -182,9 +188,11 @@ fn materialize_spec(
     unit_ids: &[String],
     facts: Option<&StoredAgentFactSummary>,
     capabilities: Option<&wist_contracts::capability_report::LogsCapabilities>,
+    log_sources: crate::app::log_source::SourceContext<'_>,
 ) -> Result<String, WorkRejection> {
     let mut units = Vec::with_capacity(unit_ids.len());
     let mut absent: BTreeSet<String> = BTreeSet::new();
+    let mut unresolved: BTreeSet<String> = BTreeSet::new();
     let mut unsupported: BTreeSet<String> = BTreeSet::new();
     let mut degraded: BTreeSet<String> = BTreeSet::new();
     for unit_id in unit_ids {
@@ -195,12 +203,32 @@ fn materialize_spec(
                 "selected unit {unit_id:?} is not in the collection catalog"
             )));
         };
-        let mut sources = Vec::with_capacity(unit.sources.len());
-        for source in &unit.sources {
-            if source_is_absent_on_this_machine(source, facts) {
-                absent.insert(source.target.clone());
-                continue;
-            }
+        // 知识库声明的最低 agentd：**在这里也拦一道**。
+        //
+        // 为什么不能只靠 `expand`：手写 spec（`validate_spec`）**不走 expand** ——
+        // 少了这一步，运维显式点名一个单元就能绕过版本闸门，把旧 agent 接不了的来源派下去。
+        // `materialize_spec` 是两条路的**唯一汇合点**，所以闸门放在这里。
+        if let Some(required) = unit.min_agentd_version.as_deref()
+            && !crate::app::agent_version::meets_minimum(log_sources.agent_version, required)
+        {
+            // 只有“手写 spec 点名了一个过旧的单元”才会走到这里（展开路径已经先筛掉了），
+            // 所以这行不吵；但排障时它就是那个答案。
+            log::warn!(
+                "event=GrantAgentdTooOld unit={unit_id} required={required} current={}",
+                log_sources.agent_version.unwrap_or("unknown")
+            );
+            return Err(WorkRejection::Conflict(format!(
+                "unit {unit_id}: agent_too_old (需要 agentd ≥ {required}，当前 {})",
+                log_sources.agent_version.unwrap_or("未上报")
+            )));
+        }
+        // 与预检**同一份**判据（`expand` 里也是它）：字面值按实测裁掉不存在的，
+        // `from_dir` 按实例展开。两处各写一套，就会「预检说可以、授权却拒绝」。
+        let resolved = crate::app::log_source::resolve_unit_sources(unit, facts, log_sources);
+        absent.extend(resolved.absent.iter().cloned());
+        unresolved.extend(resolved.unresolved.iter().cloned());
+        let mut sources = Vec::with_capacity(resolved.sources.len());
+        for source in &resolved.sources {
             // 先拼成 wire 形态：能力判据看的就是**将要发出去的那条来源**
             // （字段一字不差，避免“按目录字段判、发出去却多带一个字段”）。
             let mut candidate = WorkSpecSource {
@@ -287,6 +315,13 @@ fn materialize_spec(
                 unsupported.into_iter().collect::<Vec<_>>().join("; ")
             ));
         }
+        if !unresolved.is_empty() {
+            reasons.push(format!(
+                "log source not resolved for [{}]（服务在，但找不到它的日志目录 —— \
+                 先配人工覆盖，或开受限搜索）",
+                unresolved.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
         if reasons.is_empty() {
             reasons.push("no source".to_string());
         }
@@ -325,27 +360,6 @@ fn declares_noise_filter(capabilities: Option<&LogsCapabilities>, mode: &str) ->
     capabilities.is_some_and(|caps| caps.drop_if_contains.iter().any(|value| value == mode))
 }
 
-/// 这条来源在这台机器上是否**已被探测且确认不存在**。
-///
-/// 只看显式文件路径：`没探测过 ≠ 不存在`（三态语义）；通配与导出器都不参与裁剪。
-fn source_is_absent_on_this_machine(
-    source: &UnitSource,
-    facts: Option<&StoredAgentFactSummary>,
-) -> bool {
-    let Some(facts) = facts else {
-        return false;
-    };
-    if source.kind != "FileGlob" || !is_explicit_path(&source.target) {
-        return false;
-    }
-    let probed = facts.probed_paths.iter().any(|path| path == &source.target);
-    let present = facts
-        .present_paths
-        .iter()
-        .any(|path| path == &source.target);
-    probed && !present
-}
-
 /// 校验人工给定的 `spec`：**逐条**必须是该面在该平台上的目录单元。
 ///
 /// 允许手写是为了微调，但微调不等于可以凭空写 —— 不在目录里的单元落不了数据面规则，
@@ -356,6 +370,7 @@ pub fn validate_spec(
     family: &str,
     requested_spec: &str,
     capabilities: Option<&LogsCapabilities>,
+    log_sources: crate::app::log_source::SourceContext<'_>,
 ) -> Result<(String, i64), WorkRejection> {
     let mut selected = Vec::new();
     for token in requested_spec
@@ -384,7 +399,7 @@ pub fn validate_spec(
     // 人工手写的 spec **不按事实裁剪**（运维显式点名的路径要“看得见失败”，`facts` 传 None）；
     // 但**能力裁剪照做**：能力不匹配的后果不是“这个文件采不到”，而是 agentd
     // `deny_unknown_fields` **整份拒收**（连没点名的那几个面一起停）。
-    materialize_spec(content, &selected, None, capabilities)
+    materialize_spec(content, &selected, None, capabilities, log_sources)
         .map(|spec| (spec, content.catalog_version))
 }
 
@@ -538,6 +553,44 @@ mod tests {
     use crate::infra::StoredOneShotWork;
     use wist_contracts::capability_report::LogsCapabilities;
     use wist_contracts::work::{FILE_INPUT_ABSOLUTE_PATH, FILE_INPUT_GLOB};
+
+    // 多数用例只关心「摘哪些单元 / spec 形状」，不涉及日志源定位（L1 之前没有候选数据）。
+    // 本地同名包装给了空的 `SourceContext`，让用例的意图不被七个参数淹没。
+    fn derive_spec(
+        content: &ContentSet,
+        machine_class: &str,
+        platform: &str,
+        family: &str,
+        facts: &StoredAgentFactSummary,
+        capabilities: Option<&LogsCapabilities>,
+    ) -> Result<(String, i64), WorkRejection> {
+        super::derive_spec(
+            content,
+            machine_class,
+            platform,
+            family,
+            facts,
+            capabilities,
+            Default::default(),
+        )
+    }
+
+    fn validate_spec(
+        content: &ContentSet,
+        platform: &str,
+        family: &str,
+        requested_spec: &str,
+        capabilities: Option<&LogsCapabilities>,
+    ) -> Result<(String, i64), WorkRejection> {
+        super::validate_spec(
+            content,
+            platform,
+            family,
+            requested_spec,
+            capabilities,
+            Default::default(),
+        )
+    }
 
     fn one_shot(status: &str, interruptible: bool) -> StoredOneShotWork {
         StoredOneShotWork {
@@ -1097,7 +1150,10 @@ status = "active"
         )
         .unwrap_err();
         assert!(matches!(err, WorkRejection::Conflict(_)));
-        assert!(err.message().contains("explicit paths absent"), "{err:?}");
+        // 从 L1 起，这个单元在展开阶段就报 `source_not_resolved`（带具体原因），
+        // 不再走到物化阶段才报「explicit paths absent」—— 两种写法都对，
+        // 但前者能告诉人“到底卡在哪一步”。
+        assert!(err.message().contains("source_not_resolved"), "{err:?}");
         assert!(err.message().contains("/var/log/postgresql.log"), "{err:?}");
     }
 
@@ -1697,7 +1753,9 @@ status = "active"
             &["/var/lib/docker/containers", "/var/log/containers"],
             &["/var/lib/docker/containers"],
         );
-        let expansion = content.expand("linux-host", &facts).expect("expand");
+        let expansion = content
+            .expand("linux-host", &facts, Default::default())
+            .expect("expand");
         let containers = expansion
             .works
             .iter()
@@ -1722,7 +1780,9 @@ status = "active"
             &["/var/log/containers"],
             &["/var/log/containers"],
         );
-        let expansion = content.expand("linux-compute", &facts).expect("expand");
+        let expansion = content
+            .expand("linux-compute", &facts, Default::default())
+            .expect("expand");
         let containers = expansion
             .works
             .iter()
@@ -1746,6 +1806,10 @@ status = "active"
     fn the_real_catalog_dispatches_the_db_unit_from_its_log_directories() {
         // G3 验收：DB 单元的事实门必须是 `path_exists` —— 包清单探针还没实现
         // （`packages` 恒空），用 `installed:` 做门会让这个面永远展不开。
+        //
+        // 从 L1 起多一条裁剪：字面 glob 的**父目录**实测不存在 → 这条来源不派。
+        // 以前 mysql 目录不在时也会把 `/var/log/mysql/*slow*.log` 发下去，
+        // 结果是「页面说已授权、实际 0 文件」—— 那种“成功”比失败更难查。
         let content = real_content();
         let present = facts_with_paths(
             "linux",
@@ -1772,9 +1836,12 @@ status = "active"
                     && source.multiline == "postgres_csv"),
             "{sources:?}"
         );
-        assert!(sources.iter().any(|source| {
-            source.target == "/var/log/mysql/*slow*.log" && source.multiline == "mysql_slow"
-        }));
+        assert!(
+            !sources
+                .iter()
+                .any(|source| source.target.starts_with("/var/log/mysql")),
+            "父目录实测不存在就不该派：{sources:?}"
+        );
     }
 
     #[test]
@@ -1849,26 +1916,360 @@ status = "active"
     }
 
     #[test]
-    fn globs_and_exporters_are_never_filtered_by_path_facts() {
-        // 裁剪只针对**显式文件路径**：通配与导出器不参与（即使事实里出现同名串）。
+    fn globs_and_exporters_are_never_filtered_by_target_facts() {
+        // 「目标本身」的裁剪只针对**显式文件路径**：通配与导出器不参与（即使事实里出现同名串）。
+        // glob 另有**父目录**判据，见下一个用例 —— 两件事分开测，免得改一个就以为动了另一个。
         let facts = facts_with_paths("linux", &[], &["/var/log/misc/*", "dmesg:panic"], &[]);
-        let glob = UnitSource {
+        let glob = crate::app::content::UnitSource {
             filters: Default::default(),
             kind: "FileGlob".to_string(),
             target: "/var/log/misc/*".to_string(),
+            from_dir: None,
+            pattern: String::new(),
             multiline: "none".to_string(),
             exclude_globs: Vec::new(),
             drop_if_contains: Vec::new(),
         };
-        let exporter = UnitSource {
+        let exporter = crate::app::content::UnitSource {
             filters: Default::default(),
             kind: "Exporter".to_string(),
             target: "dmesg:panic".to_string(),
+            from_dir: None,
+            pattern: String::new(),
             multiline: "none".to_string(),
             exclude_globs: Vec::new(),
             drop_if_contains: Vec::new(),
         };
-        assert!(!source_is_absent_on_this_machine(&glob, Some(&facts)));
-        assert!(!source_is_absent_on_this_machine(&exporter, Some(&facts)));
+        assert!(!crate::app::log_source::catalog_source_is_absent(
+            &glob,
+            Some(&facts)
+        ));
+        assert!(!crate::app::log_source::catalog_source_is_absent(
+            &exporter,
+            Some(&facts)
+        ));
+    }
+
+    #[test]
+    fn a_glob_whose_parent_directory_was_probed_absent_is_dropped() {
+        // 「数据库装在 `/data/pg`、`/var/log/mysql` 根本没有」的现场：
+        // 派一个不存在的 glob 只会让页面显示「已授权」而实际 0 文件。
+        let facts = facts_with_paths(
+            "linux",
+            &[],
+            &["/var/log/mysql", "/var/log/postgresql"],
+            &["/var/log/postgresql"],
+        );
+        let source = |target: &str| crate::app::content::UnitSource {
+            filters: Default::default(),
+            kind: "FileGlob".to_string(),
+            target: target.to_string(),
+            from_dir: None,
+            pattern: String::new(),
+            multiline: "none".to_string(),
+            exclude_globs: Vec::new(),
+            drop_if_contains: Vec::new(),
+        };
+        assert!(crate::app::log_source::catalog_source_is_absent(
+            &source("/var/log/mysql/*slow*.log"),
+            Some(&facts)
+        ));
+        assert!(!crate::app::log_source::catalog_source_is_absent(
+            &source("/var/log/postgresql/*.csv"),
+            Some(&facts)
+        ));
+        // 没探过 ≠ 不存在：父目录不在实测集合里就不裁。
+        assert!(!crate::app::log_source::catalog_source_is_absent(
+            &source("/var/log/redis/*.log"),
+            Some(&facts)
+        ));
+    }
+
+    // ── L1：`from_dir` + 人工覆盖（带 roots 边界） ──
+
+    const OVERRIDE_CATALOG: &str = r#"
+
+catalog_version = 1
+
+[[units]]
+unit_id = "mac-metrics"
+family = "HostMetrics"
+capability = "collect_metrics"
+platform = "macos"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "none"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+
+[[units]]
+unit_id = "linux-db"
+family = "DatabaseService"
+capability = "collect_logs"
+platform = "linux"
+match = "port:5432"
+rule_ref = "linux/db"
+requires_privilege = "root"
+status = "active"
+
+# 标准目录：解析不到时的兜底（实测不存在时会被裁掉）
+[[units.sources]]
+kind = "FileGlob"
+target = "/var/log/postgresql/*.csv"
+multiline = "postgres_csv"
+
+# 非标准目录：目录由解析 / 覆盖得出
+[[units.sources]]
+kind = "FileGlob"
+from_dir = "log_source:postgresql"
+pattern = "*.csv"
+multiline = "postgres_csv"
+"#;
+
+    const OVERRIDE_PACKS: &str = r#"
+
+[[pack]]
+pack_id = "macos-base"
+platform = "macos"
+kind = "Baseline"
+families = ["HostMetrics"]
+unit_refs = ["mac-metrics"]
+catalog_version = 1
+status = "active"
+
+[[pack]]
+pack_id = "linux-base"
+platform = "linux"
+kind = "Baseline"
+families = ["DatabaseService"]
+unit_refs = ["linux-db"]
+catalog_version = 1
+status = "active"
+"#;
+
+    const OVERRIDE_TEMPLATES: &str = r#"
+
+[[template]]
+template_id = "linux-data"
+machine_class = "LinuxData"
+platform = "linux"
+pack_refs = ["linux-base"]
+catalog_version = 1
+template_version = 1
+status = "active"
+"#;
+
+    fn override_content() -> ContentSet {
+        crate::app::content::parse_content(OVERRIDE_CATALOG, OVERRIDE_PACKS, OVERRIDE_TEMPLATES)
+            .expect("override fixture parses")
+    }
+
+    /// 端口在听、但 `/var/log/postgresql` 不存在 —— 正是“装到非标准目录”的现场。
+    fn db_facts_without_standard_log_dir() -> StoredAgentFactSummary {
+        let mut facts = facts_with_paths("linux", &[], &["/var/log/postgresql"], &[]);
+        facts.listen_ports = vec!["tcp:5432".to_string()];
+        facts
+    }
+
+    fn override_source(source_ref: &str, dir: &str) -> crate::infra::StoredLogSource {
+        crate::infra::StoredLogSource {
+            agent_id: "agent-1".to_string(),
+            service: "postgresql".to_string(),
+            source_ref: source_ref.to_string(),
+            dir: dir.to_string(),
+            evidence: "human".to_string(),
+            detail: "manual override".to_string(),
+            confidence: 100,
+            origin: "override".to_string(),
+            observed_at: "2026-10-26T00:00:00Z".to_string(),
+            updated_at: "2026-10-26T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn an_override_expands_from_dir_per_instance() {
+        let content = override_content();
+        let facts = db_facts_without_standard_log_dir();
+        let roots = vec!["/data".to_string()];
+        // 两个实例：多实例 = 多条源，各自一条（L1 验收的核心）。
+        let overrides = vec![override_source("port:5432", "/data/pg1/log"), {
+            let mut second = override_source("port:5433", "/data/pg2/log");
+            second.observed_at = "2026-10-26T00:00:01Z".to_string();
+            second
+        }];
+        let context = crate::app::log_source::SourceContext {
+            log_sources: &overrides,
+            roots: &roots,
+            agent_version: None,
+        };
+
+        let (spec, _) = super::derive_spec(
+            &content,
+            "LinuxData",
+            "linux",
+            "DatabaseService",
+            &facts,
+            None,
+            context,
+        )
+        .expect("derives");
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        let targets: Vec<&str> = spec.units[0]
+            .sources
+            .iter()
+            .map(|source| source.target.as_str())
+            .collect();
+        assert_eq!(targets, vec!["/data/pg1/log/*.csv", "/data/pg2/log/*.csv"]);
+        // 读法（multiline）跟着目录走，不被覆盖改掉 —— 那是策展结论。
+        assert!(
+            spec.units[0]
+                .sources
+                .iter()
+                .all(|source| source.multiline == "postgres_csv")
+        );
+    }
+
+    #[test]
+    fn without_a_resolved_source_the_unit_is_source_not_resolved() {
+        let content = override_content();
+        let facts = db_facts_without_standard_log_dir();
+        let roots = vec!["/data".to_string()];
+        let context = crate::app::log_source::SourceContext {
+            log_sources: &[],
+            roots: &roots,
+            agent_version: None,
+        };
+        let err = super::derive_spec(
+            &content,
+            "LinuxData",
+            "linux",
+            "DatabaseService",
+            &facts,
+            None,
+            context,
+        )
+        .unwrap_err();
+        // 不能静默退化成“采标准目录”：那句话会让页面显示已授权、实际 0 文件。
+        assert!(err.message().contains("source_not_resolved"), "{err:?}");
+        assert!(err.message().contains("log_source:postgresql"), "{err:?}");
+    }
+
+    #[test]
+    fn an_override_outside_roots_is_ignored_and_does_not_fall_back() {
+        let content = override_content();
+        let facts = db_facts_without_standard_log_dir();
+        let roots = vec!["/data".to_string()];
+        // 覆盖写在 roots 外：**不能**借“人是好意”放行，也**不**回落到解析值。
+        let overrides = vec![override_source("port:5432", "/etc/pg/log")];
+        let context = crate::app::log_source::SourceContext {
+            log_sources: &overrides,
+            roots: &roots,
+            agent_version: None,
+        };
+        let err = super::derive_spec(
+            &content,
+            "LinuxData",
+            "linux",
+            "DatabaseService",
+            &facts,
+            None,
+            context,
+        )
+        .unwrap_err();
+        assert!(err.message().contains("source_not_resolved"), "{err:?}");
+    }
+
+    /// 手写 spec 不走 `expand`：版本闸门必须在**物化**那一层再拦一道，
+    /// 否则运维显式点名一个单元就能绕过它，把旧 agent 接不了的来源派下去。
+    #[test]
+    fn a_hand_written_spec_cannot_bypass_the_min_agentd_gate() {
+        let catalog = OVERRIDE_CATALOG.replace(
+            "match = \"port:5432\"",
+            "match = \"port:5432\"\nmin_agentd_version = \"0.10.0\"",
+        );
+        let content =
+            crate::app::content::parse_content(&catalog, OVERRIDE_PACKS, OVERRIDE_TEMPLATES)
+                .expect("fixture parses");
+        let roots = vec!["/data".to_string()];
+        // 给一条覆盖，让 `from_dir` 能落地 —— 否则被拒的原因会是 source_not_resolved，
+        // 就测不到版本闸门了。
+        let overrides = vec![override_source("port:5432", "/data/pg1/log")];
+
+        let with_version = |version: Option<&'static str>| crate::app::log_source::SourceContext {
+            log_sources: &overrides,
+            roots: &roots,
+            agent_version: version,
+        };
+
+        let err = super::validate_spec(
+            &content,
+            "linux",
+            "DatabaseService",
+            "linux-db",
+            None,
+            with_version(Some("0.9.13")),
+        )
+        .expect_err("旧 agentd 必须拒绝");
+        assert!(err.message().contains("agent_too_old"), "{err:?}");
+        assert!(err.message().contains("0.10.0"), "{err:?}");
+
+        // 没上报版本同样拒（拿不准就不派）。
+        let err = super::validate_spec(
+            &content,
+            "linux",
+            "DatabaseService",
+            "linux-db",
+            None,
+            with_version(None),
+        )
+        .expect_err("未知版本必须拒绝");
+        assert!(err.message().contains("agent_too_old"), "{err:?}");
+
+        // 够版本 → 正常出 spec。
+        assert!(
+            super::validate_spec(
+                &content,
+                "linux",
+                "DatabaseService",
+                "linux-db",
+                None,
+                with_version(Some("0.10.0")),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_standard_directory_still_wins_when_it_really_exists() {
+        // 反向兼容：标准目录在、没有覆盖 → 照旧采标准目录（不要一刀切掉 path_exists 的世界）。
+        let content = override_content();
+        let mut facts = facts_with_paths(
+            "linux",
+            &[],
+            &["/var/log/postgresql"],
+            &["/var/log/postgresql"],
+        );
+        facts.listen_ports = vec!["tcp:5432".to_string()];
+        let context = crate::app::log_source::SourceContext::default();
+        let (spec, _) = super::derive_spec(
+            &content,
+            "LinuxData",
+            "linux",
+            "DatabaseService",
+            &facts,
+            None,
+            context,
+        )
+        .expect("derives");
+        let spec = WorkSpec::parse(&spec).expect("spec");
+        let targets: Vec<&str> = spec.units[0]
+            .sources
+            .iter()
+            .map(|source| source.target.as_str())
+            .collect();
+        assert_eq!(targets, vec!["/var/log/postgresql/*.csv"]);
     }
 }

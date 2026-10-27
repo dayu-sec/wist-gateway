@@ -71,6 +71,7 @@ const DELETE_AGENT_TABLES: &[(&str, &str)] = &[
     ),
     ("agent_fact_summary", "delete agent fact summary"),
     ("agent_path_probe", "delete agent path probe"),
+    ("agent_log_source", "delete agent log source"),
     ("agent_classification", "delete agent classification"),
     (
         "agent_software_inventory",
@@ -2063,6 +2064,152 @@ impl Store for SqliteStore {
         .await
         .map_err(|err| sql_error(err, "upsert agent path probe"))?;
         Ok(())
+    }
+
+    async fn list_agent_log_sources(&self, agent_id: &str) -> StoreResult<Vec<StoredLogSource>> {
+        // 稳定排序交给 SQL：覆盖在前（人显式指定），其余按**证据档的信任顺序**、再按置信度。
+        // 为什么不能直接 `ORDER BY evidence`：那是字母序（`config_file` 会排在
+        // `cmdline_datadir` 前面），与设计稿 §4.3 的信任度正好相反。
+        let rows = sqlx::query(
+            "SELECT agent_id, service, source_ref, dir, evidence, detail, confidence, origin, \
+             observed_at, updated_at FROM agent_log_source WHERE agent_id = ?1 \
+             ORDER BY CASE origin WHEN 'override' THEN 0 ELSE 1 END, \
+                      CASE evidence \
+                        WHEN 'human' THEN 0 \
+                        WHEN 'cmdline_datadir' THEN 1 \
+                        WHEN 'cmdline_logfile' THEN 2 \
+                        WHEN 'env_datadir' THEN 3 \
+                        WHEN 'open_fd' THEN 4 \
+                        WHEN 'config_file' THEN 5 \
+                        WHEN 'search_hit' THEN 6 \
+                        WHEN 'cwd' THEN 7 \
+                        ELSE 8 END, \
+                      confidence DESC, source_ref",
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select agent log sources"))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(StoredLogSource {
+                    agent_id: column!(row, "agent_id"),
+                    service: column!(row, "service"),
+                    source_ref: column!(row, "source_ref"),
+                    dir: column!(row, "dir"),
+                    evidence: column!(row, "evidence"),
+                    detail: column!(row, "detail"),
+                    confidence: column!(row, "confidence"),
+                    origin: column!(row, "origin"),
+                    observed_at: column!(row, "observed_at"),
+                    updated_at: column!(row, "updated_at"),
+                })
+            })
+            .collect()
+    }
+
+    async fn upsert_agent_log_source(&self, source: &StoredLogSource) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO agent_log_source (agent_id, service, source_ref, dir, evidence, detail, \
+             confidence, origin, observed_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT (agent_id, service, source_ref, origin) DO UPDATE SET \
+             dir = excluded.dir, evidence = excluded.evidence, detail = excluded.detail, \
+             confidence = excluded.confidence, observed_at = excluded.observed_at, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(&source.agent_id)
+        .bind(&source.service)
+        .bind(&source.source_ref)
+        .bind(&source.dir)
+        .bind(&source.evidence)
+        .bind(&source.detail)
+        .bind(source.confidence)
+        .bind(&source.origin)
+        .bind(&source.observed_at)
+        .bind(&source.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert agent log source"))?;
+        Ok(())
+    }
+
+    async fn delete_agent_log_source(
+        &self,
+        agent_id: &str,
+        service: &str,
+        source_ref: &str,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "DELETE FROM agent_log_source WHERE agent_id = ?1 AND service = ?2 \
+             AND source_ref = ?3 AND origin = 'override'",
+        )
+        .bind(agent_id)
+        .bind(service)
+        .bind(source_ref)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "delete agent log source"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn delete_agent_log_sources(&self, agent_id: &str, service: &str) -> StoreResult<u64> {
+        let result =
+            sqlx::query("DELETE FROM agent_log_source WHERE agent_id = ?1 AND service = ?2")
+                .bind(agent_id)
+                .bind(service)
+                .execute(&self.pool)
+                .await
+                .map_err(|err| sql_error(err, "delete agent log sources"))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn replace_agent_log_sources(
+        &self,
+        agent_id: &str,
+        sources: &[StoredLogSource],
+    ) -> StoreResult<usize> {
+        // 一个事务里「先清后写」：中间态（清完还没写）不能对求值可见，
+        // 否则那一瞬的预检会把整台机器看成「什么都没有」。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin replace agent log sources"))?;
+        sqlx::query("DELETE FROM agent_log_source WHERE agent_id = ?1 AND origin = 'agent'")
+            .bind(agent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| sql_error(err, "clear agent log sources"))?;
+        for source in sources {
+            sqlx::query(
+                "INSERT INTO agent_log_source (agent_id, service, source_ref, dir, evidence, \
+                 detail, confidence, origin, observed_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT (agent_id, service, source_ref, origin) DO UPDATE SET \
+                 dir = excluded.dir, evidence = excluded.evidence, detail = excluded.detail, \
+                 confidence = excluded.confidence, observed_at = excluded.observed_at, \
+                 updated_at = excluded.updated_at",
+            )
+            .bind(&source.agent_id)
+            .bind(&source.service)
+            .bind(&source.source_ref)
+            .bind(&source.dir)
+            .bind(&source.evidence)
+            .bind(&source.detail)
+            .bind(source.confidence)
+            // 上报路径只能写 `agent`：`override` 是人写的，不能让 agent 自称覆盖。
+            .bind("agent")
+            .bind(&source.observed_at)
+            .bind(&source.updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| sql_error(err, "write agent log source"))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit replace agent log sources"))?;
+        Ok(sources.len())
     }
 
     async fn get_agent_fact_summary_digest(&self, agent_id: &str) -> StoreResult<Option<String>> {
@@ -4819,6 +4966,93 @@ mod tests {
         assert_eq!(
             store.get_agent_path_probe("agent-a").await.unwrap(),
             Some(second)
+        );
+    }
+
+    /// 日志源候选：一台多行、`(service, source_ref)` 唯一、覆盖排在解析值前面。
+    #[tokio::test]
+    async fn upserts_lists_and_deletes_agent_log_sources() {
+        let store = store().await;
+        assert!(
+            store
+                .list_agent_log_sources("agent-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let resolved = StoredLogSource {
+            agent_id: "agent-a".to_string(),
+            service: "postgresql".to_string(),
+            source_ref: "port:5432".to_string(),
+            dir: "/data/pg/data/log".to_string(),
+            evidence: "cmdline_datadir".to_string(),
+            detail: "-D /data/pg/data".to_string(),
+            confidence: 90,
+            origin: "agent".to_string(),
+            observed_at: "2026-10-26T00:00:00Z".to_string(),
+            updated_at: "2026-10-26T00:00:01Z".to_string(),
+        };
+        store.upsert_agent_log_source(&resolved).await.unwrap();
+
+        // 第二个实例：多实例 = 多行，彼此独立。
+        let second = StoredLogSource {
+            source_ref: "port:5433".to_string(),
+            dir: "/data/pg2/log".to_string(),
+            ..resolved.clone()
+        };
+        store.upsert_agent_log_source(&second).await.unwrap();
+
+        // 覆盖：同一实例再加一行（主键带 origin），**解析值仍在**——删覆盖即回落。
+        let overridden = StoredLogSource {
+            dir: "/opt/customer-pg/log".to_string(),
+            evidence: "human".to_string(),
+            detail: "manual override".to_string(),
+            confidence: 100,
+            origin: "override".to_string(),
+            updated_at: "2026-10-26T01:00:00Z".to_string(),
+            ..resolved.clone()
+        };
+        store.upsert_agent_log_source(&overridden).await.unwrap();
+
+        let listed = store.list_agent_log_sources("agent-a").await.unwrap();
+        assert_eq!(listed.len(), 3, "覆盖与解析值并存：{listed:?}");
+        // 覆盖排在最前 —— 求值方拿到的就是「覆盖优先」的视图。
+        assert_eq!(listed[0], overridden);
+        assert_eq!(listed[1], resolved);
+        assert_eq!(listed[2], second);
+
+        // 删覆盖只删**覆盖那一行**：解析值立刻回落，不必等下一次发现 tick。
+        assert!(
+            store
+                .delete_agent_log_source("agent-a", "postgresql", "port:5432")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .delete_agent_log_source("agent-a", "postgresql", "port:5432")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.list_agent_log_sources("agent-a").await.unwrap(),
+            vec![resolved, second]
+        );
+
+        assert_eq!(
+            store
+                .delete_agent_log_sources("agent-a", "postgresql")
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            store
+                .list_agent_log_sources("agent-a")
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

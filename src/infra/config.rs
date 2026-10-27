@@ -113,6 +113,12 @@ pub struct AdminConfig {
     /// 数据面订阅端的内部接入端点（明文 HTTP，只应绑环回）。
     /// `None` = 关闭订阅（见 [`RawIngestConfig`]）。
     pub ingest_listen_addr: Option<String>,
+    /// 日志源（`from_dir` / 人工覆盖）允许落地的目录 roots。
+    ///
+    /// **这是网关策略，对所有人一致**：agent 上报什么、人显式指定什么，都要过这一关。
+    /// 人工覆盖**不能**借它越权（要采 roots 外的东西 = 改这里，那是策略级变更）。
+    /// 缺省 `["/var/log", "/data", "/srv", "/opt"]`。
+    pub allowed_source_roots: Vec<String>,
     /// 启动期知识源：一个**已解开的包目录**（五份数据；`manifest.json` 不参与装载），
     /// 即 `[knowledge] source_dir`。
     /// 只在管理面**没有可用生效包**时启用 —— 出厂初始包放这里；它自己不可用也只告警回落，
@@ -162,6 +168,9 @@ struct RawAdminConfig {
     discovery: RawDiscoveryConfig,
     #[serde(default)]
     content: RawContentConfig,
+    /// `[collection]` 段：日志源允许落地的目录 roots（跑时也会被 `from_dir` / 覆盖用到）。
+    #[serde(default)]
+    collection: RawCollectionConfig,
     #[serde(default)]
     ingest: RawIngestConfig,
     #[serde(default)]
@@ -238,6 +247,27 @@ struct RawContentConfig {
     /// `wist-knowledge/templates.toml`。
     #[serde(default)]
     templates_file: Option<String>,
+}
+
+/// `[collection]` 段：采集来源的**策略边界**。
+///
+/// 为什么不做「每个 agent 一套」：roots 是**安全边界**，随机器变化就会变成「谁配的谁说了算」，
+/// 审计时无法回答「这台机器允许读哪里」。要放宽就地改这一处（策略级变更 + 留痕）。
+#[derive(Debug, Default, Deserialize)]
+struct RawCollectionConfig {
+    /// 允许的日志源目录（绝对路径）。空 = 只允许目录字面值，禁止任何解析 / 覆盖目录。
+    #[serde(default)]
+    allowed_source_roots: Option<Vec<String>>,
+}
+
+/// 缺省 roots：与设计稿 §5.4 一致。
+///
+/// 不收 `/`（那等于放开整个盘），也不收相对路径：roots 是**边界**，写得越宽越难审计。
+pub fn default_allowed_source_roots() -> Vec<String> {
+    ["/var/log", "/data", "/srv", "/opt"]
+        .iter()
+        .map(|root| (*root).to_string())
+        .collect()
 }
 
 /// `[store]` 段。缺省（旧配置无此段）时回退到本地 SQLite 文件。
@@ -525,6 +555,20 @@ impl AdminConfig {
                 None => Some(DEFAULT_INGEST_LISTEN_ADDR.to_string()),
                 Some(value) => normalize_optional(Some(expand(&env, value)?)),
             },
+            allowed_source_roots: {
+                let raw_roots = match raw.collection.allowed_source_roots {
+                    None => default_allowed_source_roots(),
+                    Some(roots) => roots
+                        .iter()
+                        .map(|root| expand(&env, root))
+                        .collect::<Result<Vec<_>, _>>()?,
+                };
+                // 装载期就归一 + 拒绝危险值：roots 是**安全边界**，
+                // 留一个 `/` 或相对路径到运行期才发现，等于这段时间内边界是假的。
+                crate::app::log_source::normalize_roots(&raw_roots).map_err(|err| {
+                    config_validation(format!("collection.allowed_source_roots: {err}"))
+                })?
+            },
             knowledge_source_dir,
             knowledge_signing_public_key_file,
             knowledge_signing_public_key,
@@ -651,6 +695,19 @@ impl AdminConfig {
             require_existing_file("content.templates_file", templates)?;
             crate::app::content::load_content(catalog, packs, templates)
                 .map_err(|err| config_validation(format!("content: {err}")))?;
+        }
+        // roots 是**安全边界**：装载期已经归一过一次，这里再守一道（`AdminConfig` 也
+        // 会被测试/嵌入方直接构造）。`/` 与相对路径一律拒启 —— 前者等于放开整个盘，
+        // 后者会把「相对什么」留给运行期 cwd 决定。
+        for root in &self.allowed_source_roots {
+            let normalized = crate::app::log_source::normalize_dir(root).map_err(|err| {
+                config_validation(format!("collection.allowed_source_roots: {err}"))
+            })?;
+            if normalized != *root {
+                return Err(config_validation(format!(
+                    "collection.allowed_source_roots: {root:?} 未归一（应为 {normalized:?}）"
+                )));
+            }
         }
         if let Some(database_url) = self.database_url.as_deref()
             && !database_url.starts_with("sqlite:")
@@ -1177,6 +1234,7 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         content_packs_file: None,
         content_templates_file: None,
         ingest_listen_addr: None,
+        allowed_source_roots: default_allowed_source_roots(),
         knowledge_source_dir: None,
         knowledge_signing_public_key_file: None,
         knowledge_signing_public_key: None,
@@ -1399,6 +1457,49 @@ policies = [
         format!(
             "[discovery]\n{discovery_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
         )
+    }
+
+    /// 同 `config_with_purpose`，但给出的是 `[collection]` 表体。
+    fn config_with_collection(collection_body: &str) -> String {
+        format!(
+            "[collection]\n{collection_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        )
+    }
+
+    #[test]
+    fn collection_roots_default_and_are_normalized() {
+        // 不写 `[collection]` → 默认四条（与设计稿 §5.4 一致）。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_purpose("")))
+            .expect("config loads");
+        assert_eq!(config.allowed_source_roots, default_allowed_source_roots());
+
+        // 尾斜杠 + 重复 → 归一（roots 是审计口径，重复只会多噪声）。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_collection(
+            "allowed_source_roots = [\"/data/\", \"/data\", \"/srv\"]",
+        )))
+        .expect("config loads");
+        assert_eq!(
+            config.allowed_source_roots,
+            vec!["/data".to_string(), "/srv".to_string()]
+        );
+    }
+
+    #[test]
+    fn collection_roots_reject_root_and_relative_paths() {
+        // `/` 等于放开整个盘；相对路径把「相对什么」留给运行期 cwd；`..` 绕过 roots。
+        for body in [
+            "allowed_source_roots = [\"/\"]",
+            "allowed_source_roots = [\"data/pg\"]",
+            "allowed_source_roots = [\"/data/../etc\"]",
+            "allowed_source_roots = [\"/data/*\"]",
+        ] {
+            let path = write_temp_config(&config_with_collection(body));
+            let err = AdminConfig::load_from_path(&path).expect_err("must reject");
+            assert!(
+                err.to_string().contains("allowed_source_roots"),
+                "{body}: {err}"
+            );
+        }
     }
 
     #[test]

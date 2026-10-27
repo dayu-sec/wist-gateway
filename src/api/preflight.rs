@@ -55,9 +55,11 @@ use crate::api::agent_ops::authenticate_agent;
 use crate::api::codes;
 use crate::api::error::ApiError;
 use crate::api::rate_limit;
-use crate::app::content::{ContentSet, Expansion, platform_for_machine_class};
+use crate::app::content::{ContentSet, Expansion, Unit, platform_for_machine_class};
+use crate::app::log_source::{SourceContext, is_under_roots, resolve_dirs};
 use crate::infra::{
-    StoredAgentFactSummary, StoredAgentPathProbe, UnreadablePath, VerifiedAgentIdentity,
+    StoredAgentFactSummary, StoredAgentPathProbe, StoredLogSource, UnreadablePath,
+    VerifiedAgentIdentity,
 };
 
 /// 实测结果超过这个年龄就标 `stale`。
@@ -170,29 +172,56 @@ pub struct ProbeView {
 #[derive(Debug, Serialize)]
 pub struct FamilyView {
     pub family: String,
-    /// `grantable` | `absent` | `unprobed` | `unreadable` | `not_ready`
+    /// `grantable` | `absent` | `unprobed` | `unreadable` | `not_ready` | `source_unresolved`
+    /// | `agent_too_old`
     ///
-    /// 这五个值就是「能不能授、不能的话为什么」，与授权时的排除原因一一对应。
+    /// 这些值就是「能不能授、不能的话为什么」，与授权时的排除原因一一对应。
     pub state: String,
-    /// 支撑该状态的一句话（`grantable` 时为 `None`）。
+    /// 支撑该状态的一句话（`grantable` 且全部实例都定位到时为 `None`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// 将被选中的单元（`state = grantable` 时非空）。
     pub selected_units: Vec<String>,
     /// 证据：该面在这台机器上的每条单元。
     pub units: Vec<UnitView>,
+    /// 这个面辖区内「看到了几个实例、定位到几个」（只对带 `from_dir` 的面有意义）。
+    ///
+    /// 为什么要单独给结构而不是只写在 `reason` 里：`reason` 是一句话，
+    /// 页面以后要按实例展开时得靠它；且 `grantable` 时 `reason` 通常为空，
+    /// 而「2 个实例，1 个没定位」恰恰是能授权、但值得人知道的状态。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instances: Option<InstanceCount>,
+}
+
+/// 一个面上的实例计数。
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct InstanceCount {
+    /// 有可用目录（已过 roots）的实例数。
+    pub resolved: usize,
+    /// 看得见的实例总数（含 `evidence = unresolved` 的占位）。
+    pub total: usize,
 }
 
 #[derive(Debug, Serialize)]
 pub struct UnitView {
     pub unit_id: String,
     /// `selected` | `match_unsatisfied` | `fact_not_collected` | `unreadable` | `collect_not_ready`
+    /// | `source_not_resolved` | `agent_too_old`
     pub result: String,
     /// 原始条件表达式（排障用的真相，别翻译）。
     pub match_expr: String,
+    /// `agent_too_old` 时：本单元要求的最低 agentd 版本。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_agentd_version: Option<String>,
     /// `path_exists` / `not_path_exists` 条件的实测值。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<PathFactView>,
+    /// 服务在、但没解析到日志目录的服务清单（`source_not_resolved` 时非空）。
+    ///
+    /// 为什么要单独列出来：处置是「配覆盖 / 开搜索」，人得知道是哪个服务没找到；
+    /// 只回一句「找不到日志」会让人从第一个服务开始一个一个猜。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_sources: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -245,6 +274,19 @@ pub async fn evaluate(state: &ApiState, agent_id: &str) -> Result<PreflightView,
                 err,
             )
         })?;
+    // agentd 版本：知识库可以声明“本单元要求 ≥ X”。拿不到（还没报过）就当不满足 ——
+    // 与授权那条路同源，否则会出现「预检说可以、授权却拒绝」。
+    let agent_version = match state.store.get_agent(agent_id).await {
+        Ok(Some(agent)) => Some(agent.version),
+        Ok(None) => None,
+        Err(err) => {
+            return Err(ApiError::internal(
+                codes::PREFLIGHT_UNAVAILABLE,
+                "failed to load agent version",
+                err,
+            ));
+        }
+    };
     // 「有没有命令在飞」只影响展示：读失败不该把结论也弄没。
     //
     // 而且命令“在路上”不等于“结果还没回来”：agentd 先回传实测、回执跟在下一拍
@@ -274,12 +316,30 @@ pub async fn evaluate(state: &ApiState, agent_id: &str) -> Result<PreflightView,
 
     let content = state.knowledge().content.clone();
     let now = chrono::Utc::now();
+    // 日志源候选：与授权那条路**同一份**（否则会出现「预检说可以、授权却拒绝」）。
+    let log_sources = state
+        .store
+        .list_agent_log_sources(agent_id)
+        .await
+        .map_err(|err| {
+            ApiError::internal(
+                codes::PREFLIGHT_UNAVAILABLE,
+                "failed to load agent log sources",
+                err,
+            )
+        })?;
+    let sources = crate::app::log_source::SourceContext {
+        log_sources: &log_sources,
+        roots: &state.config.allowed_source_roots,
+        agent_version: agent_version.as_deref(),
+    };
     Ok(build_view(
         agent_id,
         classification.map(|item| item.machine_class),
         reported,
         probe,
         content,
+        sources,
         pending,
         pending_since,
         now,
@@ -327,6 +387,7 @@ fn build_view(
     reported: Option<StoredAgentFactSummary>,
     probe: Option<StoredAgentPathProbe>,
     content: Option<std::sync::Arc<ContentSet>>,
+    sources: crate::app::log_source::SourceContext<'_>,
     pending: bool,
     pending_since: Option<String>,
     now: chrono::DateTime<chrono::Utc>,
@@ -415,7 +476,7 @@ fn build_view(
         return view;
     }
 
-    let expansion = match content.expand(&template.template_id, &facts) {
+    let expansion = match content.expand(&template.template_id, &facts, sources) {
         Ok(expansion) => expansion,
         Err(err) => {
             // 模板/目录自相矛盾：如实报，不编结论。
@@ -432,11 +493,12 @@ fn build_view(
             .find(|work| &work.family == family)
             .map(|work| work.selected_units.clone())
             .unwrap_or_default();
-        let mut units = Vec::new();
-        for unit in content
+        let family_units: Vec<&Unit> = content
             .units()
             .filter(|unit| &unit.family == family && unit.platform == platform)
-        {
+            .collect();
+        let mut units = Vec::new();
+        for unit in &family_units {
             let excluded = expansion
                 .excluded_units
                 .iter()
@@ -465,6 +527,21 @@ fn build_view(
                 result: result.to_string(),
                 match_expr: unit.match_expr.clone(),
                 paths,
+                unresolved_sources: excluded
+                    .and_then(|excluded| excluded.condition.as_deref())
+                    .and_then(|condition| condition.strip_prefix("log_source:"))
+                    .map(|rest| {
+                        rest.split(',')
+                            .filter(|service| !service.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                min_agentd_version: excluded
+                    .filter(|excluded| excluded.reason_code == "agent_too_old")
+                    .and_then(|excluded| excluded.condition.as_deref())
+                    .and_then(|condition| condition.strip_prefix("agentd_min_version:"))
+                    .map(str::to_string),
             });
         }
 
@@ -472,20 +549,41 @@ fn build_view(
             "grantable"
         } else if units.iter().any(|unit| unit.result == "collect_not_ready") {
             "not_ready"
+        } else if units.iter().any(|unit| unit.result == "agent_too_old") {
+            // 比“没探到 / 找不到日志”更前置：旧 agentd 根本承接不了这些来源，
+            // 再让运维去查路径只会把人带到错方向。
+            "agent_too_old"
         } else if units.iter().any(|unit| unit.result == "unreadable") {
             "unreadable"
+        } else if units
+            .iter()
+            .any(|unit| unit.result == "source_not_resolved")
+        {
+            // 比「还没探」具体：探多少次不会变出一个目录来，处置是「配覆盖 / 开搜索」。
+            "source_unresolved"
         } else if units.iter().any(|unit| unit.result == "fact_not_collected") {
             "unprobed"
         } else {
             "absent"
         };
-        let reason = family_reason(state, &units, &unreadable, &expansion);
+        let instances = family_instances(&family_units, sources);
+        let out_of_roots = family_out_of_roots(&family_units, sources);
+        let reason = family_reason(
+            state,
+            &units,
+            &unreadable,
+            &expansion,
+            instances.as_ref(),
+            out_of_roots,
+            sources.agent_version,
+        );
         view.families.push(FamilyView {
             family: family.clone(),
             state: state.to_string(),
             reason,
             selected_units,
             units,
+            instances,
         });
     }
 
@@ -528,6 +626,58 @@ fn build_view(
     view
 }
 
+/// 这个面辖区内的服务（`from_dir` 的 key）。
+///
+/// 一个面可以覆盖多个服务（`linux-db-service` 就是 postgres/mysql/redis/mongodb）。
+fn family_services<'a>(units: &[&'a Unit]) -> BTreeSet<&'a str> {
+    units
+        .iter()
+        .flat_map(|unit| unit.sources.iter())
+        .filter_map(|source| source.log_service())
+        .collect()
+}
+
+/// 「看到了几个实例、其中几个能采」—— 分母来自 `evidence = unresolved` 的占位行。
+///
+/// `None` = 这个面根本不靠日志目录（没有 `from_dir`），或一个实例也没看见。
+fn family_instances(units: &[&Unit], sources: SourceContext<'_>) -> Option<InstanceCount> {
+    let services = family_services(units);
+    if services.is_empty() {
+        return None;
+    }
+    let mut total = 0usize;
+    let mut resolved = 0usize;
+    for service in services {
+        let rows: Vec<&StoredLogSource> = sources
+            .log_sources
+            .iter()
+            .filter(|row| row.service == service)
+            .collect();
+        total += rows
+            .iter()
+            .map(|row| row.source_ref.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        resolved += resolve_dirs(rows.iter().copied(), service, sources.roots).len();
+    }
+    (total > 0).then_some(InstanceCount { resolved, total })
+}
+
+/// 有多少条候选被 `allowed_source_roots` 挡在外面。
+///
+/// 为什么要单独数：容器里跑的 PG 常把数据目录放在 named volume（
+/// `/var/lib/docker/volumes/...`）—— 目录**是找到了**，只是不在默认 roots 里。
+/// 不把这件事说出来，衜障会直接去查 `logging_collector`，方向就错了。
+fn family_out_of_roots(units: &[&Unit], sources: SourceContext<'_>) -> usize {
+    let services = family_services(units);
+    sources
+        .log_sources
+        .iter()
+        .filter(|row| services.contains(row.service.as_str()))
+        .filter(|row| !row.dir.trim().is_empty() && !is_under_roots(&row.dir, sources.roots))
+        .count()
+}
+
 /// 面级一句话：**只说该做什么**，不复述状态名。
 ///
 /// 所有取值都限定在**这个面自己的单元**里：`expand` 的排除集是全域的，直接 `find`
@@ -537,10 +687,47 @@ fn family_reason(
     units: &[UnitView],
     unreadable: &[UnreadablePath],
     expansion: &Expansion,
+    instances: Option<&InstanceCount>,
+    out_of_roots: usize,
+    agent_version: Option<&str>,
 ) -> Option<String> {
     match state {
-        "grantable" => None,
+        // 能授权但**没授全**："2 个实例，1 个没定位" 必须说出来，
+        // 否则人会以为两个实例都在采。全部定位到时不扰民（返回 `None`）。
+        "grantable" => instances.and_then(|counts| {
+            (counts.resolved < counts.total).then(|| {
+                format!(
+                    "{} 个实例，其中 {} 个未定位（已定位的仍在采）",
+                    counts.total,
+                    counts.total - counts.resolved
+                )
+            })
+        }),
         "not_ready" => Some("知识库还没把该面的采集单元标成 active（策展未就绪）".to_string()),
+        "agent_too_old" => {
+            // 点名**要求的版本**与**当前版本**：处置就一个字“升级”，别让人去查路径。
+            let required = units
+                .iter()
+                .filter(|unit| unit.result == "agent_too_old")
+                .find_map(|unit| unit.min_agentd_version.as_deref())
+                .unwrap_or("");
+            let current = match agent_version
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(current) => format!("当前 {current}"),
+                None => "当前版本还没上报".to_string(),
+            };
+            if required.is_empty() {
+                Some(format!(
+                    "这台机器的 agentd 版本太旧（{current}），升级后自动恢复"
+                ))
+            } else {
+                Some(format!(
+                    "这台机器的 agentd 需要 ≥ {required}（{current}），升级后自动恢复"
+                ))
+            }
+        }
         "unreadable" => {
             // 点名**本面**探不了的那条路径，并把原始错误带上：
             // 「该去要权限」与「该换机器」只有这个错误文本能区分。
@@ -565,13 +752,48 @@ fn family_reason(
                 scoped_condition(units, expansion, "fact_not_collected")
                     .map(|condition| format!("无法判定条件 {condition}"))
             }),
+        "source_unresolved" => {
+            // 名字是**服务**，不是路径：这里要回答的是「哪个服务的日志没找到」，
+            // 而路径恰恰是还没确定的那件事。
+            let services: Vec<&str> = units
+                .iter()
+                .flat_map(|unit| unit.unresolved_sources.iter().map(String::as_str))
+                .collect();
+            let counts = match instances {
+                Some(counts) if counts.total > 0 => format!(
+                    "{} 个实例在监听，其中 {} 个已定位",
+                    counts.total, counts.resolved
+                ),
+                _ => "服务在".to_string(),
+            };
+            let mut reason = if services.is_empty() {
+                format!("{counts}，但找不到日志目录（先配人工覆盖，或开受限搜索）")
+            } else {
+                format!(
+                    "{counts}，但找不到 {} 的日志目录（先配人工覆盖，或开受限搜索）",
+                    services.join(", ")
+                )
+            };
+            if out_of_roots > 0 {
+                reason.push_str(&format!(
+                    "；另有 {out_of_roots} 条候选在 allowed_source_roots 外，需要放宽 [collection] 配置"
+                ));
+            }
+            Some(reason)
+        }
         _ => units
             .iter()
             .find(|unit| unit.result == "match_unsatisfied")
             .map(|unit| {
                 // 优先用实测路径说人话；没有路径条件（如 `installed:`）就退回原始条件。
+                //
+                // **不要写「这台机器没有 X」**：路径只是目录约定的位置，服务完全可能装在
+                // `/data/db/...` 下。那句断言会把运维带去查「是不是没装」，方向刚好相反。
                 match unit.paths.iter().find(|path| path.state == "absent") {
-                    Some(path) => format!("这台机器没有 {}", path.path),
+                    Some(path) => format!(
+                        "目录约定的位置没有 {}（服务可能装在非标准目录，尚未自动定位）",
+                        path.path
+                    ),
                     None => match scoped_condition(units, expansion, "match_unsatisfied") {
                         Some(condition) => format!("不满足条件 {condition}"),
                         None => format!("不满足条件 {}", unit.match_expr),
@@ -609,18 +831,16 @@ fn path_facts_for(
     let probed: BTreeSet<&str> = facts.probed_paths.iter().map(String::as_str).collect();
     let present: BTreeSet<&str> = facts.present_paths.iter().map(String::as_str).collect();
     let mut out = Vec::new();
-    for token in match_expr.split([';', ' ']) {
-        let token = token.trim();
-        let Some((kind, value)) = token.split_once(':') else {
-            continue;
-        };
+    // `any:port:5432|path_exists:/a` 里的路径也要显示：否则「端口不够、看路径」那半边
+    // 在页面上完全看不见，人无从判断到底探过没探过。
+    let mut push = |kind: &str, value: &str| {
         if kind != "path_exists" && kind != "not_path_exists" {
-            continue;
+            return;
         }
         for path in value
             .split('|')
             .map(str::trim)
-            .filter(|p| p.starts_with('/'))
+            .filter(|path| path.starts_with('/'))
         {
             let state = if present.contains(path) {
                 "present"
@@ -632,11 +852,29 @@ fn path_facts_for(
             } else {
                 "unprobed"
             };
+            if out.iter().any(|item: &PathFactView| item.path == path) {
+                continue;
+            }
             out.push(PathFactView {
                 path: path.to_string(),
                 state: state.to_string(),
             });
         }
+    };
+    for token in match_expr.split([';', ' ']) {
+        let token = token.trim();
+        let Some((kind, value)) = token.split_once(':') else {
+            continue;
+        };
+        if kind == "any" {
+            for sub in value.split('|') {
+                if let Some((sub_kind, sub_value)) = sub.split_once(':') {
+                    push(sub_kind.trim(), sub_value);
+                }
+            }
+            continue;
+        }
+        push(kind, value);
     }
     out
 }
@@ -1079,6 +1317,8 @@ mod tests {
             result: result.to_string(),
             match_expr: String::new(),
             paths,
+            unresolved_sources: Vec::new(),
+            min_agentd_version: None,
         }
     }
 
@@ -1116,9 +1356,60 @@ mod tests {
             },
         ]);
 
-        let reason = family_reason("unprobed", &units, &[], &expansion).expect("reason");
+        let reason =
+            family_reason("unprobed", &units, &[], &expansion, None, 0, None).expect("reason");
         assert!(reason.contains("installed:postgresql"), "{reason}");
         assert!(!reason.contains("/var/log/containers"), "{reason}");
+    }
+
+    /// 字段名被**页面读取**且是可选的：名字漂了只会静默不显示，所以钉住。
+    #[test]
+    fn a_unit_view_pins_the_min_agentd_version_wire_name() {
+        let mut unit = view_unit("linux-db", "agent_too_old", Vec::new());
+        unit.min_agentd_version = Some("0.10.0".to_string());
+        let json = serde_json::to_value(&unit).expect("serialize");
+        assert_eq!(json["min_agentd_version"], "0.10.0");
+
+        // 没有要求时不输出：旧响应字节不变（页面按“没有要求”处理）。
+        let json = serde_json::to_value(view_unit("u", "selected", Vec::new())).expect("serialize");
+        assert!(json.get("min_agentd_version").is_none(), "{json}");
+    }
+
+    #[test]
+    fn an_agent_too_old_reason_names_both_versions() {
+        let mut unit = view_unit("linux-db", "agent_too_old", Vec::new());
+        unit.min_agentd_version = Some("0.10.0".to_string());
+        let reason = family_reason(
+            "agent_too_old",
+            &[unit],
+            &[],
+            &empty_expansion(),
+            None,
+            0,
+            Some("0.9.13"),
+        )
+        .expect("reason");
+        assert_eq!(
+            reason,
+            "这台机器的 agentd 需要 ≥ 0.10.0（当前 0.9.13），升级后自动恢复"
+        );
+    }
+
+    #[test]
+    fn an_agent_too_old_reason_handles_a_missing_version() {
+        let mut unit = view_unit("linux-db", "agent_too_old", Vec::new());
+        unit.min_agentd_version = Some("0.10.0".to_string());
+        let reason = family_reason(
+            "agent_too_old",
+            &[unit],
+            &[],
+            &empty_expansion(),
+            None,
+            0,
+            None,
+        )
+        .expect("reason");
+        assert!(reason.contains("还没上报"), "{reason}");
     }
 
     #[test]
@@ -1139,8 +1430,16 @@ mod tests {
             },
         ];
 
-        let reason =
-            family_reason("unreadable", &units, &unreadable, &empty_expansion()).expect("reason");
+        let reason = family_reason(
+            "unreadable",
+            &units,
+            &unreadable,
+            &empty_expansion(),
+            None,
+            0,
+            None,
+        )
+        .expect("reason");
         assert_eq!(reason, "探不了 /var/lib/docker/containers：denied-docker");
     }
 
@@ -1160,8 +1459,28 @@ mod tests {
             },
         ]);
 
-        let reason = family_reason("absent", &units, &[], &expansion).expect("reason");
+        let reason =
+            family_reason("absent", &units, &[], &expansion, None, 0, None).expect("reason");
         assert!(reason.contains("installed:postgresql"), "{reason}");
+    }
+
+    #[test]
+    fn an_absent_path_says_the_expected_location_is_empty_not_that_the_host_lacks_it() {
+        // 这句话以前是「这台机器没有 /var/log/postgresql」，现场会照着它去查「是不是没装数据库」。
+        // 实际路径只是目录约定的位置，结论只能到「约定位置没有」为止。
+        let units = vec![view_unit(
+            "linux-db",
+            "match_unsatisfied",
+            vec![path("/var/log/postgresql", "absent")],
+        )];
+
+        let reason = family_reason("absent", &units, &[], &empty_expansion(), None, 0, None)
+            .expect("reason");
+        assert_eq!(
+            reason,
+            "目录约定的位置没有 /var/log/postgresql（服务可能装在非标准目录，尚未自动定位）"
+        );
+        assert!(!reason.contains("这台机器没有"), "{reason}");
     }
 
     fn empty_expansion() -> Expansion {

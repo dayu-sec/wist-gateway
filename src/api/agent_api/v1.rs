@@ -5,6 +5,7 @@
 
 use axum::routing::{MethodRouter, post};
 
+use super::super::agent_log_sources::agent_log_sources;
 use super::super::agent_ops::{
     ack_work, poll_agent_uplink, poll_control_commands, poll_discovery_policies,
     poll_discovery_snapshot, poll_work, renew_agent_credential, report_action_result,
@@ -12,6 +13,7 @@ use super::super::agent_ops::{
 };
 use super::super::enrollment::enroll_agent;
 use super::super::preflight::agent_preflight;
+use super::super::source_search_policy::poll_source_search_policy;
 use super::ApiState;
 
 pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
@@ -38,6 +40,15 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
         // 采集预检：agentd 把本机**实测**的路径结果带上来，网关用授权同一条链求值。
         // 独立端点而不是给已有报文加字段 —— 旧网关没有它，旧 agentd 也不会调。
         ("/collection-preflight", post(agent_preflight)),
+        // 日志源候选：agentd 上报本机解析出来的「服务 → 日志目录」，网关逐条校验后落库。
+        // 与预检同一姿态（新端点；旧网关 404、旧 agentd 不调）。
+        ("/log-sources", post(agent_log_sources)),
+        // L3 搜索根下发：知识库 `[[units]] search_roots` ∩ `allowed_source_roots`。
+        // agentd 侧没有配置；拿不到（404 / 网络失败）就不搜索（fail-closed）。
+        (
+            "/source-search-policy:poll",
+            post(poll_source_search_policy),
+        ),
         // 确认收到某份工作（常驻工作带生效版本）。
         ("/work:ack", post(ack_work)),
         // 一次性工作的执行结果（进度/终态）。与 ack 分开：确认回答「我收到了」，结果回答

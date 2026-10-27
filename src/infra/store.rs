@@ -579,6 +579,51 @@ pub struct UnreadablePath {
     pub error: String,
 }
 
+/// 一台机器上「某个服务的日志目录在哪」的一条候选（一台多行）。
+///
+/// 为什么与 [`StoredAgentFactSummary`] / [`StoredAgentPathProbe`] 分表：节奏、失败面、
+/// 写入方都不同（见 `migrations/sqlite/0035_agent_log_source.sql`）。摘要报文是全舰队
+/// `deny_unknown_fields` 的线格式，加字段会让旧网关/旧 agent 整份拒收 —— 所以走独立端点。
+///
+/// 关键语义：
+///   * **一行 = 一个实例的一条候选**，`(agent_id, service, source_ref, origin)` 唯一；
+///     解析值与覆盖**并存**（同一实例两行），删覆盖即回落、不必重采；
+///   * `source_ref` 优先 `port:<n>`（pid 重启就换，同一实例不该多出一条），无监听端口才退到
+///     `pid:<n>`；
+///   * `origin = override` 的行由人显式指定（**优先级最高**），但**同样受 roots 约束**：
+///     写入时就校验，不从这一行反推「人可以越权」；
+///   * 覆盖与解析值**并存**：删覆盖即回落，不必等下一次发现 tick。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredLogSource {
+    pub agent_id: String,
+    /// v1 封闭词表：`postgresql` / `mysql` / `redis` / `mongodb`。
+    pub service: String,
+    /// 本机实例引用：`port:<n>` / `pid:<n>` / `override`。
+    pub source_ref: String,
+    /// 日志**目录**（绝对路径）。
+    pub dir: String,
+    /// `human` / `cmdline_datadir` / `env_datadir` / `open_fd` / `config_file` / `cwd` / `search_hit`。
+    pub evidence: String,
+    /// 原始依据片段（≤ 512 字符）。
+    pub detail: String,
+    /// 0..100；只在同一 `evidence` 档内排序，不参与判定。
+    pub confidence: i64,
+    /// `agent` | `override`
+    pub origin: String,
+    /// 观测时刻（agent 的墙钟；覆盖取网关写入时刻）。
+    pub observed_at: String,
+    /// 网关收到 / 改写的时刻。
+    pub updated_at: String,
+}
+
+impl StoredLogSource {
+    /// 是不是人工覆盖。覆盖永远排在最前面（§6.2）。
+    pub fn is_override(&self) -> bool {
+        self.origin == "override"
+    }
+}
+
 /// 一条命中依据（对应模型 `PurposeSignal`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredPurposeSignal {
@@ -1324,6 +1369,42 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 写入/覆盖一次预检的路径实测（一台一条）。无条件覆盖：新的实测就是权威。
     async fn upsert_agent_path_probe(&self, probe: &StoredAgentPathProbe) -> StoreResult<()>;
+
+    /// 读这台机器全部日志源候选（**含**人工覆盖）。
+    ///
+    /// 不按 origin 分两次查：求值要的就是「覆盖在前、解析在后」的**一份**有序视图，
+    /// 分两次只会让调用方自己拼排序，两处拼法迟早不一致。
+    async fn list_agent_log_sources(&self, agent_id: &str) -> StoreResult<Vec<StoredLogSource>>;
+
+    /// 写入/覆盖一条候选（`(agent_id, service, source_ref)` 唯一）。
+    ///
+    /// 覆盖与解析值用同一条路径写：差别只在 `origin` / `evidence`，不在存储形态 ——
+    /// 否则「删掉覆盖回落到解析值」还得跨两张表做合并。
+    async fn upsert_agent_log_source(&self, source: &StoredLogSource) -> StoreResult<()>;
+
+    /// 删一条**人工覆盖**；返回是否真的删掉了。
+    ///
+    /// 只删 `origin = override`：解析值要留着（删覆盖即回落，不必重采）。
+    async fn delete_agent_log_source(
+        &self,
+        agent_id: &str,
+        service: &str,
+        source_ref: &str,
+    ) -> StoreResult<bool>;
+
+    /// 删某服务的全部候选，返回删除行数（`DELETE …/{service}` 不带 `source_ref` 时用）。
+    async fn delete_agent_log_sources(&self, agent_id: &str, service: &str) -> StoreResult<u64>;
+
+    /// 用这次上报的候选**替换**该 agent 的全部自动解析行（`origin = agent`），返回写入行数。
+    ///
+    /// 为什么是替换而不是 upsert：上报是**覆盖式全集** ——
+    /// 上次有、这次没有的实例就是「进程已经没了」，留着会让网关一直按一个不存在的目录派活。
+    /// **人工覆盖（`origin = override`）不动**：它是人的显式意图，不该被一轮解析抹掉。
+    async fn replace_agent_log_sources(
+        &self,
+        agent_id: &str,
+        sources: &[StoredLogSource],
+    ) -> StoreResult<usize>;
 
     /// 用这台机器的清单**替换**它此前全部行（覆盖式重建），返回写入的行数。
     ///

@@ -32,6 +32,16 @@ pub mod content;
 // 重新生成控制面代码时需回补本模块。
 pub mod work;
 
+// NOTE(hand-added): 日志源定位的纯逻辑（路径规范化 / roots 判定 / 按实例展开）。
+// 管理 API、目录装载期与派活物化三处共用一个口径 —— 它是安全边界，不允许各写一套。
+// 重生成控制面代码时需回补本模块。
+pub mod log_source;
+
+// NOTE(hand-added): agentd 版本比较（知识库可声明「最低 agentd 版本」）。
+// 只比不推：版本号回答不了“这一版在**这个环境**里真能不能采”（那是 logs_capabilities 的事），
+// 但能回答“这台机器是不是旧到连该能力都没有”。重生成控制面代码时需回补本模块。
+pub mod agent_version;
+
 // NOTE(hand-added): 灰度发布计划（模型 Control.Rollout）的校验与物化：
 // 推进闸门、target → OneShotWork 的物化、结果 → 条目的折算。与 Control.Agent.Work 分离，
 // 物化时才落到一次性工作。重新生成控制面代码时需回补本模块。

@@ -105,6 +105,14 @@ struct UnitView {
     parse_ready: bool,
     /// 至少一条来源 agentd 能执行（否则派下去也会报 `unsupported`）。
     executable: bool,
+    /// L3 受限搜索的根（unit 级舰队上限；空 = 不搜）。
+    ///
+    /// 这里只展示**声明值**；真正生效的 roots 还要与网关 `[collection]
+    /// allowed_source_roots` 取交集（见设计 §5.4 / §6.1.1）。
+    search_roots: Vec<String>,
+    /// 要求的最低 agentd 版本（包级与单元级取高者）；`None` = 无要求。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_agentd_version: Option<String>,
     sources: Vec<UnitSourceView>,
 }
 
@@ -181,6 +189,8 @@ pub async fn view_content(
                 collect_ready: unit.collect_ready(),
                 parse_ready: unit.parse_ready(),
                 executable: sources.iter().any(|source| source.executable),
+                search_roots: unit.search_roots.clone(),
+                min_agentd_version: unit.min_agentd_version.clone(),
                 sources,
             }
         })
@@ -233,6 +243,25 @@ pub async fn view_content(
 mod tests {
     use super::*;
 
+    fn unit_view() -> UnitView {
+        UnitView {
+            unit_id: "linux-db-service".to_string(),
+            family: "DatabaseService".to_string(),
+            platform: "linux".to_string(),
+            capability: "collect_logs".to_string(),
+            match_expr: String::new(),
+            rule_ref: String::new(),
+            requires_privilege: "root".to_string(),
+            status: "active".to_string(),
+            collect_ready: true,
+            parse_ready: false,
+            executable: true,
+            search_roots: Vec::new(),
+            min_agentd_version: None,
+            sources: Vec::new(),
+        }
+    }
+
     fn source(filters: ContainerFilters, exclude_globs: Vec<String>) -> UnitSourceView {
         UnitSourceView {
             kind: "FileGlob".to_string(),
@@ -261,6 +290,26 @@ mod tests {
         view.drop_if_contains = vec!["pam_unix(cron:session)".to_string()];
         let json = serde_json::to_value(view).expect("serialize");
         assert_eq!(json["drop_if_contains"][0], "pam_unix(cron:session)");
+    }
+
+    /// 采集面视图的两个新字段：字段名被**页面读取**（都是可选字段 —— 名字漂了只会静默不显示，
+    /// 不会报错），所以必须钉在测试里。
+    #[test]
+    fn unit_view_serializes_search_roots_and_min_agentd_version() {
+        let mut view = unit_view();
+        view.search_roots = vec!["/data".to_string(), "/srv".to_string()];
+        view.min_agentd_version = Some("0.10.0".to_string());
+        let json = serde_json::to_value(view).expect("serialize");
+        assert_eq!(json["search_roots"][0], "/data");
+        assert_eq!(json["min_agentd_version"], "0.10.0");
+    }
+
+    /// 没有声明就不输出 `min_agentd_version`（旧目录/旧网关字节不变）。
+    #[test]
+    fn unit_view_omits_an_absent_min_agentd_version() {
+        let json = serde_json::to_value(unit_view()).expect("serialize");
+        assert!(json.get("min_agentd_version").is_none(), "{json}");
+        assert_eq!(json["search_roots"], serde_json::json!([]));
     }
 
     #[test]

@@ -89,6 +89,12 @@ pub const SOURCE_KINDS: &[&str] = &[
 pub use wist_contracts::work::MULTILINE_MODES;
 /// 权限闭集。
 pub const PRIVILEGES: &[&str] = &["none", "root", "fda"];
+
+/// `from_dir` 能指向的服务闭集（v1）。
+///
+/// 新增一个值 = 加一条解析规则（agentd）+ 目录里给那个服务加 `from_dir` 来源；
+/// 两边不同步时，解析结果会被网关按“不在词表”丢掉 —— 在装载期报错比在运行时静默丢好。
+pub const LOG_SERVICES: &[&str] = &["postgresql", "mysql", "redis", "mongodb"];
 /// `match` 条件 kind 闭集（与 [`eval_condition`] 认识的分支一致）。
 ///
 /// 装载期必须校验：`parse_conditions` 会**静默丢弃**没有 `:` 的片段，而空表达式等于
@@ -103,6 +109,10 @@ pub const MATCH_KINDS: &[&str] = &[
     "device",
     "service",
     "resource",
+    // 跨 kind 的 OR：`any:port:5432|path_exists:/var/log/postgresql`。
+    // 为什么需要：多条条件是 **AND**，`|` 只在同一 kind 内做 OR ——
+    // 「端口在听 **或** 日志在标准目录」跨了两个 kind，用 `;` 写会变成永远不成立。
+    "any",
 ];
 /// 单元**采集就绪度**（能不能派下去采原文；与解析规则无关）。
 pub const UNIT_STATUSES: &[&str] = &["active", "draft", "deprecated"];
@@ -121,6 +131,21 @@ fn invalid(detail: impl Into<String>) -> ConfigError {
     ConfigReason::Validation.to_err().with_detail(detail)
 }
 
+/// 归一一个「最低 agentd 版本」：能解析就规范化，解析不了就**拒载**。
+///
+/// 知识库是签名产物，一个拼错的版本号不该变成“永远拦不住 / 永远拦着”的谜题。
+fn normalize_min_agentd(label: &str, raw: Option<&str>) -> ConfigResult<Option<String>> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = crate::app::agent_version::AgentVersion::parse(raw).ok_or_else(|| {
+        invalid(format!(
+            "{label}: min_agentd_version {raw:?} 不是合法版本（形如 0.9.13 / 0.10.0-beta）"
+        ))
+    })?;
+    Ok(Some(parsed.normalized()))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 原始 TOML 形状（`deny_unknown_fields`：笔误要响，不能被静默忽略）
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,6 +162,12 @@ struct CatalogFile {
     published_at: String,
     #[serde(default)]
     superseded_by: Option<i64>,
+    /// 整包的最低 agentd 版本（可选）。与单元级取**高者**。
+    ///
+    /// 为什么要这一层：多个集群跑不同版本的 agentd，而知识库是同一份 ——
+    /// 包级下限用来表达“这一整版目录需要什么才能采”，单元级用来表达“这一条新能力需要什么”。
+    #[serde(default)]
+    min_agentd_version: Option<String>,
     /// 采集面词表。**空 = 旧包**（还没有 `[[families]]`），回落内置基线（过渡期）。
     #[serde(default)]
     families: Vec<FamilyRow>,
@@ -173,11 +204,29 @@ struct UnitRow {
     family: String,
     capability: String,
     platform: String,
+    /// 这个单元**整体**对应的服务（可选）。
+    ///
+    /// 设了就是一条声明：「本单元只服务这个服务」—— 它的每条 `from_dir` 都必顶同值。
+    /// 不设也合法（旧目录全部如此）：服务名只看每条来源自己的 `from_dir` key。
+    #[serde(default)]
+    service: String,
     // `match` 是 Rust 关键字，字段另起名；它不是“匹配”而是“采集前提条件”。
     #[serde(default, rename = "match")]
     match_expr: String,
     #[serde(default)]
     rule_ref: String,
+    /// L3 受限搜索的根（**unit 级、舰队上限**）。缺省 = 不搜。
+    ///
+    /// 生效值 = 本列表 ∩ 网关 `[collection] allowed_source_roots`（§6.1.1）；
+    /// agentd 侧**没有配置**，本字段是它唯一知道的 roots 来源。
+    #[serde(default)]
+    search_roots: Vec<String>,
+    /// 这个单元要求的最低 agentd 版本（可选；与包级取高者）。
+    ///
+    /// 用于新能力落地（如 `from_dir` 需要 0.10+）：旧 agentd 拿到这种单元只能
+    /// 报 `unsupported` 或静默拿不到候选 —— 不如在**授权前**就告诉人“升级 agentd”。
+    #[serde(default)]
+    min_agentd_version: Option<String>,
     requires_privilege: String,
     status: String,
     #[serde(default)]
@@ -188,7 +237,19 @@ struct UnitRow {
 #[serde(deny_unknown_fields)]
 struct SourceRow {
     kind: String,
+    /// 字面值（绝对路径 / glob）。与 `from_dir` **二选一**。
+    #[serde(default)]
     target: String,
+    /// 目录来自解析结果：`log_source:<service>`（与 `target` 二选一）。
+    ///
+    /// 为什么不在派活时让 agent 自己找：一旦 agent 自选路径，舰队里每台机器采的东西
+    /// 不可解释，且等于给 root 进程开「读任意路径并上送」的口。判定在网关。
+    #[serde(default)]
+    from_dir: Option<String>,
+    /// 文件名模式（`*.csv`）。**`from_dir` 的读法**：目录由解析定、文件名由策展定。
+    /// 只允许单层文件名，不允许带 `/`。
+    #[serde(default)]
+    pattern: Option<String>,
     #[serde(default = "default_multiline")]
     multiline: String,
     /// 从文件族匹配集里剔掉的绝对路径 glob（默认空，只对 `FileGlob` 有意义）。
@@ -270,6 +331,8 @@ pub struct Unit {
     pub family: String,
     pub capability: String,
     pub platform: String,
+    /// 单元级服务声明（可选；非空时本单元每条 `from_dir` 必顶同值）。
+    pub service: String,
     pub match_expr: String,
     /// **解析就绪度**（独立信号，**不参与**派活闸门）：非空 = 有解析规则，采下来的记录能被
     /// 归类、抽字段；空 = 只落原文 —— 帧进得来、落得下，但下游只能拿到未归类的原文。
@@ -278,6 +341,12 @@ pub struct Unit {
     /// 它不需要任何解析规则；规则是数据面的事。卡在这里会把「先收原文样本、后补规则」
     /// 这条最省的路堵死。
     pub rule_ref: String,
+    /// L3 受限搜索的根（已校验、已归一、已去重）；空 = 不对这个单元辖下的服务做搜索。
+    pub search_roots: Vec<String>,
+    /// 这个单元要求的最低 agentd 版本（已归一；包级下限与单元级取高者）。
+    ///
+    /// `None` = 没有要求（旧目录、或完全不依赖新能力的单元）。
+    pub min_agentd_version: Option<String>,
     pub requires_privilege: String,
     /// **采集就绪度**：`active` = 采集要素齐（有来源，且至少一条来源 agentd 真能执行）
     /// → 可以派下去采原文。派活闸门看的就是它。
@@ -290,7 +359,12 @@ pub struct Unit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitSource {
     pub kind: String,
+    /// 字面值（绝对路径 / glob）；`from_dir` 非空时为空串。
     pub target: String,
+    /// `log_source:<service>`：目录来自解析结果（与 `target` 二选一）。
+    pub from_dir: Option<String>,
+    /// `from_dir` 的文件名模式（单层，不含 `/`）；字面值来源为空串。
+    pub pattern: String,
     /// `none`（一行一条）| `indented`（行首缩进是上一条的续行）|
     /// `mysql_slow` / `postgres_csv`（W4；词表见 `wist_contracts::work::MULTILINE_MODES`）。
     pub multiline: String,
@@ -300,6 +374,20 @@ pub struct UnitSource {
     pub filters: ContainerFilters,
     /// 含这些子串的记录整条丢弃；空 = 不丢。
     pub drop_if_contains: Vec<String>,
+}
+
+impl UnitSource {
+    /// 目录取自解析结果（`from_dir`），而不是目录里写死的字面值。
+    pub fn is_from_dir(&self) -> bool {
+        self.from_dir.is_some()
+    }
+
+    /// `from_dir` 指向的服务（`log_source:postgresql` → `postgresql`）。
+    pub fn log_service(&self) -> Option<&str> {
+        self.from_dir
+            .as_deref()
+            .and_then(|key| key.strip_prefix("log_source:"))
+    }
 }
 
 impl Unit {
@@ -446,17 +534,36 @@ fn build_content(
 ) -> ConfigResult<ContentSet> {
     let families = build_vocabulary(&catalog.families)?;
     let catalog_version = validate_catalog(&catalog, &families)?;
+    // 包级下限：所有单元共用（与单元级取高者）。在消费 `catalog.units` 之前先归一。
+    let package_min_agentd =
+        normalize_min_agentd("catalog", catalog.min_agentd_version.as_deref())?;
     let units = catalog
         .units
         .into_iter()
         .map(|row| {
+            // 归一后的值才是运行期用的那份（校验已在 `validate_unit` 里做过一遍，
+            // 这里只是把规范化结果留下来 —— 不存原始写法，避免下游各自再归一）。
+            let search_roots =
+                crate::app::log_source::normalize_search_roots(&row.unit_id, &row.search_roots)
+                    .map_err(invalid)?;
+            let unit_min_agentd = normalize_min_agentd(
+                &format!("unit {}", row.unit_id),
+                row.min_agentd_version.as_deref(),
+            )?;
             let unit = Unit {
                 unit_id: row.unit_id,
                 family: row.family,
                 capability: row.capability,
                 platform: row.platform,
+                service: row.service,
                 match_expr: row.match_expr,
                 rule_ref: row.rule_ref,
+                search_roots,
+                // 包级与单元级取**高者**：哪个严就用哪个（升级门槛不该被单元“覆盖变低”）。
+                min_agentd_version: crate::app::agent_version::highest(
+                    package_min_agentd.as_deref(),
+                    unit_min_agentd.as_deref(),
+                ),
                 requires_privilege: row.requires_privilege,
                 status: row.status,
                 sources: row
@@ -465,6 +572,8 @@ fn build_content(
                     .map(|source| UnitSource {
                         kind: source.kind,
                         target: source.target,
+                        from_dir: source.from_dir,
+                        pattern: source.pattern.unwrap_or_default(),
                         multiline: source.multiline,
                         exclude_globs: source.exclude_globs,
                         filters: source.filters,
@@ -472,9 +581,9 @@ fn build_content(
                     })
                     .collect(),
             };
-            (unit.unit_id.clone(), unit)
+            Ok((unit.unit_id.clone(), unit))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<ConfigResult<BTreeMap<_, _>>>()?;
 
     validate_unique_active_paths(&units)?;
 
@@ -604,6 +713,11 @@ fn validate_unique_active_paths(units: &BTreeMap<String, Unit>) -> ConfigResult<
             if source.kind != "FileGlob" {
                 continue;
             }
+            // `from_dir` 的字面 target 是**空串**（目录还没定），不参与「同一文件只能一个单元采」
+            // 的去重 —— 否则同一服务的多条 from_dir 会彼此判重。
+            if source.target.trim().is_empty() {
+                continue;
+            }
             match claimed.insert(
                 (unit.platform.clone(), source.target.clone()),
                 unit.unit_id.clone(),
@@ -651,6 +765,15 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
             unit.platform
         )));
     }
+    if !unit.service.trim().is_empty() && !LOG_SERVICES.contains(&unit.service.as_str()) {
+        return Err(invalid(format!(
+            "unit {id}: unknown service {:?}（v1 词表：{LOG_SERVICES:?}）",
+            unit.service
+        )));
+    }
+    // L3 的 roots 在这时就校验：它们决定一个 root 进程能枚举哪些目录，
+    // 写错不该等到运行时才发现（且知识库是签名产物，笔误要响）。
+    crate::app::log_source::normalize_search_roots(id, &unit.search_roots).map_err(invalid)?;
     if !PRIVILEGES.contains(&unit.requires_privilege.as_str()) {
         return Err(invalid(format!(
             "unit {id}: unknown requires_privilege {:?}",
@@ -717,6 +840,33 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
                 "unit {id}: {kind} expects absolute paths, got {bad:?}"
             )));
         }
+        // `any:` = **跨 kind 的 OR**（`match` 的多条条件是 AND，`|` 只在同一 kind 内做 OR）。
+        // 子值必须自带 kind，且不允许嵌套 —— 嵌套会让“哪一层是真”变得难解释。
+        if kind == "any" {
+            for value in &values {
+                let Some((sub_kind, sub_rest)) = value.split_once(':') else {
+                    return Err(invalid(format!(
+                        "unit {id}: any: 的子值 {value:?} 缺少 kind（形如 port:5432 / path_exists:/a）"
+                    )));
+                };
+                let sub_kind = sub_kind.trim();
+                if sub_kind == "any" {
+                    return Err(invalid(format!("unit {id}: any: 不允许嵌套")));
+                }
+                if !MATCH_KINDS.contains(&sub_kind) {
+                    return Err(invalid(format!(
+                        "unit {id}: any: 的子值 {value:?} 的 kind 未知（允许：{MATCH_KINDS:?}）"
+                    )));
+                }
+                if (sub_kind == "path_exists" || sub_kind == "not_path_exists")
+                    && !sub_rest.trim().starts_with('/')
+                {
+                    return Err(invalid(format!(
+                        "unit {id}: {sub_kind} expects absolute paths, got {sub_rest:?}"
+                    )));
+                }
+            }
+        }
     }
     if unit.sources.is_empty() {
         return Err(invalid(format!("unit {id}: no sources")));
@@ -728,11 +878,59 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
                 source.kind
             )));
         }
-        if source.target.trim().is_empty() {
-            return Err(invalid(format!(
-                "unit {id}: source {} has empty target",
-                source.kind
-            )));
+        // 字面值 / `from_dir` **二选一**（fail-closed：两个都给说明策展没想清楚要采哪）。
+        match (source.from_dir.as_deref(), source.target.trim()) {
+            (Some(key), "") => {
+                if source.kind != "FileGlob" {
+                    return Err(invalid(format!(
+                        "unit {id}: from_dir 只对 FileGlob 有意义（got {:?}）",
+                        source.kind
+                    )));
+                }
+                let Some(service) = key.strip_prefix("log_source:") else {
+                    return Err(invalid(format!(
+                        "unit {id}: from_dir 必须写成 log_source:<service>，got {key:?}"
+                    )));
+                };
+                if !LOG_SERVICES.contains(&service) {
+                    return Err(invalid(format!(
+                        "unit {id}: from_dir 的服务 {service:?} 不在 v1 词表 {LOG_SERVICES:?} 里"
+                    )));
+                }
+                // 单元级 `service` 是「一个单元只服务一个服务」的声明；不一致就拒载，
+                // 否则预检/排障会把两个服务的日志混在一个面里讲，越讲越乱。
+                if !unit.service.trim().is_empty() && unit.service != service {
+                    return Err(invalid(format!(
+                        "unit {id}: unit.service = {:?} 与 from_dir {key:?} 不一致\
+                         （一个单元只服务一个服务；要合在一起就别写 unit.service）",
+                        unit.service
+                    )));
+                }
+                let Some(pattern) = source.pattern.as_deref() else {
+                    return Err(invalid(format!(
+                        "unit {id}: from_dir {key:?} 缺 pattern（目录由解析定，文件名由策展定）"
+                    )));
+                };
+                validate_source_pattern(id, pattern)?;
+            }
+            (None, target) if !target.is_empty() => {
+                if source.pattern.is_some() {
+                    return Err(invalid(format!(
+                        "unit {id}: pattern 只对 from_dir 有意义（字面值 target 已自带文件名）"
+                    )));
+                }
+            }
+            (Some(_), _) => {
+                return Err(invalid(format!(
+                    "unit {id}: target 与 from_dir 二选一，不能同时给"
+                )));
+            }
+            (None, _) => {
+                return Err(invalid(format!(
+                    "unit {id}: source {} has empty target（或用 from_dir + pattern）",
+                    source.kind
+                )));
+            }
         }
         if !MULTILINE_MODES.contains(&source.multiline.as_str()) {
             return Err(invalid(format!(
@@ -839,6 +1037,37 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
              (kind 要去 {EXECUTABLE_SOURCE_KINDS:?}；FileGlob 的 target 要是绝对路径 \
              （显式路径或单层 glob，不支持 `**`）、Exporter 的 ID 要在 EXPORTER_IDS 里)"
         )));
+    }
+    Ok(())
+}
+
+/// 校验 `from_dir` 的文件名 pattern：**单层文件名**（不含 `/`）。
+///
+/// 为什么必须单层：`pattern` 会被拼到解析出来的目录后面（`join_pattern`）。
+/// 带 `/` 就等于偷偷把「目录由解析定」变成「目录 + 子路径由策展定」，
+/// 而那会绕过「目录必须在 roots 内」的校验（`/data/pg/log` + `../../../etc/*`）。
+fn validate_source_pattern(unit_id: &str, pattern: &str) -> ConfigResult<()> {
+    let value = pattern.trim();
+    if value.is_empty() {
+        return Err(invalid(format!(
+            "unit {unit_id}: from_dir 的 pattern 不能为空"
+        )));
+    }
+    if value != pattern {
+        return Err(invalid(format!(
+            "unit {unit_id}: pattern {pattern:?} 首尾不能有空白"
+        )));
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err(invalid(format!(
+            "unit {unit_id}: pattern 必须是单层文件名（不能含路径分隔符），got {value:?}"
+        )));
+    }
+    if value == "." || value == ".." {
+        return Err(invalid(format!("unit {unit_id}: pattern 不能是 {value:?}")));
+    }
+    if value.contains('\0') {
+        return Err(invalid(format!("unit {unit_id}: pattern 里不能含 NUL")));
     }
     Ok(())
 }
@@ -1206,10 +1435,15 @@ impl ContentSet {
     ///   - 选中集为空的面不产生工作（但排除项仍留痕）。
     ///
     /// **不**看 `rule_ref`：能不能采与能不能解析是两件事（见 [`Unit::parse_ready`]）。
+    ///
+    /// `sources` 是日志源的求值输入（已上报候选 + 网关 roots）。`from_dir` 的分支走
+    /// [`crate::app::log_source::resolve_unit_sources`]，与实活物化**同一份**判据 ——
+    /// 否则会出现「预检说可以、授权却拒绝」。
     pub fn expand(
         &self,
         template_id: &str,
         facts: &StoredAgentFactSummary,
+        sources: crate::app::log_source::SourceContext<'_>,
     ) -> Result<Expansion, String> {
         let template = self
             .templates
@@ -1250,8 +1484,48 @@ impl ContentSet {
                     });
                     continue;
                 }
+                // 知识库声明的最低 agentd：**比“服务在不在”更前置** —— 旧 agentd 连这种来源
+                // 都接不了，先去判 match 只会给出误导性的结论（“找不到日志” vs “该升级了”）。
+                if let Some(required) = unit.min_agentd_version.as_deref()
+                    && !crate::app::agent_version::meets_minimum(sources.agent_version, required)
+                {
+                    excluded.push(ExcludedUnit {
+                        unit_id: unit.unit_id.clone(),
+                        reason_code: "agent_too_old".to_string(),
+                        condition: Some(format!("agentd_min_version:{required}")),
+                    });
+                    continue;
+                }
                 match eval_match(&unit.match_expr, facts) {
-                    Truth::Yes => selected.push(unit.unit_id.clone()),
+                    Truth::Yes => {
+                        // 「服务在」只是前提；还要真能指出**采什么**。
+                        // 两者分开报：`match_unsatisfied` 是「没有这个服务」，
+                        // `source_not_resolved` 是「服务在、但找不到日志」—— 处置相反。
+                        let resolved = crate::app::log_source::resolve_unit_sources(
+                            unit,
+                            Some(facts),
+                            sources,
+                        );
+                        if resolved.sources.is_empty() {
+                            // 条件里带**具体原因**：`log_source:` 是「哪个服务没找到目录」，
+                            // `path_absent:` 是「哪条字面路径实测不在」—— 授权被拒时，
+                            // 这两种处置不一样（前者配覆盖，后者换机器 / 改目录）。
+                            let condition = if !resolved.unresolved.is_empty() {
+                                Some(format!("log_source:{}", resolved.unresolved.join(",")))
+                            } else if !resolved.absent.is_empty() {
+                                Some(format!("path_absent:{}", resolved.absent.join(",")))
+                            } else {
+                                None
+                            };
+                            excluded.push(ExcludedUnit {
+                                unit_id: unit.unit_id.clone(),
+                                reason_code: "source_not_resolved".to_string(),
+                                condition,
+                            });
+                        } else {
+                            selected.push(unit.unit_id.clone());
+                        }
+                    }
                     Truth::No => excluded.push(ExcludedUnit {
                         unit_id: unit.unit_id.clone(),
                         reason_code: "match_unsatisfied".to_string(),
@@ -1290,16 +1564,39 @@ impl ContentSet {
 fn collect_unit_probe_paths(unit: &Unit, paths: &mut BTreeSet<String>) {
     for condition in parse_conditions(&unit.match_expr) {
         // 否定条件也要探：不探就永远是「无法判定」，那个单元永远展不开。
-        if condition.kind != "path_exists" && condition.kind != "not_path_exists" {
+        // `any:` 里的路径同样要探 —— 否则「端口不够、看路径」那半边永远掺不了真。
+        let mut push_paths = |kind: &str, values: &[String]| {
+            if kind != "path_exists" && kind != "not_path_exists" {
+                return;
+            }
+            for value in values {
+                if value.starts_with('/') {
+                    paths.insert(value.clone());
+                }
+            }
+        };
+        if condition.kind == "any" {
+            for value in &condition.values {
+                if let Some((kind, rest)) = value.split_once(':') {
+                    let values: Vec<String> = rest
+                        .split('|')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    push_paths(kind.trim(), &values);
+                }
+            }
             continue;
         }
-        for value in condition.values {
-            if value.starts_with('/') {
-                paths.insert(value);
-            }
-        }
+        push_paths(&condition.kind, &condition.values);
     }
     for source in &unit.sources {
+        // `from_dir` 的目录是**动态的**，不进探测白名单：塞进来等于在目录里又长出
+        // 第二份真相（多实例时还会随天变化）。
+        if source.is_from_dir() {
+            continue;
+        }
         if source.kind == "FileGlob" && is_explicit_path(&source.target) {
             paths.insert(source.target.clone());
         }
@@ -1421,7 +1718,48 @@ fn first_non_yes_condition(
     None
 }
 
+/// `any:<kind>:<value>|<kind>:<value>…` —— **跨 kind 的 OR**。
+///
+/// 三态与其它条件一致：任一子条件为 Yes → Yes；全部 No → No；否则 Unknown。
+/// 典型用法是「服务在 **或** 日志在标准目录」：
+/// ```text
+/// any:port:5432|port:3306|path_exists:/var/log/postgresql|path_exists:/var/log/mysql
+/// ```
+fn eval_any_condition(condition: &Condition, facts: &StoredAgentFactSummary) -> Truth {
+    let mut saw_unknown = false;
+    for value in &condition.values {
+        let Some((kind, rest)) = value.split_once(':') else {
+            saw_unknown = true;
+            continue;
+        };
+        let sub = Condition {
+            raw: value.clone(),
+            kind: kind.trim().to_string(),
+            values: rest
+                .split('|')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect(),
+        };
+        match eval_condition(&sub, facts) {
+            Truth::Yes => return Truth::Yes,
+            Truth::Unknown => saw_unknown = true,
+            Truth::No => {}
+        }
+    }
+    if saw_unknown {
+        Truth::Unknown
+    } else {
+        Truth::No
+    }
+}
+
 fn eval_condition(condition: &Condition, facts: &StoredAgentFactSummary) -> Truth {
+    // 跨 kind 的 OR：先看它，别让子值被当成普通 kind 去求值。
+    if condition.kind == "any" {
+        return eval_any_condition(condition, facts);
+    }
     // `path_exists` / `not_path_exists` 需要的是「探测过才判得出来」，与其它 kind 的
     // 「空事实 = 无法判定」不同，所以单独走分支。
     if condition.kind == "path_exists" {
@@ -1662,6 +2000,92 @@ status = "active"
         parse_content(CATALOG, PACKS, TEMPLATES).expect("minimal content parses")
     }
 
+    fn context<'a>(
+        roots: &'a [String],
+        agent_version: Option<&'a str>,
+    ) -> crate::app::log_source::SourceContext<'a> {
+        crate::app::log_source::SourceContext {
+            log_sources: &[],
+            roots,
+            agent_version,
+        }
+    }
+
+    /// 知识库声明的最低 agentd：旧版本被**前置**排除，理由能直接指出“升级”。
+    #[test]
+    fn a_unit_can_require_a_minimum_agentd_version() {
+        let catalog = CATALOG.replace(
+            "match = \"installed:postgresql\"",
+            "match = \"installed:postgresql\"\nmin_agentd_version = \"0.10.0\"",
+        );
+        let content = parse_content(&catalog, PACKS, TEMPLATES).expect("parses");
+        let facts = facts("linux", &["postgresql"]);
+        let roots: Vec<String> = Vec::new();
+
+        let excluded_by = |version: Option<&str>| {
+            let expansion = content
+                .expand("linux-data", &facts, context(&roots, version))
+                .expect("expand");
+            expansion
+                .excluded_units
+                .iter()
+                .find(|unit| unit.unit_id == "linux-db")
+                .map(|unit| (unit.reason_code.clone(), unit.condition.clone()))
+        };
+
+        // 旧版本 → 排除，且带出要求版本（页面据此说“升级到 X”）。
+        assert_eq!(
+            excluded_by(Some("0.9.13")),
+            Some((
+                "agent_too_old".to_string(),
+                Some("agentd_min_version:0.10.0".to_string())
+            ))
+        );
+        // 没报过版本 → 保守不派（与能力协商同一姿态）。
+        assert_eq!(
+            excluded_by(None).map(|(code, _)| code),
+            Some("agent_too_old".to_string())
+        );
+        // 够版本 → 正常选中。
+        assert_eq!(excluded_by(Some("0.10.0")), None);
+    }
+
+    /// 包级下限与单元级取**高者**：升级门槛不能被某个单元“覆盖变低”。
+    #[test]
+    fn the_package_floor_can_raise_a_units_requirement() {
+        let catalog = CATALOG
+            .replace(
+                "catalog_version = 1\norigin",
+                "catalog_version = 1\nmin_agentd_version = \"0.12.0\"\norigin",
+            )
+            .replace(
+                "match = \"installed:postgresql\"",
+                "match = \"installed:postgresql\"\nmin_agentd_version = \"0.10.0\"",
+            );
+        let content = parse_content(&catalog, PACKS, TEMPLATES).expect("parses");
+        let db = content
+            .units()
+            .find(|unit| unit.unit_id == "linux-db")
+            .expect("linux-db");
+        assert_eq!(db.min_agentd_version.as_deref(), Some("0.12.0"));
+        // 没有单元级声明的也没跑掉：包级下限对所有单元生效。
+        let metrics = content
+            .units()
+            .find(|unit| unit.unit_id == "linux-metrics")
+            .expect("linux-metrics");
+        assert_eq!(metrics.min_agentd_version.as_deref(), Some("0.12.0"));
+    }
+
+    #[test]
+    fn an_unparsable_min_agentd_version_is_refused() {
+        let catalog = CATALOG.replace(
+            "match = \"installed:postgresql\"",
+            "match = \"installed:postgresql\"\nmin_agentd_version = \"latest\"",
+        );
+        let err = parse_content(&catalog, PACKS, TEMPLATES).expect_err("must refuse");
+        assert!(format!("{err:?}").contains("min_agentd_version"), "{err:?}");
+    }
+
     fn facts(os: &str, packages: &[&str]) -> StoredAgentFactSummary {
         StoredAgentFactSummary {
             os: os.to_string(),
@@ -1733,6 +2157,32 @@ status = "active"
         let err = validate_unit(&unit_row("u3", "LoginSession", "linux"), &vocabulary)
             .expect_err("unknown family");
         assert!(err.to_string().contains("unknown family"), "{err}");
+    }
+
+    /// L3 的 roots 是**安全边界**：非法值拒载，且报错要点名是哪个单元的哪个字段。
+    #[test]
+    fn search_roots_are_validated_at_load_time() {
+        let vocabulary = default_vocabulary();
+        let with_roots = |roots: &[&str]| {
+            let mut row = unit_row("u1", "DatabaseService", "linux");
+            row.search_roots = roots.iter().map(|root| root.to_string()).collect();
+            row
+        };
+
+        validate_unit(&with_roots(&["/data", "/srv/"]), &vocabulary).expect("合法目录");
+        for bad in ["/", "relative", "/data/../etc", "/data/*"] {
+            let err =
+                validate_unit(&with_roots(&[bad]), &vocabulary).expect_err("非法 root 必须拒载");
+            let text = err.to_string();
+            assert!(
+                text.contains("search_roots") && text.contains(bad),
+                "报错要说清字段与值：{text}"
+            );
+        }
+        // 条数上限与 agentd 侧一致（≤ 8）。
+        let too_many: Vec<&str> = (0..=8).map(|_| "/data").collect();
+        let err = validate_unit(&with_roots(&too_many), &vocabulary).expect_err("超过上限");
+        assert!(err.to_string().contains("search_roots"), "{err}");
     }
 
     /// 平台归属也来自词表，而不是代码里的两份常量。
@@ -1932,14 +2382,19 @@ target = "/var/log/x.log"
             family: family.to_string(),
             capability: "collect_logs".to_string(),
             platform: platform.to_string(),
+            service: String::new(),
             match_expr: String::new(),
             rule_ref: String::new(),
+            search_roots: Vec::new(),
+            min_agentd_version: None,
             requires_privilege: "none".to_string(),
             status: "draft".to_string(),
             sources: vec![SourceRow {
                 filters: Default::default(),
                 kind: "FileGlob".to_string(),
                 target: "/var/log/x.log".to_string(),
+                from_dir: None,
+                pattern: None,
                 multiline: "none".to_string(),
                 exclude_globs: Vec::new(),
                 drop_if_contains: Vec::new(),
@@ -2154,7 +2609,11 @@ target = "/var/log/x.log"
             // 空事实下也要**至少有一个面能派**：模板存在但每个面都「采集未就绪」，
             // 等于给运维一个能归档、却什么都派不出去的类别。
             let expansion = set
-                .expand(&template.template_id, &facts(platform, &[]))
+                .expand(
+                    &template.template_id,
+                    &facts(platform, &[]),
+                    Default::default(),
+                )
                 .expect("expand");
             assert!(
                 !expansion.works.is_empty(),
@@ -2173,7 +2632,7 @@ target = "/var/log/x.log"
         )
         .expect("load checked-in content");
         let expansion = set
-            .expand("macos-daily", &facts("macos", &[]))
+            .expand("macos-daily", &facts("macos", &[]), Default::default())
             .expect("expand");
         // 采集就绪的面按包内行序展开（macos-base 的 unit_refs 顺序）；
         // 剩下 5 个面的单元留痕 —— 事件型（`.ips`）、目录型、或来源类型未实现。
@@ -2240,7 +2699,9 @@ target = "/var/log/x.log"
             "/run/systemd/journal".to_string(),
         ];
         host_facts.present_paths = host_facts.probed_paths.clone();
-        let expansion = set.expand("linux-host", &host_facts).expect("expand");
+        let expansion = set
+            .expand("linux-host", &host_facts, Default::default())
+            .expect("expand");
         assert_eq!(
             expansion
                 .works
@@ -2474,7 +2935,7 @@ target = "/var/log/x.log"
 
         // 事实缺位（包探针未采）→ 无法判定，不冒充“没装”。
         let unknown = set
-            .expand("linux-data", &facts("linux", &[]))
+            .expand("linux-data", &facts("linux", &[]), Default::default())
             .expect("expand");
         assert_eq!(unknown.works.len(), 1);
         let db = unknown
@@ -2487,14 +2948,22 @@ target = "/var/log/x.log"
 
         // 事实在、且满足 → 选中。
         let satisfied = set
-            .expand("linux-data", &facts("linux", &["postgresql-14"]))
+            .expand(
+                "linux-data",
+                &facts("linux", &["postgresql-14"]),
+                Default::default(),
+            )
             .expect("expand");
         assert_eq!(satisfied.works.len(), 2);
         assert!(satisfied.excluded_units.is_empty());
 
         // 事实在、但不满足 → 报“条件不满足”（与“无法判定”区分开）。
         let unsatisfied = set
-            .expand("linux-data", &facts("linux", &["nginx"]))
+            .expand(
+                "linux-data",
+                &facts("linux", &["nginx"]),
+                Default::default(),
+            )
             .expect("expand");
         let db = unsatisfied
             .excluded_units
@@ -2521,6 +2990,156 @@ target = "/var/log/x.log"
             .expect("mac-metrics");
         assert!(unit.collect_ready());
         assert!(!unit.parse_ready(), "解析未就绪只影响归类，不影响能不能采");
+    }
+
+    #[test]
+    fn accepts_a_from_dir_source_alongside_the_literal_fallback() {
+        // W1 之后的「双来源」形状：字面值是兜底，`from_dir` 是解析出来的非标准目录。
+        let catalog = format!(
+            "{CATALOG}\n[[units.sources]]\nkind = \"FileGlob\"\n\
+             from_dir = \"log_source:postgresql\"\npattern = \"*.csv\"\n"
+        );
+        let set = parse_with(&catalog, PACKS, TEMPLATES).expect("from_dir parses");
+        let unit = set
+            .units()
+            .find(|unit| unit.unit_id == "linux-db")
+            .expect("linux-db");
+        let resolved = unit
+            .sources
+            .iter()
+            .find(|source| source.is_from_dir())
+            .expect("from_dir source");
+        assert_eq!(resolved.log_service(), Some("postgresql"));
+        assert_eq!(resolved.pattern, "*.csv");
+        assert!(
+            resolved.target.is_empty(),
+            "from_dir 的字面 target 必须为空"
+        );
+        // 字面值仍在：没有解析结果时它是兜底（也是 active 的可执行来源）。
+        assert!(
+            unit.sources
+                .iter()
+                .any(|source| source.target == "/var/log/postgresql.log")
+        );
+    }
+
+    #[test]
+    fn target_and_from_dir_are_mutually_exclusive() {
+        let catalog = format!(
+            "{CATALOG}\n[[units.sources]]\nkind = \"FileGlob\"\ntarget = \"/var/log/x.log\"\n\
+             from_dir = \"log_source:postgresql\"\npattern = \"*.csv\"\n"
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("both given");
+        assert!(err.to_string().contains("二选一"), "{err}");
+    }
+
+    #[test]
+    fn from_dir_requires_a_known_service() {
+        let catalog = format!(
+            "{CATALOG}\n[[units.sources]]\nkind = \"FileGlob\"\n\
+             from_dir = \"log_source:postgres\"\npattern = \"*.csv\"\n"
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("unknown service");
+        assert!(err.to_string().contains("不在 v1 词表"), "{err}");
+
+        let catalog = format!(
+            "{CATALOG}\n[[units.sources]]\nkind = \"FileGlob\"\n\
+             from_dir = \"pgdata\"\npattern = \"*.csv\"\n"
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("bad key shape");
+        assert!(err.to_string().contains("log_source:<service>"), "{err}");
+    }
+
+    #[test]
+    fn from_dir_pattern_must_be_a_single_file_name() {
+        // pattern 带 `/` 等于绕过「目录必须在 roots 内」—— 必须在装载期拦住。
+        let catalog = format!(
+            "{CATALOG}\n[[units.sources]]\nkind = \"FileGlob\"\n\
+             from_dir = \"log_source:postgresql\"\npattern = \"../../../etc/*\"\n"
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("nested pattern");
+        assert!(err.to_string().contains("单层文件名"), "{err}");
+
+        let catalog = format!(
+            "{CATALOG}\n[[units.sources]]\nkind = \"FileGlob\"\n\
+             from_dir = \"log_source:postgresql\"\n"
+        );
+        let err = parse_with(&catalog, PACKS, TEMPLATES).expect_err("missing pattern");
+        assert!(err.to_string().contains("缺 pattern"), "{err}");
+    }
+
+    // ── `any:`：跨 kind 的 OR ──────────────────────────────────────
+
+    fn facts_with(ports: &[&str], probed: &[&str], present: &[&str]) -> StoredAgentFactSummary {
+        StoredAgentFactSummary {
+            listen_ports: ports.iter().map(|value| value.to_string()).collect(),
+            probed_paths: probed.iter().map(|value| value.to_string()).collect(),
+            present_paths: present.iter().map(|value| value.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn any_is_an_or_across_kinds() {
+        // 数据库装在 /data/pg、标准目录不在 —— 端口在听就该选中。
+        let expr = "any:port:5432|path_exists:/var/log/postgresql";
+        assert_eq!(
+            eval_match(
+                expr,
+                &facts_with(&["tcp:5432"], &["/var/log/postgresql"], &[])
+            ),
+            Truth::Yes
+        );
+        // 反向：端口不在，但日志在标准目录 → 也选中（停机的服务也要采它的日志）。
+        assert_eq!(
+            eval_match(
+                expr,
+                &facts_with(
+                    &["tcp:22"],
+                    &["/var/log/postgresql"],
+                    &["/var/log/postgresql"]
+                )
+            ),
+            Truth::Yes
+        );
+        // 端口探过、没有 5432；路径也探过且不在 → 确认没有。
+        assert_eq!(
+            eval_match(
+                expr,
+                &facts_with(&["tcp:22"], &["/var/log/postgresql"], &[])
+            ),
+            Truth::No
+        );
+        // 端口事实空 = 没采，不是「没开端口」：不能冒充否定。
+        assert_eq!(
+            eval_match(expr, &facts_with(&[], &["/var/log/postgresql"], &[])),
+            Truth::Unknown
+        );
+        assert_eq!(eval_match(expr, &facts_with(&[], &[], &[])), Truth::Unknown);
+    }
+
+    #[test]
+    fn any_rejects_nesting_and_unknown_sub_kinds() {
+        let nested = format!(
+            "{CATALOG}\n[[units.sources]]\nkind = \"FileGlob\"\n\
+             from_dir = \"log_source:postgresql\"\npattern = \"*.csv\"\n"
+        );
+        // 先确认拼出来的目录本身是合法的，再把 match 写坏。
+        assert!(parse_with(&nested, PACKS, TEMPLATES).is_ok());
+
+        let bad = CATALOG.replace(
+            "match = \"installed:postgresql\"",
+            "match = \"any:any:port:5432\"",
+        );
+        let err = parse_with(&bad, PACKS, TEMPLATES).expect_err("nested any");
+        assert!(err.to_string().contains("不允许嵌套"), "{err}");
+
+        let bad = CATALOG.replace(
+            "match = \"installed:postgresql\"",
+            "match = \"any:postgresql\"",
+        );
+        let err = parse_with(&bad, PACKS, TEMPLATES).expect_err("sub kind missing");
+        assert!(err.to_string().contains("缺少 kind"), "{err}");
     }
 
     #[test]
