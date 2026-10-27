@@ -32,6 +32,10 @@ pub struct AgentOverviewMetrics {
 pub struct RecentOnlineRegisteredAgent {
     pub agent_id: String,
     pub instance_id: String,
+    /// 机器名：页面主标题用它；agent_id 只作为排障/日志关联的次级标识。
+    pub hostname: String,
+    /// 机器级最近一次已知网卡地址（可能为空；新 agentd 才会报）。
+    pub ip_addresses: Vec<String>,
     pub version: String,
     pub registered_at: DateTime,
     pub online_since: DateTime,
@@ -176,6 +180,8 @@ fn recent_online_agents_from_store(
             recent_online_registered_agent_at(
                 &agent.agent_id,
                 &agent.instance_id,
+                &agent.hostname,
+                agent.ip_addresses.clone(),
                 &agent.version,
                 registered_at,
                 online_since,
@@ -203,6 +209,8 @@ pub fn record_recent_online_agent(
     let agent = recent_online_registered_agent_at(
         agent_id,
         instance_id,
+        "",
+        Vec::new(),
         version,
         registered_at,
         now,
@@ -227,6 +235,8 @@ pub fn record_recent_online_agent(
 fn recent_online_registered_agent_at(
     agent_id: &str,
     instance_id: &str,
+    hostname: &str,
+    ip_addresses: Vec<String>,
     version: &str,
     registered_at: DateTime,
     online_since: DateTime,
@@ -240,6 +250,8 @@ fn recent_online_registered_agent_at(
     RecentOnlineRegisteredAgent {
         agent_id: agent_id.to_string(),
         instance_id: instance_id.to_string(),
+        hostname: hostname.to_string(),
+        ip_addresses,
         version: version.to_string(),
         registered_at,
         online_since,
