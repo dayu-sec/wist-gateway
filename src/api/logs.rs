@@ -60,7 +60,9 @@ static APPEND_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Debug, Deserialize)]
 struct DataPlaneLogRecord {
     /// 帧信封里的自称 agent。身份以登记表为准，这里只用来查表。
-    #[serde(default)]
+    ///
+    /// 两种字段名都要认：旧模型（wp-rules < 1.0.18）叫 `agent_id`，当前模型叫 `agent`。
+    #[serde(default, alias = "agent")]
     agent_id: String,
     /// **采集面**与**目录单元 id**（可选）：`family` 闭集，见
     /// `doc/design/center/collection-families.md`。旧版 agentd、以及本机手工配置的输入
@@ -69,16 +71,26 @@ struct DataPlaneLogRecord {
     family: String,
     #[serde(default)]
     unit: String,
-    #[serde(default)]
+    /// 观测时间：旧模型叫 `observed_at`，当前模型叫 `ts`。
+    #[serde(default, alias = "ts")]
     observed_at: String,
     #[serde(default)]
     seq: u64,
-    #[serde(default)]
+    /// 分类 / 日志类型：旧模型叫 `category`，当前模型叫 `log_type`。
+    #[serde(default, alias = "log_type")]
     category: String,
     #[serde(default)]
     log_desc: String,
-    /// 记录原文（OML `macos_agent_record` 的 `raw`）。
+    /// 记录原文（旧模型 OML 的 `raw`）。
+    ///
+    /// **当前模型（wp-rules ≥ 1.0.18）大多不再保留整行**：结构化规则把正文拆成字段后
+    /// 就没有 `raw` 了（实测 2 万条里 1.7 万条缺它）。所以这里不再必填 —— 缺了就依次回退到
+    /// `log`、最后整条记录的 JSON。否则整批 400，数据面会把每一条都写进 rescue。
+    #[serde(default)]
     raw: String,
+    /// 解析后的日志正文（当前模型的可读字段）。
+    #[serde(default)]
+    log: String,
 }
 
 /// 内部接入端点：接收 warp-parse 转发来的日志记录。
@@ -160,7 +172,10 @@ async fn parse_log_record(
         )
     })?;
     if record.agent_id.is_empty() {
-        return Err("missing agent_id".to_string());
+        return Err(format!(
+            "not a data-plane log record: missing agent_id; received {}",
+            preview(raw)
+        ));
     }
     // 登记表是这条路径唯一的身份锚：不存在的机器不得被写进日志文件。
     let known = state
@@ -171,6 +186,14 @@ async fn parse_log_record(
     if !known {
         return Err(format!("unknown agent_id {}", record.agent_id));
     }
+    let text = record_text(&record, raw);
+    if text.is_empty() {
+        // 只有信封、没有任何内容字段的「日志」没有意义：宁可显形，也不要写一行空正文进去。
+        return Err(format!(
+            "not a data-plane log record: empty log body; received {}",
+            preview(raw)
+        ));
+    }
     Ok(AgentLogRecord {
         agent_id: record.agent_id,
         family: record.family,
@@ -179,9 +202,66 @@ async fn parse_log_record(
         seq: record.seq,
         category: record.category,
         log_desc: record.log_desc,
-        raw: record.raw,
+        raw: text,
         received_at: received_at.to_string(),
     })
+}
+
+/// 供展示的正文：优先原文 `raw`，其次解析出的 `log`，都没有就把**内容字段**序列化成 JSON。
+///
+/// 为什么不直接空着：空白日志行在页面上与「采集失败」无法区分；而结构化记录本身也是证据。
+/// 为什么要把信封 / 元数据字段剔掉：否则展示出来的是 `{"schema","agent","ts","dev_ip",…}`，
+/// 跟正文无关。
+fn record_text(record: &DataPlaneLogRecord, raw: &Value) -> String {
+    if !record.raw.is_empty() {
+        return record.raw.clone();
+    }
+    if !record.log.is_empty() {
+        return record.log.clone();
+    }
+    content_json(raw)
+}
+
+/// 信封与元数据字段：它们不是「日志正文」，回退到 JSON 展示时要剔掉。
+const ENVELOPE_FIELDS: &[&str] = &[
+    "schema",
+    "agent",
+    "agent_id",
+    "ts",
+    "seq",
+    "event_id",
+    "now",
+    "dev_ip",
+    "dev_vendor",
+    "dev_name",
+    "dev_type",
+    "log_type",
+    "log_desc",
+    "env",
+    "tenant_id",
+    "wist-gw_id",
+    "sink",
+    "wp_oml_name",
+    "category",
+    "family",
+    "unit",
+    "observed_at",
+];
+
+/// 把记录里剩下的**内容字段**压成一行 JSON；没有任何内容字段时返回空串（由调用方拒收）。
+fn content_json(raw: &Value) -> String {
+    let Some(object) = raw.as_object() else {
+        return String::new();
+    };
+    let kept: serde_json::Map<String, Value> = object
+        .iter()
+        .filter(|(key, _)| !ENVELOPE_FIELDS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if kept.is_empty() {
+        return String::new();
+    }
+    serde_json::to_string(&kept).unwrap_or_default()
 }
 
 fn append(state: &ApiState, records: &[AgentLogRecord]) -> std::io::Result<()> {

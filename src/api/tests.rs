@@ -2675,6 +2675,75 @@ async fn ingest_endpoint_accepts_a_batch_of_log_records() {
 }
 
 #[tokio::test]
+async fn ingest_endpoint_accepts_the_normalized_field_names() {
+    // 当前模型（wp-rules ≥ 1.0.18）输出的是 `agent` / `ts` / `log_type`，而且**不再保留整行**：
+    // 可读正文在 `log` 里。旧字段名要兼容，新字段名也要能解析 —— 否则整批 400，
+    // 数据面会把每条都写进 rescue（现场实测 1 分钟 ~350 MB）。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = serde_json::json!({
+        "schema": "v1",
+        "agent": "agent-node-a",
+        "ts": "2026-10-27T18:00:00Z",
+        "seq": 7,
+        "family": "ServiceLifecycle",
+        "unit": "linux-service-lifecycle",
+        "log_type": "agent.log",
+        "log_desc": "Agent 日志",
+        "log": "systemd: started demo.service",
+    });
+
+    let response = post_logs_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let stored = log_file_records(&env);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].agent_id, "agent-node-a");
+    assert_eq!(stored[0].observed_at, "2026-10-27T18:00:00Z");
+    assert_eq!(stored[0].category, "agent.log");
+    assert_eq!(stored[0].raw, "systemd: started demo.service");
+    assert_eq!(stored[0].family, "ServiceLifecycle");
+}
+
+#[tokio::test]
+async fn ingest_endpoint_falls_back_to_the_content_fields_when_raw_and_log_are_absent() {
+    // 结构化规则拆完字段后既没有 `raw` 也没有 `log`（实测占 ~16%）：把**内容字段**压成 JSON
+    // 作为展示正文，而不是拒收 —— 但信封字段（agent/ts/dev_ip/tenant_id…）不能混进去。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = serde_json::json!({
+        "schema": "v1",
+        "agent": "agent-node-a",
+        "ts": "2026-10-27T18:00:00Z",
+        "seq": 8,
+        "log_type": "host_audit_execve",
+        "dev_ip": "10.0.0.1",
+        "tenant_id": "t-1",
+        "body_program": "/usr/bin/sudo",
+        "body_host": "lab-target-01",
+    });
+
+    let response = post_logs_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let stored = log_file_records(&env);
+    assert_eq!(stored.len(), 1);
+    assert!(
+        stored[0].raw.contains("body_program"),
+        "got {}",
+        stored[0].raw
+    );
+    assert!(
+        stored[0].raw.contains("lab-target-01"),
+        "got {}",
+        stored[0].raw
+    );
+    assert!(
+        !stored[0].raw.contains("tenant_id"),
+        "信封字段不该进正文：{}",
+        stored[0].raw
+    );
+}
+
+#[tokio::test]
 async fn ingest_endpoint_rejects_logs_from_an_unregistered_agent() {
     // 登记表是这条路径唯一的身份锚：不存在的机器不得被写进日志文件。
     let env = TestEnv::new().await;
