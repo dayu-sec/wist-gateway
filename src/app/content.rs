@@ -2738,6 +2738,63 @@ target = "/var/log/x.log"
         assert_eq!(expansion.excluded_units.len(), 2);
     }
 
+    /// macOS 开发机：本地数据库与存储健康有采集单元 —— 但**只在 `macos-dev` 包里**。
+    ///
+    /// 这条测试同时钉住两件事：
+    /// 1. 面与平台的对应（`DatabaseService` / `StorageHealth` 现在对 macOS 适用），
+    /// 2. **不会**把这些采集推到 MacDaily 个人机上（包边界，不是 unit 自己的判断）。
+    #[test]
+    fn macdev_expands_local_database_and_storage_units() {
+        let set = load_content(
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
+        )
+        .expect("load checked-in content");
+        let mut mac_facts = facts("macos", &[]);
+        // Apple Silicon 的 Homebrew 日志目录在；fsck 日志也在。
+        mac_facts.probed_paths = vec![
+            "/opt/homebrew/var/log".to_string(),
+            "/var/log/fsck_apfs.log".to_string(),
+        ];
+        mac_facts.present_paths = mac_facts.probed_paths.clone();
+
+        let expansion = set
+            .expand("macos-dev", &mac_facts, Default::default())
+            .expect("expand");
+        let family = |name: &str| expansion.works.iter().find(|work| work.family == name);
+        let db = family("DatabaseService").expect("macOS 开发机应当有数据库面");
+        assert!(
+            db.selected_units
+                .iter()
+                .any(|unit| unit == "mac-db-service"),
+            "{:?}",
+            db.selected_units
+        );
+        let storage = family("StorageHealth").expect("macOS 开发机应当有存储健康面");
+        assert!(
+            storage
+                .selected_units
+                .iter()
+                .any(|unit| unit == "mac-storage-health"),
+            "{:?}",
+            storage.selected_units
+        );
+
+        // 个人机不买这两个面：包边界保证不会把开发机的采集推到普通机器上。
+        let daily = set
+            .expand("macos-daily", &mac_facts, Default::default())
+            .expect("expand");
+        assert!(
+            daily
+                .works
+                .iter()
+                .all(|work| work.family != "DatabaseService" && work.family != "StorageHealth"),
+            "MacDaily 不应带上数据库/存储健康面：{:?}",
+            daily.works.iter().map(|w| &w.family).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn path_exists_is_three_state_and_needs_probing() {
         let expr = "path_exists:/var/log/sudo.log";
