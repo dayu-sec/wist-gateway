@@ -3,6 +3,21 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.23.1-alpha] - 2026-10-28
+
+### 修复
+
+- **日志接入兼容当前模型（wp-rules ≥ 1.0.18）的字段名与缺失 `raw`**：
+  - `agent_id` / `observed_at` / `category` 增加别名（`agent` / `ts` / `log_type`），
+    旧记录形状不变；
+  - `raw` 改为**可选**：优先 `raw`，其次 `log`，都没有就把内容字段（剔除信封/元数据）
+    压成 JSON 展示；
+  - 只有信封、没有任何内容字段的记录仍拒收（错误文案带上收到的形状）。
+- **背景**：新模型把日志正文拆成字段后大多不再保留整行（实测 2 万条里 1.7 万条缺 `raw`）。
+  旧实现要求 `raw` 必填且只认旧字段名，导致数据面一开日志出站就整批 400，
+  把每条都写进 `data/rescue/gateway-logs`（实测 1 分钟 ~350 MB）。
+- 验证：`cargo test --lib ingest_endpoint` 16 passed（含新增的两种记录形状）。
+
 ## [0.23.0-alpha] - 2026-10-27
 
 ### 新增（日志源动态定位：服务装在非标准目录也能采到）
