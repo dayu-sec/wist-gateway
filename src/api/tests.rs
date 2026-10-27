@@ -2744,6 +2744,43 @@ async fn ingest_endpoint_falls_back_to_the_content_fields_when_raw_and_log_are_a
 }
 
 #[tokio::test]
+async fn ingest_endpoint_rejects_contract_frames_that_fall_into_the_log_channel() {
+    // 安全网：事实 / 快照帧误投到 `gateway-logs`（oml=["*"] 兑底）时必须拒收。
+    // 否则 `raw` 改为可选后，它们会被当成一条「日志」写进去（快照一帧数百 KB）。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    for kind in [
+        "agent_uplink_obs_fact",
+        "agent_uplink_obs_dsnap",
+        "agent_uplink_metrics_frame",
+    ] {
+        let record = serde_json::json!({
+            "schema": "v1",
+            "agent": "agent-node-a",
+            "ts": "2026-10-27T18:00:00Z",
+            "seq": 9,
+            "log_type": kind,
+            "body": "{\"kind\":\"report_discovery_snapshot\"}",
+        });
+        let response = post_logs_to_ingest_router(&env, &record).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{kind} 必须被拒"
+        );
+        let body: serde_json::Value = decode_json_response(response).await;
+        assert!(
+            body["failures"][0]
+                .as_str()
+                .expect("failure text")
+                .contains("must not be ingested as a log"),
+            "got {body}"
+        );
+    }
+    assert!(log_file_records(&env).is_empty(), "契约帧不得进日志文件");
+}
+
+#[tokio::test]
 async fn ingest_endpoint_rejects_logs_from_an_unregistered_agent() {
     // 登记表是这条路径唯一的身份锚：不存在的机器不得被写进日志文件。
     let env = TestEnv::new().await;

@@ -187,6 +187,15 @@ async fn parse_log_record(
         return Err(format!("unknown agent_id {}", record.agent_id));
     }
     let text = record_text(&record, raw);
+    if let Some(kind) = contract_frame_kind(&record, raw) {
+        // 事实 / 快照 / 指标帧有各自的 sink 分组；一旦误投到 `gateway-logs`（`oml=["*"]` 兑底），
+        // 必须拒收 —— 否则会被当成一条「日志」写进文件。以前 `raw` 必填时正是这个 400 让误配显形的，
+        // 现在 raw 可空，就要用帧类型把这张安全网补回来。
+        return Err(format!(
+            "not a data-plane log record: {kind} frame must not be ingested as a log; received {}",
+            preview(raw)
+        ));
+    }
     if text.is_empty() {
         // 只有信封、没有任何内容字段的「日志」没有意义：宁可显形，也不要写一行空正文进去。
         return Err(format!(
@@ -205,6 +214,27 @@ async fn parse_log_record(
         raw: text,
         received_at: received_at.to_string(),
     })
+}
+
+/// 帧类型（不是日志）对应的 `log_type`：`agent_uplink` 包的三种上行帧。
+const CONTRACT_FRAME_TYPES: &[&str] = &[
+    "agent_uplink_obs_fact",
+    "agent_uplink_obs_dsnap",
+    "agent_uplink_metrics_frame",
+];
+
+/// 这条记录是不是「契约帧误投到日志通道」。
+///
+/// 两个判据：`log_type` 命中帧类型（新模型）；或者既没 `raw` 也没 `log`，却带着契约正文 `body`
+/// （旧/未来帧形状的傅底）。命中即拒收，让误配在数据面可见（rescue），而不是静默污染日志文件。
+fn contract_frame_kind(record: &DataPlaneLogRecord, raw: &Value) -> Option<String> {
+    if CONTRACT_FRAME_TYPES.contains(&record.category.as_str()) {
+        return Some(record.category.clone());
+    }
+    if record.raw.is_empty() && record.log.is_empty() && raw.get("body").is_some() {
+        return Some("contract".to_string());
+    }
+    None
 }
 
 /// 供展示的正文：优先原文 `raw`，其次解析出的 `log`，都没有就把**内容字段**序列化成 JSON。
