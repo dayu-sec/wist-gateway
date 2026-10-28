@@ -113,6 +113,10 @@ pub struct AdminConfig {
     /// 数据面订阅端的内部接入端点（明文 HTTP，只应绑环回）。
     /// `None` = 关闭订阅（见 [`RawIngestConfig`]）。
     pub ingest_listen_addr: Option<String>,
+    /// 数据面工作根（宿主 `data-plane-run/work`，容器内只读挂载）：
+    /// 管理面「配置与规则」从这里读 conf / topology / connectors / models。
+    /// `None` = 没挂载（该页面回 503）。
+    pub data_plane_work_dir: Option<PathBuf>,
     /// 日志源（`from_dir` / 人工覆盖）允许落地的目录 roots。
     ///
     /// **这是网关策略，对所有人一致**：agent 上报什么、人显式指定什么，都要过这一关。
@@ -173,6 +177,9 @@ struct RawAdminConfig {
     collection: RawCollectionConfig,
     #[serde(default)]
     ingest: RawIngestConfig,
+    /// `[data_plane]` 段：数据面工作根的只读浏览器（管理面页面用）。
+    #[serde(default)]
+    data_plane: RawDataPlaneConfig,
     #[serde(default)]
     knowledge: RawKnowledgeConfig,
     #[serde(default)]
@@ -214,6 +221,18 @@ struct RawKnowledgeConfig {
 struct RawIngestConfig {
     #[serde(default)]
     listen_addr: Option<String>,
+}
+
+/// `[data_plane]` 段：数据面工作根（只读浏览）。
+///
+/// 缺省 = 不挂载，管理面「配置与规则」回 503；容器部署时由 compose 把宿主
+/// `data-plane-run/work` 只读挂到 `/data-plane`，模板里写死 `work_dir = "/data-plane"`。
+#[derive(Debug, Default, Deserialize)]
+struct RawDataPlaneConfig {
+    /// 数据面工作根（`conf/`、`topology/`、`connectors/`、`models/` 的父目录）。
+    /// **故意不做存在性校验**：没挂载只让这一个页面不可用，不能把网关挡在启动之外。
+    #[serde(default)]
+    work_dir: Option<String>,
 }
 
 /// `[purpose]` 段。缺省时不装载规则表：摘要照常入库，但不产出建议。
@@ -555,6 +574,14 @@ impl AdminConfig {
                 None => Some(DEFAULT_INGEST_LISTEN_ADDR.to_string()),
                 Some(value) => normalize_optional(Some(expand(&env, value)?)),
             },
+            data_plane_work_dir: normalize_optional(
+                raw.data_plane
+                    .work_dir
+                    .as_deref()
+                    .map(|value| expand(&env, value))
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
             allowed_source_roots: {
                 let raw_roots = match raw.collection.allowed_source_roots {
                     None => default_allowed_source_roots(),
@@ -1234,6 +1261,7 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         content_packs_file: None,
         content_templates_file: None,
         ingest_listen_addr: None,
+        data_plane_work_dir: None,
         allowed_source_roots: default_allowed_source_roots(),
         knowledge_source_dir: None,
         knowledge_signing_public_key_file: None,
@@ -1464,6 +1492,34 @@ policies = [
         format!(
             "[collection]\n{collection_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
         )
+    }
+
+    /// 同 `config_with_purpose`，但给出的是 `[data_plane]` 表体。
+    fn config_with_data_plane(data_plane_body: &str) -> String {
+        format!(
+            "[data_plane]\n{data_plane_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        )
+    }
+
+    #[test]
+    fn data_plane_work_dir_is_optional_and_absolutized() {
+        let unset = write_temp_config(&config_with_data_plane(""));
+        let config = AdminConfig::load_from_path(&unset).expect("config loads");
+        assert_eq!(config.data_plane_work_dir, None);
+
+        // 空串归成 None：否则会变成配置目录本身（页面会把整棵目录当工作根）。
+        let blank = write_temp_config(&config_with_data_plane("work_dir = \"\""));
+        let config = AdminConfig::load_from_path(&blank).expect("config loads");
+        assert_eq!(config.data_plane_work_dir, None);
+
+        // 相对路径按配置目录解析（容器部署写绝对路径 /data-plane）。
+        let relative = write_temp_config(&config_with_data_plane("work_dir = \"data-plane\""));
+        let config = AdminConfig::load_from_path(&relative).expect("config loads");
+        let expected = relative.parent().expect("parent").join("data-plane");
+        assert_eq!(
+            config.data_plane_work_dir.as_deref(),
+            Some(expected.as_path())
+        );
     }
 
     #[test]

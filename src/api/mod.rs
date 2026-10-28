@@ -40,6 +40,10 @@ mod rate_limit;
 // NOTE(hand-added): 采集内容目录的只读视图（模板组成 + 面就绪度）。不在 jumo 静态模型
 // binding.mju 的声明里，与 software_ops 同一模式。重新生成控制面代码时需回补本模块与路由。
 mod content_ops;
+// NOTE(hand-added): 数据面（wparse）配置与规则的只读浏览（页面「配置与规则」tab）。
+// 数据面工作根由 compose 只读挂载；白名单 / 逃逸检查见模块头。不在 jumo 静态模型
+// binding.mju 的声明里，重新生成控制面代码时需回补本模块与下方路由。
+mod data_plane;
 // NOTE(hand-added): 知识库内容包的管理面（录入 / 历史 / 激活回滚 / 生效视图 / 锁在旧版的工作）。
 // 与安装包那套的关键差别是**录入 ≠ 生效**。不在 jumo 静态模型 binding.mju 的声明里，
 // 重新生成控制面代码时需回补本模块与下方路由。设计见
@@ -117,6 +121,7 @@ use admin_ops::{
     view_discovery_policies, view_discovery_snapshot, view_purpose_coverage,
 };
 use content_ops::view_content;
+use data_plane::{list_data_plane_files, read_data_plane_file};
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
 use ingest::{MAX_INGEST_BODY_BYTES, ingest_agent_facts};
 use install::{
@@ -455,6 +460,10 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/admin/pipeline/topology",
             get(get_pipeline_topology),
         )
+        // NOTE(hand-added): 数据面（wparse）配置与规则的只读浏览（页面「配置与规则」tab）。
+        // 走白名单 + 符号链接逃逸检查，全部只读 —— 见 api/data_plane.rs 顶部说明。
+        .route("/api/v1/admin/data-plane/files", get(list_data_plane_files))
+        .route("/api/v1/admin/data-plane/file", get(read_data_plane_file))
         // NOTE(hand-added): L1a 机械资产清单（见 api/software_ops.rs 顶部说明）。
         // 「按软件看机器」在前，「按机器看软件」在后 —— 后者要 `{agent_id}` 路径参数，
         // 两条路由不冲突，但把静态段放前面更不容易让人误以为是同一个前缀。
