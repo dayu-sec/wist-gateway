@@ -3,6 +3,36 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.25.0-alpha] - 2026-10-28
+
+### 新增（数据面配置与规则：只读浏览接口）
+
+页面「数据采集 → 配置与规则」需要看到 wparse **实际在用**的配置与规则（也就是宿主
+`data-plane-run/work` 的内容）。新增两条只读接口：
+
+- `GET /api/v1/admin/data-plane/files` —— 白名单目录树（`entries[]` 为扁平路径表，
+  前端自行建树），带 `truncated` 标志；
+- `GET /api/v1/admin/data-plane/file?path=…` —— 单个文件内容（大小 / 修改时间 /
+  `binary` / `truncated` / `content`）。
+
+安全与降级：
+
+- **白名单**：只开放 `conf` / `topology` / `connectors` / `models` 四个目录与
+  `wparse.local.toml` 一个文件；其余一律不列不可读。
+- **逃逸检查**：拒绝绝对路径、`..`、反斜杠、`.` 分量；`canonicalize` 之后仍要求
+  顶层分量落在白名单内 —— 挡住指向外部的符号链接；列目录时不展开符号链接。
+- **单文件 1 MiB 上限**，超出置 `truncated`；非 UTF-8 只回元数据、不回正文。
+- **未挂载即 503**（`data_plane_unavailable`）：新配置项 `[data_plane] work_dir`
+  缺省为空，不写就没有这个页面，不影响网关启动；配了也不做存在性校验。
+- 新增错误码：`data_plane_unavailable` / `data_plane_path_invalid` /
+  `data_plane_file_not_found` / `data_plane_read_failed`。
+
+### 配套
+
+- 页面：`wist-gateway-web v0.20.0-alpha`（`/pipeline` 新增「配置与规则」tab）。
+- 栈：`wist-gateway-stack v0.5.0-alpha`（compose 把宿主 `data-plane-run/work`
+  只读挂到 `/data-plane`，模板写 `[data_plane] work_dir = "/data-plane"`）。
+
 ## [0.24.0-alpha] - 2026-10-28
 
 ### 新增
