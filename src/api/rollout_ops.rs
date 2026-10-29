@@ -380,6 +380,32 @@ async fn dispatch_spec_for(
         )
         .into_response());
     };
+    // 包里声明了 `requires`（上游 = 当前网关）时，先核对；不兼容就拒绝派活，并提示先升网关。
+    let manifest = (!package.cached_path.trim().is_empty())
+        .then(|| {
+            wist_release::compat::read_manifest_from_path(std::path::Path::new(
+                &package.cached_path,
+            ))
+        })
+        .flatten();
+    let current = std::collections::BTreeMap::from([(
+        "wist-gateway".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    )]);
+    let compatibility = wist_release::compat::check(
+        manifest.as_ref(),
+        "wist-agentd",
+        &package.version,
+        &current,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    if compatibility.is_blocking() {
+        return Err(ApiError::conflict(
+            codes::ROLLOUT_PACKAGE_INCOMPATIBLE,
+            compatibility.summary(),
+        )
+        .into_response());
+    }
     let base = effective_advertise_base(&state.config, &state.store).await;
     let package_url = state
         .config

@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.25.0" #@gxl:set(version)
+version = "0.26.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -59,7 +59,7 @@ x509-parser = "0.16"
 time = { version = "0.3", features = ["std"] }
 serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
-# 安装包内核（来源读取 / 摘要校验 / 身份解析 / 命名）——与中心共用一份。
+# 安装包内核（来源读取 / 摘要校验 / 身份解析 / 命名）+ 升级兼容声明检查 —— 与中心共用一份。
 wist-release = "0.6"
 # 本地联调：按 rust-gx 约定切下面这行用 path 指向本地 `wist-release`；发版时切回上面的 registry。
 #wist-release = { version = "0.6", path = "../wist-release" }

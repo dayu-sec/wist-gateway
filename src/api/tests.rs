@@ -6714,6 +6714,154 @@ async fn install_package_set_rejects_mismatched_digest() {
 }
 
 #[tokio::test]
+async fn install_package_rejects_a_package_that_requires_a_newer_gateway() {
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-9.9.9-aarch64-apple-darwin/compat.json",
+        br#"{"requires":{"wist-gateway":">=99.0.0"}}"#,
+    );
+    let source = write_source_package(&env, "incompatible-agent", &pkg);
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "install_package_incompatible");
+    assert_eq!(body["compatibility"]["status"], "error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("请先升级"),
+        "{body}"
+    );
+    // 兼容性不通过时**不能**先覆盖 `/agent/packages/current` 的缓存：否则被拒的包仍会被安装。
+    assert!(
+        !env.config
+            .install_package_cache_path(TEST_PLATFORM)
+            .exists(),
+        "rejected package must not become the current cache"
+    );
+}
+
+#[tokio::test]
+async fn install_package_records_and_reports_a_compatible_package() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-1.0.0-aarch64-apple-darwin/compat.json",
+        br#"{"requires":{"wist-gateway":">=0.0.1"}}"#,
+    );
+    let source = write_source_package(&env, "compatible-agent", &pkg);
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["compatibility"][0]["compatibility"]["status"], "ok");
+
+    let list = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-packages",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(list).await;
+    assert_eq!(body["packages"][0]["compatibility"]["status"], "ok");
+}
+
+#[tokio::test]
+async fn install_package_history_marks_a_package_without_a_manifest_unknown() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.4.0-aarch64-apple-darwin/wist-agentd",
+        b"agentd-0.4.0",
+    );
+    set_install_package_source(&env, "no-manifest", &pkg).await;
+
+    let list = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-packages",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(list).await;
+    assert_eq!(body["packages"][0]["compatibility"]["status"], "unknown");
+}
+
+#[tokio::test]
+async fn install_package_rejects_a_mixed_set_without_writing_any_cache() {
+    let env = TestEnv::new_without_package().await;
+    let compatible = tar_gz_with_entry(
+        "wist-agentd-1.0.0-aarch64-apple-darwin/compat.json",
+        br#"{"requires":{"wist-gateway":">=0.0.1"}}"#,
+    );
+    let incompatible = tar_gz_with_entry(
+        "wist-agentd-2.0.0-x86_64-unknown-linux-musl/compat.json",
+        br#"{"requires":{"wist-gateway":">=99.0.0"}}"#,
+    );
+    let compatible_source = write_source_package(&env, "compatible", &compatible);
+    let incompatible_source = write_source_package(&env, "incompatible", &incompatible);
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [
+                {
+                    "platform": TEST_PLATFORM,
+                    "package_url": compatible_source,
+                    "package_sha256": format!("sha256:{}", bytes_sha256_hex(&compatible)),
+                },
+                {
+                    "platform": PLATFORM_LINUX_X86,
+                    "package_url": incompatible_source,
+                    "package_sha256": format!("sha256:{}", bytes_sha256_hex(&incompatible)),
+                },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        !env.config
+            .install_package_cache_path(TEST_PLATFORM)
+            .exists(),
+        "compatible platform cache must not be written when the set is rejected"
+    );
+    assert!(
+        !env.config
+            .install_package_cache_path(PLATFORM_LINUX_X86)
+            .exists(),
+        "incompatible platform cache must not be written"
+    );
+}
+
+#[tokio::test]
 async fn install_package_set_stores_computed_digest() {
     let env = TestEnv::new().await;
     let uri = "/api/v1/admin/agent/install-package";
@@ -13090,6 +13238,92 @@ async fn post_to_state(state: &ApiState, uri: &str, body: &serde_json::Value) ->
 }
 
 // ── 知识库管理面：录入 → 激活 → 换版（设计 §7）────────────────────────────
+
+#[tokio::test]
+async fn knowledge_record_rejects_a_package_that_requires_a_newer_gateway() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let root = crate::test_support::unique_temp_dir("wist-knowledge-incompatible");
+    let tarball = crate::test_support::knowledge_package_tarball_with_compat(
+        &root,
+        false,
+        Some(r#"{"requires":{"wist-gateway":">=99.0.0"}}"#),
+    );
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages",
+        &serde_json::json!({
+            "source": tarball.to_string_lossy(),
+            "sha256": crate::infra::bytes_sha256_hex(
+                &std::fs::read(&tarball).expect("read tarball")
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "package_incompatible");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("请先升级"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn knowledge_record_reports_a_compatible_package() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let root = crate::test_support::unique_temp_dir("wist-knowledge-compatible");
+    let tarball = crate::test_support::knowledge_package_tarball_with_compat(
+        &root,
+        false,
+        Some(r#"{"requires":{"wist-gateway":">=0.0.1"}}"#),
+    );
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages",
+        &serde_json::json!({
+            "source": tarball.to_string_lossy(),
+            "sha256": crate::infra::bytes_sha256_hex(
+                &std::fs::read(&tarball).expect("read tarball")
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["compatibility"]["status"], "ok");
+}
+
+#[tokio::test]
+async fn knowledge_activation_rechecks_compatibility() {
+    let env = TestEnv::new().await;
+    let package_id = "kbp-incompatible";
+    let dir = stage_knowledge_package(&env, package_id);
+    std::fs::write(
+        dir.join("compat.json"),
+        r#"{"requires":{"wist-gateway":">=99.0.0"}}"#,
+    )
+    .expect("write compat");
+    env.store_handle
+        .upsert_knowledge_package(&knowledge_package_row(package_id, &dir))
+        .await
+        .expect("record knowledge package");
+
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let response = post_to_state(
+        &state,
+        &format!("/api/v1/admin/knowledge/packages/{package_id}/activate"),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "knowledge_package_incompatible");
+}
 
 /// 整条链走一遍：录入不生效 → 激活当场换版（同一个 router，**不重启**）→ 回滚留痕。
 ///

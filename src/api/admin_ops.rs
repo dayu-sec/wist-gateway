@@ -25,7 +25,7 @@ use crate::infra::{
 };
 use wist_contracts::work::{OneShotWork, StandingWork, WorkKind, WorkReceipt};
 
-use super::install_package::{PackageFetchError, fetch_into_package_cache};
+use super::install_package::{PackageFetchError, cache_verified_package, fetch_verified_package};
 use super::{ApiState, admin_auth::require_admin_bearer, error::ApiError, rate_limit};
 
 /// 列表默认/最大分页大小（防止一次拉全表）。
@@ -155,6 +155,18 @@ pub struct SetAgentInstallPackageArtifact {
 #[derive(Debug, Serialize)]
 pub struct AgentInstallPackageResponse {
     pub packages: Vec<AgentInstallPackagePlatform>,
+    /// 录入时算出的兼容性报告；老客户端忽略即可。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatibility: Vec<AgentInstallPackageCompat>,
+}
+
+/// 一个平台包的兼容性报告。
+#[derive(Debug, Serialize)]
+pub struct AgentInstallPackageCompat {
+    pub platform: String,
+    pub package_id: String,
+    pub version: String,
+    pub compatibility: wist_release::compat::CompatReport,
 }
 
 /// 一个平台的当前安装包来源（对应模型 `AgentInstallPackageAddress`，`address_id` = 平台）。
@@ -190,6 +202,9 @@ pub struct AgentInstallPackageHistoryEntry {
     pub agent_package_url: String,
     pub created_by: String,
     pub created_at: String,
+    /// 按**当前网关版本**重算的兼容性报告（包内没有 `compat.json` → `unknown`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<wist_release::compat::CompatReport>,
 }
 
 /// 安装包录入历史列表响应。
@@ -2149,7 +2164,7 @@ pub async fn view_agent_install_package(
         return response;
     }
     match state.store.list_agent_install_package_addresses().await {
-        Ok(settings) => Json(install_package_response(&settings)).into_response(),
+        Ok(settings) => Json(install_package_response(&settings, Vec::new())).into_response(),
         Err(err) => ApiError::internal(
             codes::INSTALL_PACKAGE_ADDRESS_UNAVAILABLE,
             "failed to load agent install package address",
@@ -2251,17 +2266,14 @@ pub(crate) async fn apply_agent_install_package(
     }
     // 第二阶段：全部拉到网关本地（拉取/校验失败整次不生效，不覆盖已有缓存）。
     // 同时核「声明的平台」与「包内读出的 triple」：不符即拒，免得把错平台的包挂到某槽。
+    let current = gateway_compat_current();
+    let mut compatibility = Vec::new();
     let mut fetched = Vec::with_capacity(prepared.len());
     for (platform, package_url, expected_sha256, origin) in &prepared {
-        let cached = match fetch_into_package_cache(
-            &state.config,
-            platform,
-            package_url,
-            Some(expected_sha256.as_str()),
-        )
-        .await
+        let verified = match fetch_verified_package(package_url, Some(expected_sha256.as_str()))
+            .await
         {
-            Ok(cached) => cached,
+            Ok(verified) => verified,
             Err(err) => {
                 // 失败正文必须带**哪个平台、哪个来源、为什么**。
                 // 这条消息会被 gwlinkd 原样摆进中心的任务日志（`configs/gwlinkd/state/tasks/…`），
@@ -2283,29 +2295,66 @@ pub(crate) async fn apply_agent_install_package(
                 return ApiError::internal_with(status, code, message, err).into_response();
             }
         };
-        if !cached.arch.is_empty() && cached.arch != *platform {
+        if !verified.arch.is_empty() && verified.arch != *platform {
             return ApiError::bad_request(
                 codes::INSTALL_PACKAGE_PLATFORM_MISMATCH,
                 format!(
                     "artifact platform `{platform}` does not match the package triple `{}`",
-                    cached.arch
+                    verified.arch
                 ),
             )
             .into_response();
         }
+        // 兼容性：包声明 `requires` 里的上游（例如 `wist-gateway`）不满足当前节点时，
+        // 默认阻止录入，并明确提示“先升级当前节点”。没有 `compat.json` → unknown（不阻止）。
+        let report = wist_release::compat::check(
+            verified.compat.as_ref(),
+            "wist-agentd",
+            &verified.version,
+            &current,
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        if report.is_blocking() {
+            return incompatible_package_response(codes::INSTALL_PACKAGE_INCOMPATIBLE, report);
+        }
+        compatibility.push(AgentInstallPackageCompat {
+            platform: platform.clone(),
+            package_id: verified.package_id.clone(),
+            version: verified.version.clone(),
+            compatibility: report,
+        });
+        // **兼容性通过之后**才写缓存：不兼容的包不能先覆盖 `/agent/packages/current`。
+        // 这里先只收集，全部平台都通过检查后再统一落缓存。
         fetched.push((
             platform.clone(),
             package_url.clone(),
-            cached,
+            verified,
             origin.clone(),
         ));
+    }
+    // 全部平台都通过兼容性检查后，才真正写缓存（避免其中一台不兼容时留下半套新缓存）。
+    let mut cached_fetched = Vec::with_capacity(fetched.len());
+    for (platform, package_url, verified, origin) in fetched {
+        let cached = match cache_verified_package(&state.config, &platform, verified) {
+            Ok(cached) => cached,
+            Err(err) => {
+                return ApiError::internal_with(
+                    StatusCode::BAD_GATEWAY,
+                    codes::INSTALL_PACKAGE_SOURCE_UNAVAILABLE,
+                    format!("cache agent install package for {platform}: {err}"),
+                    err,
+                )
+                .into_response();
+            }
+        };
+        cached_fetched.push((platform, package_url, cached, origin));
     }
     let requested_by = input
         .requested_by
         .unwrap_or_else(|| "platform-maintenance-engineer".to_string());
     let recorded_at = chrono::Utc::now().to_rfc3339();
     // 第三阶段：落库（每平台一份设置 + 一条内容寻址历史）。
-    for (platform, package_url, cached, origin) in fetched {
+    for (platform, package_url, cached, origin) in cached_fetched {
         let package_sha256 = format!("sha256:{}", cached.sha256);
         // 「历史里的 source」= **provenance**：② 记中心地址（origin）；人填来源同 `package_url`。
         let source = origin.unwrap_or_else(|| package_url.clone());
@@ -2352,7 +2401,7 @@ pub(crate) async fn apply_agent_install_package(
     }
     // 回读一遍给回执（已按平台列出）。
     match state.store.list_agent_install_package_addresses().await {
-        Ok(settings) => Json(install_package_response(&settings)).into_response(),
+        Ok(settings) => Json(install_package_response(&settings, compatibility)).into_response(),
         Err(err) => ApiError::internal(
             codes::INSTALL_PACKAGE_ADDRESS_UNAVAILABLE,
             "failed to load agent install package address",
@@ -2483,19 +2532,38 @@ pub async fn list_agent_install_packages(
         Ok(entries) => {
             // 基址只取一次（`effective_advertise_base` 会读库设置），循环里复用。
             let base = super::install::effective_advertise_base(&state.config, &state.store).await;
+            let current = gateway_compat_current();
+            let checked_at = chrono::Utc::now().to_rfc3339();
             let packages = entries
                 .into_iter()
-                .map(|entry| AgentInstallPackageHistoryEntry {
-                    agent_package_url: state
-                        .config
-                        .agent_package_url_by_id_at(&base, &entry.package_id),
-                    package_id: entry.package_id,
-                    source: entry.source,
-                    package_sha256: entry.package_sha256,
-                    version: entry.version,
-                    arch: entry.arch,
-                    created_by: entry.created_by,
-                    created_at: entry.created_at,
+                .map(|entry| {
+                    let manifest = (!entry.cached_path.trim().is_empty())
+                        .then(|| {
+                            wist_release::compat::read_manifest_from_path(std::path::Path::new(
+                                &entry.cached_path,
+                            ))
+                        })
+                        .flatten();
+                    let compatibility = wist_release::compat::check(
+                        manifest.as_ref(),
+                        "wist-agentd",
+                        &entry.version,
+                        &current,
+                        &checked_at,
+                    );
+                    AgentInstallPackageHistoryEntry {
+                        agent_package_url: state
+                            .config
+                            .agent_package_url_by_id_at(&base, &entry.package_id),
+                        package_id: entry.package_id,
+                        source: entry.source,
+                        package_sha256: entry.package_sha256,
+                        version: entry.version,
+                        arch: entry.arch,
+                        created_by: entry.created_by,
+                        created_at: entry.created_at,
+                        compatibility: Some(compatibility),
+                    }
                 })
                 .collect();
             Json(AgentInstallPackageHistoryResponse { packages }).into_response()
@@ -2511,6 +2579,7 @@ pub async fn list_agent_install_packages(
 
 fn install_package_response(
     settings: &[StoredAgentInstallPackageAddress],
+    compatibility: Vec<AgentInstallPackageCompat>,
 ) -> AgentInstallPackageResponse {
     AgentInstallPackageResponse {
         packages: settings
@@ -2523,7 +2592,34 @@ fn install_package_response(
                 updated_at: DateTime::from_rfc3339(&setting.updated_at),
             })
             .collect(),
+        compatibility,
     }
+}
+
+/// 当前网关节点（兼容性检查的“当前节点”一侧）。
+fn gateway_compat_current() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([(
+        "wist-gateway".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    )])
+}
+
+/// 兼容性不通过时的统一回执：带结构化报告，消息里点名“先升级当前节点”。
+fn incompatible_package_response(
+    code: &'static str,
+    report: wist_release::compat::CompatReport,
+) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": report.summary(),
+            },
+            "compatibility": report,
+        })),
+    )
+        .into_response()
 }
 
 /// 查看当前生效的发现方向策略表（管理面）。

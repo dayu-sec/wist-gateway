@@ -93,6 +93,15 @@ pub(crate) fn model_file(relative: &str) -> PathBuf {
 /// 想验真制品本身看 `app::knowledge` 里那条 `#[ignore]` 的 e2e。
 #[cfg(test)]
 pub(crate) fn knowledge_package_tarball(root: &Path, tamper_catalog: bool) -> PathBuf {
+    knowledge_package_tarball_with_compat(root, tamper_catalog, None)
+}
+
+/// 同上，但可额外放一份 `compat.json`（用于兼容性检查的用例）。
+pub(crate) fn knowledge_package_tarball_with_compat(
+    root: &Path,
+    tamper_catalog: bool,
+    compat: Option<&str>,
+) -> PathBuf {
     const SUFFIX: &str = "9.9.9-test";
     let package_name = format!("wist-knowledge-{SUFFIX}");
     let stage = root.join("stage").join(&package_name);
@@ -110,6 +119,13 @@ pub(crate) fn knowledge_package_tarball(root: &Path, tamper_catalog: bool) -> Pa
             bytes
         };
         std::fs::write(stage.join(name), written).expect("write package file");
+    }
+    if let Some(compat) = compat {
+        std::fs::write(stage.join("compat.json"), compat).expect("write compat.json");
+        digests.insert(
+            "compat.json",
+            crate::infra::bytes_sha256_hex(compat.as_bytes()),
+        );
     }
     let manifest = serde_json::json!({
         "name": crate::app::knowledge::PACKAGE_NAME,

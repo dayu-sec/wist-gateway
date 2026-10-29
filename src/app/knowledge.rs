@@ -325,6 +325,8 @@ pub enum KnowledgeRecordError {
     ContentInvalid(String),
     /// 配了验签公钥，但签名缺失 / 验不过 / 格式错。
     SignatureInvalid(String),
+    /// 包的 `compat.json` 声明与当前网关不兼容。
+    Compatibility(String),
     /// 落库失败。
     Store(String),
 }
@@ -339,6 +341,7 @@ impl KnowledgeRecordError {
             Self::ManifestInconsistent(_) => "package_manifest_inconsistent",
             Self::ContentInvalid(_) => "package_content_invalid",
             Self::SignatureInvalid(_) => "package_signature_invalid",
+            Self::Compatibility(_) => "package_incompatible",
             Self::Store(_) => "package_store_failed",
         }
     }
@@ -353,6 +356,7 @@ impl fmt::Display for KnowledgeRecordError {
             | Self::ManifestInconsistent(message)
             | Self::ContentInvalid(message)
             | Self::SignatureInvalid(message)
+            | Self::Compatibility(message)
             | Self::Store(message) => f.write_str(message),
         }
     }
@@ -464,6 +468,25 @@ pub async fn record_package(
             return Err(err);
         }
     };
+
+    // 兼容性：包内 `compat.json` 的 `requires`（上游，如 `wist-gateway`）不满足当前节点时，
+    // 默认拒绝录入，并明确提示“先升级当前节点”。没有声明 → 不阻止（页面显示 unknown）。
+    let compat = wist_release::compat::read_manifest_from_tar(&bytes);
+    let current = std::collections::BTreeMap::from([(
+        "wist-gateway".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    )]);
+    let compatibility = wist_release::compat::check(
+        compat.as_ref(),
+        PACKAGE_NAME,
+        &validated.manifest.version,
+        &current,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    if compatibility.is_blocking() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(KnowledgeRecordError::Compatibility(compatibility.summary()));
+    }
 
     // 原子换入 `<state>/knowledge/<package_id>/`。
     // 目标已存在就**换掉**（可能是上次录入留下的、也可能被人改过）—— 重复录入因此也是修复。

@@ -3,6 +3,29 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.26.0-alpha] - 2026-10-29
+
+### 新增（升级兼容检查）
+
+按包内可选的 `compat.json`（`requires` / `supports` / `coexists_with` / `compat_mode` /
+`bridge` / `reversible`，口径在 `wist-release` 的 `compat` 模块）在所有**包管理入口**做检查：
+
+- **安装包录入** `POST /api/v1/admin/agent/install-package`（人工录入与中心环回推送**共用**这条内核）：
+  先全部取包 + 验摘要 + 解析身份 + 兼容检查，**全部平台通过后才写包缓存**；任何一台不满足 →
+  `409 install_package_incompatible`（`compatibility` 带逐条原因），**不落缓存**（否则被拒的包
+  仍会被 Agent 装走）。响应增加 `compatibility[]`，历史列表（`packages[]`）也带兼容报告。
+- **知识库包录入 / 激活**：录入时 `409 package_incompatible`；激活时按**当前网关版本**重算
+  （录入 ≠ 生效，生效时再校一次）。
+- **计划下发**（rollout）：选中包后检查，不兼容 → `409 rollout_package_incompatible`。
+- 新增错误码：`install_package_incompatible` / `knowledge_package_incompatible` /
+  `package_incompatible` / `rollout_package_incompatible`。
+- 没有 `compat.json` → `compatibility.status = unknown`（允许，但**显式**显示“未验证兼容性”）；
+  只有 `requires` 被明确违反才阻断，`supports` 越界 / peer 版本未知只告警。
+
+### 依赖
+
+- `wist-release` 升到 **0.6.1**（新增 `compat` 模块；本仓已切回 registry 依赖，不再走 path）。
+
 ## [0.25.0-alpha] - 2026-10-28
 
 ### 新增（数据面配置与规则：只读浏览接口）

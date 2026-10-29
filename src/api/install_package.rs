@@ -1,7 +1,7 @@
 //! wist-agentd 安装包的获取、本地缓存与生效来源解析。
 //!
-//! 管理面设置安装包**来源地址**时，网关先把制品拉到本地（[`fetch_into_package_cache`]），
-//! 之后所有安装都从网关自身的 `/api/v1/agent/packages/current` 取这份缓存
+//! 管理面设置安装包**来源地址**时，网关先把制品拉到本地（[`fetch_verified_package`] +
+//! [`cache_verified_package`]），之后所有安装都从网关自身的 `/api/v1/agent/packages/current` 取这份缓存
 //! （[`effective_package_path`]）。这样做有两个目的：
 //!
 //! 1. 安装脚本里内嵌的校验摘要与真正分发出去的内容**天然同源** —— 不会再出现
@@ -155,28 +155,58 @@ pub struct CachedInstallPackage {
     pub arch: String,
 }
 
-/// 把来源制品拉到网关本地：**同时**写单例缓存（安装用）与按条副本（升级用）。
+/// 已经取到并校验过、但**尚未落缓存**的包。
 ///
-/// 来源只读一次：读到的字节同时用于写两份缓存与解析包身份，避免重复拉取几十 MB 的制品。
-pub async fn fetch_into_package_cache(
-    config: &AdminConfig,
-    platform: &str,
+/// 拆出这一步是为了让调用方在写缓存**之前**做兼容性检查：不兼容的包不能先覆盖
+/// `/api/v1/agent/packages/current` 的那份缓存，否则被拒的包仍会被 agent 安装到。
+#[derive(Debug, Clone)]
+pub struct VerifiedInstallPackage {
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub package_id: String,
+    pub version: String,
+    pub arch: String,
+    pub compat: Option<wist_release::compat::CompatManifest>,
+}
+
+/// 取包 + 校验摘要 + 解析身份/兼容声明；**不写任何缓存**。
+pub async fn fetch_verified_package(
     source: &str,
     expected_sha256: Option<&str>,
-) -> Result<CachedInstallPackage, PackageFetchError> {
+) -> Result<VerifiedInstallPackage, PackageFetchError> {
     let (bytes, sha256) = read_verified_source(source, expected_sha256).await?;
-    // 按平台的当前缓存：安装路径 /api/v1/agent/packages/current?platform= 从它分发。
-    write_cache_to(&config.install_package_cache_path(platform), &bytes)?;
     let package_id = package_id_for_sha256(&sha256);
-    let cached_path = config.install_package_history_path(&package_id);
-    write_cache_to(&cached_path, &bytes)?;
     let (version, arch) = read_package_identity(&bytes);
-    Ok(CachedInstallPackage {
+    let compat = wist_release::compat::read_manifest_from_tar(&bytes);
+    Ok(VerifiedInstallPackage {
+        bytes,
         sha256,
         package_id,
-        cached_path,
         version,
         arch,
+        compat,
+    })
+}
+
+/// 把已经校验过的包写入两份缓存（按平台的当前缓存 + 按条副本）。
+pub fn cache_verified_package(
+    config: &AdminConfig,
+    platform: &str,
+    verified: VerifiedInstallPackage,
+) -> Result<CachedInstallPackage, PackageFetchError> {
+    // 按平台的当前缓存：安装路径 /api/v1/agent/packages/current?platform= 从它分发。
+    write_cache_to(
+        &config.install_package_cache_path(platform),
+        &verified.bytes,
+    )?;
+    let cached_path = config.install_package_history_path(&verified.package_id);
+    write_cache_to(&cached_path, &verified.bytes)?;
+    Ok(CachedInstallPackage {
+        sha256: verified.sha256,
+        package_id: verified.package_id,
+        cached_path,
+        version: verified.version,
+        arch: verified.arch,
     })
 }
 

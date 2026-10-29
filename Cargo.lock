@@ -3572,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "wist-gateway"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3628,12 +3628,13 @@ dependencies = [
 
 [[package]]
 name = "wist-release"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c32c070553024ebb95182c0c483888cb96b2e894a7404114a4aa39b5b049fce1"
+checksum = "b61d3fa274b0da8abee2253cbb0fc64d57af6545de0b47f7ea51e74a17a88beb"
 dependencies = [
  "flate2",
  "serde",
+ "serde_json",
  "tar",
  "wist-artifact",
 ]

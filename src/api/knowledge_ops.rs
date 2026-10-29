@@ -118,6 +118,8 @@ struct KnowledgePackageView {
     available: bool,
     /// 副本里实际有哪些文件（逐条 sha256）。副本不在时为空。
     files: Vec<KnowledgeFileView>,
+    /// 按**当前网关版本**算出的兼容性报告（没有 `compat.json` → `unknown`）。
+    compatibility: wist_release::compat::CompatReport,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,6 +164,7 @@ pub(super) fn record_error_response(err: KnowledgeRecordError) -> Response {
         KnowledgeRecordError::ManifestInconsistent(_)
         | KnowledgeRecordError::ContentInvalid(_)
         | KnowledgeRecordError::SignatureInvalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        KnowledgeRecordError::Compatibility(_) => StatusCode::CONFLICT,
         KnowledgeRecordError::SourceUnavailable(_) => StatusCode::BAD_GATEWAY,
         KnowledgeRecordError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -196,6 +199,22 @@ fn package_view(
     }
     files.sort_by(|left, right| left.name.cmp(&right.name));
     let available = PACKAGE_FILES.iter().all(|name| dir.join(name).is_file());
+    let current = std::collections::BTreeMap::from([(
+        "wist-gateway".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    )]);
+    let manifest = if package.cached_path.trim().is_empty() {
+        None
+    } else {
+        wist_release::compat::read_manifest_from_dir(dir)
+    };
+    let compatibility = wist_release::compat::check(
+        manifest.as_ref(),
+        "wist-knowledge",
+        &package.version,
+        &current,
+        &chrono::Utc::now().to_rfc3339(),
+    );
     KnowledgePackageView {
         package_id: package.package_id.clone(),
         source: package.source.clone(),
@@ -213,6 +232,7 @@ fn package_view(
         active: active_package_id == Some(package.package_id.as_str()),
         available,
         files,
+        compatibility,
     }
 }
 
@@ -442,8 +462,8 @@ pub async fn activate_knowledge_package(
         .clone()
         .unwrap_or_else(|| DEFAULT_ACTOR.to_string());
     // 副本不在（从未录入 / 被删）：明确回 not_found，而不是笼统的装载失败。
-    match state.store.knowledge_package(&package_id).await {
-        Ok(Some(_)) => {}
+    let package = match state.store.knowledge_package(&package_id).await {
+        Ok(Some(package)) => package,
         Ok(None) => {
             return knowledge_error(
                 StatusCode::NOT_FOUND,
@@ -452,6 +472,27 @@ pub async fn activate_knowledge_package(
             );
         }
         Err(err) => return store_failure("读该包失败", err.display_chain()),
+    };
+    // 激活前按**当前网关版本**重算兼容性：录入时兼容，不代表升级/降级后仍兼容。
+    let dir = state.config.knowledge_package_dir(&package_id);
+    let manifest = wist_release::compat::read_manifest_from_dir(&dir);
+    let current = std::collections::BTreeMap::from([(
+        "wist-gateway".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    )]);
+    let compatibility = wist_release::compat::check(
+        manifest.as_ref(),
+        "wist-knowledge",
+        &package.version,
+        &current,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    if compatibility.is_blocking() {
+        return knowledge_error(
+            StatusCode::CONFLICT,
+            codes::KNOWLEDGE_PACKAGE_INCOMPATIBLE,
+            compatibility.summary(),
+        );
     }
     let loaded = match load_recorded_package(&state.config, &package_id) {
         Ok(loaded) => loaded,
