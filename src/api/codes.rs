@@ -71,6 +71,7 @@ codes! {
     CREDENTIAL_RENEWAL_FAILED => "credential_renewal_failed",
     CREDENTIAL_REQUIRED => "credential_required",
     DATA_PLANE_FILE_NOT_FOUND => "data_plane_file_not_found",
+    DATA_PLANE_FILE_NOT_TEXT => "data_plane_file_not_text",
     DATA_PLANE_PATH_INVALID => "data_plane_path_invalid",
     DATA_PLANE_READ_FAILED => "data_plane_read_failed",
     DATA_PLANE_UNAVAILABLE => "data_plane_unavailable",

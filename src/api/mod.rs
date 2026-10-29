@@ -121,7 +121,9 @@ use admin_ops::{
     view_discovery_policies, view_discovery_snapshot, view_purpose_coverage,
 };
 use content_ops::view_content;
-use data_plane::{list_data_plane_files, read_data_plane_file};
+use data_plane::{
+    list_data_plane_files, list_data_plane_outputs, read_data_plane_file, tail_data_plane_output,
+};
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
 use ingest::{MAX_INGEST_BODY_BYTES, ingest_agent_facts};
 use install::{
@@ -464,6 +466,16 @@ pub fn router_with_state(state: ApiState) -> Router {
         // 走白名单 + 符号链接逃逸检查，全部只读 —— 见 api/data_plane.rs 顶部说明。
         .route("/api/v1/admin/data-plane/files", get(list_data_plane_files))
         .route("/api/v1/admin/data-plane/file", get(read_data_plane_file))
+        // NOTE(hand-added): 数据面**输出文件**的 tail（页面「采集日志」）。
+        // 输出目录不在配置树白名单里：这是“看 wparse 写出了什么”，不是“看它吃了什么配置”。
+        .route(
+            "/api/v1/admin/data-plane/output/files",
+            get(list_data_plane_outputs),
+        )
+        .route(
+            "/api/v1/admin/data-plane/output/tail",
+            get(tail_data_plane_output),
+        )
         // NOTE(hand-added): L1a 机械资产清单（见 api/software_ops.rs 顶部说明）。
         // 「按软件看机器」在前，「按机器看软件」在后 —— 后者要 `{agent_id}` 路径参数，
         // 两条路由不冲突，但把静态段放前面更不容易让人误以为是同一个前缀。

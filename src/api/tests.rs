@@ -2955,6 +2955,88 @@ async fn a_record_without_a_family_still_lands_and_matches_no_family_filter() {
     assert_eq!(body["logs"], serde_json::json!([]));
 }
 
+// ── 数据面输出文件 tail（页面「采集日志」）────────────────────────
+
+#[tokio::test]
+async fn admin_data_plane_output_routes_require_admin_bearer() {
+    let env = TestEnv::new().await;
+    for uri in [
+        "/api/v1/admin/data-plane/output/files",
+        "/api/v1/admin/data-plane/output/tail?path=gateway.json",
+    ] {
+        let response = get_to_router(&env.config, &env.store_handle, uri, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "uri {uri}");
+    }
+}
+
+#[tokio::test]
+async fn admin_data_plane_output_tail_follows_new_bytes() {
+    let mut env = TestEnv::new().await;
+    env.config.data_plane_work_dir = Some(env._root.clone());
+    let out = env._root.join("data/out_dat");
+    std::fs::create_dir_all(&out).expect("create output dir");
+    std::fs::write(out.join("gateway.json"), "one\ntwo\n").expect("write output");
+    std::fs::write(out.join("blob.bin"), [0xff, 0x00]).expect("write binary");
+
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/data-plane/output/files").await).await;
+    assert_eq!(body["available"], true);
+    assert!(
+        body["dir"].as_str().expect("dir").ends_with("data/out_dat"),
+        "got {body}"
+    );
+    let paths: Vec<&str> = body["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|file| file["path"].as_str().expect("path"))
+        .collect();
+    assert!(paths.contains(&"gateway.json"), "got {paths:?}");
+    assert!(!paths.contains(&"blob.bin"), "binary must be excluded");
+
+    let body: serde_json::Value = decode_json_response(
+        get_admin(
+            &env,
+            "/api/v1/admin/data-plane/output/tail?path=gateway.json",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(body["content"], "one\ntwo\n");
+    assert_eq!(body["next_offset"], 8);
+    assert_eq!(body["reset"], false);
+    let offset = body["next_offset"].as_u64().expect("offset");
+
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(out.join("gateway.json"))
+            .expect("open output");
+        file.write_all(b"three\n").expect("append");
+    }
+
+    let uri = format!("/api/v1/admin/data-plane/output/tail?path=gateway.json&offset={offset}");
+    let body: serde_json::Value = decode_json_response(get_admin(&env, &uri).await).await;
+    assert_eq!(body["content"], "three\n");
+    assert_eq!(body["next_offset"], 14);
+}
+
+#[tokio::test]
+async fn admin_data_plane_output_tail_rejects_binary_files() {
+    let mut env = TestEnv::new().await;
+    env.config.data_plane_work_dir = Some(env._root.clone());
+    let out = env._root.join("data/out_dat");
+    std::fs::create_dir_all(&out).expect("create output dir");
+    std::fs::write(out.join("blob.bin"), [0xff, 0x00]).expect("write binary");
+
+    let body: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/data-plane/output/tail?path=blob.bin").await,
+    )
+    .await;
+    assert_eq!(body["error"]["code"], "data_plane_file_not_text");
+}
+
 // ── L1a 机械资产清单（从事实摘要派生）────────────────────────────
 
 #[tokio::test]
