@@ -38,6 +38,10 @@ wist-config = { version = "0.1" }
 # 跨进程错误投影 wire 类型（`ProtocolError` / `Severity`），见 `api/error.rs`。
 wist-shared = { version = "0.2" }
 #wist-shared = { version = "0.2", path = "../wist-shared" }
+# 管理面鉴权原语（Bearer token / sha256 / 常数时间比较 / 失败限流桶）。
+# 已发布到 crates.io（CI 发版）。本地联调可临时切 path：
+#wist-auth = { path = "../wist-auth" }
+wist-auth = "0.1.1"
 orion-error = { version = "0.9", features = ["derive", "serde_json"] }
 # 配置里的 `${SEC_...}` 变量解析：orion-sec 读 `./.galaxy/sec_value.yml` / `~/.galaxy/sec_value.yml`，
 # orion-variate 提供 `EnvDict` / `EnvEvaluable` / `EnvChecker`（含 `${VAR:default}` 与未解析校验）。

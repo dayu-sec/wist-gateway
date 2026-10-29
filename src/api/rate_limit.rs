@@ -1,7 +1,6 @@
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::{
     extract::FromRequestParts,
@@ -13,24 +12,13 @@ use axum::{
 
 use super::ApiState;
 
-const MAX_FAILURES_PER_WINDOW: u32 = 5;
-const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// 与 `wist-auth` 默认封禁时长一致，仅用于日志。
 const BLOCK_DURATION: Duration = Duration::from_secs(60);
-/// Upper bound on tracked buckets so a rotating-IP attacker cannot grow the map
-/// without limit. Oldest-first eviction keeps the bound while retaining fresh buckets.
-const MAX_BUCKETS: usize = 10_000;
 
-#[derive(Debug, Default)]
-pub struct RateLimitState {
-    buckets: HashMap<String, RateLimitBucket>,
-}
-
-#[derive(Debug)]
-struct RateLimitBucket {
-    failures: u32,
-    first_failure_at: Instant,
-    blocked_until: Option<Instant>,
-}
+/// 每作用域、每客户端的失败桶（`Default` = 5 次 / 60s → 封 60s）。
+///
+/// 桶的存储、窗口与淘汰逻辑在共享 crate `wist-auth`；这里只保留 HTTP 形态与 key 约定。
+pub type RateLimitState = wist_auth::FailureLimiter<String>;
 
 /// Peer socket address if one was injected (via the `ConnectInfo` middleware
 /// in production or `MockConnectInfo` in tests), otherwise `None`.
@@ -67,63 +55,31 @@ pub fn client_key(client: Option<SocketAddr>) -> String {
 
 pub fn check_rate_limit(state: &ApiState, client_key: &str, scope: &str) -> Option<Response> {
     let key = rate_limit_key(client_key, scope);
-    let now = Instant::now();
-    let mut limits = state.rate_limits.lock().ok()?;
-    let bucket = limits.buckets.get_mut(&key)?;
-    if now.duration_since(bucket.first_failure_at) > FAILURE_WINDOW {
-        limits.buckets.remove(&key);
-        return None;
-    }
-    if let Some(blocked_until) = bucket.blocked_until {
-        if blocked_until > now {
-            let retry_after = blocked_until
-                .duration_since(now)
-                .as_secs()
-                .max(1)
-                .to_string();
-            log::warn!(
-                "event=AuthRateLimited scope={scope} client={client_key} retry_after_secs={retry_after}"
-            );
-            return Some(
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [
-                        (header::RETRY_AFTER, retry_after),
-                        (header::CACHE_CONTROL, "no-store".to_string()),
-                    ],
-                    "too many failed authentication attempts",
-                )
-                    .into_response(),
-            );
-        }
-        limits.buckets.remove(&key);
-    }
-    None
+    let limits = state.rate_limits.lock().ok()?;
+    let retry_after = limits.blocked_for(&key)?;
+    log::warn!(
+        "event=AuthRateLimited scope={scope} client={client_key} retry_after_secs={retry_after}"
+    );
+    Some(
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (header::RETRY_AFTER, retry_after.to_string()),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+            "too many failed authentication attempts",
+        )
+            .into_response(),
+    )
 }
 
 pub fn record_auth_failure(state: &ApiState, client_key: &str, scope: &str) {
     let key = rate_limit_key(client_key, scope);
-    let now = Instant::now();
-    let Ok(mut limits) = state.rate_limits.lock() else {
+    let Ok(limits) = state.rate_limits.lock() else {
         return;
     };
-    if !limits.buckets.contains_key(&key) && limits.buckets.len() >= MAX_BUCKETS {
-        evict_oldest_bucket(&mut limits.buckets);
-    }
-    let bucket = limits.buckets.entry(key).or_insert(RateLimitBucket {
-        failures: 0,
-        first_failure_at: now,
-        blocked_until: None,
-    });
-    if now.duration_since(bucket.first_failure_at) > FAILURE_WINDOW {
-        bucket.failures = 0;
-        bucket.first_failure_at = now;
-        bucket.blocked_until = None;
-    }
-    bucket.failures = bucket.failures.saturating_add(1);
-    let failures = bucket.failures;
-    if failures >= MAX_FAILURES_PER_WINDOW {
-        bucket.blocked_until = Some(now + BLOCK_DURATION);
+    let failures = limits.record_failure(&key);
+    if limits.blocked_for(&key).is_some() {
         log::warn!(
             "event=AuthBlocked scope={scope} client={client_key} failures={failures} block_secs={}",
             BLOCK_DURATION.as_secs()
@@ -135,24 +91,14 @@ pub fn record_auth_failure(state: &ApiState, client_key: &str, scope: &str) {
 
 pub fn clear_auth_failures(state: &ApiState, client_key: &str, scope: &str) {
     let key = rate_limit_key(client_key, scope);
-    let Ok(mut limits) = state.rate_limits.lock() else {
+    let Ok(limits) = state.rate_limits.lock() else {
         return;
     };
-    limits.buckets.remove(&key);
+    limits.clear(&key);
 }
 
 fn rate_limit_key(client_key: &str, scope: &str) -> String {
     format!("{scope}:{client_key}")
-}
-
-fn evict_oldest_bucket(buckets: &mut HashMap<String, RateLimitBucket>) {
-    if let Some((oldest_key, _)) = buckets
-        .iter()
-        .min_by_key(|(_, bucket)| bucket.first_failure_at)
-    {
-        let oldest_key = oldest_key.clone();
-        buckets.remove(&oldest_key);
-    }
 }
 
 #[cfg(test)]
@@ -160,29 +106,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rate_limit_buckets_are_capped_and_evict_oldest() {
-        let now = Instant::now();
-        let mut buckets = HashMap::new();
-        for index in 0..(MAX_BUCKETS + 50) {
-            let key = format!("client-{index}");
-            if !buckets.contains_key(&key) && buckets.len() >= MAX_BUCKETS {
-                evict_oldest_bucket(&mut buckets);
-            }
-            buckets.insert(
-                key,
-                RateLimitBucket {
-                    failures: 1,
-                    first_failure_at: now - Duration::from_secs((MAX_BUCKETS + 50 - index) as u64),
-                    blocked_until: None,
-                },
-            );
-        }
-        assert_eq!(buckets.len(), MAX_BUCKETS);
-        // The 50 oldest entries (smallest first_failure_at) were evicted first;
-        // the survivors are numeric indices 50..=10049.
-        assert!(!buckets.contains_key("client-0"));
-        assert!(!buckets.contains_key("client-49"));
-        assert!(buckets.contains_key("client-50"));
-        assert!(buckets.contains_key("client-10049"));
+    fn keys_are_scoped_per_purpose() {
+        assert_eq!(rate_limit_key("1.2.3.4", "admin"), "admin:1.2.3.4");
+        assert_ne!(
+            rate_limit_key("1.2.3.4", "admin"),
+            rate_limit_key("1.2.3.4", "install_all")
+        );
     }
 }

@@ -1,15 +1,17 @@
 use super::codes;
 use axum::{
-    http::{HeaderMap, header},
+    http::HeaderMap,
     response::{IntoResponse, Response},
 };
-
-use crate::infra::sha256_hex;
 
 use super::{ApiState, error::ApiError, rate_limit};
 
 const ADMIN_AUTH_SCOPE: &str = "admin";
 
+/// 管理面鉴权：Admin Token（Bearer，sha256 常数时间比较）+ 鉴权失败限流。
+///
+/// token 原语与限流桶来自共享 crate `wist-auth`（与 wist-center / wist-ingest-ctrl 同一份）；
+/// 这里只保留本服务的错误码与错误体。
 #[allow(clippy::result_large_err)]
 pub(super) fn require_admin_bearer(
     state: &ApiState,
@@ -19,7 +21,7 @@ pub(super) fn require_admin_bearer(
     if let Some(response) = rate_limit::check_rate_limit(state, client_key, ADMIN_AUTH_SCOPE) {
         return Err(response);
     }
-    let Some(token) = bearer_token(headers) else {
+    let Some(token) = wist_auth::bearer_token(headers) else {
         // A missing token is an unauthenticated request, not a brute-force
         // attempt against a specific credential. Counting it toward the per-IP
         // rate limit lets an unauthenticated client (e.g. the web UI polling
@@ -35,10 +37,7 @@ pub(super) fn require_admin_bearer(
         )
         .into_response());
     };
-    if !constant_time_eq(
-        sha256_hex(token).as_bytes(),
-        state.config.admin_api_token_hash.as_bytes(),
-    ) {
+    if !wist_auth::token_matches(token, &state.config.admin_api_token_hash) {
         // Invalid token: count it toward the brute-force window
         // (`record_auth_failure` logs `event=AuthFailure` / `event=AuthBlocked`).
         rate_limit::record_auth_failure(state, client_key, ADMIN_AUTH_SCOPE);
@@ -50,25 +49,4 @@ pub(super) fn require_admin_bearer(
     }
     rate_limit::clear_auth_failures(state, client_key, ADMIN_AUTH_SCOPE);
     Ok(())
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-    for index in 0..max_len {
-        let left_byte = left.get(index).copied().unwrap_or(0);
-        let right_byte = right.get(index).copied().unwrap_or(0);
-        diff |= (left_byte ^ right_byte) as usize;
-    }
-    diff == 0
 }

@@ -3527,6 +3527,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wist-auth"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2115b61b4c87f042e6af7780362e9e8ebc9900214d4ebf0b775c0c06f4fc754c"
+dependencies = [
+ "http",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "wist-config"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3604,6 +3614,7 @@ dependencies = [
  "toml",
  "tower",
  "wist-api",
+ "wist-auth",
  "wist-config",
  "wist-contracts",
  "wist-control",
