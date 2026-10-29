@@ -37,7 +37,9 @@ jobs:
         run: |
           mkdir -p artifacts
           cp "target/${{ matrix.target }}/release/wist-gateway" artifacts/wist-gateway
-          tar -czf "wist-gateway-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C artifacts wist-gateway
+          # 升级兼容声明随包走（缺了只是“兼容性未知”，有它才能在安装/派发前拦住不兼容组合）。
+          cp compat.json artifacts/compat.json
+          tar -czf "wist-gateway-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C artifacts wist-gateway compat.json
 
       - uses: actions/upload-artifact@v7
         with:

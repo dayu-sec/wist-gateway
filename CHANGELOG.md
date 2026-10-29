@@ -3,6 +3,15 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.26.1-alpha] - 2026-10-29
+
+### 变更（发版带上升级兼容声明）
+
+- 新增仓根 `compat.json`：`requires: { "wist-center": ">=0.24.0" }`，
+  `supports: { "wist-gwlinkd": ">=0.18.0", "wist-agentd": ">=0.10.0" }`，
+  `compat_mode=true` + `coexists_with: { "wist-center": ">=0.22.0" }`。
+- 两个平台的 tarball 都带 `compat.json`（与二进制同级）；中心发布 / 计划批准时据此判定兼容性。
+
 ## [0.26.0-alpha] - 2026-10-29
 
 ### 新增（升级兼容检查）
