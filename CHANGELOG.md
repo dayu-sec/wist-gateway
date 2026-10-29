@@ -3,6 +3,33 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.27.0-alpha] - 2026-10-29
+
+### 新增（采集日志：数据面输出文件 tail）
+
+管理面新增两条只读接口，直接跟随 wparse file sink 的输出文件；页面「采集日志」据此做
+`tail -f`，不用再 SSH 到宿主看 wparse 到底写出了什么：
+
+- `GET /api/v1/admin/data-plane/output/files` —— 列出 `<work_dir>/data/out_dat`
+  （兼容 `out_data`）下的文本输出，按修改时间倒序，带 `available` / `truncated`。
+- `GET /api/v1/admin/data-plane/output/tail?path=…&offset=…&max_bytes=…` —— 按字节偏移
+  增量返回；首屏取文件尾部窗口并跳到行首，文件被截断 / 轮转（变小）时回 `reset` 从新文件
+  开头重读；UTF-8 多字节字符不会被切一半。
+- 只开放文本扩展名（`*.log` / `*.json` / `*.jsonl` / `*.txt` / `*.csv` / `*.dat` 等）；
+  二进制 sink 产物拒收。
+- 安全边界与配置浏览一致：拒绝绝对路径 / `..` / 反斜杠；`canonicalize` 后必须仍在输出
+  目录内；列表不展开符号链接；目录扫描有 512 文件 + 10,000 条目预算。
+- 输出目录顶层不可读回 500（`data_plane_read_failed`），不伪装成「还没有文件」。
+- 新增错误码：`data_plane_file_not_text`。
+- 轮转检测目前只看文件大小：新文件若一上来就比旧偏移大，无法识别（当前栈未启用 file sink
+  滚动，不在已知路径上）。
+
+### 配套
+
+- 栈：`wist-gateway-stack v0.7.0-alpha` 把宿主 `data-plane-run/data` 只读挂到容器
+  `/data-plane/data`，网关按 `work_root/data/out_dat` 推导输出目录。
+- 前端：`wist-gateway-web v0.21.0-alpha`（下拉选文件 + `grep` 式行过滤）。
+
 ## [0.26.1-alpha] - 2026-10-29
 
 ### 变更（发版带上升级兼容声明）
