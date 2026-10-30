@@ -3,6 +3,73 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.28.0-alpha] - 2026-10-30
+
+### 新增（一次性调查：下发 + 报告读取）
+
+管理面新增一组端点，把「主机页发起一次只读取证 → agentd 当场查 → 报告回到网关本机」闭环：
+
+- `POST /api/v1/admin/agents/{agent_id}/investigations` —— 下发一条 `kind = investigate` 的
+  一次性命令（走既有命令通道，agent 在下一个状态上报回执里认领）。
+  - `topic` 只认词表里的值（目前 `disk`），不认识就 400；
+  - `path` 必须是绝对路径且不含 `..`；`top` / `depth` / `max_seconds` **由网关夹紧**
+    （50 / 64 / 30），与 agentd 同值 —— 网关不放宽；
+  - 同 `kind` 的未确认命令被覆盖（`superseded`）：连点只保留最后一次。
+- `GET /api/v1/admin/agents/{agent_id}/investigations` —— 最近一次下发状态 + 该 Agent 的报告列表。
+- `GET /api/v1/admin/agents/{agent_id}/investigations/{command_id}` —— 一份完整报告。
+- 报告**不由网关接收**：wparse 把 ` IVSREP: ` 帧落到 `<data_plane.work_dir>/data/ivsrep/*.jsonl`，
+  网关只读目录（与「采集日志」tail `data/out_dat` 同一模型、同一安全边界：
+  固定推导路径、只认文本扩展名、不跟符号链接、文件数 / 字节 / 条数三重上限）。
+- 归属只看**帧信封里的 `agent`**；同一 `command_id` 的重复投递保留 `seq` 最大的一条
+  （数据面 at-least-once）。
+- 新增错误码：`investigation_unknown_topic` / `investigation_bad_params` /
+  `investigation_report_not_found`。
+
+#### 调查的两道闸（G1 授权 / G2 能力）
+
+- **G2 能力闸**：agent 在状态上报里报 `investigation_capabilities`
+  （`{surfaces, privileged}`；`wist-contracts` 0.9.9 / `wist-api` 0.9.4）。
+  网关落 `agent_instances.investigation_capabilities`，并在**入队前**校验：
+  - 没报过（旧 agentd / 刚升级）→ **`409 investigation_unsupported`**，当作不可用；
+  - 报了但面不在列表里 → 同样 409，并列出它自报的面；
+  - 放行时把 `capabilities` 回带在响应里（页面据此提示“非 root = 部分答案”）。
+  为什么拦在入队前：agentd 对不认识的题只能回 `failed`，管理面上“命令失败”与
+  “这台不会 / 没升级 / 没权限”是两种完全不同的处置。
+- **G1 审计**：`agent_commands.requested_by`（迁移 `0036`），值形如 `admin:<sha256(token) 前 12 位>`
+  —— 能区分 token（含轮换前后）却不可反推；调查 / 重采 / 采集预检三条入队路径都写，
+  视图里一并回显。
+- ⚠ 升级顺序：`AgentStatusReport` 是 `deny_unknown_fields` 的，**网关先于 agentd**。
+  旧 agentd 永远不报能力 → 调查菜单在它们身上一直置灰（属于预期）。
+- 依赖 `wist-contracts` 0.9.9 / `wist-api` 0.9.4（registry）：契约先发，网关随之；
+  与 `wist-agentd` 0.11 的先后顺序见下（网关先）。
+
+#### 调查的另三道闸（G1 按面授权 / 配额 / 保留期）
+
+新增 `[investigations]` 配置段，把「谁能查什么、能查几次、报告看多久」交给网关而不是 agent：
+
+```toml
+[investigations]
+allowed_topics = ["disk"]        # 省略 = 全部已知面；空表 = 一个都不许
+max_per_agent_per_hour = 12      # 0 = 不限
+report_retention_days = 7        # 0 = 不限
+```
+
+- **按面授权（403）**：`allowed_topics` 与内置词表取**交集**（写错的 id 静默滤掉，不会 500）。
+  被关掉的面在 `POST` 时回 `403 investigation_not_allowed`，错误里列出当前真正生效的面；
+  下发响应与列表响应都回带 `allowed_topics`，页面照着它决定菜单项是否置灰。
+  为什么是网关侧：agentd 只保证「能跑」，**谁允许在这台机器上读什么**是控制面的事。
+- **配额（429）**：数的是**发起次数**（含被覆盖、未确认的），按 agent 每滑动小时计。
+  拦的是“重试按钮连点 / 脚本误触”，不是成果 —— 因此不因确认而退还名额。
+  `0` = 不限（给内网/开发环境留出口）。新增错误码 `investigation_quota_exceeded`。
+- **保留期**：`report_retention_days` 之外的报告**不再出现在列表与详情**（回 `404`），
+  但**不删文件**——报告目录是数据面（wparse）写的，网关只是读者，只读视图不该替写者删数据。
+  时间戳缺 / 坏的报告按“未知时间”放行，宁可多看一条也不静默丢证据。
+- 闸顺序：`allowed_topics`（403）→ 能力（409）→ 配额（429）→ 入队。
+  先授权后能力：**这台不许查**和**这台查不了**要给出不同的处置，且前者不该泄露出能力细节。
+- 报告读取改为**读尾部**：wparse 的 file sink 只追加、不轮转，`agent-ivsrep.jsonl` 会一直长；
+  旧写法在文件超过上限时把整个文件跳掉，页面会从「有报告」突变成「没报告」（出事时最不能出现的假象）。
+  现在按「新 → 旧」遍历文件（预算先花在新证据上），单文件只读尾部 2 MiB、丢掉被切半的首行。
+
 ## [0.27.0-alpha] - 2026-10-29
 
 ### 新增（采集日志：数据面输出文件 tail）
