@@ -3,6 +3,16 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.28.1-alpha] - 2026-10-30
+
+### 变更（调查：授权与额度在界面上看得见）
+
+- `GET /api/v1/admin/agents/{id}/investigations` 多回一个 `quota: { limit_per_hour, used_last_hour }`。
+  以前页面只能看到一句 429，人得去翻代码才知道上限在哪、已经用了几次。
+- `wist-gateway.toml`（`init-config` 生成的那份）补了 `[investigations]` 注释段：
+  `allowed_topics` / `max_per_agent_per_hour` / `report_retention_days` 与它们的默认值。
+  这之前这个授权开关**只存在于代码里** —— 不写这一段，运维不会知道有它。
+
 ## [0.28.0-alpha] - 2026-10-30
 
 ### 新增（一次性调查：下发 + 报告读取）
