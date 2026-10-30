@@ -59,6 +59,7 @@ pub const FAMILIES: &[&str] = &[
     "ComputeWorkload",
     "BackupJob",
     "NetworkService",
+    "TrafficInspection",
 ];
 /// 只在 macOS 出现的面（照 `families.mju` 的分类）。**仅用于旧包回落**：
 /// 带 `[[families]]` 的包按词表里的 `platforms` 判，不看这里。
@@ -72,6 +73,7 @@ const LINUX_ONLY_FAMILIES: &[&str] = &[
     "ComputeWorkload",
     "BackupJob",
     "NetworkService",
+    "TrafficInspection",
 ];
 /// 能力闭集。
 pub const CAPABILITIES: &[&str] = &["collect_logs", "collect_metrics"];
@@ -2727,15 +2729,21 @@ target = "/var/log/x.log"
         );
         // 容器单元现在在**基线包**里（LinuxHost 也有 ContainerWorkload 面）：
         // 这台机的两条容器根都不存在 → 两个单元被事实门排除，面本身不展开。
-        assert!(
+        // `linux-ids` 同理：没探到 `/var/log/suricata/eve.json` 就不派 `TrafficInspection`
+        // —— 包在模板里不等于可以派，真正的闸门是单元的 `match`。
+        assert_eq!(
             expansion
                 .excluded_units
                 .iter()
-                .all(|unit| unit.unit_id.contains("container")),
-            "LinuxHost 只应排除容器单元（没有容器根）：{:?}",
-            expansion.excluded_units
+                .map(|unit| unit.unit_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "linux-container-stdout",
+                "linux-docker-container-stdout",
+                "linux-suricata-eve"
+            ],
+            "LinuxHost 只应排除事实门不成立的单元（容器根 / Suricata 输出）"
         );
-        assert_eq!(expansion.excluded_units.len(), 2);
     }
 
     /// macOS 开发机：本地数据库与存储健康有采集单元 —— 但**只在 `macos-dev` 包里**。
