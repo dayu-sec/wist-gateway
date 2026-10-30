@@ -471,6 +471,15 @@ struct InvestigationReportView {
     pub seq: u64,
 }
 
+/// 本 agent 的**调查额度**：页面要能回答「为什么点了没反应（429）」而不必去翻配置。
+#[derive(Debug, Serialize)]
+struct InvestigationQuotaView {
+    /// 每小时上限（`[investigations] max_per_agent_per_hour`；`0` = 不限）。
+    limit_per_hour: u32,
+    /// 最近一小时**已发起**次数（数的是尝试，含被覆盖/未确认的）。`None` = 库读不出来。
+    used_last_hour: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 struct InvestigationListResponse {
     pub agent_id: String,
@@ -478,6 +487,8 @@ struct InvestigationListResponse {
     pub capabilities: Option<InvestigationCapabilitiesView>,
     /// 本网关允许的面（配置 ∩ 词表）。
     pub allowed_topics: Vec<String>,
+    /// 本 agent 的额度使用情况。
+    pub quota: InvestigationQuotaView,
     /// 报告的**可见**保留天数（`0` = 不限）；超期的报告不会出现在 `reports` 里。
     pub retention_days: u32,
     pub report_dir: ReportDirView,
@@ -541,6 +552,25 @@ pub async fn list_agent_investigations(
     let dir = report_dir(&state);
     let retention_days = state.config.investigation_report_retention_days;
     let now = chrono::Utc::now();
+    // 额度使用数：读不出来不影响整页（`None` = 页面显示 `—`，但授权/报告照常展示）。
+    let used_last_hour = match state
+        .store
+        .count_agent_commands_since(
+            &agent_id,
+            INVESTIGATE_KIND,
+            now.timestamp_millis() - 60 * 60 * 1000,
+        )
+        .await
+    {
+        Ok(count) => Some(count),
+        Err(err) => {
+            log::warn!(
+                "event=InvestigationQuotaUnreadable agent_id={} detail=\"{err}\"",
+                agent_id
+            );
+            None
+        }
+    };
     let reports = match dir.as_deref() {
         Some(dir) => match load_agent_reports(dir, &agent_id, retention_days, now) {
             Ok(reports) => reports,
@@ -565,6 +595,10 @@ pub async fn list_agent_investigations(
         .into_iter()
         .map(str::to_string)
         .collect(),
+        quota: InvestigationQuotaView {
+            limit_per_hour: state.config.investigation_max_per_agent_per_hour,
+            used_last_hour,
+        },
         retention_days,
         report_dir: ReportDirView {
             configured: dir.is_some(),

@@ -9054,6 +9054,9 @@ async fn admin_investigation_dispatch_and_report_directory_round_trip() {
     assert_eq!(list["allowed_topics"][0], "disk");
     assert_eq!(list["capabilities"]["surfaces"][0], "disk");
     assert_eq!(list["retention_days"], 7);
+    // 额度：默认上限 12，本小时已发起 1 次（上面那次下发）—— 页面靠它解释 429。
+    assert_eq!(list["quota"]["limit_per_hour"], 12);
+    assert_eq!(list["quota"]["used_last_hour"], 1);
     // G1：发起人要回显在视图里（审计发生在事前，但取证要事后可查）。
     assert!(
         list["latest_command"]["requested_by"]
@@ -9246,6 +9249,14 @@ async fn admin_investigation_is_quota_limited_per_agent() {
         launch_disk_investigation(&env).await.status(),
         StatusCode::OK
     );
+
+    // 列表回带额度现状：上限与「本小时已发起」（含被 429 拦下的那次之前的那一次）。
+    let list: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+    )
+    .await;
+    assert_eq!(list["quota"]["limit_per_hour"], 0);
+    assert_eq!(list["quota"]["used_last_hour"], 2, "{list}");
 }
 
 async fn launch_disk_investigation(env: &TestEnv) -> axum::response::Response {
