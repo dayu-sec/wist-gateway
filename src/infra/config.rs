@@ -54,6 +54,18 @@ const MAX_BOOTSTRAP_TOKEN_TTL_SECONDS: i64 = 60 * 60;
 /// 之上，下一批会把它当成「遗留超大文件」丢掉 —— 丢数据。取回看窗口（8 MiB）作为下限，
 /// 比窗口还小的文件，按窗口回看本身也没意义。
 const MIN_AGENT_LOG_BYTES: u64 = crate::infra::TAIL_WINDOW_BYTES;
+
+/// 一次性调查的默认额度：每台 agent 每小时 12 次（= 5 分钟一次，远高于人工排障的频率）。
+///
+/// 为什么需要额度：调查会在客户机上扫盘，而管理面一个“重试”就能把一台机器扫一整天；
+/// 12 次/小时足够连点排障，又能把脚本误触挡在门外。`0` = 不限。
+pub(crate) const DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR: u32 = 12;
+
+/// 报告的默认保留天数（`0` = 不限）。
+///
+/// 报告含客户机的路径/文件名（`sensitivity = paths`），默认不该在网关上永远留着；
+/// 7 天够一次事故回看。**只过滤不删文件**（报告由数据面写，网关是只读方）。
+pub(crate) const DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS: u32 = 7;
 /// Well-known weak values that must never be used as the admin API token.
 const WEAK_ADMIN_API_TOKENS: &[&str] = &[
     "admin",
@@ -117,6 +129,22 @@ pub struct AdminConfig {
     /// 管理面「配置与规则」从这里读 conf / topology / connectors / models。
     /// `None` = 没挂载（该页面回 503）。
     pub data_plane_work_dir: Option<PathBuf>,
+    /// 允许触发的一次性调查面（`None` = 全部已知面；空表 = 一个都不许）。
+    ///
+    /// 为什么网关侧要再拦一道：agentd 只保证「能跑」，**谁允许在这台机器上读什么**是控制面的事
+    /// （见 `doc/design/center/investigation-surfaces.md` §3 G1）。在还没有按调用者身份分权之前，
+    /// 这一节就是最小的「按面授权」：关掉一个面是**整个网关**的开关，不必去下线 agent。
+    pub investigation_allowed_topics: Option<Vec<String>>,
+    /// 每台 agent 每小时最多几次调查（`0` = 不限）。默认 [`DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR`]。
+    ///
+    /// 为什么需要：调查会在客户机上扫盘，而管理面一个“重试”按钮就能把一台机器扫一整天。
+    /// 计数看的是**尝试**（含已被覆盖/未确认的），已确认的不回退名额。
+    pub investigation_max_per_agent_per_hour: u32,
+    /// 报告保留天数（`0` = 不限）。超过的**不再出现在列表/详情**（不删文件）。
+    ///
+    /// 为什么只过滤不删：报告目录是数据面（wparse）写的，网关只是读者；
+    /// 一个只读视图不该替写者删数据。真要清盘，按运维的保留策略清。
+    pub investigation_report_retention_days: u32,
     /// 日志源（`from_dir` / 人工覆盖）允许落地的目录 roots。
     ///
     /// **这是网关策略，对所有人一致**：agent 上报什么、人显式指定什么，都要过这一关。
@@ -180,6 +208,9 @@ struct RawAdminConfig {
     /// `[data_plane]` 段：数据面工作根的只读浏览器（管理面页面用）。
     #[serde(default)]
     data_plane: RawDataPlaneConfig,
+    /// `[investigations]` 段：一次性调查的**网关侧**授权与配额。
+    #[serde(default)]
+    investigations: RawInvestigationConfig,
     #[serde(default)]
     knowledge: RawKnowledgeConfig,
     #[serde(default)]
@@ -233,6 +264,22 @@ struct RawDataPlaneConfig {
     /// **故意不做存在性校验**：没挂载只让这一个页面不可用，不能把网关挡在启动之外。
     #[serde(default)]
     work_dir: Option<String>,
+}
+
+/// `[investigations]` 段：一次性调查的网关侧闸（按面授权 / 配额 / 保留期）。
+///
+/// 缺省全用默认值（默认全开、每小时 12 次、保留 7 天）——**旧配置不需要改**。
+#[derive(Debug, Default, Deserialize)]
+struct RawInvestigationConfig {
+    /// 允许触发的工作面；`None` = 全部已知面，空表 = 一个都不许。
+    #[serde(default)]
+    allowed_topics: Option<Vec<String>>,
+    /// 每台 agent 每小时次数；`0` = 不限。
+    #[serde(default)]
+    max_per_agent_per_hour: Option<u32>,
+    /// 报告保留天数；`0` = 不限。
+    #[serde(default)]
+    report_retention_days: Option<u32>,
 }
 
 /// `[purpose]` 段。缺省时不装载规则表：摘要照常入库，但不产出建议。
@@ -582,6 +629,21 @@ impl AdminConfig {
                     .transpose()?,
             )
             .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            investigation_allowed_topics: raw.investigations.allowed_topics.map(|topics| {
+                topics
+                    .into_iter()
+                    .map(|topic| topic.trim().to_string())
+                    .filter(|topic| !topic.is_empty())
+                    .collect::<Vec<_>>()
+            }),
+            investigation_max_per_agent_per_hour: raw
+                .investigations
+                .max_per_agent_per_hour
+                .unwrap_or(DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR),
+            investigation_report_retention_days: raw
+                .investigations
+                .report_retention_days
+                .unwrap_or(DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS),
             allowed_source_roots: {
                 let raw_roots = match raw.collection.allowed_source_roots {
                     None => default_allowed_source_roots(),
@@ -1262,6 +1324,9 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         content_templates_file: None,
         ingest_listen_addr: None,
         data_plane_work_dir: None,
+        investigation_allowed_topics: None,
+        investigation_max_per_agent_per_hour: DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR,
+        investigation_report_retention_days: DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS,
         allowed_source_roots: default_allowed_source_roots(),
         knowledge_source_dir: None,
         knowledge_signing_public_key_file: None,
@@ -1499,6 +1564,54 @@ policies = [
         format!(
             "[data_plane]\n{data_plane_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
         )
+    }
+
+    /// 同 `config_with_purpose`，但给出的是 `[investigations]` 表体。
+    fn config_with_investigations(investigations_body: &str) -> String {
+        format!(
+            "[investigations]\n{investigations_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        )
+    }
+
+    #[test]
+    fn investigation_gates_default_and_tighten_via_config() {
+        // 不写 `[investigations]` → 全开 / 每小时 12 次 / 保留 7 天：**旧配置不需要改**。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_purpose("")))
+            .expect("config loads");
+        assert_eq!(config.investigation_allowed_topics, None);
+        assert_eq!(
+            config.investigation_max_per_agent_per_hour,
+            DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR
+        );
+        assert_eq!(
+            config.investigation_report_retention_days,
+            DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS
+        );
+
+        // 空白项被滤掉：允许集是**安全边界**，不该因为多一个逗号就多出一个面。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_investigations(
+            "allowed_topics = [\"disk\", \" \", \"\"]",
+        )))
+        .expect("config loads");
+        assert_eq!(
+            config.investigation_allowed_topics,
+            Some(vec!["disk".to_string()])
+        );
+
+        // 空表 ≠ 没写：`[]` 是「一个都不许」，`None` 是「全开」。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_investigations(
+            "allowed_topics = []",
+        )))
+        .expect("config loads");
+        assert_eq!(config.investigation_allowed_topics, Some(Vec::new()));
+
+        // `0` 是显式的「不限」，与「没写 → 默认值」区分开。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_investigations(
+            "max_per_agent_per_hour = 0\nreport_retention_days = 0",
+        )))
+        .expect("config loads");
+        assert_eq!(config.investigation_max_per_agent_per_hour, 0);
+        assert_eq!(config.investigation_report_retention_days, 0);
     }
 
     #[test]

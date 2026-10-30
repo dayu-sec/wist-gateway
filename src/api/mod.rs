@@ -22,7 +22,11 @@ pub mod error;
 pub use error::{ApiError, ProtocolError, ProtocolErrorEnvelope, Severity};
 mod host_metrics;
 mod ingest;
+// NOTE(hand-added): 一次性调查（`investigate`）的下发与报告读取。报告本体由数据面
+// （wparse）写入 `<data-plane>/data/ivsrep/`，网关只读 —— 与 data_plane 同一模型。
+// 不在 jumo 静态模型 binding.mju 的声明里，重新生成控制面代码时需回补本模块与下方路由。
 mod install;
+mod investigations;
 // NOTE(hand-added): 安装包的拉取/本地缓存（管理面设置来源地址后网关先拉到本地，
 // 之后统一从网关分发）。对应 jumo 模型 WistGatewayManagementInterface 的
 // AdminSetAgentInstallPackageAddress 与 AgentInstallPackageAddress；新路由未变，
@@ -129,6 +133,9 @@ use ingest::{MAX_INGEST_BODY_BYTES, ingest_agent_facts};
 use install::{
     download_agent_package, download_agent_package_by_id, get_agent_initial_config_with_token,
     get_agent_install_code, get_agent_install_script,
+};
+use investigations::{
+    launch_agent_investigation, list_agent_investigations, view_agent_investigation_report,
 };
 use knowledge_ops::{
     activate_knowledge_package, list_knowledge_packages, record_knowledge_package, view_knowledge,
@@ -411,6 +418,16 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agents/{agent_id}/fact-refresh",
             get(view_agent_fact_refresh).post(request_agent_fact_refresh),
+        )
+        // NOTE(hand-added): 一次性调查。POST 下发（`kind = investigate`），GET 拿「最近一次
+        // 下发 + 本机报告列表」；`/{command_id}` 读完整报告（数据面落盘，网关只读）。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/investigations",
+            get(list_agent_investigations).post(launch_agent_investigation),
+        )
+        .route(
+            "/api/v1/admin/agents/{agent_id}/investigations/{command_id}",
+            get(view_agent_investigation_report),
         )
         .route(
             "/api/v1/admin/agents/{agent_id}/work",

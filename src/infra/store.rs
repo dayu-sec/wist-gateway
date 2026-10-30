@@ -180,6 +180,12 @@ pub struct StoredAgentRegistration {
     /// `None` 不等于「什么都不会采」，而是「**不知道**」—— 那时不做能力裁剪，
     /// 退回契约判据（与 D7 之前的行为一致）。
     pub logs_capabilities: Option<wist_contracts::capability_report::LogsCapabilities>,
+    /// 最近一次上报的**调查能力**（能跑哪些调查面、是否 root）。
+    ///
+    /// `None` = 旧版本 agentd 没报 —— 与 `logs_capabilities` 不同，这里的「不知道」要按
+    /// **不可用**处理：调查是一次性只读操作，发一条注定被回 `unsupported` 的命令没有价值。
+    pub investigation_capabilities:
+        Option<wist_contracts::capability_report::InvestigationCapabilities>,
 }
 
 /// Agent 的**机器身份**读投影：只含「这是哪台机器」需要的列，不读 `local_work` / `uplink_state`
@@ -702,6 +708,9 @@ pub struct StoredAgentCommand {
     /// 见 `wist_api::status::command_outcome`（网关侧另有 `superseded`）。
     pub outcome: Option<String>,
     pub detail: Option<String>,
+    /// 谁发起的（审计）：`admin:<token 指纹>`；空 = 本机命令或迁移前的历史记录。
+    #[serde(default)]
+    pub requested_by: String,
 }
 
 /// Agent 的工作确认回执（网关侧留痕，模型里没有对应元素）。
@@ -1068,6 +1077,10 @@ pub struct AgentStatusUpdate<'a> {
     /// 落库后保持上一次的值（与 `local_work` / `uplink_state` 同口径：一次老报文
     /// 不该把最后一次可信的能力清单擦掉）。
     pub logs_capabilities: Option<wist_contracts::capability_report::LogsCapabilities>,
+    /// 本机**调查能力**（能跑哪些面、是否 root）：`None` = 这次没带（旧版本 agentd）——
+    /// 落库后保持上一次的值（与 `logs_capabilities` / `uplink_state` 同口径）。
+    pub investigation_capabilities:
+        Option<wist_contracts::capability_report::InvestigationCapabilities>,
 }
 
 /// 机器画像回填（agentd 状态上报携带的 `HostProfile`）。
@@ -1612,6 +1625,17 @@ pub trait Store: Send + Sync + fmt::Debug {
         agent_id: &str,
         kind: &str,
     ) -> StoreResult<Option<StoredAgentCommand>>;
+
+    /// 某台 agent 在 `since_ms` 之后**入门过**多少条某种 kind 的命令（含已被覆盖/已确认）。
+    ///
+    /// 为什么数“入门”而不是“执行完成”：额度要拦的是**发起动作**（连点、脚本误触），
+    /// 而不是成果；已确认的也不回退名额。
+    async fn count_agent_commands_since(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        since_ms: i64,
+    ) -> StoreResult<u64>;
 
     /// 写入最近一次状态上报；返回 `false` 表示该 Agent 不存在（不再静默丢弃）。
     async fn record_agent_status(&self, update: &AgentStatusUpdate<'_>) -> StoreResult<bool>;

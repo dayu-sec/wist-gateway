@@ -1056,6 +1056,8 @@ async fn enqueue_probe(state: &ApiState, agent_id: &str) -> Result<(), ApiError>
         acked_at: None,
         outcome: None,
         detail: None,
+        // 采集预检也是管理面发起的动作：“谁让这台机器去探路径”一并留痕。
+        requested_by: super::admin_auth::admin_actor(&state.config),
     };
     state
         .store

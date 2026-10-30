@@ -761,6 +761,9 @@ pub async fn request_agent_fact_refresh(
         acked_at: None,
         outcome: None,
         detail: None,
+        // G1：审计——重采虽不读客户文件内容，但它是“谁让这台机器动了”的一环；
+        // 与调查共用一列，口径统一（`admin:<token 指纹>`）。
+        requested_by: super::admin_auth::admin_actor(&state.config),
     };
     match state.store.enqueue_agent_command(&command, true).await {
         Ok(()) => Json(agent_command_response(&agent_id, Some(command))).into_response(),

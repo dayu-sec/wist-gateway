@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.27.0" #@gxl:set(version)
+version = "0.28.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -23,11 +23,9 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rustls-pki-types = "1"
 rustls-webpki = "0.103"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-wist-contracts = { version = "0.9" }
-#wist-contracts = { version = "0.8", path = "../wist-contracts" }
-# 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可改用下面注释的 path 行。
-wist-api = { version = "0.9" }
-#wist-api = { version = "0.8", path = "../wist-api" }
+wist-contracts = "0.9.9"
+# 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可临时切 path。
+wist-api = "0.9.4"
 wist-control = { version = "0.14" }
 #wist-control = { version = "0.14", path = "../wist-control" }
 wist-error = { version = "0.2" }
@@ -95,7 +93,8 @@ async-trait = "0.1"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 
-# 本地联调：与 `wist-contracts` 同期改动时，取消下面两行的注释 ——
-# `[patch]` 放在这里（而不是逐条改依赖行），是为了让 api/control/shared 也解析到本地版本。
+# 本地联调：与 `wist-contracts` / `wist-api` 同期改动时启用（`[patch]` 让 api/control/shared 也解析到本地版本，
+# 否则会同时存在两份 contracts、类型互不认识）。**发布态不要留**：
 # [patch.crates-io]
 # wist-contracts = { path = "../wist-contracts" }
+# wist-api = { path = "../wist-api" }

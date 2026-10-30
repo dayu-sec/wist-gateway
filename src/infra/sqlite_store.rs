@@ -43,6 +43,7 @@ const AGENT_PROJECTION: &str = "SELECT a.agent_id, a.tenant_id, a.environment_id
      COALESCE(i.started_at, '') AS started_at, \
      i.memory_bytes, i.cpu_percent, i.cpu_cores, i.admin_latency_ms, i.work_state_changes, \
      i.discovery_policy_version, i.local_work, i.uplink_state, i.logs_capabilities, \
+     i.investigation_capabilities, \
      COALESCE(a.current_credential_id, '') AS credential_id, \
      COALESCE(c.token_hash, '') AS credential_token_hash, \
      COALESCE(c.issued_at, '') AS credential_issued_at, \
@@ -431,6 +432,29 @@ fn deserialize_logs_capabilities(
     }
 }
 
+/// 调查能力同样整块存 JSON（面会随演进加），只留最近一份。
+fn serialize_investigation_capabilities(
+    value: Option<wist_contracts::capability_report::InvestigationCapabilities>,
+) -> StoreResult<Option<String>> {
+    match value {
+        Some(value) => serde_json::to_string(&value).map(Some).source_err(
+            StoreReason::Json,
+            "serialize agent investigation capabilities",
+        ),
+        None => Ok(None),
+    }
+}
+
+/// 读到坏 JSON 就当「没报过」（`None`）= 网关侧按「不可用」处理（不发注定失败的调查）。
+fn deserialize_investigation_capabilities(
+    raw: Option<String>,
+) -> Option<wist_contracts::capability_report::InvestigationCapabilities> {
+    match raw.as_deref() {
+        Some(value) if !value.is_empty() => serde_json::from_str(value).ok(),
+        _ => None,
+    }
+}
+
 /// 网卡地址列表：存的是 JSON 数组文本；空串 / 解析失败都当空表 —— 这是展示信息，坏值不该影响整行读取。
 fn deserialize_ip_addresses(raw: Option<String>) -> Vec<String> {
     match raw.as_deref() {
@@ -554,6 +578,7 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
     let local_work: Option<String> = column!(row, "local_work");
     let uplink_state: Option<String> = column!(row, "uplink_state");
     let logs_capabilities: Option<String> = column!(row, "logs_capabilities");
+    let investigation_capabilities: Option<String> = column!(row, "investigation_capabilities");
     let ip_addresses: Option<String> = column!(row, "ip_addresses");
     Ok(StoredAgentRegistration {
         agent_id: column!(row, "agent_id"),
@@ -582,6 +607,9 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
         local_work: deserialize_local_work(local_work),
         uplink_state: deserialize_uplink_state(uplink_state),
         logs_capabilities: deserialize_logs_capabilities(logs_capabilities),
+        investigation_capabilities: deserialize_investigation_capabilities(
+            investigation_capabilities,
+        ),
     })
 }
 
@@ -1777,13 +1805,15 @@ impl Store for SqliteStore {
             let local_work = serialize_local_work(update.local_work.clone())?;
             let uplink_state = serialize_uplink_state(update.uplink_state.clone())?;
             let logs_capabilities = serialize_logs_capabilities(update.logs_capabilities.clone())?;
+            let investigation_capabilities =
+                serialize_investigation_capabilities(update.investigation_capabilities.clone())?;
             // 实例行不存在则新建（Agentd 重启换 boot_id / instance_id 时保留历史）。
             sqlx::query(
                 "INSERT INTO agent_instances (instance_id, agent_id, boot_id, version, \
                  started_at, last_seen_at, memory_bytes, cpu_percent, cpu_cores, admin_latency_ms, \
                  work_state_changes, discovery_policy_version, local_work, uplink_state, \
-                 logs_capabilities) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+                 logs_capabilities, investigation_capabilities) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                  ON CONFLICT (instance_id) DO UPDATE SET version = excluded.version, \
                  boot_id = CASE WHEN excluded.boot_id = '' THEN agent_instances.boot_id \
                  ELSE excluded.boot_id END, \
@@ -1798,7 +1828,10 @@ impl Store for SqliteStore {
                  uplink_state = CASE WHEN excluded.uplink_state IS NULL \
                  THEN agent_instances.uplink_state ELSE excluded.uplink_state END, \
                  logs_capabilities = CASE WHEN excluded.logs_capabilities IS NULL \
-                 THEN agent_instances.logs_capabilities ELSE excluded.logs_capabilities END",
+                 THEN agent_instances.logs_capabilities ELSE excluded.logs_capabilities END, \
+                 investigation_capabilities = CASE WHEN excluded.investigation_capabilities IS NULL \
+                 THEN agent_instances.investigation_capabilities \
+                 ELSE excluded.investigation_capabilities END",
             )
             .bind(&instance_id)
             .bind(update.agent_id)
@@ -1814,6 +1847,7 @@ impl Store for SqliteStore {
             .bind(local_work)
             .bind(uplink_state)
             .bind(logs_capabilities)
+            .bind(investigation_capabilities)
             .execute(&mut *tx)
             .await
             .map_err(|err| sql_error(err, "upsert agent instance"))?;
@@ -2584,8 +2618,9 @@ impl Store for SqliteStore {
         }
         sqlx::query(
             "INSERT INTO agent_commands \
-             (command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail) \
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL) \
+             (command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail, \
+              requested_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, ?6) \
              ON CONFLICT (command_id) DO NOTHING",
         )
         .bind(&command.command_id)
@@ -2593,6 +2628,7 @@ impl Store for SqliteStore {
         .bind(&command.kind)
         .bind(&command.params)
         .bind(command.requested_at_ms)
+        .bind(&command.requested_by)
         .execute(&mut *tx)
         .await
         .map_err(|err| sql_error(err, "insert agent command"))?;
@@ -2608,7 +2644,8 @@ impl Store for SqliteStore {
         limit: usize,
     ) -> StoreResult<Vec<StoredAgentCommand>> {
         let rows = sqlx::query(
-            "SELECT command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail \
+            "SELECT command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail, \
+             requested_by \
              FROM agent_commands WHERE agent_id = ?1 AND acked_at IS NULL \
              ORDER BY requested_at_ms ASC, command_id ASC LIMIT ?2",
         )
@@ -2672,7 +2709,8 @@ impl Store for SqliteStore {
         kind: &str,
     ) -> StoreResult<Option<StoredAgentCommand>> {
         let row = sqlx::query(
-            "SELECT command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail \
+            "SELECT command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail, \
+             requested_by \
              FROM agent_commands WHERE agent_id = ?1 AND kind = ?2 \
              ORDER BY requested_at_ms DESC, command_id DESC LIMIT 1",
         )
@@ -2682,6 +2720,25 @@ impl Store for SqliteStore {
         .await
         .map_err(|err| sql_error(err, "select latest agent command"))?;
         row.as_ref().map(agent_command_from_row).transpose()
+    }
+
+    async fn count_agent_commands_since(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        since_ms: i64,
+    ) -> StoreResult<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_commands \
+             WHERE agent_id = ?1 AND kind = ?2 AND requested_at_ms >= ?3",
+        )
+        .bind(agent_id)
+        .bind(kind)
+        .bind(since_ms)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "count agent commands"))?;
+        Ok(count.max(0) as u64)
     }
 
     async fn save_standing_work(&self, work: &StandingWork) -> StoreResult<()> {
@@ -3380,6 +3437,11 @@ fn agent_command_from_row(row: &SqliteRow) -> StoreResult<StoredAgentCommand> {
         acked_at: column!(row, "acked_at"),
         outcome: column!(row, "outcome"),
         detail: column!(row, "detail"),
+        // 迁移前的历史行该列为 `NULL`（不是空串），两者都当「没有发起人」。
+        requested_by: {
+            let value: Option<String> = column!(row, "requested_by");
+            value.unwrap_or_default()
+        },
     })
 }
 
@@ -3893,6 +3955,7 @@ mod tests {
         let missing = store
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-unknown",
                 instance_id: "inst-x",
                 boot_id: "",
@@ -3919,6 +3982,7 @@ mod tests {
             let recorded = store
                 .record_agent_status(&AgentStatusUpdate {
                     logs_capabilities: None,
+                    investigation_capabilities: None,
                     agent_id: "agent-1",
                     instance_id,
                     boot_id: "boot-1",
@@ -4011,6 +4075,33 @@ mod tests {
         assert!(
             columns.iter().any(|name| name == "logs_capabilities"),
             "{columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_adds_the_investigation_columns() {
+        // 迁移 0036 是两个 ALTER TABLE ADD COLUMN（SQLite 不支持 ADD COLUMN IF NOT EXISTS）：
+        // 一个是能力列，一个是审计列 —— 两者都要真存在，“能插不能读”这类错靠这条拦住。
+        let store = store().await;
+        let instance_columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('agent_instances')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            instance_columns
+                .iter()
+                .any(|name| name == "investigation_capabilities"),
+            "{instance_columns:?}"
+        );
+        let command_columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('agent_commands')")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            command_columns.iter().any(|name| name == "requested_by"),
+            "{command_columns:?}"
         );
     }
 
@@ -4229,6 +4320,7 @@ mod tests {
         store
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -4252,6 +4344,7 @@ mod tests {
         store
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -4277,6 +4370,7 @@ mod tests {
         store
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -4326,6 +4420,7 @@ mod tests {
             local_work: None,
             uplink_state: None,
             logs_capabilities: capabilities,
+            investigation_capabilities: None,
         };
 
         // 旧 agentd（不报）：读出 None —— 网关据此退回契约判据（不做能力裁剪）。
@@ -4354,6 +4449,64 @@ mod tests {
         assert_eq!(agent.logs_capabilities, Some(reported));
     }
 
+    /// G2：调查能力的落库与回读 + “没带就不清”（与 `logs_capabilities` 同一条取舍）。
+    #[tokio::test]
+    async fn stores_and_reads_back_the_investigation_capabilities() {
+        use wist_contracts::capability_report::InvestigationCapabilities;
+
+        fn caps(surfaces: &[&str], privileged: bool) -> InvestigationCapabilities {
+            InvestigationCapabilities {
+                surfaces: surfaces.iter().map(|s| s.to_string()).collect(),
+                privileged,
+            }
+        }
+
+        let store = store().await;
+        register(&store, "hash-i", "agent-1", "inst-1").await;
+        let update = |capabilities, version: &'static str| AgentStatusUpdate {
+            agent_id: "agent-1",
+            instance_id: "inst-1",
+            boot_id: "boot-1",
+            version,
+            last_seen_at: "2026-10-30T00:00:00+00:00",
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+            logs_capabilities: None,
+            investigation_capabilities: capabilities,
+        };
+
+        // 旧 agentd（不报）：读出 None —— 网关据此把调查面当作「不可用」。
+        store
+            .record_agent_status(&update(None, "0.10.0"))
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert!(agent.investigation_capabilities.is_none());
+
+        // 报了：读写一致（面是按数组存的，顺序不能变）。
+        let reported = caps(&["disk"], true);
+        store
+            .record_agent_status(&update(Some(reported.clone()), "0.11.0"))
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.investigation_capabilities, Some(reported.clone()));
+
+        // 关键语义：一次没带（旧版心跳）不该把最后一次可信的能力清单擦掉。
+        store
+            .record_agent_status(&update(None, "0.11.0"))
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.investigation_capabilities, Some(reported));
+    }
+
     fn uplink_state(
         kind: &str,
         target: Option<&str>,
@@ -4378,6 +4531,7 @@ mod tests {
         store
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -4401,6 +4555,7 @@ mod tests {
         store
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -4428,6 +4583,7 @@ mod tests {
         store
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -4460,6 +4616,7 @@ mod tests {
         let legacy = store
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -4484,6 +4641,7 @@ mod tests {
         let recorded = store
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -4508,6 +4666,7 @@ mod tests {
         store
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -4762,6 +4921,7 @@ mod tests {
             acked_at: None,
             outcome: None,
             detail: None,
+            requested_by: String::new(),
         };
         store.enqueue_agent_command(&first, true).await.unwrap();
         assert_eq!(
@@ -4846,6 +5006,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_commands_keep_the_requested_by_audit_field() {
+        // G1：命令落库必须能回答“这是谁发起的”——否则在客户机上读文件/路径这种动作，
+        // 库里只留了一个 kind。待下发与“最近一次”两条读路径都要带回来。
+        let store = store().await;
+        let command = StoredAgentCommand {
+            command_id: "cmd-audit".to_string(),
+            agent_id: "agent-a".to_string(),
+            kind: "investigate".to_string(),
+            params: "{}".to_string(),
+            requested_at_ms: 1_700_000_000_000,
+            acked_at: None,
+            outcome: None,
+            detail: None,
+            requested_by: "admin:0123456789ab".to_string(),
+        };
+        store.enqueue_agent_command(&command, true).await.unwrap();
+
+        let pending = store
+            .list_pending_agent_commands("agent-a", 8)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].requested_by, "admin:0123456789ab");
+
+        let latest = store
+            .get_latest_agent_command("agent-a", "investigate")
+            .await
+            .unwrap()
+            .expect("latest");
+        assert_eq!(latest.requested_by, "admin:0123456789ab");
+    }
+
+    #[tokio::test]
     async fn expires_pending_agent_commands_outside_the_window() {
         let store = store().await;
         let base = StoredAgentCommand {
@@ -4857,6 +5050,7 @@ mod tests {
             acked_at: None,
             outcome: None,
             detail: None,
+            requested_by: String::new(),
         };
         store.enqueue_agent_command(&base, false).await.unwrap();
         let fresh = StoredAgentCommand {

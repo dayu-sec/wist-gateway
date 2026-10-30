@@ -12,6 +12,20 @@ const ADMIN_AUTH_SCOPE: &str = "admin";
 ///
 /// token 原语与限流桶来自共享 crate `wist-auth`（与 wist-center / wist-ingest-ctrl 同一份）；
 /// 这里只保留本服务的错误码与错误体。
+/// 管理面“发起人”标识，写进审计字段（`agent_commands.requested_by`）。
+///
+/// 为什么不是原 token：它要进库、进页面、进日志 —— 凭据落一次就多一个泄露面。
+/// 用 `sha256(token)` 的前 12 个 hex 作**指纹**：能区分不同 token（含轮换前后），
+/// 却不能反推。将来管理面有了用户体系，这里换成 `user:<id>` 即可，字段类型不变。
+pub(super) fn admin_actor(config: &crate::infra::AdminConfig) -> String {
+    let fingerprint: String = config.admin_api_token_hash.chars().take(12).collect();
+    if fingerprint.is_empty() {
+        "admin:unknown".to_string()
+    } else {
+        format!("admin:{fingerprint}")
+    }
+}
+
 #[allow(clippy::result_large_err)]
 pub(super) fn require_admin_bearer(
     state: &ApiState,

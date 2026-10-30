@@ -1695,6 +1695,7 @@ async fn agent_status_route_requires_a_client_certificate() {
         Some(&agent_id),
         &AgentStatusReport {
             logs_capabilities: None,
+            investigation_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -1721,6 +1722,7 @@ async fn agent_status_route_requires_a_client_certificate() {
         None,
         &AgentStatusReport {
             logs_capabilities: None,
+            investigation_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -1753,6 +1755,7 @@ async fn agent_status_route_persists_reported_metrics() {
         Some(&agent_id),
         &AgentStatusReport {
             logs_capabilities: None,
+            investigation_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -1798,6 +1801,7 @@ async fn post_agent_status_cpu(
         Some(agent_id),
         &AgentStatusReport {
             logs_capabilities: None,
+            investigation_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -3588,6 +3592,7 @@ async fn post_agent_status(
     let body = match policy_version {
         Some(version) => serde_json::to_value(AgentStatusReport {
             logs_capabilities: None,
+            investigation_capabilities: None,
             agent_id,
             instance_id: instance_id.to_string(),
             version: "v0.2.0".to_string(),
@@ -3951,6 +3956,7 @@ async fn stale_fact_refresh_commands_are_expired_instead_of_delivered_forever() 
                 acked_at: None,
                 outcome: None,
                 detail: None,
+                requested_by: String::new(),
             },
             false,
         )
@@ -4038,6 +4044,7 @@ async fn viewing_a_fact_refresh_sweeps_commands_of_an_agent_that_never_reports()
                 acked_at: None,
                 outcome: None,
                 detail: None,
+                requested_by: String::new(),
             },
             false,
         )
@@ -4402,6 +4409,7 @@ async fn agent_status_route_persists_work_state_changes() {
         Some(&credential),
         &AgentStatusReport {
             logs_capabilities: None,
+            investigation_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -4483,6 +4491,7 @@ async fn the_work_view_exposes_the_agents_local_work_report() {
         Some(&credential),
         &AgentStatusReport {
             logs_capabilities: None,
+            investigation_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -4534,6 +4543,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
         Some(&credential),
         &AgentStatusReport {
             logs_capabilities: None,
+            investigation_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -4574,6 +4584,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
         Some(&credential),
         &AgentStatusReport {
             logs_capabilities: None,
+            investigation_capabilities: None,
             machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
@@ -4608,6 +4619,7 @@ async fn a_status_report_with_a_machine_profile_backfills_the_registry() {
 
     let report = |profile: Option<wist_contracts::enrollment::HostProfile>| AgentStatusReport {
         logs_capabilities: None,
+        investigation_capabilities: None,
         machine_profile: profile,
         agent_id: "agent-node-a".to_string(),
         instance_id: "node-a".to_string(),
@@ -4673,6 +4685,7 @@ async fn enroll_agent_with_machine_profile(env: &TestEnv, ip_addresses: Vec<Stri
     let credential = enroll_agent_credential(env).await;
     let report = AgentStatusReport {
         logs_capabilities: None,
+        investigation_capabilities: None,
         machine_profile: Some(wist_contracts::enrollment::HostProfile {
             node_id: "node-1".to_string(),
             hostname: "host-1".to_string(),
@@ -5747,6 +5760,7 @@ async fn admin_agent_list_marks_stale_agents_offline() {
         .store_handle
         .record_agent_status(&AgentStatusUpdate {
             logs_capabilities: None,
+            investigation_capabilities: None,
             agent_id: "agent-node-a",
             instance_id: "node-a",
             boot_id: "",
@@ -5773,6 +5787,7 @@ async fn admin_agent_list_marks_stale_agents_offline() {
     env.store_handle
         .record_agent_status(&AgentStatusUpdate {
             logs_capabilities: None,
+            investigation_capabilities: None,
             agent_id: "agent-node-a",
             instance_id: "node-a",
             boot_id: "",
@@ -5808,6 +5823,7 @@ async fn admin_agent_runtime_status_shares_the_online_verdict_with_the_list() {
         env.store_handle
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-node-a",
                 instance_id: "node-a",
                 boot_id: "",
@@ -5836,6 +5852,7 @@ async fn admin_agent_runtime_status_shares_the_online_verdict_with_the_list() {
     env.store_handle
         .record_agent_status(&AgentStatusUpdate {
             logs_capabilities: None,
+            investigation_capabilities: None,
             agent_id: "agent-node-a",
             instance_id: "node-a",
             boot_id: "",
@@ -5869,6 +5886,7 @@ async fn delete_agent_refuses_an_online_agent() {
         env.store_handle
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-node-a",
                 instance_id: "node-a",
                 boot_id: "",
@@ -5915,6 +5933,7 @@ async fn delete_agent_removes_an_offline_agent_and_its_credential() {
         env.store_handle
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
+                investigation_capabilities: None,
                 agent_id: "agent-node-a",
                 instance_id: "node-a",
                 boot_id: "",
@@ -8953,6 +8972,399 @@ template_version = 1
 status = "active"
 "#;
 
+/// 一次性调查：下发 → 命令进待下发集 → 报告从此后的目录读回。
+///
+/// 这条用例钉的是**接线**（路由 / 鉴权 / 形状），报告解析的细节在
+/// `api::investigations` 的单元测试里；两者合起来才是「页面能看到东西」。
+#[tokio::test]
+async fn admin_investigation_dispatch_and_report_directory_round_trip() {
+    let mut env = TestEnv::new().await;
+    // 管理面接口先查"这台机器在不在册"（未知 Agent 回 404），所以要真的入网一台。
+    let agent_id = enroll_agent_credential(&env).await;
+    assert_eq!(agent_id, "agent-node-a");
+    // G2：网关只给**自报认识这道题**的机器下发。先让这台机器报一次能力。
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    env.config.data_plane_work_dir = Some(env._root.clone());
+    let report_dir = env._root.join("data").join("ivsrep");
+    std::fs::create_dir_all(&report_dir).expect("create report dir");
+    let body = serde_json::json!({
+        "command_id": "cmd_prev",
+        "topic": "disk",
+        "report_schema": "wist.investigation.disk/v1",
+        "observed_at": "2026-10-30T10:00:05Z",
+        "findings": [],
+        "summary": { "ok": 3, "warn": 1, "fail": 0, "overall": "warn" },
+        "verdict": "3 项正常 / 1 项警告 / 0 项失败"
+    })
+    .to_string();
+    let line = serde_json::json!({
+        "schema": "v1",
+        "agent": "agent-node-a",
+        "ts": "2026-10-30T10:00:05Z",
+        "seq": 7,
+        "body": body,
+    })
+    .to_string();
+    std::fs::write(report_dir.join("agent-ivsrep.jsonl"), format!("{line}\n"))
+        .expect("write report");
+
+    // 1) 下发：网关夹紧参数，命令进待下发集。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk", "top": 500 }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let dispatched: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(dispatched["command"]["kind"], "investigate");
+    assert!(dispatched["command"]["command_id"].is_string());
+    assert_eq!(dispatched["capabilities"]["surfaces"][0], "disk");
+    assert_eq!(dispatched["capabilities"]["privileged"], true);
+    // 下发响应也回带允许集：页面不必先 GET 一次才知道该禁哪个菜单项。
+    assert_eq!(dispatched["allowed_topics"][0], "disk");
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 8)
+        .await
+        .expect("pending commands");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, "investigate");
+    // G1：审计——谁点的这次调查。指纹不是原 token，但必须非空且稳定。
+    assert!(
+        pending[0].requested_by.starts_with("admin:"),
+        "requested_by={}",
+        pending[0].requested_by
+    );
+    let params: serde_json::Value = serde_json::from_str(&pending[0].params).expect("params json");
+    assert_eq!(params["topic"], "disk");
+    assert_eq!(params["top"], 50, "网关必须自己夹紧 top");
+
+    // 2) 列表：最近一次下发 + 报告目录里的报告。
+    let response = get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let list: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(list["report_dir"]["configured"], true);
+    assert_eq!(list["reports"][0]["command_id"], "cmd_prev");
+    assert_eq!(list["reports"][0]["overall"], "warn");
+    assert_eq!(list["latest_command"]["kind"], "investigate");
+    // 菜单可用性的两个输入 + 保留期：没配 `[investigations]` 时就是「全开 / 7 天」。
+    assert_eq!(list["allowed_topics"][0], "disk");
+    assert_eq!(list["capabilities"]["surfaces"][0], "disk");
+    assert_eq!(list["retention_days"], 7);
+    // G1：发起人要回显在视图里（审计发生在事前，但取证要事后可查）。
+    assert!(
+        list["latest_command"]["requested_by"]
+            .as_str()
+            .is_some_and(|by| by.starts_with("admin:"))
+    );
+
+    // 3) 单份报告：正文原样返回。
+    let response = get_admin(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/investigations/cmd_prev",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let detail: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(detail["report"]["topic"], "disk");
+
+    // 4) 未知 command / 未知题目都是"说清楚"，不是 500。
+    let response = get_admin(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/investigations/cmd_missing",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "memory" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// 造一份带调查能力的 `AgentStatusReport`（与 agentd 的实际上报同一形状）。
+async fn report_investigation_capabilities(
+    env: &TestEnv,
+    agent_id: &str,
+    surfaces: &[&str],
+    privileged: bool,
+) {
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(agent_id),
+        &AgentStatusReport {
+            agent_id: agent_id.to_string(),
+            instance_id: "node-a".to_string(),
+            version: "0.11.0".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            work_state_changes: None,
+            discovery_policy_version: None,
+            local_work: None,
+            uplink_state: None,
+            certificate_status: None,
+            machine_profile: None,
+            logs_capabilities: None,
+            investigation_capabilities: Some(
+                wist_contracts::capability_report::InvestigationCapabilities {
+                    surfaces: surfaces.iter().map(|surface| surface.to_string()).collect(),
+                    privileged,
+                },
+            ),
+            command_acks: Vec::new(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+/// 一条数据面报告记录（与 `business.d/agent_ivsrep.toml` 的 file sink 同形）。
+fn ivsrep_line(agent: &str, seq: u64, command_id: &str, observed_at: &str) -> String {
+    let body = serde_json::json!({
+        "command": "investigate",
+        "topic": "disk",
+        "report_schema": "wist.investigation.disk/v1",
+        "observed_at": observed_at,
+        "command_id": command_id,
+        "findings": [],
+        "summary": { "ok": 1, "warn": 0, "fail": 0, "overall": "ok" },
+        "verdict": "1 项正常"
+    })
+    .to_string();
+    serde_json::json!({
+        "schema": "v1",
+        "agent": agent,
+        "ts": observed_at,
+        "seq": seq,
+        "body": body,
+    })
+    .to_string()
+}
+
+/// 没挂数据面（`[data_plane] work_dir` 未配）：列表说清楚“没挂载”，按 id 读报告回 404。
+///
+/// 为什么值一条 e2e：现场最常见的错不是“报告解析不对”，而是**挂载/路径没对上** ——
+/// 代码路径不给 `configured=false`，页面就只会显示“暂无数据”，没人知道是没挂载。
+#[tokio::test]
+async fn admin_investigation_without_a_mounted_data_plane_says_so() {
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    // 默认没配 `data_plane_work_dir`。
+    assert!(env.config.data_plane_work_dir.is_none());
+
+    let response = get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let list: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(list["report_dir"]["configured"], false);
+    assert!(list["reports"].as_array().is_some_and(|r| r.is_empty()));
+
+    let response = get_admin(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/investigations/cmd_any",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_report_not_found");
+}
+
+/// 按面授权（`[investigations] allowed_topics`）：网关关掉的面 → 403，且**不入队**。
+#[tokio::test]
+async fn admin_investigation_respects_the_gateway_allow_list() {
+    let mut env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    env.config.investigation_allowed_topics = Some(Vec::new());
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_not_allowed");
+    assert!(
+        env.store
+            .list_pending_agent_commands("agent-node-a", 8)
+            .await
+            .expect("pending")
+            .is_empty(),
+        "被策略拦下的调查不能进待下发集"
+    );
+
+    // 列表把「本网关允许什么」一并告诉页面（否则菜单不知道置灰哪几项）。
+    let list: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+    )
+    .await;
+    assert!(
+        list["allowed_topics"]
+            .as_array()
+            .is_some_and(|v| v.is_empty()),
+        "{list}"
+    );
+}
+
+/// 配额（`[investigations] max_per_agent_per_hour`）：连点第二次 → 429，且不入队。
+#[tokio::test]
+async fn admin_investigation_is_quota_limited_per_agent() {
+    let mut env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    env.config.investigation_max_per_agent_per_hour = 1;
+
+    assert_eq!(
+        launch_disk_investigation(&env).await.status(),
+        StatusCode::OK
+    );
+    let refused = launch_disk_investigation(&env).await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    // 必须是**额度**码，而不是平台限流（`invalid_admin_bearer_token` / `retry later`）：
+    // 两者同为 429，页面要靠 `code` 决定是“等额度”还是“token 错了”。
+    let body: serde_json::Value = decode_json_response(refused).await;
+    assert_eq!(body["error"]["code"], "investigation_quota_exceeded");
+
+    // `0` = 不限。
+    env.config.investigation_max_per_agent_per_hour = 0;
+    assert_eq!(
+        launch_disk_investigation(&env).await.status(),
+        StatusCode::OK
+    );
+}
+
+async fn launch_disk_investigation(env: &TestEnv) -> axum::response::Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk" }),
+    )
+    .await
+}
+
+/// 可见保留期（`[investigations] report_retention_days`）：超期报告列表不显示、按 id 也读不回。
+#[tokio::test]
+async fn admin_investigation_reports_expire_from_the_view() {
+    let mut env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    env.config.data_plane_work_dir = Some(env._root.clone());
+    env.config.investigation_report_retention_days = 7;
+
+    let report_dir = env._root.join("data").join("ivsrep");
+    std::fs::create_dir_all(&report_dir).expect("create report dir");
+    let old = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    let fresh = chrono::Utc::now().to_rfc3339();
+    std::fs::write(
+        report_dir.join("agent-ivsrep.jsonl"),
+        format!(
+            "{}\n{}\n",
+            ivsrep_line("agent-node-a", 1, "cmd-old", &old),
+            ivsrep_line("agent-node-a", 2, "cmd-fresh", &fresh),
+        ),
+    )
+    .expect("write reports");
+
+    let list: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+    )
+    .await;
+    assert_eq!(list["retention_days"], 7);
+    let reports = list["reports"].as_array().expect("reports");
+    assert_eq!(reports.len(), 1, "超期的一条不该出现：{list}");
+    assert_eq!(reports[0]["command_id"], "cmd-fresh");
+
+    let response = get_admin(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/investigations/cmd-old",
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "过期后按 id 也读不回"
+    );
+    let response = get_admin(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/investigations/cmd-fresh",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// G2：能力闸拦在**入队前** —— 不会把命令发给一台注定做不了的机器。
+#[tokio::test]
+async fn admin_investigation_is_refused_when_the_agent_cannot_run_it() {
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+
+    // ① 从没报过能力（旧 agentd / 刚升级）：当作不可用，而不是“什么都会”。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_unsupported");
+    assert!(
+        env.store
+            .list_pending_agent_commands("agent-node-a", 8)
+            .await
+            .expect("pending")
+            .is_empty(),
+        "被拦下的调查不能进待下发集"
+    );
+
+    // ② 报了能力但不在列表里（这台机器实现了别的面）：同样拦。
+    report_investigation_capabilities(&env, &agent_id, &[], false).await;
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_unsupported");
+
+    // ③ 报对了：放行，并回带能力（页面据此提示“非 root = 部分答案”）。
+    report_investigation_capabilities(&env, &agent_id, &["disk"], false).await;
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["capabilities"]["privileged"], false);
+}
+
 struct TestEnv {
     config: AdminConfig,
     store: SqliteStore,
@@ -9068,6 +9480,12 @@ impl TestEnv {
             // 内部接入端点默认关：测试走 `router()`，明文监听由 main.rs 单独起。
             ingest_listen_addr: None,
             data_plane_work_dir: None,
+            // 调查闸默认值（与线上一致）：全开、每小时 12 次、保留 7 天。
+            investigation_allowed_topics: None,
+            investigation_max_per_agent_per_hour:
+                crate::infra::config::DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR,
+            investigation_report_retention_days:
+                crate::infra::config::DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS,
             // 知识库包默认不验签（要验签的用例自己把公钥填上）。
             knowledge_source_dir: None,
             knowledge_signing_public_key_file: None,

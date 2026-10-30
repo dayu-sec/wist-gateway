@@ -102,6 +102,9 @@ pub async fn submit_agent_status(
                     // D7 能力清单：同样“没带就不清”。旧 agentd 一直不报，网关就一直按
                     // “不知道”处理（不做能力裁剪），不会因为某次老报文把清单擦掉。
                     logs_capabilities: input.logs_capabilities.clone(),
+                    // 调查能力（G2）：同样“没带就不清”。`None` 在**入队前**被当作「不可用」
+                    // （见 `api::investigations`），而不是「什么都会」。
+                    investigation_capabilities: input.investigation_capabilities.clone(),
                 })
                 .await;
             match status_result {
