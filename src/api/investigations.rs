@@ -71,7 +71,14 @@ const INVESTIGATE_KIND: &str = wist_api::status::command_kind::INVESTIGATE;
 ///
 /// 新增题目=两侧一起加：这里加 id，agentd 加实现；**不要在网关猜一个题目下发**
 /// （agentd 对不认识的题目回 `failed`，页面会看到一条没法解释的失败）。
-const TOPICS: &[&str] = &["disk", "load"];
+const TOPICS: &[&str] = &[
+    "disk",
+    "load",
+    "accounts",
+    "persistence",
+    "exposure",
+    "telemetry-health",
+];
 
 /// 报告目录相对数据面工作根的位置（与 `business.d/agent_ivsrep.toml` 的 `base` 对齐）。
 const REPORT_DIR: &str = "data/ivsrep";
@@ -564,6 +571,12 @@ struct InvestigationReportView {
     pub findings_ok: u64,
     pub findings_warn: u64,
     pub findings_fail: u64,
+    /// 无法判定（读不到 / 平台不支持 / 源不存在）。**不能省**：
+    /// 少了这一个计数，页面就会把“没读到”当成“正常”。
+    pub findings_unknown: u64,
+    /// 这一题做不做安全判定。`false`（如 `exposure`）时 verdict 只说“N 项证据”，
+    /// 页面不得渲染成“全部正常”；老报告没有这个字段 → 当作 `true`。
+    pub judged: bool,
     /// 帧里的 `seq`：同 `command_id` 重复投递时按它保留最新的一条。
     pub seq: u64,
 }
@@ -1174,6 +1187,9 @@ fn parse_report_line(record: &Value, agent_id: &str) -> Option<StoredReport> {
             findings_ok: count("ok"),
             findings_warn: count("warn"),
             findings_fail: count("fail"),
+            findings_unknown: count("unknown"),
+            // 0.17 之前的报告没有这个字段；那些题都是做安全判定的，所以默认 true。
+            judged: body.get("judged").and_then(Value::as_bool).unwrap_or(true),
             seq,
         },
         report: body,
@@ -1202,7 +1218,8 @@ mod tests {
             "observed_at": "2026-10-30T10:00:00Z",
             "command_id": command_id,
             "findings": [],
-            "summary": { "ok": 3, "warn": 1, "fail": 0, "overall": "warn" },
+            "summary": { "ok": 3, "warn": 1, "fail": 0, "unknown": 0, "overall": "warn" },
+            "judged": true,
             "verdict": "3 项正常 / 1 项警告 / 0 项失败"
         })
         .to_string();
@@ -1263,8 +1280,52 @@ mod tests {
     /// （`unknown investigation topic`）—— 所以让测试比人先发现。
     #[test]
     fn the_vocabulary_covers_the_topics_the_agents_implement() {
-        assert!(TOPICS.contains(&"disk"), "{TOPICS:?}");
-        assert!(TOPICS.contains(&"load"), "{TOPICS:?}");
+        for topic in [
+            "disk",
+            "load",
+            "accounts",
+            "persistence",
+            "exposure",
+            "telemetry-health",
+        ] {
+            assert!(TOPICS.contains(&topic), "缺 {topic}: {TOPICS:?}");
+        }
+    }
+
+    /// 新契约的两个字段必须被保留：`unknown` 计数与 `judged`。
+    /// 漏了前者，页面会把“读不到”当“正常”；漏了后者，会把证据型题目渲染成结论。
+    #[test]
+    fn the_report_view_keeps_unknown_and_judged() {
+        let dir = temp_dir("unknown-judged");
+        let file = dir.join("agent-ivsrep.jsonl");
+        let body = serde_json::json!({
+            "command": "investigate",
+            "topic": "exposure",
+            "report_schema": "wist.investigation.exposure/v1",
+            "observed_at": "2026-10-31T10:00:00Z",
+            "command_id": "cmd-x",
+            "judged": false,
+            "findings": [],
+            "limits": ["仅快照"],
+            "summary": { "ok": 1, "warn": 0, "fail": 0, "unknown": 1, "overall": "ok" },
+            "verdict": "2 项证据（本调查不做安全判定）"
+        })
+        .to_string();
+        let line = serde_json::json!({
+            "schema": "v1",
+            "agent": "agent-a",
+            "ts": "2026-10-31T10:00:00Z",
+            "seq": 1,
+            "body": body,
+        })
+        .to_string();
+        fs::write(&file, format!("{line}\n")).expect("write report");
+
+        let reports = load_agent_reports(&dir, "agent-a", 0, chrono::Utc::now()).expect("load");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].findings_unknown, 1);
+        assert!(!reports[0].judged, "证据型题目必须保留 judged=false");
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// `[investigations] allowed_topics`：`None` = 全开；空表 = 全关；写错的 id 被滤掉。
@@ -1437,7 +1498,11 @@ mod tests {
         fs::write(&file, &text).expect("write");
 
         // 预算小于文件：能且只能读到最后几行，且首行（被切了一半）不能造出假报告。
-        let budget = 400u64;
+        //
+        // 不要写死字节数：报告行会随契约长（比如新增 `judged` / `unknown`），
+        // 写死会让“预算刚好落在一行中间”变成“切完什么都不剩”。按文件长度取比例。
+        let budget = (text.len() as u64 / 4).max(1);
+        assert!(budget < text.len() as u64, "必须是“读尾”而不是“全读”");
         let bytes = read_tail(&file, budget).expect("read tail");
         assert!((bytes.len() as u64) <= budget, "不能超预算");
         let tail = String::from_utf8(bytes).expect("tail is utf-8");

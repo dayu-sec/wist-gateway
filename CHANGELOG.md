@@ -3,6 +3,21 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.32.0-alpha] - 2026-10-31
+
+### 新增（调查词表加四题：账号 / 持久化 / 暴露面 / 遥测健康）
+
+- `TOPICS` 增加 `accounts` / `persistence` / `exposure` / `telemetry-health`：
+  `[investigations] allowed_topics`、按机器授权与下发前校验都走同一份词表。
+- 报告视图保留新契约的两个字段：
+  * `findings_unknown`：“无法判定”不再被折叠成 0；
+  * `judged`：`false`（如 `exposure`）时不得把证据渲染成“全部正常”；老报告按 `true` 处理。
+
+### 配套
+
+- agentd ≥ `0.17.0-alpha`（三题）、≥ `0.18.0-alpha`（遥测健康 + 报告头 `boot_id`）；
+- web ≥ `0.27.0-alpha`（题目文案与 `judged` 渲染）。
+
 ## [0.31.1-alpha] - 2026-10-31
 
 ### 修复（仅格式：0.31.0 的 CI 红在 `cargo fmt --check`）
