@@ -1233,7 +1233,10 @@ mod tests {
         assert_eq!(value["path"], "/var");
         assert_eq!(value["top"], 50, "top 由网关夹紧，不放宽");
         assert_eq!(value["depth"], 1);
-        assert_eq!(value["max_seconds"], 300, "与 agentd 的 MAX_SCAN_SECONDS 同值");
+        assert_eq!(
+            value["max_seconds"], 300,
+            "与 agentd 的 MAX_SCAN_SECONDS 同值"
+        );
         assert!(value.get("min_size").is_none(), "没给就不发");
     }
 
