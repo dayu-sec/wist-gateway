@@ -3,6 +3,13 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.31.1-alpha] - 2026-10-31
+
+### 修复（仅格式：0.31.0 的 CI 红在 `cargo fmt --check`）
+
+- 0.31.0 改了一行测试断言，超过了 rustfmt 的行宽导致 `Build & Test` 红。
+  功能没变（夹紧值 300 从 0.31.0 起就生效），这个 patch 只是让发布标签的 CI 回到全绿。
+
 ## [0.31.0-alpha] - 2026-10-31
 
 ### 修复（`max_seconds` 被夹到 30s，磁盘调查永远扫不完）
