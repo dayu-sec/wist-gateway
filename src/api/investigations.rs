@@ -149,9 +149,11 @@ fn build_params(request: &LaunchInvestigationRequest) -> Result<(String, String)
         params.insert("depth".to_string(), Value::from(depth.clamp(1, 64)));
     }
     if let Some(max_seconds) = request.max_seconds {
+        // 与 agentd 的 `MAX_SCAN_SECONDS` 同值：磁盘调查在真实机器上（几百万条）
+        // 需要几分钟才能扫完，夹到 30s 等于“永远给不出完整答案”。
         params.insert(
             "max_seconds".to_string(),
-            Value::from(max_seconds.clamp(1, 30)),
+            Value::from(max_seconds.clamp(1, 300)),
         );
     }
     if let Some(min_size) = request.min_size {
@@ -1231,7 +1233,7 @@ mod tests {
         assert_eq!(value["path"], "/var");
         assert_eq!(value["top"], 50, "top 由网关夹紧，不放宽");
         assert_eq!(value["depth"], 1);
-        assert_eq!(value["max_seconds"], 30);
+        assert_eq!(value["max_seconds"], 300, "与 agentd 的 MAX_SCAN_SECONDS 同值");
         assert!(value.get("min_size").is_none(), "没给就不发");
     }
 

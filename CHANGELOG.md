@@ -3,6 +3,16 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.31.0-alpha] - 2026-10-31
+
+### 修复（`max_seconds` 被夹到 30s，磁盘调查永远扫不完）
+
+- `POST …/investigations` 的 `params.max_seconds` 夹紧从 `1..=30` 改为 **`1..=300`**（与 agentd
+  的 `MAX_SCAN_SECONDS` 同值）。旧值把 UI 传上来的大预算默默夹回去，而真实机器的 `/Users`
+  有两百万条、一分多钟才扫完 —— 夹到 30s 等于“永远只给部分答案”。
+- 不传 `max_seconds` 时依旧用 agentd 的默认值（现在是 **120s**），网关不替 agent 叠一层默认。
+- 配套 agentd ≥ `0.16.0-alpha`（体量改按实际占用、条目上限改时间主导）。
+
 ## [0.30.0-alpha] - 2026-10-31
 
 ### 新增（调查词表加 `load`：负载过高）
