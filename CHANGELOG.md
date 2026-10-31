@@ -3,6 +3,25 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.29.0-alpha] - 2026-10-30
+
+### 新增（调查授权：按 agent 可改，即时生效）
+
+- `PUT /api/v1/admin/agents/{agent_id}/investigations/grant` —— 设置这台机器的允许集：
+  `{ "topics": ["disk"] }`，或 `{ "topics": [] }` 表示**这台机器显式全关**。
+- `DELETE …/investigations/grant` —— **恢复继承**网关默认（删行，不存快照：默认会被改，
+  存快照就会与该网关的策略默默分叉）。
+- 授权分两层，语义刻意不同：
+  - **上界** `[investigations] allowed_topics` = 环境策略（改配置 + 重启）；
+  - **下界** 本表（迁移 `0037_investigation_grant`）= 这台机器开哪几面，页面可改、**即时生效**，
+    且**只能在上界内收窄** —— 越界直接 403，不静默夹住（否则页面看到的与配置对不上）。
+- 列表响应新增 `grant { inherited, topics, updated_at, updated_by }` 与
+  `effective_topics`（= 上界 ∩ 下界 ∩ agent 自报能力）：页面直接拿生效集画菜单，
+  不必自己拼三层交集；`inherited` 与“空数组”是两件事，页面要分开说。
+- 新错误码 `investigation_not_granted`（403）与 `investigation_grant_store_failed`。
+- 授权变更同样写 `updated_by = admin:<token 指纹>`：谁能改“哪台机器能查什么”必须可追。
+- 只影响**下发**：已落盘报告的读取不受收权影响（取证记录不该因为事后收权就看不到）。
+
 ## [0.28.1-alpha] - 2026-10-30
 
 ### 变更（调查：授权与额度在界面上看得见）
