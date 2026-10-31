@@ -3,6 +3,18 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.30.0-alpha] - 2026-10-31
+
+### 新增（调查词表加 `load`：负载过高）
+
+- `src/api/investigations.rs` 的 `TOPICS` 增加 **`load`**（对应 agentd ≥ `0.14.0-alpha` 的
+  `investigate load`）：下发校验、`allowed_topics` 默认集、按机器授权的上下界全部自动跟上
+  （三处都是“词表 ∩ 配置”，不需要另加开关）。
+- 新增测试 `the_vocabulary_covers_the_topics_the_agents_implement`：把「网关认识哪几题」钉住 ——
+  漏改这里、只改了 agentd 的表现是「页面能选到、一下发就 400 `unknown investigation topic`」。
+- 兼容：旧 agentd（不报 `load` 能力）上，页面按「能力 ∩ 允许集」自然看不到这一题；
+  旧网关收到 `load` 会拒（400），所以**发布序：agentd 先、网关后**。
+
 ## [0.29.0-alpha] - 2026-10-30
 
 ### 新增（调查授权：按 agent 可改，即时生效）

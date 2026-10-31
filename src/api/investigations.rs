@@ -71,7 +71,7 @@ const INVESTIGATE_KIND: &str = wist_api::status::command_kind::INVESTIGATE;
 ///
 /// 新增题目=两侧一起加：这里加 id，agentd 加实现；**不要在网关猜一个题目下发**
 /// （agentd 对不认识的题目回 `failed`，页面会看到一条没法解释的失败）。
-const TOPICS: &[&str] = &["disk"];
+const TOPICS: &[&str] = &["disk", "load"];
 
 /// 报告目录相对数据面工作根的位置（与 `business.d/agent_ivsrep.toml` 的 `base` 对齐）。
 const REPORT_DIR: &str = "data/ivsrep";
@@ -1250,6 +1250,16 @@ mod tests {
             });
             assert!(err.is_err(), "path {path:?} 应被拒绝");
         }
+    }
+
+    /// 题目词表：加题目是**跨仓**动作，这里钉住本网关认识的那几个。
+    ///
+    /// 漏改这里、只改了 agentd 的表现是：页面能选到题目但一下发就 400
+    /// （`unknown investigation topic`）—— 所以让测试比人先发现。
+    #[test]
+    fn the_vocabulary_covers_the_topics_the_agents_implement() {
+        assert!(TOPICS.contains(&"disk"), "{TOPICS:?}");
+        assert!(TOPICS.contains(&"load"), "{TOPICS:?}");
     }
 
     /// `[investigations] allowed_topics`：`None` = 全开；空表 = 全关；写错的 id 被滤掉。
