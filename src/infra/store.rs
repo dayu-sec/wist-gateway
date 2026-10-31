@@ -576,6 +576,23 @@ pub struct StoredAgentPathProbe {
     pub received_at: String,
 }
 
+/// 一次性调查的**按 agent 授权**（一台一条；**没有行 = 继承网关默认**）。
+///
+/// 三层的分工见 `migrations/sqlite/0037_investigation_grant.sql`：
+/// 网关配置是**上界**（环境策略，改了要重启），本表是**下界**（页面可改，即时生效），
+/// agent 自报的能力是**存在性**（这台机器到底会不会）；有效集 = 三者取交。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredInvestigationGrant {
+    pub agent_id: String,
+    /// 这台机器开启的调查面。空数组 = **显式全关**（与“没有行”不同）。
+    pub topics: Vec<String>,
+    /// 最近一次修改的时刻（RFC3339，网关墙钟）。
+    pub updated_at: String,
+    /// 谁改的（`admin:<token 指纹>`）。
+    pub updated_by: String,
+}
+
 /// 一条探不了的路径 + 原始错误（`permission denied` 之类）。
 ///
 /// 原始错误必须带上来：预检要回答「该去改权限还是该换机器」，只有错误文本能区分。
@@ -1382,6 +1399,19 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 写入/覆盖一次预检的路径实测（一台一条）。无条件覆盖：新的实测就是权威。
     async fn upsert_agent_path_probe(&self, probe: &StoredAgentPathProbe) -> StoreResult<()>;
+
+    /// 读取一次性调查的按 agent 授权；**`None` = 继承网关默认**（不是“全关”）。
+    async fn get_investigation_grant(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<StoredInvestigationGrant>>;
+
+    /// 写入/覆盖某台机器的允许集（页面上的“保存”）。
+    async fn upsert_investigation_grant(&self, grant: &StoredInvestigationGrant)
+    -> StoreResult<()>;
+
+    /// 删掉某台机器的允许集 = **回到继承网关默认**（页面上的“恢复继承”）。
+    async fn delete_investigation_grant(&self, agent_id: &str) -> StoreResult<()>;
 
     /// 读这台机器全部日志源候选（**含**人工覆盖）。
     ///

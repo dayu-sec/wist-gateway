@@ -2100,6 +2100,58 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn get_investigation_grant(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<StoredInvestigationGrant>> {
+        let row = sqlx::query(
+            "SELECT agent_id, topics, updated_at, updated_by FROM investigation_grant \
+             WHERE agent_id = ?1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "load investigation grant"))?;
+        let Some(row) = row else { return Ok(None) };
+        let topics_raw: String = column!(row, "topics");
+        Ok(Some(StoredInvestigationGrant {
+            agent_id: column!(row, "agent_id"),
+            topics: deserialize_json_array(&topics_raw, "parse investigation grant topics")?,
+            updated_at: column!(row, "updated_at"),
+            updated_by: column!(row, "updated_by"),
+        }))
+    }
+
+    async fn upsert_investigation_grant(
+        &self,
+        grant: &StoredInvestigationGrant,
+    ) -> StoreResult<()> {
+        let topics = serialize_json_array(&grant.topics, "serialize investigation grant topics")?;
+        sqlx::query(
+            "INSERT INTO investigation_grant (agent_id, topics, updated_at, updated_by) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (agent_id) DO UPDATE SET topics = excluded.topics, \
+             updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+        )
+        .bind(&grant.agent_id)
+        .bind(topics)
+        .bind(&grant.updated_at)
+        .bind(&grant.updated_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert investigation grant"))?;
+        Ok(())
+    }
+
+    async fn delete_investigation_grant(&self, agent_id: &str) -> StoreResult<()> {
+        sqlx::query("DELETE FROM investigation_grant WHERE agent_id = ?1")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "delete investigation grant"))?;
+        Ok(())
+    }
+
     async fn list_agent_log_sources(&self, agent_id: &str) -> StoreResult<Vec<StoredLogSource>> {
         // 稳定排序交给 SQL：覆盖在前（人显式指定），其余按**证据档的信任顺序**、再按置信度。
         // 为什么不能直接 `ORDER BY evidence`：那是字母序（`config_file` 会排在
@@ -5161,6 +5213,58 @@ mod tests {
             store.get_agent_path_probe("agent-a").await.unwrap(),
             Some(second)
         );
+    }
+
+    /// 调查的按 agent 授权：**无行 = 继承**、`[]` = 显式全关、删行回到继承。
+    #[tokio::test]
+    async fn investigation_grant_round_trips_and_distinguishes_empty_from_missing() {
+        let store = store().await;
+        assert!(
+            store
+                .get_investigation_grant("agent-a")
+                .await
+                .unwrap()
+                .is_none(),
+            "没写过就必须是 None（继承），不能是空集"
+        );
+
+        let grant = StoredInvestigationGrant {
+            agent_id: "agent-a".to_string(),
+            topics: vec!["disk".to_string()],
+            updated_at: "2026-10-30T00:00:00Z".to_string(),
+            updated_by: "admin:9f2c1a7b3d40".to_string(),
+        };
+        store.upsert_investigation_grant(&grant).await.unwrap();
+        assert_eq!(
+            store.get_investigation_grant("agent-a").await.unwrap(),
+            Some(grant.clone())
+        );
+
+        // 覆盖式：再次保存就换成新的（不合并）。
+        let narrowed = StoredInvestigationGrant {
+            topics: Vec::new(),
+            updated_at: "2026-10-30T00:05:00Z".to_string(),
+            ..grant
+        };
+        store.upsert_investigation_grant(&narrowed).await.unwrap();
+        let stored = store
+            .get_investigation_grant("agent-a")
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert!(stored.topics.is_empty(), "`[]` 是「全关」，必须原样存下来");
+
+        // 删行 = 回到继承（与「全关」不是同一件事）。
+        store.delete_investigation_grant("agent-a").await.unwrap();
+        assert!(
+            store
+                .get_investigation_grant("agent-a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // 删除不存在的行不报错（页面重复点“恢复继承”不该 500）。
+        store.delete_investigation_grant("agent-a").await.unwrap();
     }
 
     /// 日志源候选：一台多行、`(service, source_ref)` 唯一、覆盖排在解析值前面。

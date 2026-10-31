@@ -135,7 +135,8 @@ use install::{
     get_agent_install_code, get_agent_install_script,
 };
 use investigations::{
-    launch_agent_investigation, list_agent_investigations, view_agent_investigation_report,
+    launch_agent_investigation, list_agent_investigations, reset_agent_investigation_grant,
+    set_agent_investigation_grant, view_agent_investigation_report,
 };
 use knowledge_ops::{
     activate_knowledge_package, list_knowledge_packages, record_knowledge_package, view_knowledge,
@@ -428,6 +429,12 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agents/{agent_id}/investigations/{command_id}",
             get(view_agent_investigation_report),
+        )
+        // NOTE(hand-added): 按 agent 的调查授权（G1 的第二层）：PUT 设集合、DELETE 恢复继承。
+        // 只影响下发，不影响已落盘报告的读取。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/investigations/grant",
+            put(set_agent_investigation_grant).delete(reset_agent_investigation_grant),
         )
         .route(
             "/api/v1/admin/agents/{agent_id}/work",

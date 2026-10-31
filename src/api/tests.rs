@@ -9270,6 +9270,122 @@ async fn launch_disk_investigation(env: &TestEnv) -> axum::response::Response {
     .await
 }
 
+async fn put_grant(env: &TestEnv, body: serde_json::Value) -> axum::response::Response {
+    put_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations/grant",
+        Some(TEST_ADMIN_API_TOKEN),
+        &body,
+    )
+    .await
+}
+
+/// G1 的第二层（按 agent 授权）：无行 = 继承、`[]` = 显式全关、删行 = 回到继承。
+///
+/// 为什么值一条 e2e：“继承”与“全关”在库里只差一行，但在**下发行为**上完全是两回事 ——
+/// 把这层只做成页面逻辑的话，绕开页面直接调 API 就能把机器打开或锁死。
+#[tokio::test]
+async fn admin_investigation_grant_narrows_per_agent_and_can_be_reset() {
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+
+    // ① 初始：没有本机行 = 继承网关默认（上界 = 词表），能下发。
+    let list: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+    )
+    .await;
+    assert_eq!(list["grant"]["inherited"], true, "{list}");
+    assert_eq!(list["effective_topics"][0], "disk");
+    assert_eq!(
+        launch_disk_investigation(&env).await.status(),
+        StatusCode::OK
+    );
+
+    // ② 显式全关：`[]` 存下来（不是删行），下发 403 `investigation_not_granted` 且不入队。
+    let response = put_grant(&env, serde_json::json!({ "topics": [] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(saved["grant"]["inherited"], false);
+    assert!(
+        saved["effective_topics"]
+            .as_array()
+            .is_some_and(|topics| topics.is_empty()),
+        "全关后没有可跑的面：{saved}"
+    );
+    assert!(
+        saved["grant"]["updated_by"]
+            .as_str()
+            .is_some_and(|by| by.starts_with("admin:")),
+        "授权变更要留审计：{saved}"
+    );
+
+    let pending_before = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 8)
+        .await
+        .expect("pending")
+        .len();
+    let refused = launch_disk_investigation(&env).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(refused).await;
+    assert_eq!(body["error"]["code"], "investigation_not_granted");
+    assert_eq!(
+        env.store
+            .list_pending_agent_commands("agent-node-a", 8)
+            .await
+            .expect("pending")
+            .len(),
+        pending_before,
+        "被授权闸拦下的调查不能进待下发集"
+    );
+
+    // ③ 恢复继承：删行后又能下发（证明“继承”不等于“全关”）。
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations/grant",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reset: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(reset["grant"]["inherited"], true, "{reset}");
+    assert_eq!(
+        launch_disk_investigation(&env).await.status(),
+        StatusCode::OK
+    );
+
+    // ④ 未知题目 400；越界（不在上界里）403 —— 下界只能收窄，不能绕过策略。
+    let response = put_grant(&env, serde_json::json!({ "topics": ["memory"] })).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_unknown_topic");
+}
+
+/// 下界不能超过上界：网关配成 `allowed_topics = []` 时，页面写 `["disk"]` 必须被拒。
+#[tokio::test]
+async fn admin_investigation_grant_cannot_exceed_the_gateway_allow_list() {
+    let mut env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    env.config.investigation_allowed_topics = Some(Vec::new());
+
+    let response = put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_not_allowed");
+    assert!(
+        env.store
+            .get_investigation_grant("agent-node-a")
+            .await
+            .expect("read grant")
+            .is_none(),
+        "被拒的授权不能落库"
+    );
+}
+
 /// 可见保留期（`[investigations] report_retention_days`）：超期报告列表不显示、按 id 也读不回。
 #[tokio::test]
 async fn admin_investigation_reports_expire_from_the_view() {
@@ -9838,6 +9954,32 @@ async fn delete_to_router(
     }
     router(config.clone(), Arc::clone(store))
         .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("route response")
+}
+
+async fn put_json_to_router<T: serde::Serialize>(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    uri: &str,
+    admin_token: Option<&str>,
+    body: &T,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = admin_token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    router(config.clone(), Arc::clone(store))
+        .oneshot(
+            builder
+                .body(Body::from(
+                    serde_json::to_string(body).expect("serialize body"),
+                ))
+                .expect("request"),
+        )
         .await
         .expect("route response")
 }

@@ -59,7 +59,7 @@ use super::admin_auth::{admin_actor, require_admin_bearer};
 use super::admin_ops::agent_not_found_response;
 use super::agent_ops::PENDING_COMMAND_TTL_MS;
 use super::{ApiError, ApiState, codes, rate_limit};
-use crate::infra::StoredAgentCommand;
+use crate::infra::{StoredAgentCommand, StoredInvestigationGrant};
 
 /// 调查命令的 kind —— 直接用词表**唯一来源**（`wist_api::status::command_kind`）。
 ///
@@ -192,6 +192,89 @@ fn ensure_allowed(state: &ApiState, topic: &str) -> Result<Vec<&'static str>, Bo
         codes::INVESTIGATION_NOT_ALLOWED,
         format!("investigation topic {topic:?} is disabled on this gateway (allowed: {listed})"),
     )))
+}
+
+/// 每台机器实际**被允许**的面 = 上界（`[investigations] allowed_topics`）∩ 下界（按 agent 授权）。
+///
+/// **没有授权行 = 继承**（下界等于上界）；空数组 = 这台机器显式全关 —— 两件事不能混：
+/// 前者会跟着配置走，后者不会。下界永远不可能超过上界（上界是环境策略，改它要重启）。
+fn granted_topics(
+    ceiling: &[&'static str],
+    grant: Option<&StoredInvestigationGrant>,
+) -> Vec<&'static str> {
+    match grant {
+        None => ceiling.to_vec(),
+        Some(grant) => ceiling
+            .iter()
+            .copied()
+            .filter(|topic| grant.topics.iter().any(|value| value == topic))
+            .collect(),
+    }
+}
+
+/// 真正**跑得起来**的面 = 被允许 ∩ agent 自报能力（`None` = 还没上报 → 一个都跑不了）。
+///
+/// 这是菜单该亮的集合：被允许但机器不支持的题不该让人去点（点了只会换一个 409）。
+fn usable_topics(
+    granted: &[&'static str],
+    capabilities: Option<&InvestigationCapabilities>,
+) -> Vec<String> {
+    let Some(capabilities) = capabilities else {
+        return Vec::new();
+    };
+    granted
+        .iter()
+        .filter(|topic| {
+            capabilities
+                .surfaces
+                .iter()
+                .any(|surface| surface == *topic)
+        })
+        .map(|topic| (*topic).to_string())
+        .collect()
+}
+
+/// 这台机器有没有被授权跑这个面（G1 的第二层：按 agent 的下界）。
+fn ensure_granted(
+    granted: &[&'static str],
+    topic: &str,
+    agent_id: &str,
+) -> Result<(), Box<ApiError>> {
+    if granted.contains(&topic) {
+        return Ok(());
+    }
+    let listed = if granted.is_empty() {
+        "none".to_string()
+    } else {
+        granted.join(", ")
+    };
+    Err(Box::new(ApiError::forbidden(
+        codes::INVESTIGATION_NOT_GRANTED,
+        format!(
+            "investigation topic {topic:?} is not granted to agent {agent_id} (granted: {listed}); \
+             enable it on the agent's investigation page"
+        ),
+    )))
+}
+
+/// 读这台机器的允许集；`None` = 继承网关默认。
+#[allow(clippy::result_large_err)]
+async fn load_grant(
+    state: &ApiState,
+    agent_id: &str,
+) -> Result<Option<StoredInvestigationGrant>, Response> {
+    state
+        .store
+        .get_investigation_grant(agent_id)
+        .await
+        .map_err(|err| {
+            ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load investigation grant",
+                err,
+            )
+            .into_response()
+        })
 }
 
 /// 每台 agent 每小时的额度（`[investigations] max_per_agent_per_hour`；`0` = 不限）。
@@ -348,6 +431,15 @@ pub async fn launch_agent_investigation(
     if let Err(err) = ensure_supported(capabilities.as_ref(), &topic) {
         return (*err).into_response();
     }
+    // G1 的第二层：**这台机器**开没开这个面（上界之上再收一层；页面可改，即时生效）。
+    let grant = match load_grant(&state, &agent_id).await {
+        Ok(grant) => grant,
+        Err(response) => return response,
+    };
+    let granted = granted_topics(&allowed, grant.as_ref());
+    if let Err(err) = ensure_granted(&granted, &topic, &agent_id) {
+        return (*err).into_response();
+    }
     let now = chrono::Utc::now();
     if let Err(response) = ensure_quota(&state, &agent_id, now).await {
         return response;
@@ -372,6 +464,7 @@ pub async fn launch_agent_investigation(
             agent_id,
             capabilities: capabilities_view(capabilities.as_ref()),
             allowed_topics: allowed.into_iter().map(str::to_string).collect(),
+            granted_topics: granted.into_iter().map(str::to_string).collect(),
             command: command_view(Some(&command)),
         })
         .into_response(),
@@ -452,6 +545,8 @@ struct InvestigationLaunchResponse {
     capabilities: Option<InvestigationCapabilitiesView>,
     /// 本网关允许的面（配置 ∩ 词表）：与 `capabilities` 的**交集**才是可点的。
     allowed_topics: Vec<String>,
+    /// 这台机器实际被授权的面（上界 ∩ 按 agent 授权）—— 下发时的闸用的就是它。
+    granted_topics: Vec<String>,
     command: InvestigationCommandView,
 }
 
@@ -480,13 +575,46 @@ struct InvestigationQuotaView {
     used_last_hour: Option<u64>,
 }
 
+/// 按 agent 的允许集（页面据此画“继承 / 本机自定义”与保存按钮）。
+#[derive(Debug, Serialize)]
+struct InvestigationGrantView {
+    /// `true` = 没有本机行，**跟随网关默认**（`topics` 此时为空）。
+    inherited: bool,
+    /// 本机存下来的面（`inherited = true` 时为 `[]`；空数组 = 显式全关）。
+    topics: Vec<String>,
+    updated_at: Option<String>,
+    /// 谁改的（`admin:<token 指纹>`）。
+    updated_by: Option<String>,
+}
+
+fn grant_view(grant: Option<&StoredInvestigationGrant>) -> InvestigationGrantView {
+    match grant {
+        Some(grant) => InvestigationGrantView {
+            inherited: false,
+            topics: grant.topics.clone(),
+            updated_at: Some(grant.updated_at.clone()),
+            updated_by: Some(grant.updated_by.clone()),
+        },
+        None => InvestigationGrantView {
+            inherited: true,
+            topics: Vec::new(),
+            updated_at: None,
+            updated_by: None,
+        },
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct InvestigationListResponse {
     pub agent_id: String,
     /// 这台 agent 自报的调查能力（`None` = 还没报过）—— 与下发时的闸同一口径。
     pub capabilities: Option<InvestigationCapabilitiesView>,
-    /// 本网关允许的面（配置 ∩ 词表）。
+    /// 本网关允许的面（配置 ∩ 词表）——**上界**。
     pub allowed_topics: Vec<String>,
+    /// 按 agent 的允许集（缺行 = 继承上界）。
+    pub grant: InvestigationGrantView,
+    /// 真正能跑的面 = 上界 ∩ 按 agent 授权 ∩ agent 自报能力（菜单该亮的集合）。
+    pub effective_topics: Vec<String>,
     /// 本 agent 的额度使用情况。
     pub quota: InvestigationQuotaView,
     /// 报告的**可见**保留天数（`0` = 不限）；超期的报告不会出现在 `reports` 里。
@@ -534,6 +662,12 @@ pub async fn list_agent_investigations(
         Ok(capabilities) => capabilities,
         Err(response) => return response,
     };
+    let grant = match load_grant(&state, &agent_id).await {
+        Ok(grant) => grant,
+        Err(response) => return response,
+    };
+    let ceiling = effective_allowed_topics(state.config.investigation_allowed_topics.as_deref());
+    let granted = granted_topics(&ceiling, grant.as_ref());
     let command = match state
         .store
         .get_latest_agent_command(&agent_id, INVESTIGATE_KIND)
@@ -589,12 +723,9 @@ pub async fn list_agent_investigations(
     Json(InvestigationListResponse {
         agent_id,
         capabilities: capabilities_view(capabilities.as_ref()),
-        allowed_topics: effective_allowed_topics(
-            state.config.investigation_allowed_topics.as_deref(),
-        )
-        .into_iter()
-        .map(str::to_string)
-        .collect(),
+        allowed_topics: ceiling.into_iter().map(str::to_string).collect(),
+        grant: grant_view(grant.as_ref()),
+        effective_topics: usable_topics(&granted, capabilities.as_ref()),
         quota: InvestigationQuotaView {
             limit_per_hour: state.config.investigation_max_per_agent_per_hour,
             used_last_hour,
@@ -655,6 +786,152 @@ pub async fn view_agent_investigation_report(
             err,
         )
         .into_response(),
+    }
+}
+
+// ── 按 agent 授权（页面可改，即时生效）────────────────────────────────
+
+/// 写这台机器的允许集（**下界**）。`[]` = 显式全关（与“继承”不同）。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetInvestigationGrantRequest {
+    pub topics: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InvestigationGrantResponse {
+    agent_id: String,
+    grant: InvestigationGrantView,
+    /// 真正能跑的面（上界 ∩ 下界 ∩ 能力）—— 保存后页面直接拿它刷新菜单。
+    effective_topics: Vec<String>,
+}
+
+/// 把请求里的面收敛成**词表顺序**的集合：去重、拒未知、拒越界。
+///
+/// 越界（不在 `[investigations] allowed_topics` 里）直接 403，而不是静默夹住：
+/// 下界能悄无声息地被“夹小”的话，运维看到的结果会与配置对不上。
+fn normalize_grant_topics(
+    ceiling: &[&'static str],
+    requested: &[String],
+) -> Result<Vec<String>, Box<ApiError>> {
+    for raw in requested {
+        let topic = raw.trim();
+        if !TOPICS.contains(&topic) {
+            return Err(Box::new(ApiError::bad_request(
+                codes::INVESTIGATION_UNKNOWN_TOPIC,
+                format!(
+                    "unknown investigation topic {topic:?} (known: {})",
+                    TOPICS.join(", ")
+                ),
+            )));
+        }
+        if !ceiling.contains(&topic) {
+            let listed = if ceiling.is_empty() {
+                "none".to_string()
+            } else {
+                ceiling.join(", ")
+            };
+            return Err(Box::new(ApiError::forbidden(
+                codes::INVESTIGATION_NOT_ALLOWED,
+                format!(
+                    "investigation topic {topic:?} is disabled on this gateway (allowed: {listed}); \
+                     a per-agent grant can only narrow that list"
+                ),
+            )));
+        }
+    }
+    Ok(TOPICS
+        .iter()
+        .filter(|topic| requested.iter().any(|raw| raw.trim() == **topic))
+        .map(|topic| (*topic).to_string())
+        .collect())
+}
+
+/// 保存后的统一回包：允许集 + 生效集（页面一次就能把菜单刷对）。
+#[allow(clippy::result_large_err)]
+async fn grant_response(state: &ApiState, agent_id: String) -> Result<Response, Response> {
+    let capabilities = load_investigation_capabilities(state, &agent_id).await?;
+    let grant = load_grant(state, &agent_id).await?;
+    let ceiling = effective_allowed_topics(state.config.investigation_allowed_topics.as_deref());
+    let granted = granted_topics(&ceiling, grant.as_ref());
+    Ok(Json(InvestigationGrantResponse {
+        agent_id,
+        grant: grant_view(grant.as_ref()),
+        effective_topics: usable_topics(&granted, capabilities.as_ref()),
+    })
+    .into_response())
+}
+
+/// `PUT /api/v1/admin/agents/{agent_id}/investigations/grant`：设置这台机器开哪几个面。
+///
+/// 只影响**下发**（能不能发命令），不影响已落盘报告的读取 —— 取证记录不该因为事后收权就看不到。
+pub async fn set_agent_investigation_grant(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(agent_id): AxumPath<String>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Json(request): Json<SetInvestigationGrantRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    let ceiling = effective_allowed_topics(state.config.investigation_allowed_topics.as_deref());
+    let topics = match normalize_grant_topics(&ceiling, &request.topics) {
+        Ok(topics) => topics,
+        Err(err) => return (*err).into_response(),
+    };
+    let grant = StoredInvestigationGrant {
+        agent_id: agent_id.clone(),
+        topics,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        // G1/审计：授权变更也要能回答“谁点的”（与命令台账同一口径）。
+        updated_by: admin_actor(&state.config),
+    };
+    if let Err(err) = state.store.upsert_investigation_grant(&grant).await {
+        return ApiError::internal(
+            codes::INVESTIGATION_GRANT_STORE_FAILED,
+            "failed to save investigation grant",
+            err,
+        )
+        .into_response();
+    }
+    match grant_response(&state, agent_id).await {
+        Ok(response) => response,
+        Err(response) => response,
+    }
+}
+
+/// `DELETE /api/v1/admin/agents/{agent_id}/investigations/grant`：恢复**继承网关默认**。
+///
+/// 删行而不是存一份“当前默认”：默认会被改（改配置重启），存快照就会与该网关的策略默默分叉。
+pub async fn reset_agent_investigation_grant(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(agent_id): AxumPath<String>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    if let Err(err) = state.store.delete_investigation_grant(&agent_id).await {
+        return ApiError::internal(
+            codes::INVESTIGATION_GRANT_STORE_FAILED,
+            "failed to reset investigation grant",
+            err,
+        )
+        .into_response();
+    }
+    match grant_response(&state, agent_id).await {
+        Ok(response) => response,
+        Err(response) => response,
     }
 }
 

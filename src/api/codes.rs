@@ -60,6 +60,8 @@ codes! {
     AGENT_UPLINK_UNAVAILABLE => "agent_uplink_unavailable",
     INVESTIGATION_BAD_PARAMS => "investigation_bad_params",
     INVESTIGATION_NOT_ALLOWED => "investigation_not_allowed",
+    INVESTIGATION_NOT_GRANTED => "investigation_not_granted",
+    INVESTIGATION_GRANT_STORE_FAILED => "investigation_grant_store_failed",
     INVESTIGATION_QUOTA_EXCEEDED => "investigation_quota_exceeded",
     INVESTIGATION_REPORT_NOT_FOUND => "investigation_report_not_found",
     INVESTIGATION_UNKNOWN_TOPIC => "investigation_unknown_topic",
