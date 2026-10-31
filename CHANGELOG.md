@@ -3,6 +3,16 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.32.1-alpha] - 2026-10-31
+
+### 修复（发版链路：macOS runner 镜像下线）
+
+- CI 矩阵 `macos-14` → `macos-15`。GitHub 从 10 月起对 `macos-14` 做 brownout，
+  **11-02 永久下线**；期间 job 一启动就被 `cancelled`（`runner_name` 为空），
+  连带把 `Upload to COS` / `release` / `docker` 变成 skipped。
+- 因此 **0.32.0 从未产出制品**（GitHub Release / COS / 镜像都没有）。本版内容与它相同，
+  只修了 CI，用于把 alpha 通道补发到位。
+
 ## [0.32.0-alpha] - 2026-10-31
 
 ### 新增（调查词表加四题：账号 / 持久化 / 暴露面 / 遥测健康）
