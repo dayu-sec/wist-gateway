@@ -8984,6 +8984,9 @@ async fn admin_investigation_dispatch_and_report_directory_round_trip() {
     assert_eq!(agent_id, "agent-node-a");
     // G2：网关只给**自报认识这道题**的机器下发。先让这台机器报一次能力。
     report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    // G1 的下界默认**全关**（与采集面一致）：先显式开这张面，才谈得上下发。
+    let response = put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
     env.config.data_plane_work_dir = Some(env._root.clone());
     let report_dir = env._root.join("data").join("ivsrep");
     std::fs::create_dir_all(&report_dir).expect("create report dir");
@@ -9050,8 +9053,10 @@ async fn admin_investigation_dispatch_and_report_directory_round_trip() {
     assert_eq!(list["reports"][0]["command_id"], "cmd_prev");
     assert_eq!(list["reports"][0]["overall"], "warn");
     assert_eq!(list["latest_command"]["kind"], "investigate");
-    // 菜单可用性的两个输入 + 保留期：没配 `[investigations]` 时就是「全开 / 7 天」。
+    // 菜单可用性的两个输入 + 保留期：没配 `[investigations]` 时上界是全词表、保留 7 天；
+    // 这台机器被授权（且能跑）的只有 `disk`。
     assert_eq!(list["allowed_topics"][0], "disk");
+    assert_eq!(list["grant"]["topics"][0], "disk");
     assert_eq!(list["capabilities"]["surfaces"][0], "disk");
     assert_eq!(list["retention_days"], 7);
     // 额度：默认上限 12，本小时已发起 1 次（上面那次下发）—— 页面靠它解释 429。
@@ -9183,6 +9188,44 @@ async fn admin_investigation_without_a_mounted_data_plane_says_so() {
     assert_eq!(body["error"]["code"], "investigation_report_not_found");
 }
 
+/// 报告目录可配：绝对路径不依赖 `[data_plane] work_dir`（报告可以单独挂一个卷）。
+///
+/// 为什么要这条：报告是 **wparse 写、网关读**，两侧靠路径约定对齐。
+/// 约定被改（sink 的 `base` 换了位置 / 报告单独挂盘）时，网关必须能跟上，
+/// 不能只留一个写死的 `data/ivsrep`。
+#[tokio::test]
+async fn admin_investigation_reads_reports_from_a_configured_directory() {
+    let mut env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+
+    let report_dir = env._root.join("elsewhere").join("ivsrep");
+    std::fs::create_dir_all(&report_dir).expect("create report dir");
+    std::fs::write(
+        report_dir.join("agent-ivsrep.jsonl"),
+        format!(
+            "{}\n",
+            ivsrep_line("agent-node-a", 3, "cmd-abs", "2026-10-30T10:00:05Z")
+        ),
+    )
+    .expect("write report");
+    // 注意：`data_plane_work_dir` 仍是 `None` —— 绝对路径不需要它。
+    assert!(env.config.data_plane_work_dir.is_none());
+    env.config.investigation_report_dir = Some(report_dir.clone());
+
+    let list: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+    )
+    .await;
+    assert_eq!(list["report_dir"]["configured"], true, "{list}");
+    assert_eq!(
+        list["report_dir"]["path"],
+        report_dir.display().to_string(),
+        "页面要显示真实读的那份目录"
+    );
+    assert_eq!(list["reports"][0]["command_id"], "cmd-abs");
+}
+
 /// 按面授权（`[investigations] allowed_topics`）：网关关掉的面 → 403，且**不入队**。
 #[tokio::test]
 async fn admin_investigation_respects_the_gateway_allow_list() {
@@ -9230,6 +9273,8 @@ async fn admin_investigation_is_quota_limited_per_agent() {
     let mut env = TestEnv::new().await;
     let agent_id = enroll_agent_credential(&env).await;
     report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    // 授权默认全关：额度用例要先开这张面，否则会在授权闸先被 403 拦下。
+    put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
     env.config.investigation_max_per_agent_per_hour = 1;
 
     assert_eq!(
@@ -9281,52 +9326,80 @@ async fn put_grant(env: &TestEnv, body: serde_json::Value) -> axum::response::Re
     .await
 }
 
-/// G1 的第二层（按 agent 授权）：无行 = 继承、`[]` = 显式全关、删行 = 回到继承。
+/// G1 的第二层（按 agent 授权）：**默认全关**（与采集面一致），要开必须显式写、随时可收。
 ///
-/// 为什么值一条 e2e：“继承”与“全关”在库里只差一行，但在**下发行为**上完全是两回事 ——
+/// 为什么值一条 e2e：授权在库里只是一行，但在**下发行为**上是“发不发得出去” ——
 /// 把这层只做成页面逻辑的话，绕开页面直接调 API 就能把机器打开或锁死。
 #[tokio::test]
-async fn admin_investigation_grant_narrows_per_agent_and_can_be_reset() {
+async fn admin_investigation_is_deny_by_default_and_grants_can_be_revoked() {
     let env = TestEnv::new().await;
     let agent_id = enroll_agent_credential(&env).await;
     report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
 
-    // ① 初始：没有本机行 = 继承网关默认（上界 = 词表），能下发。
+    // ① 初始：没有本机行 = 一个面都没开（上界是全词表也不行），下发 403。
     let list: serde_json::Value = decode_json_response(
         get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
     )
     .await;
-    assert_eq!(list["grant"]["inherited"], true, "{list}");
-    assert_eq!(list["effective_topics"][0], "disk");
-    assert_eq!(
-        launch_disk_investigation(&env).await.status(),
-        StatusCode::OK
-    );
-
-    // ② 显式全关：`[]` 存下来（不是删行），下发 403 `investigation_not_granted` 且不入队。
-    let response = put_grant(&env, serde_json::json!({ "topics": [] })).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let saved: serde_json::Value = decode_json_response(response).await;
-    assert_eq!(saved["grant"]["inherited"], false);
+    assert_eq!(list["grant"]["inherited"], false, "{list}");
     assert!(
-        saved["effective_topics"]
+        list["grant"]["topics"]
             .as_array()
             .is_some_and(|topics| topics.is_empty()),
-        "全关后没有可跑的面：{saved}"
+        "没授权过就是空集：{list}"
     );
+    assert!(
+        list["effective_topics"]
+            .as_array()
+            .is_some_and(|topics| topics.is_empty()),
+        "没授权就没有可跑的面：{list}"
+    );
+    let refused = launch_disk_investigation(&env).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(refused).await;
+    assert_eq!(body["error"]["code"], "investigation_not_granted");
+    assert!(
+        env.store
+            .list_pending_agent_commands("agent-node-a", 8)
+            .await
+            .expect("pending")
+            .is_empty(),
+        "被授权闸拦下的调查不能进待下发集"
+    );
+
+    // ② 显式开一个面：立刻能下发，且能跑的面就是这一个。
+    let response = put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(saved["grant"]["topics"][0], "disk");
+    assert_eq!(saved["effective_topics"][0], "disk");
     assert!(
         saved["grant"]["updated_by"]
             .as_str()
             .is_some_and(|by| by.starts_with("admin:")),
         "授权变更要留审计：{saved}"
     );
+    assert_eq!(
+        launch_disk_investigation(&env).await.status(),
+        StatusCode::OK
+    );
 
+    // ③ 收权（`[]`）：即时生效，下发又变 403。
     let pending_before = env
         .store
         .list_pending_agent_commands("agent-node-a", 8)
         .await
         .expect("pending")
         .len();
+    let response = put_grant(&env, serde_json::json!({ "topics": [] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let revoked: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        revoked["effective_topics"]
+            .as_array()
+            .is_some_and(|topics| topics.is_empty()),
+        "全关后没有可跑的面：{revoked}"
+    );
     let refused = launch_disk_investigation(&env).await;
     assert_eq!(refused.status(), StatusCode::FORBIDDEN);
     let body: serde_json::Value = decode_json_response(refused).await;
@@ -9341,7 +9414,7 @@ async fn admin_investigation_grant_narrows_per_agent_and_can_be_reset() {
         "被授权闸拦下的调查不能进待下发集"
     );
 
-    // ③ 恢复继承：删行后又能下发（证明“继承”不等于“全关”）。
+    // ④ 删行 = 回到默认，也是全关 —— 不能再像旧构建那样“删行即全开”。
     let response = delete_to_router(
         &env.config,
         &env.store_handle,
@@ -9351,13 +9424,20 @@ async fn admin_investigation_grant_narrows_per_agent_and_can_be_reset() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let reset: serde_json::Value = decode_json_response(response).await;
-    assert_eq!(reset["grant"]["inherited"], true, "{reset}");
+    assert_eq!(reset["grant"]["inherited"], false, "{reset}");
+    assert!(
+        reset["effective_topics"]
+            .as_array()
+            .is_some_and(|topics| topics.is_empty()),
+        "删行后仍是全关：{reset}"
+    );
     assert_eq!(
         launch_disk_investigation(&env).await.status(),
-        StatusCode::OK
+        StatusCode::FORBIDDEN,
+        "默认全关：删行不等于放行"
     );
 
-    // ④ 未知题目 400；越界（不在上界里）403 —— 下界只能收窄，不能绕过策略。
+    // ⑤ 未知题目 400；越界（不在上界里）403 —— 下界只能收窄，不能绕过策略。
     let response = put_grant(&env, serde_json::json!({ "topics": ["memory"] })).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: serde_json::Value = decode_json_response(response).await;
@@ -9477,8 +9557,9 @@ async fn admin_investigation_is_refused_when_the_agent_cannot_run_it() {
     let body: serde_json::Value = decode_json_response(response).await;
     assert_eq!(body["error"]["code"], "investigation_unsupported");
 
-    // ③ 报对了：放行，并回带能力（页面据此提示“非 root = 部分答案”）。
+    // ③ 报对了：放行（授权默认全关：先显式开这张面），并回带能力（页面据此提示“非 root = 部分答案”）。
     report_investigation_capabilities(&env, &agent_id, &["disk"], false).await;
+    put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
     let response = post_json_to_router(
         &env.config,
         &env.store_handle,
@@ -9607,12 +9688,13 @@ impl TestEnv {
             // 内部接入端点默认关：测试走 `router()`，明文监听由 main.rs 单独起。
             ingest_listen_addr: None,
             data_plane_work_dir: None,
-            // 调查闸默认值（与线上一致）：全开、每小时 12 次、保留 7 天。
+            // 调查闸默认值（与线上一致）：上界全开、每小时 12 次、保留 7 天、报告目录跟数据面布局。
             investigation_allowed_topics: None,
             investigation_max_per_agent_per_hour:
                 crate::infra::config::DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR,
             investigation_report_retention_days:
                 crate::infra::config::DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS,
+            investigation_report_dir: None,
             // 知识库包默认不验签（要验签的用例自己把公钥填上）。
             knowledge_source_dir: None,
             knowledge_signing_public_key_file: None,

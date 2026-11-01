@@ -5,7 +5,7 @@
 //! | 产物 | 通道 | 落点 |
 //! | --- | --- | --- |
 //! | 结论摘要 | **控制面**（agent 的下一次状态上报回执 `command_acks`） | 网关 `agent_commands` 表 |
-//! | 完整报告 | **数据面**（agentd 发 ` IVSREP: ` 帧 → wparse） | 网关本机 `<data-plane>/data/ivsrep/*.jsonl` |
+//! | 完整报告 | **数据面**（agentd 发 ` IVSREP: ` 帧 → wparse） | 网关本机报告目录（缺省 `<data-plane>/data/ivsrep/*.jsonl`） |
 //!
 //! 为什么报告不塞进 ack：ack 是每 3s 一条的控制报文，一份 `disk` 报告几十 KB —— 塞进去等于
 //! 让所有机器的心跳为一次调查让路。报告走数据面与 `LOGREC`/`OBSFACT`/`DSNAP` 同一条通道，
@@ -14,8 +14,9 @@
 //! ## 为什么这里只读目录、不做「收件箱」
 //!
 //! 报告的**写入者是 wparse**（栈里由 `business.d/agent_ivsrep.toml` 的 file sink 决定），
-//! 网关只按既有布局读：`<data_plane work_dir>/data/ivsrep/`（与「采集日志」tail
-//! `data/out_dat` 同一个模型，compose 已把整个 `data/` 只读挂进来）。
+//! 网关只按既有布局读：缺省 `<data_plane work_dir>/data/ivsrep/`（与「采集日志」tail
+//! `data/out_dat` 同一个模型，compose 已把整个 `data/` 只读挂进来）；
+//! 布局不同时用 `[investigations] report_dir` 覆盖（相对 = 相对 `work_dir`，绝对 = 直接用）。
 //! 这样网关不需要新的入站端点、不需要缓存层，也不与 wparse 争「谁是唯一写者」。
 //!
 //! 安全边界（这些端点能读文件，边界必须写在代码里）：
@@ -80,8 +81,11 @@ const TOPICS: &[&str] = &[
     "telemetry-health",
 ];
 
-/// 报告目录相对数据面工作根的位置（与 `business.d/agent_ivsrep.toml` 的 `base` 对齐）。
-const REPORT_DIR: &str = "data/ivsrep";
+/// 报告目录的**缺省**位置（与 `business.d/agent_ivsrep.toml` 的 `base` 对齐）。
+///
+/// 可被 `[investigations] report_dir` 覆盖 —— 数据面 sink 的 `base` 改了，这里要一起改
+/// （分隔的两份配置，网关不猜）。
+const DEFAULT_REPORT_DIR: &str = "data/ivsrep";
 
 /// 一次最多看多少个报告文件。
 const MAX_REPORT_FILES: usize = 32;
@@ -203,22 +207,23 @@ fn ensure_allowed(state: &ApiState, topic: &str) -> Result<Vec<&'static str>, Bo
     )))
 }
 
-/// 每台机器实际**被允许**的面 = 上界（`[investigations] allowed_topics`）∩ 下界（按 agent 授权）。
+/// 每台机器实际**被允许**的面 = 上界（`[investigations] allowed_topics`）∩ 本机授权。
 ///
-/// **没有授权行 = 继承**（下界等于上界）；空数组 = 这台机器显式全关 —— 两件事不能混：
-/// 前者会跟着配置走，后者不会。下界永远不可能超过上界（上界是环境策略，改它要重启）。
+/// **没有授权行 = 这台机器一个面都没开**（与采集面同一逻辑：没派过活就不采）。
+/// 要放开必须显式写（页面勾选 / `PUT …/investigations/grant`）；
+/// 下界永远不可能超过上界（上界是环境策略，改它要重启）。
 fn granted_topics(
     ceiling: &[&'static str],
     grant: Option<&StoredInvestigationGrant>,
 ) -> Vec<&'static str> {
-    match grant {
-        None => ceiling.to_vec(),
-        Some(grant) => ceiling
-            .iter()
-            .copied()
-            .filter(|topic| grant.topics.iter().any(|value| value == topic))
-            .collect(),
-    }
+    let Some(grant) = grant else {
+        return Vec::new();
+    };
+    ceiling
+        .iter()
+        .copied()
+        .filter(|topic| grant.topics.iter().any(|value| value == topic))
+        .collect()
 }
 
 /// 真正**跑得起来**的面 = 被允许 ∩ agent 自报能力（`None` = 还没上报 → 一个都跑不了）。
@@ -266,7 +271,7 @@ fn ensure_granted(
     )))
 }
 
-/// 读这台机器的允许集；`None` = 继承网关默认。
+/// 读这台机器的允许集；`None` = 没有本机行（默认全关，一个面都没开）。
 #[allow(clippy::result_large_err)]
 async fn load_grant(
     state: &ApiState,
@@ -590,12 +595,14 @@ struct InvestigationQuotaView {
     used_last_hour: Option<u64>,
 }
 
-/// 按 agent 的允许集（页面据此画“继承 / 本机自定义”与保存按钮）。
+/// 按 agent 的允许集（页面据此画“已开启 / 未开启”与保存按钮）。
 #[derive(Debug, Serialize)]
 struct InvestigationGrantView {
-    /// `true` = 没有本机行，**跟随网关默认**（`topics` 此时为空）。
+    /// 历史字段：旧构建用它表示“没有本机行、跟随上界”。
+    ///
+    /// **现在恒为 `false`**（缺行就是全关）。保留它只是为了让旧前端能继续解析回包。
     inherited: bool,
-    /// 本机存下来的面（`inherited = true` 时为 `[]`；空数组 = 显式全关）。
+    /// 本机存下来的面；`[]` = 一个面都没开（默认状态也是这个值）。
     topics: Vec<String>,
     updated_at: Option<String>,
     /// 谁改的（`admin:<token 指纹>`）。
@@ -611,7 +618,7 @@ fn grant_view(grant: Option<&StoredInvestigationGrant>) -> InvestigationGrantVie
             updated_by: Some(grant.updated_by.clone()),
         },
         None => InvestigationGrantView {
-            inherited: true,
+            inherited: false,
             topics: Vec::new(),
             updated_at: None,
             updated_by: None,
@@ -626,7 +633,7 @@ struct InvestigationListResponse {
     pub capabilities: Option<InvestigationCapabilitiesView>,
     /// 本网关允许的面（配置 ∩ 词表）——**上界**。
     pub allowed_topics: Vec<String>,
-    /// 按 agent 的允许集（缺行 = 继承上界）。
+    /// 按 agent 的允许集（**缺行 = 全关**，与采集面一致）。
     pub grant: InvestigationGrantView,
     /// 真正能跑的面 = 上界 ∩ 按 agent 授权 ∩ agent 自报能力（菜单该亮的集合）。
     pub effective_topics: Vec<String>,
@@ -647,13 +654,26 @@ struct InvestigationReportResponse {
     pub report: Value,
 }
 
-/// 报告目录：数据面工作根下的固定相对路径。未配置（没挂载）时 `None`。
+/// 报告目录 = 配置值 ∪ `[data_plane] work_dir`。
+///
+/// 三种情况：
+///   · `report_dir` 是**绝对路径** → 直接用（不要求挂 `work_dir`：单独挂一个卷也能读）；
+///   · `report_dir` 是相对路径 → `<work_dir>/<report_dir>`；
+///   · 没配 → `<work_dir>/data/ivsrep`（与数据面默认 sink 对齐）。
+/// 没有 `work_dir` 且没配绝对路径时 `None`：页面会说明“报告目录没挂进来”，而不是假装没有报告。
+fn resolve_report_dir(work_dir: Option<&Path>, configured: Option<&Path>) -> Option<PathBuf> {
+    let relative = configured.unwrap_or(Path::new(DEFAULT_REPORT_DIR));
+    if relative.is_absolute() {
+        return Some(relative.to_path_buf());
+    }
+    work_dir.map(|root| root.join(relative))
+}
+
 fn report_dir(state: &ApiState) -> Option<PathBuf> {
-    state
-        .config
-        .data_plane_work_dir
-        .as_ref()
-        .map(|root| root.join(REPORT_DIR))
+    resolve_report_dir(
+        state.config.data_plane_work_dir.as_deref(),
+        state.config.investigation_report_dir.as_deref(),
+    )
 }
 
 /// `GET /api/v1/admin/agents/{agent_id}/investigations`。
@@ -806,7 +826,7 @@ pub async fn view_agent_investigation_report(
 
 // ── 按 agent 授权（页面可改，即时生效）────────────────────────────────
 
-/// 写这台机器的允许集（**下界**）。`[]` = 显式全关（与“继承”不同）。
+/// 写这台机器的允许集（**下界**）。`[]` = 一个面都不开（与默认状态同义）。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetInvestigationGrantRequest {
@@ -920,9 +940,10 @@ pub async fn set_agent_investigation_grant(
     }
 }
 
-/// `DELETE /api/v1/admin/agents/{agent_id}/investigations/grant`：恢复**继承网关默认**。
+/// `DELETE /api/v1/admin/agents/{agent_id}/investigations/grant`：清空这台机器的授权。
 ///
-/// 删行而不是存一份“当前默认”：默认会被改（改配置重启），存快照就会与该网关的策略默默分叉。
+/// 删行 = 回到**默认全关**（与采集面一致：没派过活就不采）。旧构建里这里叫“恢复继承”，
+/// 因为它的默认是上界；现在默认是空集，所以删行不再等于“全开”。
 pub async fn reset_agent_investigation_grant(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1328,7 +1349,61 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// `[investigations] allowed_topics`：`None` = 全开；空表 = 全关；写错的 id 被滤掉。
+    /// 下界默认全关（与采集面一致）：没写过行 = 一个面都不给，写了才在上界内收窄。
+    #[test]
+    fn per_agent_grants_default_to_nothing() {
+        let grant = |topics: &[&str]| StoredInvestigationGrant {
+            agent_id: "agent-a".to_string(),
+            topics: topics.iter().map(|topic| (*topic).to_string()).collect(),
+            updated_at: "2026-11-01T00:00:00Z".to_string(),
+            updated_by: "admin:test".to_string(),
+        };
+
+        assert!(
+            granted_topics(TOPICS, None).is_empty(),
+            "缺行 = 全关：上界开着也不等于这台机器开了"
+        );
+        assert!(granted_topics(TOPICS, Some(&grant(&[]))).is_empty());
+        assert_eq!(
+            granted_topics(TOPICS, Some(&grant(&["disk"]))),
+            vec!["disk"]
+        );
+        // 下界不能超过上界：上界没有的面，行里写了也不生效。
+        assert_eq!(
+            granted_topics(&["load"], Some(&grant(&["disk", "load"]))),
+            vec!["load"]
+        );
+        // 词表里不存在的值被滤掉（不 panic、不变成“放行”）。
+        assert!(granted_topics(TOPICS, Some(&grant(&["nope"]))).is_empty());
+    }
+
+    /// 报告目录：缺省跟数据面布局；相对路径跟 `work_dir`；绝对路径不依赖挂载。
+    #[test]
+    fn the_report_directory_is_configurable_and_defaults_to_the_data_plane_layout() {
+        let work = Path::new("/data-plane");
+        assert_eq!(
+            resolve_report_dir(Some(work), None),
+            Some(PathBuf::from("/data-plane/data/ivsrep")),
+            "缺省 = 数据面 sink 的 base（旧部署不用改配置）"
+        );
+        assert_eq!(
+            resolve_report_dir(Some(work), Some(Path::new("reports"))),
+            Some(PathBuf::from("/data-plane/reports")),
+            "相对路径跟 work_dir"
+        );
+        assert_eq!(
+            resolve_report_dir(None, Some(Path::new("/var/lib/wist/ivsrep"))),
+            Some(PathBuf::from("/var/lib/wist/ivsrep")),
+            "绝对路径不要求挂 work_dir（报告可以单独一个卷）"
+        );
+        assert_eq!(
+            resolve_report_dir(None, None),
+            None,
+            "都没有 → 页面说“没挂进来”，而不是假装没报告"
+        );
+    }
+
+    /// `[investigations] allowed_topics`：`None` = 上界全开；空表 = 全关；写错的 id 被滤掉。
     #[test]
     fn the_allowed_topic_set_is_config_intersected_with_the_vocabulary() {
         assert_eq!(effective_allowed_topics(None), TOPICS.to_vec());

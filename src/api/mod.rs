@@ -439,7 +439,7 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/admin/agents/{agent_id}/investigations/{command_id}",
             get(view_agent_investigation_report),
         )
-        // NOTE(hand-added): 按 agent 的调查授权（G1 的第二层）：PUT 设集合、DELETE 恢复继承。
+        // NOTE(hand-added): 按 agent 的调查授权（G1 的第二层）：PUT 设集合、DELETE 清空（默认全关）。
         // 只影响下发，不影响已落盘报告的读取。
         .route(
             "/api/v1/admin/agents/{agent_id}/investigations/grant",

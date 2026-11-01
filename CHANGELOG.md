@@ -3,6 +3,29 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.34.0-alpha] - 2026-11-01
+
+### 变更（调查授权默认全关，与采集面一致）
+
+- **缺行 = 一个面都不开**：`granted_topics` 不再把上界当成默认授权。
+  `[investigations] allowed_topics` 仍是环境上界，但每台机器要查什么必须**显式授权**
+  （`PUT …/investigations/grant`，或在页面上勾选）—— 与采集面同一逻辑：没派过活就不采。
+- `DELETE …/investigations/grant` 删行回到**默认全关**（旧构建里它等于“恢复继承上界 = 全开”）。
+- `GET …/investigations` 的 `grant.inherited` 恒为 `false`（字段保留只为旧前端继续解析）；
+  默认状态下 `grant.topics = []`、`effective_topics = []`。
+- **升级影响**：已有部署升级后，没有授权行的机器将无法发起调查
+  （403 `investigation_not_granted`），需要到「授权 → 调查授权」勾选。这是刻意的安全默认。
+- 用例：`granted_topics` 默认空、下发前必须授权、收权与删行都不再等于放行。
+
+### 新增（报告目录可配：`[investigations] report_dir`）
+
+- 以前网关只读 `<data_plane work_dir>/data/ivsrep/`（`REPORT_DIR` 写死），而写入侧是
+  数据面 `business.d/agent_ivsrep.toml` 的 `base` —— 两侧靠路径约定对齐，改一边就只能改代码。
+- 新增 `[investigations] report_dir`：相对路径 = 相对 `[data_plane] work_dir`；
+  **绝对路径** = 直接用它（不要求挂 work_dir，报告可单独挂一个卷）：
+  缺省仍然是 `data/ivsrep`，旧配置不需要改。
+- `GET …/investigations` 回带的 `report_dir.path` 就是真实读取的那份目录。
+
 ## [0.33.0-alpha] - 2026-10-31
 
 ### 新增（环回「Agent 明细」面：把网关机队送到中心）

@@ -131,6 +131,9 @@ pub struct AdminConfig {
     pub data_plane_work_dir: Option<PathBuf>,
     /// 允许触发的一次性调查面（`None` = 全部已知面；空表 = 一个都不许）。
     ///
+    /// 这是**上界**：每台机器实际开哪几面由 `investigation_grant` 决定，**默认全关**
+    /// （与采集面一致）—— `None` 不等于“所有机器都能查”。
+    ///
     /// 为什么网关侧要再拦一道：agentd 只保证「能跑」，**谁允许在这台机器上读什么**是控制面的事
     /// （见 `doc/design/center/investigation-surfaces.md` §3 G1）。在还没有按调用者身份分权之前，
     /// 这一节就是最小的「按面授权」：关掉一个面是**整个网关**的开关，不必去下线 agent。
@@ -145,6 +148,12 @@ pub struct AdminConfig {
     /// 为什么只过滤不删：报告目录是数据面（wparse）写的，网关只是读者；
     /// 一个只读视图不该替写者删数据。真要清盘，按运维的保留策略清。
     pub investigation_report_retention_days: u32,
+    /// 调查报告目录（`[investigations] report_dir`）。
+    ///
+    /// 相对路径 = 相对 `[data_plane] work_dir`；绝对路径 = 直接就是那个目录（不要求挂 work_dir）。
+    /// 缺省 `None` → `data/ivsrep`（与数据面 `business.d/agent_ivsrep.toml` 的 `base` 对齐）。
+    /// 改这个值 = 数据面 sink 的 `base` 也改了，或报告单独挂了一个卷；两侧必须一起改。
+    pub investigation_report_dir: Option<PathBuf>,
     /// 日志源（`from_dir` / 人工覆盖）允许落地的目录 roots。
     ///
     /// **这是网关策略，对所有人一致**：agent 上报什么、人显式指定什么，都要过这一关。
@@ -268,7 +277,10 @@ struct RawDataPlaneConfig {
 
 /// `[investigations]` 段：一次性调查的网关侧闸（按面授权 / 配额 / 保留期）。
 ///
-/// 缺省全用默认值（默认全开、每小时 12 次、保留 7 天）——**旧配置不需要改**。
+/// 缺省全用默认值（上界全开、每小时 12 次、保留 7 天）——**旧配置不需要改**。
+///
+/// 注意“上界全开”不是“调查默认可用”：每台机器还要在「授权 → 调查授权」里显式开面，
+/// 没有授权行 = 一个面都不开。
 #[derive(Debug, Default, Deserialize)]
 struct RawInvestigationConfig {
     /// 允许触发的工作面；`None` = 全部已知面，空表 = 一个都不许。
@@ -280,6 +292,9 @@ struct RawInvestigationConfig {
     /// 报告保留天数；`0` = 不限。
     #[serde(default)]
     report_retention_days: Option<u32>,
+    /// 报告目录：相对 `[data_plane] work_dir`，也接受绝对路径；缺省 `data/ivsrep`。
+    #[serde(default)]
+    report_dir: Option<String>,
 }
 
 /// `[purpose]` 段。缺省时不装载规则表：摘要照常入库，但不产出建议。
@@ -644,6 +659,16 @@ impl AdminConfig {
                 .investigations
                 .report_retention_days
                 .unwrap_or(DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS),
+            // 只做 `$VAR` 展开与去空白：**不** absolutize —— 相对路径的基准是
+            // `[data_plane] work_dir`，不是配置文件所在目录。
+            investigation_report_dir: normalize_optional(
+                raw.investigations
+                    .report_dir
+                    .as_deref()
+                    .map(|value| expand(&env, value))
+                    .transpose()?,
+            )
+            .map(PathBuf::from),
             allowed_source_roots: {
                 let raw_roots = match raw.collection.allowed_source_roots {
                     None => default_allowed_source_roots(),
@@ -1327,6 +1352,7 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         investigation_allowed_topics: None,
         investigation_max_per_agent_per_hour: DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR,
         investigation_report_retention_days: DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS,
+        investigation_report_dir: None,
         allowed_source_roots: default_allowed_source_roots(),
         knowledge_source_dir: None,
         knowledge_signing_public_key_file: None,
@@ -1575,7 +1601,8 @@ policies = [
 
     #[test]
     fn investigation_gates_default_and_tighten_via_config() {
-        // 不写 `[investigations]` → 全开 / 每小时 12 次 / 保留 7 天：**旧配置不需要改**。
+        // 不写 `[investigations]` → 上界全开 / 每小时 12 次 / 保留 7 天：**旧配置不需要改**。
+        // （按机器授权另算：默认全关，与采集面一致。）
         let config = AdminConfig::load_from_path(write_temp_config(&config_with_purpose("")))
             .expect("config loads");
         assert_eq!(config.investigation_allowed_topics, None);
@@ -1586,6 +1613,10 @@ policies = [
         assert_eq!(
             config.investigation_report_retention_days,
             DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS
+        );
+        assert_eq!(
+            config.investigation_report_dir, None,
+            "缺省跟数据面布局（`data/ivsrep`），不是写进配置的一份拷贝"
         );
 
         // 空白项被滤掉：允许集是**安全边界**，不该因为多一个逗号就多出一个面。
@@ -1598,7 +1629,7 @@ policies = [
             Some(vec!["disk".to_string()])
         );
 
-        // 空表 ≠ 没写：`[]` 是「一个都不许」，`None` 是「全开」。
+        // 空表 ≠ 没写：`[]` 是「上界一个都不许」，`None` 是「上界全开」。
         let config = AdminConfig::load_from_path(write_temp_config(&config_with_investigations(
             "allowed_topics = []",
         )))
@@ -1612,6 +1643,21 @@ policies = [
         .expect("config loads");
         assert_eq!(config.investigation_max_per_agent_per_hour, 0);
         assert_eq!(config.investigation_report_retention_days, 0);
+
+        // 报告目录：相对路径**不**转绝对（基准是 `[data_plane] work_dir`）；空白归成没写。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_investigations(
+            "report_dir = \"reports/ivsrep\"",
+        )))
+        .expect("config loads");
+        assert_eq!(
+            config.investigation_report_dir,
+            Some(PathBuf::from("reports/ivsrep"))
+        );
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_investigations(
+            "report_dir = \"  \"",
+        )))
+        .expect("config loads");
+        assert_eq!(config.investigation_report_dir, None);
     }
 
     #[test]

@@ -49,13 +49,17 @@ listen_addr = "127.0.0.1:3001"
 
 # ── 可选：一次性调查（`investigate`）的**网关侧授权与额度** ──
 # 调查是**另一道授权轴**，不参与采集面的「就绪度 / 上送开关」：采集能力坏掉时，诊断能力必须仍在。
-# 三件事都在网关做（agentd 只保证「能跑、有界」）：允许查哪几个面、一台机器一小时能查几次、
-# 报告在管理面能看多久。不写这一段 = 全部面都开 / 每小时 12 次 / 保留 7 天。
+# 三件事都在网关做（agentd 只保证「能跑、有界」）：上界能查哪几个面、一台机器一小时能查几次、
+# 报告在管理面能看多久。不写这一段 = 上界全开 / 每小时 12 次 / 保留 7 天。
+# 但**上界全开 ≠ 机器能查**：每台机器还要在「授权 → 调查授权」里显式开面
+# （按机器授权默认全关，与采集面一致；没有授权行时下发回 403 `investigation_not_granted`）。
 # 被关掉的面在管理面会置灰（`POST` 回 403 `investigation_not_allowed`），不需要去下线 agent。
 # [investigations]
 # allowed_topics = ["disk"]     # 省略 = 全部已知面；空表 `[]` = 一个都不许
 # max_per_agent_per_hour = 12   # 0 = 不限（内网/开发环境）
 # report_retention_days = 7     # 0 = 不限；只影响**可见性**，网关从不删数据面写的报告文件
+# report_dir = "data/ivsrep"    # 相对 [data_plane] work_dir；也可写绝对路径（报告单独挂卷）
+#                               # 缺省 data/ivsrep，与数据面 business.d/agent_ivsrep.toml 的 base 对齐
 
 # ── 可选段（默认都不装载；要启用就把文件放进配置目录并取消注释）──
 # 源头是知识库仓 wist-knowledge/*.toml；改了内容要同步 bump 相应版本号。

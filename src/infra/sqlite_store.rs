@@ -5215,7 +5215,10 @@ mod tests {
         );
     }
 
-    /// 调查的按 agent 授权：**无行 = 继承**、`[]` = 显式全关、删行回到继承。
+    /// 调查的按 agent 授权：**无行 = 默认全关**、`[]` = 显式全关。
+    ///
+    /// 两者在下发行为上都是“一个面都没开”（与采集面一致），存储上仍分开：
+    /// 一个回答“没配过”，一个回答“配成了空”。
     #[tokio::test]
     async fn investigation_grant_round_trips_and_distinguishes_empty_from_missing() {
         let store = store().await;
@@ -5225,7 +5228,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "没写过就必须是 None（继承），不能是空集"
+            "没写过就必须是 None（没配过），不能是空集"
         );
 
         let grant = StoredInvestigationGrant {
@@ -5254,7 +5257,7 @@ mod tests {
             .expect("row exists");
         assert!(stored.topics.is_empty(), "`[]` 是「全关」，必须原样存下来");
 
-        // 删行 = 回到继承（与「全关」不是同一件事）。
+        // 删行 = 回到默认（也是全关，但表的形状不同）。
         store.delete_investigation_grant("agent-a").await.unwrap();
         assert!(
             store
@@ -5263,7 +5266,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // 删除不存在的行不报错（页面重复点“恢复继承”不该 500）。
+        // 删除不存在的行不报错（页面重复点“恢复默认”不该 500）。
         store.delete_investigation_grant("agent-a").await.unwrap();
     }
 
