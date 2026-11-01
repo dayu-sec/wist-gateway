@@ -1053,9 +1053,16 @@ fn collect_reports(dir: &Path, agent_id: &str) -> io::Result<Vec<StoredReport>> 
         .collect();
     // 先排序再截断：`read_dir` 的顺序本来就不保证，先 `take` 就变成「每次看的文件集可能不同」，
     // 大到目录被塞满时会出现「同一份报告一会儿在一会儿没了」。
-    // 倒序 = **新 → 旧**：轮转文件名通常按时间排列（`…20261030.jsonl`），而报告本身也有
-    // 字节 / 条数预算 —— 预算要花在最新的证据上，不能先被最老的文件吃掉。
-    files.sort_by(|left, right| right.cmp(left));
+    //
+    // 排序**先看是不是报告文件**，再看路径倒序：
+    //   `report_dir` 可以指到 `data/out_dat`（那里还有 raw / parsed / ignore 这类日志 JSON）。
+    //   纯路径字典序会把 `agent-ivsrep.jsonl` 排到最后，而文件数 / 字节预算有限 ——
+    //   一旦被日志 JSON 吃满，报告文件根本不会被读到（页面永远「报告未到」）。
+    files.sort_by(|left, right| {
+        report_like(right)
+            .cmp(&report_like(left))
+            .then_with(|| right.cmp(left))
+    });
     files.truncate(MAX_REPORT_FILES);
 
     let mut by_command: BTreeMap<String, StoredReport> = BTreeMap::new();
@@ -1147,6 +1154,18 @@ fn is_report_file(path: &Path) -> bool {
     };
     let lower = name.to_ascii_lowercase();
     lower.ends_with(".json") || lower.ends_with(".jsonl") || lower.ends_with(".ndjson")
+}
+
+/// 文件名像不像「调查报告」：`report_dir` 指向 `data/out_dat` 这类混放目录时，
+/// 读取预算要先给报告，不能先被日志 JSON 吃掉。
+///
+/// 只是**排序提示**，不是筛选条件 —— 不匹配的文件仍然会被扫（预算还有时），
+/// 所以自定义 sink 文件名（不含 `ivsrep`）也不会丢报告，只是退回路径倒序。
+fn report_like(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase().contains("ivsrep"))
+        .unwrap_or(false)
 }
 
 /// 把一行数据面记录解析成报告。
@@ -1473,6 +1492,34 @@ mod tests {
                 .is_none(),
             "别人的报告不能挂到这台机器上"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `report_dir` 指到 `data/out_dat` 这类混放目录时，报告文件不能因为路径排序被挤出。
+    ///
+    /// 典型现场：`out_dat` 里还有 `raw.json` / `gateway.json` / `ignore.json` 等日志 JSON，
+    /// 而读取预算（文件数 / 总字节）有限 —— 纯路径倒序会把 `agent-ivsrep.jsonl` 排到最后，
+    /// 报告就被截掉，页面永远停在「报告未到」。
+    #[test]
+    fn reports_are_found_even_when_the_directory_has_many_other_json_files() {
+        let dir = temp_dir("mixed-out-dat");
+        // 35 个名字排在 `agent-ivsrep.jsonl` 之后的日志 JSON。
+        for index in 0..35 {
+            fs::write(
+                dir.join(format!("z{index}.json")),
+                "{\"raw\":\"log line\"}\n",
+            )
+            .expect("write log file");
+        }
+        fs::write(
+            dir.join("agent-ivsrep.jsonl"),
+            format!("{}\n", report_line("agent-a", 1, "cmd-mixed")),
+        )
+        .expect("write report");
+
+        let reports = load_agent_reports(&dir, "agent-a", 0, chrono::Utc::now()).expect("load");
+        assert_eq!(reports.len(), 1, "混放目录里也要能找到报告");
+        assert_eq!(reports[0].command_id, "cmd-mixed");
         let _ = fs::remove_dir_all(dir);
     }
 

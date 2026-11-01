@@ -3,6 +3,17 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.34.1-alpha] - 2026-11-01
+
+### 修复（报告目录混放时「主机 → 调查」页永远空）
+
+- 报告目录可以指到 `data/out_dat`（那里还有 `raw.json` / `gateway.json` / `ignore.json` 等日志 JSON）。
+  读取端原来纯按**路径倒序**取前 32 个文件、总量 8 MiB：`agent-ivsrep.jsonl` 字典序排在最后，
+  很可能被日志 JSON 把预算吃满后直接截掉 —— 文件就在目录里，页面却一直「报告未到」。
+- 改为**先看是不是报告文件**（文件名含 `ivsrep`）再按路径倒序兑底；不属于报告的文件仍会扫
+  （预算还有时），只是不再抢在报告前面。
+- 新增用例：混放目录里 35 个 `z*.json` + `agent-ivsrep.jsonl`，报告必须还能读到。
+
 ## [0.34.0-alpha] - 2026-11-01
 
 ### 变更（调查授权默认全关，与采集面一致）
