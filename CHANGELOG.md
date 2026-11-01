@@ -3,6 +3,24 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.33.0-alpha] - 2026-10-31
+
+### 新增（环回「Agent 明细」面：把网关机队送到中心）
+
+- `GET /api/v1/gateway/agents?gateway_id=`（**仅本机**调用）：把网关注册表投影成上报契约
+  `AgentRuntimeStatus`，供宿主侧 `wist-gwlinkd` 拉取后 mTLS 转报中心
+  `POST /api/v1/gateway/agents/status`。中心「网关详情 → Agent 状态」页由此有真实数据。
+- **机器身份**：投影带 `node_id` / `hostname` / `ip_addresses`（空值报 `null`，不写空串），
+  中心页能回答“这是哪台机器”。依赖 `wist-control 0.19`。
+- 准入沿用环回面通用判据（`LocalPeers`：环回 ∪ 容器默认网关 ∪ `[server] self_face_allow`），
+  非本机 / 取不到 peer 一律 403。新错误码
+  `gateway_agents_loopback_only` / `gateway_agents_missing_gateway_id`。
+- 网关**仍不直连中心**（CR-003）：本面只面向本机常驻，出站仍由 gwlinkd 负责。
+
+### 兼容性
+
+- 纯新增面，不影响既有端点；`wist-control` 0.14 → 0.19（新增字段均为可选）。
+
 ## [0.32.1-alpha] - 2026-10-31
 
 ### 修复（发版链路：macOS runner 镜像下线）

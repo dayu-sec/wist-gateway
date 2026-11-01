@@ -16617,3 +16617,138 @@ async fn an_agent_directory_outside_roots_is_stored_but_never_collected() {
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
+
+/// 环回「Agent 明细」面（gwlinkd 拉取后转报中心）：真环回 socket 上按机队列出，缺 `gateway_id` → 400。
+///
+/// 形状是**上报契约** `wist_control::AgentRuntimeStatus`（snake_case）—— gwlinkd 原样转报中心
+/// `POST /api/v1/gateway/agents/status`，任一侧改名即导致中心 Agent 页静默变空。
+#[tokio::test]
+async fn gateway_agents_lists_the_fleet_over_a_loopback_socket() {
+    let env = env_with_enrolled_agent().await;
+    let (addr, server) = spawn_gateway_on_loopback(&env).await;
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/gateway/agents?gateway_id=gw-1"
+        ))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["gateway_id"], "gw-1", "调用方自报的 id 原样回显");
+    let agents = body["agents"].as_array().expect("agents array");
+    assert_eq!(agents.len(), 1, "enrolled agent must be listed: {body}");
+    assert_eq!(agents[0]["agent_id"], "agent-node-a");
+    // 上报契约字段一个不能少（`status` 现算：注册过但没上报过 → 也是合法取值，不写死 online）。
+    for key in [
+        "agent_id",
+        "instance_id",
+        "version",
+        "status",
+        "health",
+        "last_seen_at",
+        "memory_bytes",
+        "cpu_percent",
+        "admin_latency_ms",
+        "node_id",
+        "hostname",
+        "ip_addresses",
+    ] {
+        assert!(agents[0].get(key).is_some(), "missing key {key}: {body}");
+    }
+    assert!(
+        matches!(
+            agents[0]["status"].as_str(),
+            Some("online") | Some("offline")
+        ),
+        "status 必须是 online/offline：{body}"
+    );
+
+    // 缺 gateway_id → 400（与自述面同口径：调用方必须自报 id）。
+    let missing = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/gateway/agents"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    server.abort();
+}
+
+/// 非环回 / 取不到 peer 一律拒绝（fail-closed）—— 与自述面 / agent-package 同一护栏。
+#[tokio::test]
+async fn gateway_agents_is_loopback_only() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    let env = env_with_enrolled_agent().await;
+
+    let request = |addr: Option<SocketAddr>| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/gateway/agents?gateway_id=gw-1")
+            .body(Body::empty())
+            .expect("request");
+        if let Some(addr) = addr {
+            request.extensions_mut().insert(MockConnectInfo(addr));
+        }
+        request
+    };
+
+    let remote = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(request(Some(SocketAddr::from(([192, 0, 2, 7], 40_000)))))
+        .await
+        .expect("response");
+    assert_eq!(remote.status(), StatusCode::FORBIDDEN, "非环回不得读到机队");
+
+    // 取不到 peer（没注入连接信息）→ 也拒绝，不因「没连接信息」就放行。
+    let unknown = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(request(None))
+        .await
+        .expect("response");
+    assert_eq!(unknown.status(), StatusCode::FORBIDDEN);
+}
+
+/// 容器部署的准入（`[server] self_face_allow`）：列出的那个对端按「本机」放行，
+/// 同网段的**别的**地址与外部地址仍 403 —— 这条钉住「放宽只放宿主、不外扩」。
+#[tokio::test]
+async fn gateway_agents_allows_the_configured_peer_and_rejects_the_rest() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    let env = env_with_enrolled_agent().await;
+    let mut config = env.config.clone();
+    // 就是容器里「宿主那一跳」的样子：对端 = 网络网关（这里显式列入放行）。
+    config.self_face_allow = vec![crate::infra::IpNet::parse("172.28.0.1").expect("ip")];
+    let store = env.store_handle.clone();
+
+    let request = |addr: SocketAddr| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/gateway/agents?gateway_id=gw-1")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(MockConnectInfo(addr));
+        request
+    };
+
+    let allowed = router(config.clone(), Arc::clone(&store))
+        .oneshot(request(SocketAddr::from(([172, 28, 0, 1], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(allowed.status(), StatusCode::OK, "列出的本机对端必须放行");
+
+    // 同网段的**别的**地址（别的容器）不是本机 —— 放行的是那一个地址，不是整网段。
+    let sibling = router(config.clone(), Arc::clone(&store))
+        .oneshot(request(SocketAddr::from(([172, 28, 0, 9], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(sibling.status(), StatusCode::FORBIDDEN);
+
+    let external = router(config, store)
+        .oneshot(request(SocketAddr::from(([203, 0, 113, 9], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(external.status(), StatusCode::FORBIDDEN);
+}

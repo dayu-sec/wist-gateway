@@ -85,6 +85,8 @@ codes! {
     DATA_PLANE_UNAVAILABLE => "data_plane_unavailable",
     DIR => "dir",
     DISCOVERY_POLICY_TABLE_UNCONFIGURED => "discovery_policy_table_unconfigured",
+    GATEWAY_AGENTS_LOOPBACK_ONLY => "gateway_agents_loopback_only",
+    GATEWAY_AGENTS_MISSING_GATEWAY_ID => "gateway_agents_missing_gateway_id",
     DISCOVERY_SNAPSHOT_GRANT_BUILD_FAILED => "discovery_snapshot_grant_build_failed",
     DISCOVERY_SNAPSHOT_INVALID => "discovery_snapshot_invalid",
     DISCOVERY_SNAPSHOT_STORE_FAILED => "discovery_snapshot_store_failed",

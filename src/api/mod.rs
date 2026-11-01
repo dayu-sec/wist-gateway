@@ -80,6 +80,10 @@ mod source_search_policy;
 // NOTE(hand-added): 网关自述面（环回；CR-003）。对应 jumo 模型 Control.GatewayApp.SelfInterface
 // 的 QuerySelfState（模型 bind 未定、环回鉴权未决），故路由手加。供 host 侧 wist-gwlinkd 消费。
 mod self_state;
+// NOTE(hand-added): 网关环回「Agent 明细」面（供 host 侧 wist-gwlinkd 拉取后转报中心）。
+// 与 self_state 同一形态（环回 + 手加路由）。模型留档：`Control.GatewayApp.AgentReportInterface`
+// （刻意未 bind）。见 api/gateway_agents.rs 与设计 `wist-design/doc/design/edge/gateway-agent-report.md`。
+mod gateway_agents;
 // NOTE(hand-added): 网关（容器）自述状态的**周期自采**（页面「网关（容器）」tab 的趋势）。
 // 与 `work_expiry` / `revocation_gc` 同一模式（自身 tick，不搭在任何请求路径上）。
 // 重新生成控制面代码时需回补本模块与 `main` 里那一行 spawn。
@@ -337,6 +341,11 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/gateway/self-state",
             get(self_state::query_self_state),
+        )
+        // NOTE(hand-added): 网关环回「Agent 明细」面。见上方 `mod gateway_agents` 说明。
+        .route(
+            "/api/v1/gateway/agents",
+            get(gateway_agents::query_gateway_agents),
         )
         // NOTE(hand-added): 接入请求通道（环回；CR-003）。见上方 `mod link_request` 说明。
         .route(
