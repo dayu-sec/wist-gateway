@@ -3,6 +3,21 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.34.4-alpha] - 2026-11-01
+
+### 变更（流量检测：事实门与采集来源统一到同一路径）
+
+- 跟随知识库 0.8.1：`linux-suricata-eve` 的来源与事实门都是 `/opt/suricata/logs/eve.json`
+  （现场是自定义安装，不是发行版包的 `/var/log/suricata`），网关据此推导探针路径并派发
+  `TrafficInspection`。
+- 把「门与来源必须是同一路径」钉进用例：两处写岔**不会报错**，只是门探 A、采 B ——
+  装了 Suricata 的机器永远「不满足」，或者采到别的东西。
+
+### 测试（+2）
+
+- 探针与采集来源同路径（`probe_paths` 里只允许出现一条，出现两条即写岔）。
+- `LinuxHost` 只在探到 `eve.json` 时展开 `TrafficInspection`（漏派 / 误派分开断言）。
+
 ## [0.34.3-alpha] - 2026-11-01
 
 ### 改进（命令「正在跑」与「还没被取走」分开）

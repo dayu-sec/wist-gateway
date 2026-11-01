@@ -2729,7 +2729,7 @@ target = "/var/log/x.log"
         );
         // 容器单元现在在**基线包**里（LinuxHost 也有 ContainerWorkload 面）：
         // 这台机的两条容器根都不存在 → 两个单元被事实门排除，面本身不展开。
-        // `linux-ids` 同理：没探到 `/var/log/suricata/eve.json` 就不派 `TrafficInspection`
+        // `linux-ids` 同理：没探到 `/opt/suricata/logs/eve.json` 就不派 `TrafficInspection`
         // —— 包在模板里不等于可以派，真正的闸门是单元的 `match`。
         assert_eq!(
             expansion
@@ -2743,6 +2743,109 @@ target = "/var/log/x.log"
                 "linux-suricata-eve"
             ],
             "LinuxHost 只应排除事实门不成立的单元（容器根 / Suricata 输出）"
+        );
+    }
+
+    /// 流量检测：**事实门与来源必须是同一个路径**，且是部署契约里的
+    /// `/opt/suricata/logs/eve.json`。
+    ///
+    /// 为什么要一条专门的用例：这两个值分在同一个单元的两处（`match` 与
+    /// `[[units.sources]]`），写岔了**不会报错** —— 门探的是 A、采的是 B：装了 Suricata 的机器
+    /// 永远“不满足”，或者采到别的东西。`probe_paths` 会同时收进来，所以只要出现两条同前缀
+    /// 路径，就说明岔了。
+    #[test]
+    fn traffic_inspection_gates_on_the_same_eve_json_it_collects() {
+        const EVE: &str = "/opt/suricata/logs/eve.json";
+        let set = load_content(
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
+        )
+        .expect("load checked-in content");
+        let unit = set
+            .units()
+            .find(|unit| unit.unit_id == "linux-suricata-eve")
+            .expect("目录里应有 linux-suricata-eve");
+        assert_eq!(unit.family, "TrafficInspection");
+        assert_eq!(unit.platform, "linux");
+        assert_eq!(unit.capability, "collect_logs");
+        assert_eq!(
+            unit.status, "active",
+            "显式绝对路径 = 今天所有 agentd 都能采"
+        );
+        assert_eq!(unit.requires_privilege, "root");
+        assert_eq!(unit.match_expr, format!("path_exists:{EVE}"));
+        assert_eq!(unit.rule_ref, "", "解析属另一轴：采原文不依赖规则");
+        let sources: Vec<(&str, &str)> = unit
+            .sources
+            .iter()
+            .map(|source| (source.kind.as_str(), source.target.as_str()))
+            .collect();
+        assert_eq!(sources, vec![("FileGlob", EVE)]);
+        assert_eq!(
+            unit.sources[0].multiline, "none",
+            "eve.json 是一行一条 JSON"
+        );
+
+        let probes: Vec<String> = set
+            .probe_paths_for_platform("linux")
+            .into_iter()
+            .filter(|path| path.starts_with("/opt/suricata/logs/"))
+            .collect();
+        assert_eq!(
+            probes,
+            vec![EVE.to_string()],
+            "门与来源只能是一条路径（两条 = 写岔了）"
+        );
+    }
+
+    /// 探到 `eve.json` 就派 `TrafficInspection`；没探到就不展开。
+    ///
+    /// 这两半分开断言是有意的：事实门的**两个错误方向**后果不同 —— 漏派是「有数据但没人采」，
+    /// 误派是「每台 Linux 都多一个采不到的常驻面」。
+    #[test]
+    fn linux_host_dispatches_traffic_inspection_only_when_eve_json_exists() {
+        const EVE: &str = "/opt/suricata/logs/eve.json";
+        let set = load_content(
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
+        )
+        .expect("load checked-in content");
+
+        let mut with_eve = facts("linux", &[]);
+        with_eve.probed_paths = vec![EVE.to_string()];
+        with_eve.present_paths = with_eve.probed_paths.clone();
+        let expansion = set
+            .expand("linux-host", &with_eve, Default::default())
+            .expect("expand");
+        let work = expansion
+            .works
+            .iter()
+            .find(|work| work.family == "TrafficInspection")
+            .unwrap_or_else(|| {
+                panic!(
+                    "探到 eve.json 就该派 TrafficInspection，实际展开的面：{:?}",
+                    expansion
+                        .works
+                        .iter()
+                        .map(|work| work.family.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(work.selected_units, vec!["linux-suricata-eve"]);
+        assert_eq!(work.capability, "collect_logs");
+
+        // 没探到（或不存在）→ 这一面不展开：不能给每台 Linux 都派一个采不到的面。
+        let without = set
+            .expand("linux-host", &facts("linux", &[]), Default::default())
+            .expect("expand");
+        assert!(
+            !without
+                .works
+                .iter()
+                .any(|work| work.family == "TrafficInspection"),
+            "没探到 eve.json 不应展开 TrafficInspection"
         );
     }
 
