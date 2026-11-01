@@ -3954,6 +3954,7 @@ async fn stale_fact_refresh_commands_are_expired_instead_of_delivered_forever() 
                 params: String::new(),
                 requested_at_ms: chrono::Utc::now().timestamp_millis() - 2 * 60 * 60 * 1000,
                 acked_at: None,
+                claimed_at: None,
                 outcome: None,
                 detail: None,
                 requested_by: String::new(),
@@ -4042,6 +4043,7 @@ async fn viewing_a_fact_refresh_sweeps_commands_of_an_agent_that_never_reports()
                 params: String::new(),
                 requested_at_ms: chrono::Utc::now().timestamp_millis() - 2 * 60 * 60 * 1000,
                 acked_at: None,
+                claimed_at: None,
                 outcome: None,
                 detail: None,
                 requested_by: String::new(),
@@ -9095,6 +9097,141 @@ async fn admin_investigation_dispatch_and_report_directory_round_trip() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `accepted` 阶段回报：**认领不等于完成**。
+///
+/// 走完整链路（agent 状态上报 → 落库 → 管理面视图），钉三件事：
+///   1. `accepted` 到达后命令**仍在**待下发集合里（agent 重启不丢命令）；
+///   2. 视图里 `claimed_at` 有值、`acknowledged_at` / `outcome` / `detail` 仍是 null
+///      —— 页面靠这一列把「等待认领」换成「调查中」；
+///   3. 终态到达后 `claimed_at` 保持第一次的值，不被覆盖。
+#[tokio::test]
+async fn an_investigation_accepted_stage_claims_the_command_without_finishing_it() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, "agent-node-a", &["disk"], true).await;
+    let response = put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    env.config.data_plane_work_dir = Some(env._root.clone());
+
+    let dispatched: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-node-a/investigations",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({ "topic": "disk" }),
+        )
+        .await,
+    )
+    .await;
+    let command_id = dispatched["command"]["command_id"]
+        .as_str()
+        .expect("command id")
+        .to_string();
+
+    let status_report = |acks: serde_json::Value| {
+        serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "0.18.4",
+            "command_acks": acks,
+        })
+    };
+    let read_list = || async {
+        decode_json_response::<serde_json::Value>(
+            get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+        )
+        .await
+    };
+
+    // 1) agent 取走（还在扫）：回 `accepted`。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_report(serde_json::json!([{
+            "command_id": command_id,
+            "outcome": "accepted",
+            "detail": "已取走，扫描中（最长 120s）",
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    // 阶段回报**不结束投递**：同一份回执里命令还会被带下去（agent 侧靠台账去重）。
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(
+        ack.commands.len(),
+        1,
+        "accepted 之后命令仍要留在待下发集合（agent 重启拿得到）"
+    );
+    assert_eq!(ack.commands[0].command_id, command_id);
+
+    let list = read_list().await;
+    let claimed_at = list["latest_command"]["claimed_at"]
+        .as_str()
+        .expect("claimed_at 要有值：页面据此把「等待认领」换成「调查中」")
+        .to_string();
+    assert!(
+        list["latest_command"]["acknowledged_at"].is_null(),
+        "accepted 不是终态：acknowledged_at 必须还是 null"
+    );
+    assert!(
+        list["latest_command"]["outcome"].is_null(),
+        "accepted 不能写进 outcome（它是阶段词，不是终态词）"
+    );
+    assert!(
+        list["latest_command"]["detail"].is_null(),
+        "detail 留给终态，阶段内容不能占位"
+    );
+
+    // 2) 命令重发带来的重复 `accepted`：认领时刻只认第一次。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_report(serde_json::json!([{
+            "command_id": command_id,
+            "outcome": "accepted",
+            "detail": "已取走，扫描中（最长 120s）",
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        read_list().await["latest_command"]["claimed_at"],
+        serde_json::Value::String(claimed_at.clone()),
+        "重复的阶段回报不能把认领时刻往后推"
+    );
+
+    // 3) 终态：收口，但认领时刻保持。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_report(serde_json::json!([{
+            "command_id": command_id,
+            "outcome": "succeeded",
+            "detail": "6 项正常 / 1 项警告",
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert!(ack.commands.is_empty(), "终态之后不再下发同一条命令");
+
+    let done = read_list().await;
+    assert_eq!(done["latest_command"]["outcome"], "succeeded");
+    assert!(done["latest_command"]["acknowledged_at"].is_string());
+    assert_eq!(
+        done["latest_command"]["claimed_at"],
+        serde_json::Value::String(claimed_at),
+        "终态不能覆盖认领时刻"
+    );
 }
 
 /// 造一份带调查能力的 `AgentStatusReport`（与 agentd 的实际上报同一形状）。

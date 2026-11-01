@@ -1,0 +1,14 @@
+-- 命令的「已认领」时刻。
+--
+-- 与 `acked_at` **分开**：
+--   * `claimed_at` —— agent 取走命令时先回一条 `outcome = 'accepted'` 的阶段回报，
+--     只说明「在跑了」。页面据此把「等待认领」换成「调查中」；
+--   * `acked_at`   —— 仍然是**终态**（结果已回传）。两者都在 `agent_commands` 上。
+--
+-- 为什么要它：一条 `disk` 调查默认要扫 120s，而 ack 只在扫描结束后才回 ——
+-- 没有这一列时，管理面在整段扫描里只能显示「等 Agent 认领（≤3s）」，
+-- 运维会以为命令丢了（实际情况是机器正在扫盘）。
+--
+-- 待下发集合仍然是 `acked_at IS NULL`：`accepted` 不结束投递，agent 重启后
+-- 还能拿到同一条命令（agent 侧有台账去重，不会重复执行）。
+ALTER TABLE agent_commands ADD COLUMN claimed_at TEXT;

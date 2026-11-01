@@ -722,6 +722,11 @@ pub struct StoredAgentCommand {
     pub requested_at_ms: i64,
     /// agent 回传结果的时刻；`None` = 还没被认领。
     pub acked_at: Option<String>,
+    /// agent **取走**命令的时刻（阶段回报 `outcome = accepted`）；`None` = 还没取走。
+    ///
+    /// 与 `acked_at` 分开：一条 `disk` 调查默认要扫 120s，页面需要知道「正在跑」
+    /// 而不是「还没认领」。
+    pub claimed_at: Option<String>,
     /// 见 `wist_api::status::command_outcome`（网关侧另有 `superseded`）。
     pub outcome: Option<String>,
     pub detail: Option<String>,
@@ -1638,6 +1643,10 @@ pub trait Store: Send + Sync + fmt::Debug {
     ) -> StoreResult<u64>;
 
     /// 记录 agent 回传的执行结果；只在该 `command_id` 仍属于该 Agent 时生效。
+    ///
+    /// `outcome = accepted` 是**阶段回报**（已取走、正在执行）：只写 `claimed_at`，
+    /// 不写 `acked_at` —— 命令仍在待下发集合里，终态（succeeded / failed / …）到达时
+    /// 才收口。其余 `outcome` 都是终态。
     ///
     /// 返回 `false` = 命令已被覆盖 / 已确认过（正常竞态，不报错）。
     async fn ack_agent_command(

@@ -2697,7 +2697,7 @@ impl Store for SqliteStore {
     ) -> StoreResult<Vec<StoredAgentCommand>> {
         let rows = sqlx::query(
             "SELECT command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail, \
-             requested_by \
+             requested_by, claimed_at \
              FROM agent_commands WHERE agent_id = ?1 AND acked_at IS NULL \
              ORDER BY requested_at_ms ASC, command_id ASC LIMIT ?2",
         )
@@ -2738,10 +2738,32 @@ impl Store for SqliteStore {
         outcome: &str,
         detail: &str,
     ) -> StoreResult<bool> {
-        // 条件更新：只认「仍属于该 Agent 且未确认」的那一条 —— 迟到/伪造的确认
-        // 不会改写已覆盖或被新命令替代的记录。
+        // 阶段回报（`accepted`）：命令被取走了、还在跑 —— **只**记认领时刻。
+        //
+        // `acked_at` 保持 NULL 是刻意的：待下发集合仍是 `acked_at IS NULL`，所以
+        // agent 重启后还能拿到同一条（agent 侧台账会去重、不会重复执行）；
+        // 超窗回收（`expire_pending_agent_commands`）也照旧生效。
+        if outcome == command_outcome::ACCEPTED {
+            // `COALESCE`：网关注重在收不到 ack 时会重发命令，agent 会重复回 `accepted`。
+            // 认领时刻只认第一次 —— 否则页面上的「已等 N 秒」会每每被刷新回 0。
+            let result = sqlx::query(
+                "UPDATE agent_commands SET claimed_at = COALESCE(claimed_at, ?3) \
+                 WHERE agent_id = ?1 AND command_id = ?2 AND acked_at IS NULL",
+            )
+            .bind(agent_id)
+            .bind(command_id)
+            .bind(acked_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "claim agent command"))?;
+            return Ok(result.rows_affected() > 0);
+        }
+        // 终态：条件更新，只认「仍属于该 Agent 且未确认」的那一条 —— 迟到/伪造的确认
+        // 不会改写已覆盖或被新命令替代的记录。顺带把 `claimed_at` 补上：旧 agent 不回
+        // `accepted`，不能让页面永远停在「未认领」。
         let result = sqlx::query(
-            "UPDATE agent_commands SET acked_at = ?3, outcome = ?4, detail = ?5 \
+            "UPDATE agent_commands SET acked_at = ?3, outcome = ?4, detail = ?5, \
+                 claimed_at = COALESCE(claimed_at, ?3) \
              WHERE agent_id = ?1 AND command_id = ?2 AND acked_at IS NULL",
         )
         .bind(agent_id)
@@ -2762,7 +2784,7 @@ impl Store for SqliteStore {
     ) -> StoreResult<Option<StoredAgentCommand>> {
         let row = sqlx::query(
             "SELECT command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail, \
-             requested_by \
+             requested_by, claimed_at \
              FROM agent_commands WHERE agent_id = ?1 AND kind = ?2 \
              ORDER BY requested_at_ms DESC, command_id DESC LIMIT 1",
         )
@@ -3494,6 +3516,7 @@ fn agent_command_from_row(row: &SqliteRow) -> StoreResult<StoredAgentCommand> {
             let value: Option<String> = column!(row, "requested_by");
             value.unwrap_or_default()
         },
+        claimed_at: column!(row, "claimed_at"),
     })
 }
 
@@ -4971,6 +4994,7 @@ mod tests {
             params: String::new(),
             requested_at_ms: 1_700_000_000_000,
             acked_at: None,
+            claimed_at: None,
             outcome: None,
             detail: None,
             requested_by: String::new(),
@@ -5069,6 +5093,7 @@ mod tests {
             params: "{}".to_string(),
             requested_at_ms: 1_700_000_000_000,
             acked_at: None,
+            claimed_at: None,
             outcome: None,
             detail: None,
             requested_by: "admin:0123456789ab".to_string(),
@@ -5091,6 +5116,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_accepted_ack_claims_the_command_without_finishing_it() {
+        // 阶段回报（`accepted`）：命令被取走、还在跑 —— 只记 `claimed_at`，
+        // 命令**仍在**待下发集合里（agent 重启后还能拿到，agent 侧台账去重），
+        // 终态到达时才收口，且不能把认领时刻覆盖掉。
+        let store = store().await;
+        let command = StoredAgentCommand {
+            command_id: "cmd-claim".to_string(),
+            agent_id: "agent-a".to_string(),
+            kind: "investigate".to_string(),
+            params: "{}".to_string(),
+            requested_at_ms: 1_700_000_000_000,
+            acked_at: None,
+            claimed_at: None,
+            outcome: None,
+            detail: None,
+            requested_by: String::new(),
+        };
+        store.enqueue_agent_command(&command, true).await.unwrap();
+
+        assert!(
+            store
+                .ack_agent_command(
+                    "agent-a",
+                    "cmd-claim",
+                    "2026-11-01T09:33:02Z",
+                    command_outcome::ACCEPTED,
+                    "已取走，扫描中",
+                )
+                .await
+                .unwrap()
+        );
+
+        let claimed = store
+            .get_latest_agent_command("agent-a", "investigate")
+            .await
+            .unwrap()
+            .expect("latest");
+        assert_eq!(claimed.claimed_at.as_deref(), Some("2026-11-01T09:33:02Z"));
+        assert_eq!(claimed.acked_at, None, "阶段回报不是终态");
+        assert_eq!(claimed.outcome, None);
+        assert_eq!(
+            store
+                .list_pending_agent_commands("agent-a", 8)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "认领后仍要留在待下发集合里（agent 重启不丢命令）"
+        );
+
+        // 重复的阶段回报（命令重发、ack 丢了重来）不能把认领时刻往后推。
+        assert!(
+            store
+                .ack_agent_command(
+                    "agent-a",
+                    "cmd-claim",
+                    "2026-11-01T09:33:05Z",
+                    command_outcome::ACCEPTED,
+                    "已取走，扫描中",
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_latest_agent_command("agent-a", "investigate")
+                .await
+                .unwrap()
+                .expect("latest")
+                .claimed_at
+                .as_deref(),
+            Some("2026-11-01T09:33:02Z"),
+            "认领时刻只认第一次"
+        );
+
+        assert!(
+            store
+                .ack_agent_command(
+                    "agent-a",
+                    "cmd-claim",
+                    "2026-11-01T09:35:17Z",
+                    command_outcome::SUCCEEDED,
+                    "6 项正常 / 1 项警告",
+                )
+                .await
+                .unwrap()
+        );
+        let done = store
+            .get_latest_agent_command("agent-a", "investigate")
+            .await
+            .unwrap()
+            .expect("latest");
+        assert_eq!(done.acked_at.as_deref(), Some("2026-11-01T09:35:17Z"));
+        assert_eq!(done.outcome.as_deref(), Some(command_outcome::SUCCEEDED));
+        assert_eq!(
+            done.claimed_at.as_deref(),
+            Some("2026-11-01T09:33:02Z"),
+            "终态不能把认领时刻覆盖掉"
+        );
+        assert!(
+            store
+                .list_pending_agent_commands("agent-a", 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `accepted` 的两条边界：不认识的命令 / 已被网关收口的命令都不能被它“复活”。
+    ///
+    /// 为什么重要：`accepted` 只在 `acked_at IS NULL` 上生效。一旦这个守卫写错（比如
+    /// 漏了 `acked_at IS NULL`），迟到的阶段回报会把已 `expired` 的命令重新拉回待下发集，
+    /// 最后变成“网关把同一条命令又派一遍”。
+    #[tokio::test]
+    async fn an_accepted_ack_does_not_revive_an_unknown_or_finished_command() {
+        let store = store().await;
+
+        // 不认识的 command_id：命中 0 行（agent 回了一条不在册的命令）。
+        assert!(
+            !store
+                .ack_agent_command(
+                    "agent-a",
+                    "cmd-missing",
+                    "2026-11-01T09:33:02Z",
+                    command_outcome::ACCEPTED,
+                    "已取走，扫描中",
+                )
+                .await
+                .unwrap(),
+            "未知命令不能算认领成功"
+        );
+
+        // 已过待执行窗口的命令：网关已经把它收口为 expired。
+        store
+            .enqueue_agent_command(
+                &StoredAgentCommand {
+                    command_id: "cmd-expired".to_string(),
+                    agent_id: "agent-a".to_string(),
+                    kind: "investigate".to_string(),
+                    params: "{}".to_string(),
+                    requested_at_ms: 1_700_000_000_000,
+                    acked_at: None,
+                    claimed_at: None,
+                    outcome: None,
+                    detail: None,
+                    requested_by: String::new(),
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .expire_pending_agent_commands("agent-a", 1_700_000_500_000, "2026-11-01T09:40:00Z")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !store
+                .ack_agent_command(
+                    "agent-a",
+                    "cmd-expired",
+                    "2026-11-01T09:41:00Z",
+                    command_outcome::ACCEPTED,
+                    "已取走，扫描中",
+                )
+                .await
+                .unwrap(),
+            "已收口的命令不接受阶段回报"
+        );
+        let latest = store
+            .get_latest_agent_command("agent-a", "investigate")
+            .await
+            .unwrap()
+            .expect("latest");
+        assert_eq!(
+            latest.outcome.as_deref(),
+            Some(command_outcome::EXPIRED),
+            "仍是被网关收口的终态"
+        );
+        assert_eq!(latest.claimed_at, None, "迟到的 accepted 不能补写认领时刻");
+        assert!(
+            store
+                .list_pending_agent_commands("agent-a", 8)
+                .await
+                .unwrap()
+                .is_empty(),
+            "已收口的命令不能因为一条 accepted 重新排队"
+        );
+    }
+
+    #[tokio::test]
     async fn expires_pending_agent_commands_outside_the_window() {
         let store = store().await;
         let base = StoredAgentCommand {
@@ -5100,6 +5318,7 @@ mod tests {
             params: String::new(),
             requested_at_ms: 1_700_000_000_000,
             acked_at: None,
+            claimed_at: None,
             outcome: None,
             detail: None,
             requested_by: String::new(),

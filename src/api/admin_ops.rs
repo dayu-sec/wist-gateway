@@ -759,6 +759,7 @@ pub async fn request_agent_fact_refresh(
         params: String::new(),
         requested_at_ms,
         acked_at: None,
+        claimed_at: None,
         outcome: None,
         detail: None,
         // G1：审计——重采虽不读客户文件内容，但它是“谁让这台机器动了”的一环；

@@ -466,6 +466,7 @@ pub async fn launch_agent_investigation(
         params,
         requested_at_ms: now.timestamp_millis(),
         acked_at: None,
+        claimed_at: None,
         outcome: None,
         detail: None,
         // G1：审计——调查读的是客户机上的路径/文件名，必须能回答“这是谁点的”。
@@ -506,6 +507,8 @@ struct InvestigationCommandView {
     /// 谁发起的（审计）：`admin:<token 指纹>`；空 = 本机命令 / 历史记录。
     requested_by: Option<String>,
     requested_at: Option<String>,
+    /// agent 取走命令的时刻（阶段回报）；`null` = 还没被取走。
+    claimed_at: Option<String>,
     acknowledged_at: Option<String>,
     outcome: Option<String>,
     detail: Option<String>,
@@ -521,6 +524,7 @@ fn command_view(command: Option<&StoredAgentCommand>) -> InvestigationCommandVie
                 command.requested_at_ms,
             )
             .map(|at| at.to_rfc3339()),
+            claimed_at: command.claimed_at.clone(),
             acknowledged_at: command.acked_at.clone(),
             outcome: command.outcome.clone(),
             detail: command.detail.clone(),
@@ -530,6 +534,7 @@ fn command_view(command: Option<&StoredAgentCommand>) -> InvestigationCommandVie
             kind: None,
             requested_by: None,
             requested_at: None,
+            claimed_at: None,
             acknowledged_at: None,
             outcome: None,
             detail: None,
