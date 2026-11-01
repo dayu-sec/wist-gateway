@@ -1080,9 +1080,16 @@ fn collect_reports(dir: &Path, agent_id: &str) -> io::Result<Vec<StoredReport>> 
         };
         // 预算 = 单文件上限 ∩ 剩余总量。预算花完就不再往下读：按倒序遍历，后面的文件更旧。
         let remaining = MAX_TOTAL_BYTES.saturating_sub(total);
+        if remaining == 0 {
+            break;
+        }
         let budget = metadata.len().min(MAX_FILE_BYTES).min(remaining);
         if budget == 0 {
-            break;
+            // **空文件不是预算花完**：`out_dat` 里 `ignore.json` / `error.json` 这类 0 字节
+            // 占位按路径倒序可能排在报告文件前面 —— 一刀切 `break` 会把后面的报告全跳过，
+            // 页面就一直说「报告目录里还没有这台主机的报告」（文件明明就在那儿）。
+            // 跳过它，继续看下一个。
+            continue;
         }
         let Ok(bytes) = read_tail(&real, budget) else {
             continue;
@@ -1520,6 +1527,31 @@ mod tests {
         let reports = load_agent_reports(&dir, "agent-a", 0, chrono::Utc::now()).expect("load");
         assert_eq!(reports.len(), 1, "混放目录里也要能找到报告");
         assert_eq!(reports[0].command_id, "cmd-mixed");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// **0 字节的 JSON 不能把后面的报告档掉。**
+    ///
+    /// 典型现场：`data/out_dat` 里 `ignore.json` / `error.json` 是 0 字节，路径倒序时它们
+    /// 可能排在报告文件前面。旧实现把「读预算为 0」一刀切当「预算花完了」直接 `break`，
+    /// 于是报告文件一个都没读到 —— 页面就一直说「报告目录里还没有这台主机的报告」，
+    /// 而文件明明就在那里。
+    ///
+    /// 用**不含 `ivsrep`** 的文件名跑：走的是「路径倒序兜底」那条排序，"zzz-empty.json"
+    /// （0 字节）会排在报告前面，正好复现现场。
+    #[test]
+    fn an_empty_json_file_does_not_hide_a_later_report() {
+        let dir = temp_dir("empty-json");
+        fs::write(dir.join("zzz-empty.json"), b"").expect("write empty json");
+        fs::write(
+            dir.join("custom-report.jsonl"),
+            format!("{}\n", report_line("agent-a", 3, "cmd-after-empty")),
+        )
+        .expect("write report");
+
+        let reports = load_agent_reports(&dir, "agent-a", 0, chrono::Utc::now()).expect("load");
+        assert_eq!(reports.len(), 1, "空文件之后的报告也要被读到");
+        assert_eq!(reports[0].command_id, "cmd-after-empty");
         let _ = fs::remove_dir_all(dir);
     }
 
