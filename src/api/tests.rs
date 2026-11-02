@@ -4162,7 +4162,7 @@ async fn agent_status_metric_reports_policy_version_only_when_present() {
     );
     let version_line = with
         .iter()
-        .find(|line| line["metric"]["__name__"] == "agent.discovery_policy_version")
+        .find(|line| line["metric"]["__name__"] == "agent_discovery_policy_version")
         .expect("discovery policy version metric line");
     assert_eq!(version_line["values"][0], 2.0);
     assert_eq!(version_line["metric"]["agent"], "agent-node-a");
@@ -4194,7 +4194,7 @@ async fn agent_status_metric_reports_cpu_cores_when_present() {
     );
     let cores_line = with
         .iter()
-        .find(|line| line["metric"]["__name__"] == "agent.cpu.cores")
+        .find(|line| line["metric"]["__name__"] == "agent_cpu_cores")
         .expect("cpu cores metric line");
     assert_eq!(cores_line["values"][0], 4.0);
     assert_eq!(cores_line["metric"]["agent"], "agent-node-a");
@@ -4211,9 +4211,34 @@ async fn agent_status_metric_reports_cpu_cores_when_present() {
     assert!(
         without
             .iter()
-            .all(|line| line["metric"]["__name__"] != "agent.cpu.cores"),
+            .all(|line| line["metric"]["__name__"] != "agent_cpu_cores"),
         "{without:?}"
     );
+}
+
+#[tokio::test]
+async fn agent_status_metric_scales_cpu_and_latency_into_spec_units() {
+    // 规范单位：CPU 是 0–1 比例（单核口径），延迟是秒；上报入参仍是百分比 / 毫秒。
+    let lines = super::agent_ops::agent_status_metric_lines(
+        "agent-node-a",
+        None,
+        Some(50.0),
+        Some(4),
+        Some(250),
+        None,
+        1_700_000_000_000,
+    );
+    let find = |name: &str| {
+        lines
+            .iter()
+            .find(|line| line["metric"]["__name__"] == name)
+            .unwrap_or_else(|| panic!("missing metric line {name}"))
+            .clone()
+    };
+
+    assert_eq!(find("agent_cpu_ratio")["values"][0], 0.5);
+    assert_eq!(find("agent_admin_latency_seconds")["values"][0], 0.25);
+    assert_eq!(find("agent_cpu_cores")["values"][0], 4.0);
 }
 
 /// 用**真实策展策略表**跑通下发：装载校验通过，且下发的是七个方向那一版。
@@ -4768,6 +4793,10 @@ async fn host_metrics_routes_join_registry_identity_onto_data_plane_metrics() {
         serde_json::json!(["en0 10.0.0.5/24", "utun100 100.64.0.9/32"])
     );
     assert_eq!(rows[0]["memoryAvailableKb"], 512);
+    // 比例 → 百分比在展示层换算；旧字段只读 system 角色，不被 data 覆盖。
+    assert_eq!(rows[0]["diskUsagePercent"], 60.0);
+    assert_eq!(rows[0]["maxFilesystemUsagePercent"], 95.0);
+    assert_eq!(rows[0]["maxFilesystemUsageMount"], "/var");
 
     // 未知 agent：404（存在性走注册表，与指标无关）。
     let missing = get_admin(&env, "/api/v1/admin/agents/agent-missing/host-metrics").await;
@@ -4786,11 +4815,11 @@ async fn host_metrics_list_drops_metrics_from_agents_outside_the_registry() {
             "resultType": "vector",
             "result": [
                 {
-                    "metric": { "__name__": "system.load_average.1m", "agent": "agent-node-a" },
+                    "metric": { "__name__": "system_load_average_1m", "agent": "agent-node-a" },
                     "value": [1_700_000_000, "1.5"],
                 },
                 {
-                    "metric": { "__name__": "system.load_average.1m", "agent": "ghost-agent" },
+                    "metric": { "__name__": "system_load_average_1m", "agent": "ghost-agent" },
                     "value": [1_700_000_000, "9.9"],
                 },
             ],
@@ -4880,16 +4909,32 @@ async fn spawn_victoria_metrics_stub(agent_id: &str, load_1m: f64) -> String {
             "resultType": "vector",
             "result": [
                 {
-                    "metric": { "__name__": "system.load_average.1m", "agent": agent },
+                    "metric": { "__name__": "system_load_average_1m", "agent": agent },
                     "value": [1_700_000_000, load_1m.to_string()],
                 },
                 {
-                    "metric": { "__name__": "system.memory.total", "agent": agent },
-                    "value": [1_700_000_000, "1024"],
+                    "metric": { "__name__": "system_memory_total_bytes", "agent": agent },
+                    "value": [1_700_000_000, "1048576"],
                 },
                 {
-                    "metric": { "__name__": "system.memory.available", "agent": agent },
-                    "value": [1_700_000_000, "512"],
+                    "metric": { "__name__": "system_memory_available_bytes", "agent": agent },
+                    "value": [1_700_000_000, "524288"],
+                },
+                {
+                    "metric": { "__name__": "system_disk_usage_ratio", "agent": agent, "disk_role": "system" },
+                    "value": [1_700_000_000, "0.6"],
+                },
+                {
+                    "metric": { "__name__": "system_disk_usage_ratio", "agent": agent, "disk_role": "data" },
+                    "value": [1_700_000_000, "0.95"],
+                },
+                {
+                    "metric": { "__name__": "system_filesystem_usage_ratio", "agent": agent, "mountpoint": "/" },
+                    "value": [1_700_000_000, "0.6"],
+                },
+                {
+                    "metric": { "__name__": "system_filesystem_usage_ratio", "agent": agent, "mountpoint": "/var" },
+                    "value": [1_700_000_000, "0.95"],
                 },
             ],
         },
@@ -4900,7 +4945,7 @@ async fn spawn_victoria_metrics_stub(agent_id: &str, load_1m: f64) -> String {
             "resultType": "matrix",
             "result": [
                 {
-                    "metric": { "__name__": "system.load_average.1m", "agent": agent },
+                    "metric": { "__name__": "system_load_average_1m", "agent": agent },
                     "values": [
                         [1_700_000_000, load_1m.to_string()],
                         [1_700_000_030, load_1m.to_string()],

@@ -268,7 +268,7 @@ pub async fn submit_agent_status(
 /// 对 `discovery_policy_version` 尤其致命 —— 0 代表确实生效了第 0 版，与「还没拉到策略表」
 /// 是两回事，混为一谈正好毁掉运维要回答的那句「哪些机器还没生效」。
 ///
-/// 注意 `agent.cpu.percent` 是**单核口径**（100% = 占满一个核，多线程进程可 >100），
+/// 注意 `agent_cpu_ratio` 是**单核口径**（1.0 = 占满一个核，多线程进程可 >1），
 /// 只统计 agent 进程自身；整机占比由管理面读投影按 `cpu_percent / cpu_cores` 派生，
 /// 不在这条上报链路上另发一条线。
 pub(super) fn agent_status_metric_lines(
@@ -283,7 +283,7 @@ pub(super) fn agent_status_metric_lines(
     [
         memory_bytes.map(|value| {
             metric_line(
-                "agent.memory.bytes",
+                "agent_memory_bytes",
                 agent_id,
                 "agent_metrics",
                 value as f64,
@@ -292,17 +292,17 @@ pub(super) fn agent_status_metric_lines(
         }),
         cpu_percent.map(|value| {
             metric_line(
-                "agent.cpu.percent",
+                "agent_cpu_ratio",
                 agent_id,
                 "agent_metrics",
-                value,
+                value / 100.0,
                 timestamp_ms,
             )
         }),
         cpu_cores.map(|value| {
             metric_line(
                 // 单位=个（逻辑核数）：gauge 型。整机占比的分母，随状态上报一起进时序。
-                "agent.cpu.cores",
+                "agent_cpu_cores",
                 agent_id,
                 "agent_metrics",
                 value as f64,
@@ -311,16 +311,16 @@ pub(super) fn agent_status_metric_lines(
         }),
         admin_latency_ms.map(|value| {
             metric_line(
-                "agent.admin_latency.ms",
+                "agent_admin_latency_seconds",
                 agent_id,
                 "agent_metrics",
-                value as f64,
+                value as f64 / 1000.0,
                 timestamp_ms,
             )
         }),
         discovery_policy_version.map(|value| {
             metric_line(
-                "agent.discovery_policy_version",
+                "agent_discovery_policy_version",
                 agent_id,
                 "agent_metrics",
                 value as f64,
