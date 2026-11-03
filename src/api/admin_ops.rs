@@ -653,7 +653,7 @@ pub struct AgentCommandResponse {
     detail: Option<String>,
 }
 
-fn agent_command_response(
+pub(super) fn agent_command_response(
     agent_id: &str,
     command: Option<StoredAgentCommand>,
 ) -> AgentCommandResponse {

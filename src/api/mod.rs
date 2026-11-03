@@ -79,6 +79,10 @@ mod agent_log_sources;
 // `deny_unknown_fields`，加字段会让旧 agentd 整份拒收。见 api/metrics_labels.rs 与
 // `wist-agentd/docs/design/metrics-selection-labels.md`。重新生成控制面代码时需回补本模块与下方路由。
 mod metrics_labels;
+// NOTE(hand-added): 手工刷新入口（`POST /api/v1/admin/agents/{id}/refresh`）。复用通用 `refresh`
+// 命令面（`command_kind::REFRESH` + `RefreshParams`），不新增第二套刷新语义；见 api/refresh.rs 与
+// `wist-agentd/docs/design/metrics-selection-labels.md` §3.2 / §10。重新生成控制面代码时需回补本模块与下方路由。
+mod refresh;
 // NOTE(hand-added): L3 搜索根的下发（`POST /api/v1/agent/source-search-policy:poll`）。
 // 生效值 = 知识库 `[[units]] search_roots` ∩ `[collection] allowed_source_roots`；
 // agentd 侧不留配置，拿不到策略就不搜索。见 api/source_search_policy.rs 与设计 §6.1.1。
@@ -162,6 +166,7 @@ use metrics_labels::{
 use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
 use pipeline::get_pipeline_topology;
 use preflight::{run_agent_preflight, view_agent_preflight};
+use refresh::dispatch_agent_refresh;
 use rollout_ops::{
     advance_rollout_plan, approve_rollout_plan, create_rollout_plan, list_rollout_plans,
     retry_rollout_plan, view_rollout_plan,
@@ -440,6 +445,13 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agents/{agent_id}/fact-refresh",
             get(view_agent_fact_refresh).post(request_agent_fact_refresh),
+        )
+        // NOTE(hand-added): 手工刷新一组“知识/期望状态”（`what` 闭集见
+        // `wist_api::status::refresh_what`）。只排命令、不等 ack；台账页已能看结果。
+        // 与 metrics-labels 写入路径的关系：写入已自动排刷新，这里只是“再发一次”。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/refresh",
+            post(dispatch_agent_refresh),
         )
         // NOTE(hand-added): 一次性调查。POST 下发（`kind = investigate`），GET 拿「最近一次
         // 下发 + 本机报告列表」；`/{command_id}` 读完整报告（数据面落盘，网关只读）。
