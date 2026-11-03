@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -7,42 +7,117 @@ use axum::{
     body::{Body, to_bytes},
     extract::State,
     http::{Request, StatusCode, header},
-};
-use ring::{
-    rand as ring_rand,
-    signature::{self, Ed25519KeyPair, KeyPair},
+    response::Response,
 };
 use tower::ServiceExt;
-use wist_contracts::enrollment::{
+use wist_api::enrollment::{
     AgentIdentityStatus, CredentialRenewal, CredentialRenewed, EnrollmentEnvelope,
     EnrollmentRequest, EnrollmentStatus,
 };
+use wist_api::status::{AgentStatusAck, AgentStatusReport, AgentWorkState, AgentWorkStateChange};
 
+use crate::app::knowledge::{KnowledgeSource, LoadedKnowledge};
 use crate::infra::{
-    AdminConfig, AdminStore, StoredEnrollmentTokenStatus, load_install_script_public_key_pem,
-    sha256_hex,
+    AdminConfig, AgentStatusUpdate, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
+    KnowledgeActivation, LocalPeers, SqliteStore, Store, StoredAgentCommand,
+    StoredAgentInstallPackage, StoredAgentInstallPackageAddress, StoredAgentRevocation,
+    StoredAgentUplinkAddress, StoredCredentialStatus, StoredEnrollmentTokenStatus,
+    StoredKnowledgePackage, VerifiedAgentIdentity, bytes_sha256_hex, sha256_hex,
 };
+use wist_api::action_result::{ReportActionResult, ResultAttestation};
+use wist_api::discovery_policies::{
+    DiscoveryPoliciesReturned, POLL_DISCOVERY_POLICIES_KIND, PollDiscoveryPolicies,
+};
+use wist_api::discovery_snapshot::{
+    APPLIED_SOURCE_LOCAL_CONFIG, AppliedDiscoverySnapshot, DiscoverySnapshotGrant,
+    GRANT_SOURCE_AGENT, GRANT_SOURCE_GLOBAL, POLL_DISCOVERY_SNAPSHOT_KIND,
+};
+use wist_api::facts::ReportAgentFactSummary;
+use wist_api::uplink::{AgentUplinkGrant, POLL_AGENT_UPLINK_KIND};
+use wist_api::work::{ACK_WORK_KIND, POLL_WORK_KIND, REPORT_WORK_RESULT_KIND};
 use wist_contracts::action_result::{ActionResult, FinalStatus};
-use wist_contracts::gateway::{
-    AgentStatusReport, AgentWorkState, AgentWorkStateChange, ReportActionResult, ResultAttestation,
-};
+use wist_contracts::fact_summary::FactContent;
+use wist_contracts::work::WorkSpec;
 use wist_control::PollControlCommands;
 use wist_control::types::DateTime;
 
 use super::{
     AdminRuntimeState, ApiState,
-    enrollment::{
-        agent_enrollment_result, agent_enrollment_result_with_token_issuer, enroll_agent,
-    },
+    enrollment::{agent_enrollment_result, enroll_agent},
     install::{
-        agent_initial_config_toml, agent_install_code, agent_package_sha256,
-        issue_agent_install_code, token_hash, validate_bootstrap_token_for_config,
+        agent_initial_config_toml, agent_install_code, issue_agent_install_code, token_hash,
+        validate_bootstrap_token_for_config,
     },
-    overview::{RecentOnlineRegisteredAgentSource, agent_overview},
+    install_package::{
+        AgentPackageSource, PLATFORM_LINUX_ARM, PLATFORM_LINUX_X86, package_id_for_sha256,
+        read_package_identity,
+    },
+    overview::{
+        OVERVIEW_RECENT_AGENT_LIMIT, RecentOnlineRegisteredAgentSource, agent_is_online,
+        agent_overview, record_recent_online_agent,
+    },
     router,
+    work_expiry::expire_overdue_one_shot_works,
 };
 
 const TEST_ADMIN_API_TOKEN: &str = "test-admin-token";
+/// 测试用固定平台（target-triple）：`TestEnv` 的制品是裸文件（读不出 triple），
+/// 因此平台在调用处显式给。
+const TEST_PLATFORM: &str = "aarch64-apple-darwin";
+
+/// 测试用的本地制品来源（直接从文件构造 `AgentPackageSource`，不经过库）。
+fn local_package(env: &TestEnv) -> AgentPackageSource {
+    local_package_for(env, TEST_PLATFORM)
+}
+
+/// 按**平台**构造本地来源：同一个制品文件即可 —— 测试只关心由平台决定的那部分
+/// （分发 URL / 摘要），不关心制品内容。
+fn local_package_for(env: &TestEnv, platform: &str) -> AgentPackageSource {
+    AgentPackageSource::from_local_file(
+        &env.config,
+        &env.config.public_base_url,
+        platform,
+        env.package_file.clone(),
+    )
+    .expect("local package source")
+}
+
+/// 在 TestEnv 的临时目录里放一个安装包**来源**文件，返回其绝对路径。
+fn write_source_package(env: &TestEnv, name: &str, bytes: &[u8]) -> String {
+    let path = env._root.join(name);
+    std::fs::write(&path, bytes).expect("write source package");
+    path.to_string_lossy().to_string()
+}
+
+/// 把一份来源制品设置进管理面（走真实 POST），返回（来源路径, 制品摘要）。
+///
+/// 平台从制品自身读（包内目录名的 target-triple）；裸字节读不出时回落 [`TEST_PLATFORM`]。
+async fn set_install_package_source(env: &TestEnv, name: &str, bytes: &[u8]) -> (String, String) {
+    let source = write_source_package(env, name, bytes);
+    let (_, arch) = read_package_identity(bytes);
+    let platform = if arch.is_empty() {
+        TEST_PLATFORM
+    } else {
+        arch.as_str()
+    };
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": platform,
+                "package_url": source,
+                // 摘要必填：这里交真实字节的 sha256（与网关拉到的内容同源）。
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(bytes)),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    (source, bytes_sha256_hex(bytes))
+}
 
 /// Self-signed TLS cert (CN=localhost, RSA) written into each TestEnv so the
 /// macOS install code can compute its `--pinnedpubkey` pin.
@@ -50,222 +125,1237 @@ const TEST_TLS_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDCTCCAfGgAwIBAg
 /// Expected `sha256//` pin (base64 of the sha256 of the SPKI) of the cert above.
 const TEST_TLS_CERT_PIN: &str = "uq4O4EN3e09Xmlo5euGldyHw+y27baJ+Jm/OBnFHrZc=";
 
-#[test]
-fn install_code_uses_header_bootstrap_token_without_url_token_leak() {
-    let env = TestEnv::new();
+/// 用手边的本地制品签发一份安装代码：下面几个测试关心的是安装命令/引导包的形态。
+async fn local_package_install_code(env: &TestEnv) -> wist_control::types::AgentInstallCode {
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(900);
-    let install_code =
-        agent_install_code(&env.config, "token-a", expires_at).expect("install code");
+    agent_install_code(
+        &env.config,
+        "token-a",
+        expires_at,
+        &[(TEST_PLATFORM.to_string(), local_package(env))],
+        &env.config.public_base_url,
+    )
+    .expect("install code")
+}
 
+/// linux 两份命令要按平台算脚本摘要，因此夹具里得有对应平台的包。
+async fn linux_package_install_code(env: &TestEnv) -> wist_control::types::AgentInstallCode {
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(900);
+    agent_install_code(
+        &env.config,
+        "token-a",
+        expires_at,
+        &[
+            (
+                PLATFORM_LINUX_X86.to_string(),
+                local_package_for(env, PLATFORM_LINUX_X86),
+            ),
+            (
+                PLATFORM_LINUX_ARM.to_string(),
+                local_package_for(env, PLATFORM_LINUX_ARM),
+            ),
+        ],
+        &env.config.public_base_url,
+    )
+    .expect("install code")
+}
+
+#[tokio::test]
+async fn install_code_bundle_targets_gateway_package() {
+    let env = TestEnv::new().await;
+    let install_code = local_package_install_code(&env).await;
+
+    let bundle = &install_code.bootstrap_bundle;
+    assert_eq!(bundle.platforms.len(), 1);
+    assert_eq!(bundle.platforms[0].platform, TEST_PLATFORM);
     assert_eq!(
-        install_code.bootstrap_bundle.agent_package_url,
-        "https://127.0.0.1:3000/api/v1/agent/packages/current"
+        bundle.platforms[0].agent_package_url,
+        format!("https://127.0.0.1:3000/api/v1/agent/packages/current?platform={TEST_PLATFORM}")
     );
-    assert!(
-        !install_code
-            .bootstrap_bundle
-            .agent_package_sha256
-            .is_empty()
-    );
-    assert!(install_code.x86_linux_install_code.contains(
-        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/x86/install.sh\" -o \"$D/s\""
-    ));
+    assert!(!bundle.platforms[0].agent_package_sha256.is_empty());
+}
+
+#[tokio::test]
+async fn linux_install_code_checks_script_digest() {
+    let env = TestEnv::new().await;
+    let install_code = linux_package_install_code(&env).await;
+    let command = &install_code.x86_linux_install_code;
+
     assert!(install_code.arm_linux_install_code.contains(
-        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/arm/install.sh\" -o \"$D/s\""
+        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/aarch64-unknown-linux-musl/install.sh\" -o \"$D/s\""
     ));
-    assert!(
-        install_code
-            .x86_linux_install_code
-            .contains("install.sh.sig")
+    assert!(command.contains(
+        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/x86_64-unknown-linux-musl/install.sh\" -o \"$D/s\""
+    ));
+    assert!(command.contains("mktemp -d"));
+    // 引导命令只报「在做什么」，不把临时工作目录这种实现细节吐给运维（安装脚本自己有进度输出）。
+    assert!(!command.contains("working dir"));
+    assert!(command.contains("echo \"==> 校验安装脚本摘要\""));
+    // 摘要必须等于**同一平台、同一份包来源**渲染出的那份脚本的 sha256。
+    let expected = bytes_sha256_hex(
+        super::install::install_script(
+            &env.config,
+            PLATFORM_LINUX_X86,
+            &local_package_for(&env, PLATFORM_LINUX_X86),
+            &env.config.public_base_url,
+        )
+        .as_bytes(),
     );
+    assert_eq!(expected.len(), 64);
+    assert!(command.contains(&expected));
+    // 摘要工具的取法与 install.sh 同口径：sha256sum 优先、shasum 兜底。
+    assert!(command.contains("command -v sha256sum"));
+    assert!(command.contains("command -v shasum"));
+    // 不匹配就不执行（fail-closed），并且要给出可读报错。
+    assert!(command.contains("摘要不匹配"));
+    assert!(command.contains("sh \"$D/s\""));
+    // 不再依赖 openssl（底线兼容），也不再下载 .sig。
+    assert!(!command.contains("openssl"));
+    assert!(!command.contains(".sig"));
+    // 公钥不再被塞进命令（摘要取代了它）：底部机不需要任何 PEM / 密钥材料。
+    assert!(!command.contains("BEGIN PUBLIC KEY"));
+    assert!(!command.contains("key.pem"));
+    // 不把脚本管进 shell：必须先校验，校验过了才执行。
+    assert!(!command.contains("| sh"));
+}
+
+#[tokio::test]
+async fn linux_install_codes_carry_per_platform_digests() {
+    let env = TestEnv::new().await;
+    let code = linux_package_install_code(&env).await;
+    let digest_for = |platform: &str| {
+        bytes_sha256_hex(
+            super::install::install_script(
+                &env.config,
+                platform,
+                &local_package_for(&env, platform),
+                &env.config.public_base_url,
+            )
+            .as_bytes(),
+        )
+    };
+    let x86 = digest_for(PLATFORM_LINUX_X86);
+    let arm = digest_for(PLATFORM_LINUX_ARM);
+
+    // 同一份制品、不同平台：脚本本身不同（ARCH / 分发地址），摘要必须各自独立。
+    assert_ne!(x86, arm);
+    assert!(code.x86_linux_install_code.contains(&x86));
+    assert!(code.arm_linux_install_code.contains(&arm));
+    // 一份命令里不能挟带另一平台的摘要（那意味着取错了脚本）。
+    assert!(!code.x86_linux_install_code.contains(&arm));
+    assert!(!code.arm_linux_install_code.contains(&x86));
+    // 口径：小写裸 hex（与 sha256sum 输出可直接比对）。
     assert!(
-        install_code
-            .x86_linux_install_code
-            .contains("openssl pkeyutl -verify -pubin")
+        x86.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     );
-    assert!(install_code.x86_linux_install_code.contains("sh \"$D/s\""));
+}
+
+#[tokio::test]
+async fn linux_install_code_digest_follows_the_advertise_base() {
+    // 脚本里含分发地址与 initial-config 地址，二者都由**生效基址**派生 → 换基址摘要必须跟着变，
+    // 且等于新基址下那份脚本的 sha256（防住「复用/缓存了旧摘要」这类错）。
+    let env = TestEnv::new().await;
+    let package = local_package_for(&env, PLATFORM_LINUX_X86);
+    let render = |base: &str| {
+        let code = agent_install_code(
+            &env.config,
+            "token-a",
+            chrono::Utc::now() + chrono::Duration::seconds(900),
+            &[(PLATFORM_LINUX_X86.to_string(), package.clone())],
+            base,
+        )
+        .expect("install code");
+        let digest = bytes_sha256_hex(
+            super::install::install_script(&env.config, PLATFORM_LINUX_X86, &package, base)
+                .as_bytes(),
+        );
+        (code.x86_linux_install_code, digest)
+    };
+
+    let (command_a, digest_a) = render("https://a.example.com");
+    let (command_b, digest_b) = render("https://b.example.com");
+    assert_ne!(digest_a, digest_b);
+    assert!(command_a.contains(&digest_a));
+    assert!(command_b.contains(&digest_b));
+    assert!(!command_a.contains(&digest_b));
+}
+
+#[tokio::test]
+async fn linux_install_code_is_bound_to_the_package_at_issue_time() {
+    // B 方案与签名方案的一个**真实差异**：摘要在**签发时刻**算好并写进命令，而签名是在
+    // **取用时刻**由端点现场生成的。后果：签发后换了包（脚本内容随之变化），旧命令会因摘要
+    // 不匹配而拒跑。这是有意的：宁可拒跑，也不执行一份没校验过的脚本（fail-closed）；
+    // 换包后重新复制一次命令即可（安装代码本来就是短时效的）。
+    let env = TestEnv::new().await;
+    let issued = linux_package_install_code(&env).await;
+
+    let other_path = env._root.join("package-v2.tar.gz");
+    std::fs::write(&other_path, b"another build").expect("write package v2");
+    let other = AgentPackageSource::from_local_file(
+        &env.config,
+        &env.config.public_base_url,
+        PLATFORM_LINUX_X86,
+        other_path,
+    )
+    .expect("package source");
+    let digest_after_reupload = bytes_sha256_hex(
+        super::install::install_script(
+            &env.config,
+            PLATFORM_LINUX_X86,
+            &other,
+            &env.config.public_base_url,
+        )
+        .as_bytes(),
+    );
+
+    // 旧命令押的是旧包那份脚本的摘要 → 对不上新脚本（在目标机上就是「摘要不匹配」而中止）。
     assert!(
-        install_code
+        !issued
             .x86_linux_install_code
-            .contains("-----BEGIN PUBLIC KEY-----")
+            .contains(&digest_after_reupload)
     );
+    // 而旧命令的摘要本身仍是有效的（只要包没换）：它等于签发时那份脚本的 sha256。
+    let digest_at_issue = bytes_sha256_hex(
+        super::install::install_script(
+            &env.config,
+            PLATFORM_LINUX_X86,
+            &local_package_for(&env, PLATFORM_LINUX_X86),
+            &env.config.public_base_url,
+        )
+        .as_bytes(),
+    );
+    assert!(issued.x86_linux_install_code.contains(&digest_at_issue));
+}
+
+#[tokio::test]
+async fn linux_install_codes_handle_a_partly_recorded_platform_set() {
+    // 真实常见的中间态：只录了 x86 的包。此时 x86 必须是完整命令，arm 必须只是说明 ——
+    // 两个平台互不影响。
+    let env = TestEnv::new().await;
+    let code = agent_install_code(
+        &env.config,
+        "token-a",
+        chrono::Utc::now() + chrono::Duration::seconds(900),
+        &[(
+            PLATFORM_LINUX_X86.to_string(),
+            local_package_for(&env, PLATFORM_LINUX_X86),
+        )],
+        &env.config.public_base_url,
+    )
+    .expect("install code");
+
+    assert!(
+        code.x86_linux_install_code.contains("install.sh")
+            && code.x86_linux_install_code.contains("sha256sum")
+    );
+    assert!(code.arm_linux_install_code.contains(PLATFORM_LINUX_ARM));
+    assert!(code.arm_linux_install_code.contains("安装包"));
+    assert!(!code.arm_linux_install_code.contains("sha256sum"));
+}
+
+#[tokio::test]
+async fn linux_install_code_without_package_explains_instead_of_running() {
+    // 夹具只录了 macOS 包 → 两份 linux 命令都算不出脚本摘要（摘要只能从**将要下发的那份脚本**算）。
+    let env = TestEnv::new().await;
+    let install_code = local_package_install_code(&env).await;
+
+    for (platform, command) in [
+        (PLATFORM_LINUX_X86, &install_code.x86_linux_install_code),
+        (PLATFORM_LINUX_ARM, &install_code.arm_linux_install_code),
+    ] {
+        assert!(command.contains(platform), "{command}");
+        assert!(command.contains("安装包"), "{command}");
+        assert!(command.contains("exit 1"), "{command}");
+        // 什么都不做：不下载、不校验、不执行。
+        assert!(!command.contains("curl"), "{command}");
+        assert!(!command.contains("sh \"$D/s\""), "{command}");
+    }
+}
+
+/// e2e 用的假 `curl`：按 URL 把本地预置文件搬到 `-o` 指定的位置。
+/// 只实现本测试用到的那几个 flag（`-fsSLk` / `--cacert` / `-H` / `-o`）。
+const E2E_FAKE_CURL: &str = r#"#!/bin/sh
+url=""; out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift; out="$1" ;;
+    http*) url="$1" ;;
+  esac
+  shift
+done
+[ -n "$out" ] || { echo "fake curl: missing -o" >&2; exit 2; }
+case "$url" in
+  *install.sh) cp "$FAKE_SCRIPT" "$out" ;;
+  */agent/packages/current*) cp "$FAKE_PACKAGE" "$out" ;;
+  *initial-config*) cp "$FAKE_CONFIG" "$out" ;;
+  *) echo "fake curl: unexpected url: $url" >&2; exit 22 ;;
+esac
+"#;
+
+fn e2e_run_ok(program: &str, args: &[&str]) -> String {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("跑不起 {program}：{err}"));
+    assert!(
+        out.status.success(),
+        "{program} {args:?} 失败：\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// 底线机 e2e：在 `ubuntu:20.04` 里跑**真正渲染出来的** linux 引导命令。
+///
+/// 单测只能断言命令的「形状」；这条要证明它**在那台机器上真能跑**（`sh` 是 dash、coreutils
+/// 是老版本），且覆盖到 `install.sh` 的 下载 → 校验 → 落盘 → 自检 整条路径。
+///
+/// 有意画出的边界：
+///  - HTTP 换成假 `curl`（按 URL 分发本地预置文件）：钉的是「底线机的 shell + 工具链 + 命令/脚本
+///    逻辑」，不是 curl 本身；真网络 / TLS 不在这里。
+///  - `WIST_AGENTD_SERVICE=0`：容器里没有 systemd（PID 1），服务托管另行在 systemd 环境里验。
+///  - token 不进命令（`install_code_leaks_no_enrollment_token` 钉住了），安装页在命令外层注入；
+///    这里等价地用容器环境变量给。
+///
+/// 默认跳过：常规 `cargo test` 不该依赖 docker 与镜像拉取。设 `WIST_GATEWAY_DOCKER_E2E=1` 开启。
+#[tokio::test]
+async fn linux_install_command_runs_on_ubuntu_2004() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::env::var_os("WIST_GATEWAY_DOCKER_E2E").is_none() {
+        eprintln!("跳过：设 WIST_GATEWAY_DOCKER_E2E=1 才跑（需要 docker 与 ubuntu:20.04）");
+        return;
+    }
+
+    let env = TestEnv::new().await;
+    let dir = env._root.join("e2e");
+    std::fs::create_dir_all(dir.join("bin")).expect("e2e dir");
+
+    // 命令必须按**底线机的架构**选，否则 install.sh 的平台检查会先把它拒掉。
+    let arch = e2e_run_ok("docker", &["run", "--rm", "ubuntu:20.04", "uname", "-m"]);
+    let platform = match arch.trim() {
+        "x86_64" => PLATFORM_LINUX_X86,
+        "aarch64" => PLATFORM_LINUX_ARM,
+        other => panic!("底线机架构异常：{other}"),
+    };
+
+    // 一个「装上去真能跑」的包：tarball 形态要求三件齐全，各自打印版本即可（自检只跑 `version`）。
+    let pkg_root = dir.join("pkg");
+    let pkg_dir = pkg_root.join("wist-agentd-0.0.0-test");
+    std::fs::create_dir_all(&pkg_dir).expect("pkg dir");
+    for name in ["wist-agentd", "wist-exec", "wist-upgrader"] {
+        let path = pkg_dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\necho 0.0.0-test\n").expect("stub binary");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    e2e_run_ok(
+        "tar",
+        &[
+            "-czf",
+            dir.join("package.tar.gz").to_str().expect("path"),
+            "-C",
+            pkg_root.to_str().expect("path"),
+            "wist-agentd-0.0.0-test",
+        ],
+    );
+
+    let source = AgentPackageSource::from_local_file(
+        &env.config,
+        &env.config.public_base_url,
+        platform,
+        dir.join("package.tar.gz"),
+    )
+    .expect("package source");
+    let install_code = agent_install_code(
+        &env.config,
+        "token-a",
+        chrono::Utc::now() + chrono::Duration::seconds(900),
+        &[(platform.to_string(), source.clone())],
+        &env.config.public_base_url,
+    )
+    .expect("install code");
+    let command = if platform == PLATFORM_LINUX_X86 {
+        &install_code.x86_linux_install_code
+    } else {
+        &install_code.arm_linux_install_code
+    };
+
+    // 预置件：真脚本（与命令内嵌的摘要同源 —— 就取同一次渲染的输出）、被篡改的脚本、
+    // 初始配置、假 curl。
+    let script =
+        super::install::install_script(&env.config, platform, &source, &env.config.public_base_url);
+    std::fs::write(dir.join("script.sh"), &script).expect("script");
+    std::fs::write(
+        dir.join("tampered.sh"),
+        "#!/bin/sh\necho TAMPERED_SCRIPT_RAN\n",
+    )
+    .expect("tampered script");
+    std::fs::write(dir.join("config.toml"), "").expect("initial config");
+    // 一份“跟脚本里记录的摘要不一致”的包：给内层（install.sh）的包校验用。
+    std::fs::write(
+        dir.join("bad-package.tar.gz"),
+        b"not the package the script expects\n",
+    )
+    .expect("bad package");
+    let shim = dir.join("bin/curl");
+    std::fs::write(&shim, E2E_FAKE_CURL).expect("fake curl");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let run = |cmd: &str, fake_script: &str, fake_package: &str| -> (bool, String) {
+        let mount = format!("{}:/t:ro", dir.display());
+        let fake_script_env = format!("FAKE_SCRIPT={fake_script}");
+        let fake_package_env = format!("FAKE_PACKAGE={fake_package}");
+        let out = std::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "-v",
+                mount.as_str(),
+                "-e",
+                "PATH=/t/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "-e",
+                "WIST_ENROLLMENT_TOKEN=token-a",
+                "-e",
+                "WIST_AGENTD_SERVICE=0",
+                "-e",
+                fake_script_env.as_str(),
+                "-e",
+                fake_package_env.as_str(),
+                "-e",
+                "FAKE_CONFIG=/t/config.toml",
+                "ubuntu:20.04",
+                "sh",
+                "-c",
+                cmd,
+            ])
+            .output()
+            .expect("docker run");
+        (
+            out.status.success(),
+            format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+
+    // ① 摘要正确：命令放行 → install.sh 下载/校验/落盘/自检 → 跳过注册（容器里没有 systemd）。
+    let (ok, log) = run(command, "/t/script.sh", "/t/package.tar.gz");
+    assert!(ok, "底线机上应当装完（WIST_AGENTD_SERVICE=0）：\n{log}");
+    // 这几行只会在 install.sh 真的在底线机上执行时出现（不是命令自己的输出）。
+    assert!(log.contains("wist-agentd 安装程序"), "{log}");
+    assert!(log.contains("[1/4] 下载安装包并校验摘要"), "{log}");
+    assert!(log.contains("形态 tarball"), "{log}");
+    assert!(log.contains("自检通过"), "{log}");
+    assert!(log.contains("已跳过注册"), "{log}");
+    assert!(!log.contains("摘要不匹配"), "{log}");
+
+    // ② 摘要不匹配：不执行脚本（fail-closed），并给出可读报错。
+    let (ok, log) = run(command, "/t/tampered.sh", "/t/package.tar.gz");
+    assert!(!ok, "摘要不匹配时必须失败：\n{log}");
+    assert!(log.contains("安装脚本摘要不匹配"), "{log}");
+    assert!(!log.contains("TAMPERED_SCRIPT_RAN"), "{log}");
+    assert!(!log.contains("wist-agentd 安装程序"), "{log}");
+
+    // ③ 包被换掉（脚本自身记录的是另一个 sha256）：命令放行，但 install.sh 的包校验必须拦下。
+    //    外层（命令对脚本）与内层（脚本对制品）各一道闸，这里钉住内层。
+    let (ok, log) = run(command, "/t/script.sh", "/t/bad-package.tar.gz");
+    assert!(!ok, "包摘要不符时必须失败：\n{log}");
+    assert!(log.contains("agent package sha256 mismatch"), "{log}");
+    assert!(!log.contains("已跳过注册"), "{log}");
+
+    // ④ 连 sha256sum / shasum 都没有：命令必须明确拒绝（底线要求二者有其一），且不执行脚本。
+    //    20.04 自带 sha256sum 而没有 shasum，删掉前者就落到 else 分支。
+    let stripped = format!("rm -f /usr/bin/sha256sum; {command}");
+    let (ok, log) = run(&stripped, "/t/script.sh", "/t/package.tar.gz");
+    assert!(!ok, "缺校验工具时必须失败：\n{log}");
+    assert!(log.contains("缺少 sha256sum / shasum"), "{log}");
+    assert!(!log.contains("wist-agentd 安装程序"), "{log}");
+
+    // ⑤ 「该平台没录包」的那条说明命令也要能真跑（页面对三份命令都会渲染）：
+    //    必须明确失败、且什么都不做（不下载、不执行）。
+    let stub = if platform == PLATFORM_LINUX_X86 {
+        &install_code.arm_linux_install_code
+    } else {
+        &install_code.x86_linux_install_code
+    };
+    let (ok, log) = run(stub, "/t/script.sh", "/t/package.tar.gz");
+    assert!(!ok, "无包说明命令必须以非 0 退出：\n{log}");
+    assert!(log.contains("这条命令不会做任何改动"), "{log}");
+    assert!(!log.contains("wist-agentd 安装程序"), "{log}");
+}
+
+#[tokio::test]
+async fn macos_install_code_pins_gateway_certificate() {
+    let env = TestEnv::new().await;
+    let install_code = local_package_install_code(&env).await;
     let macos = &install_code.macos_install_code;
+
     assert!(macos.contains("\"$(uname -s)\" != \"Darwin\""));
-    assert!(macos.contains("arm64) ARCH=arm ;; *) ARCH=x86"));
     assert!(macos.contains(&format!(
-        "curl -fsSLk --pinnedpubkey \"sha256//{TEST_TLS_CERT_PIN}\" \"https://127.0.0.1:3000/api/v1/agent/install/$ARCH/install.sh\""
+        "curl -fsSLk --pinnedpubkey \"sha256//{TEST_TLS_CERT_PIN}\" \"https://127.0.0.1:3000/api/v1/agent/install/aarch64-apple-darwin/install.sh\""
     )));
     assert!(macos.contains("sh \"$D/s\""));
+    assert!(!macos.contains("working dir"));
+    // macOS 靠 curl 的证书锁定认证，不靠 Ed25519 脚本签名（系统自带的 LibreSSL 验不了）。
     assert!(!macos.contains("openssl pkeyutl"));
-    assert!(!macos.contains("install.sh.sig"));
-    assert!(!macos.contains("token-a"));
-    assert!(!macos.contains("?token="));
-    assert_eq!(install_code.bootstrap_enrollment_token, "token-a");
-    assert!(!install_code.x86_linux_install_code.contains("token-a"));
-    assert!(!install_code.arm_linux_install_code.contains("token-a"));
-    assert!(
-        !install_code
-            .x86_linux_install_code
-            .contains("WARP_INSIGHT_ENROLLMENT_TOKEN=")
-    );
-    assert!(
-        !install_code
-            .arm_linux_install_code
-            .contains("WARP_INSIGHT_ENROLLMENT_TOKEN=")
-    );
-    assert!(!install_code.x86_linux_install_code.contains("?token="));
-    assert!(!install_code.arm_linux_install_code.contains("?token="));
-    assert!(
-        !install_code
-            .bootstrap_bundle
-            .install_script_url
-            .contains("?token=")
-    );
-    assert!(
-        !install_code
-            .bootstrap_bundle
-            .agent_package_url
-            .contains("?token=")
-    );
 }
 
-#[test]
-fn issue_install_code_persists_one_time_enrollment_token() {
-    let env = TestEnv::new();
-    let install_code = issue_agent_install_code(&env.config, &env.store).expect("install code");
+#[tokio::test]
+async fn install_code_leaks_no_enrollment_token() {
+    let env = TestEnv::new().await;
+    let install_code = local_package_install_code(&env).await;
+
+    // 令牌只能经 Authorization 头或交互输入进入脚本，不能落在命令、URL 或环境变量里。
+    assert_eq!(install_code.bootstrap_enrollment_token, "token-a");
+    for command in [
+        &install_code.x86_linux_install_code,
+        &install_code.arm_linux_install_code,
+        &install_code.macos_install_code,
+    ] {
+        assert!(!command.contains("token-a"));
+        assert!(!command.contains("?token="));
+        assert!(!command.contains("WIST_ENROLLMENT_TOKEN="));
+    }
+    for platform in &install_code.bootstrap_bundle.platforms {
+        assert!(!platform.install_script_url.contains("?token="));
+        assert!(!platform.agent_package_url.contains("?token="));
+    }
+}
+
+#[tokio::test]
+async fn issue_install_code_persists_one_time_token() {
+    let env = TestEnv::new().await;
+    let install_code = issue_agent_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("install code");
     let token = install_code.bootstrap_enrollment_token;
 
-    validate_bootstrap_token_for_config(&env.config, &env.store, &token).expect("token valid");
-    let snapshot = env.store.load().expect("store load");
-    assert_eq!(snapshot.enrollment_tokens.len(), 1);
-    assert!(snapshot.enrollment_tokens.contains_key(&token_hash(&token)));
-    assert!(snapshot.enrollment_tokens.values().all(|token| {
-        token.max_uses == 1
-            && token.used_count == 0
-            && token.status == StoredEnrollmentTokenStatus::Active
-    }));
+    validate_bootstrap_token_for_config(&env.config, &env.store_handle, &token)
+        .await
+        .expect("token valid");
+    // The Store trait deliberately exposes no token enumeration, so the old
+    // `len() == 1` assertion is preserved with an explicit count query.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM enrollment_tokens")
+        .fetch_one(env.store.pool())
+        .await
+        .expect("count enrollment tokens");
+    assert_eq!(count, 1);
+    let stored = env
+        .store
+        .get_enrollment_token(&token_hash(&token))
+        .await
+        .expect("store read")
+        .expect("stored enrollment token");
+    assert_eq!(stored.max_uses, 1);
+    assert_eq!(stored.used_count, 0);
+    assert_eq!(stored.status, StoredEnrollmentTokenStatus::Active);
 }
 
-#[test]
-fn install_script_downloads_package_verifies_sha256_and_fetches_scoped_initial_config() {
-    let env = TestEnv::new();
-    let script = super::install::install_script(&env.config, "x86").expect("install script");
-    let sha256 = agent_package_sha256(&env.config).expect("sha256");
+fn rendered_install_script(env: &TestEnv) -> String {
+    super::install::install_script(
+        &env.config,
+        TEST_PLATFORM,
+        &local_package(env),
+        &env.config.public_base_url,
+    )
+}
 
-    assert!(script.contains("ARCH=\"x86\""));
+#[tokio::test]
+async fn install_script_verifies_package_digest() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+    let sha256 = local_package(&env).sha256;
+
+    assert!(script.contains(&format!("ARCH=\"{TEST_PLATFORM}\"")));
     assert!(script.contains("AGENT_PACKAGE_SHA256=\""));
-    assert!(script.contains("WARP_INSIGHT_ENROLLMENT_TOKEN"));
-    assert!(script.contains("Enrollment token:"));
-    assert!(script.contains("</dev/tty"));
-    assert!(script.contains("umask 077"));
-    assert!(script.contains("chmod 0700 \"$CONFIG_DIR\""));
-    assert!(script.contains("chmod 0600 \"$CONFIG_DIR/agentd.toml\""));
     assert!(script.contains(&sha256));
     assert!(script.contains("sha256sum"));
     assert!(script.contains("shasum -a 256"));
-    assert!(script.contains("WARP_INSIGHT_HOME=\"/opt/warp-insight\""));
-    assert!(script.contains("WARP_INSIGHT_HOME=\"/usr/local/warp-insight\""));
-    assert!(script.contains("WARP_INSIGHT_HOME=\"$HOME/.warp-insight\""));
-    assert!(script.contains("CONFIG_DIR=\"$WARP_INSIGHT_HOME/.wist-agentd\""));
-    assert!(script.contains("-H \"authorization: Bearer $WARP_INSIGHT_ENROLLMENT_TOKEN\""));
-    assert!(script.contains("\"https://127.0.0.1:3000/api/v1/agent/packages/current\""));
+}
+
+#[tokio::test]
+async fn install_script_handles_tarball_and_bare_package() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    // 发布产物是 tarball（内含 wist-agentd + wist-exec + wist-upgrader，三者必须同级），
+    // 开发/调试时录的可能是一个裸二进制；两种形态都要装到 $BIN_DIR。
+    assert!(script.contains("if tar tzf \"$PACKAGE_FILE\""));
+    assert!(script.contains("for BIN_NAME in wist-agentd wist-exec wist-upgrader"));
+    assert!(script.contains("install_bin \"$SRC\" \"$BIN_NAME\""));
+    assert!(script.contains("install_bin \"$PACKAGE_FILE\" \"wist-agentd\""));
+    // 必须先写新文件再 rename：直接 cp 到正在运行的二进制上会把该路径改坏
+    // （macOS 上之后每次 exec 都被 SIGKILL），重装/升级就会卡在服务注册。
+    assert!(script.contains("mv -f \"$BIN_DIR/$2.new\" \"$BIN_DIR/$2\""));
+}
+
+#[tokio::test]
+async fn install_script_scopes_initial_config_to_token() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    assert!(script.contains("WIST_ENROLLMENT_TOKEN"));
+    // 网关生成的安装指令导出的是旧命名，两个名字都要认，否则页面复制出来的命令会丢掉 token。
+    assert!(script.contains("WARP_INSIGHT_ENROLLMENT_TOKEN"));
+    assert!(script.contains("Enrollment token:"));
+    assert!(script.contains("</dev/tty"));
+    assert!(script.contains("-H \"authorization: Bearer $WIST_ENROLLMENT_TOKEN\""));
+    assert!(script.contains(&format!(
+        "\"https://127.0.0.1:3000/api/v1/agent/packages/current?platform={TEST_PLATFORM}\""
+    )));
     assert!(script.contains("\"https://127.0.0.1:3000/api/v1/agent/initial-config\""));
     assert!(!script.contains("?token="));
     assert!(script.contains("wist-agentd --config-dir"));
 }
 
-#[test]
-fn install_script_fails_when_package_file_is_unreadable() {
-    let env = TestEnv::new();
-    let package_path = env.config.agent_package_file.clone();
+#[tokio::test]
+async fn install_script_places_binaries() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    assert!(script.contains("CONFIG_DIR=\"$WIST_AGENTD_HOME\""));
+    // 只装系统级：`/usr/local/bin` + `/etc/wist-agentd`（用户级自 agentd 0.4.0 起已移除）。
+    assert!(script.contains("BIN_DIR=\"${WIST_AGENTD_BIN_DIR:-/usr/local/bin}\""));
+    assert!(script.contains("WIST_AGENTD_HOME=\"${WIST_AGENTD_HOME:-/etc/wist-agentd}\""));
+}
+
+#[tokio::test]
+async fn install_script_escalates_to_root_without_scope_flags() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    // 只装系统级，由脚本自己提权（不是要求使用者手工加 sudo）。
+    assert!(script.contains("if [ \"$(id -u)\" != \"0\" ]; then"));
+    // 手工加 sudo 会清掉 token 所在的环境变量，所以重跑自己时把 token 作为参数带过去。
+    assert!(script.contains("sh \"$0\" --enrollment-token \"$WIST_ENROLLMENT_TOKEN\""));
+    // agentd 0.4.0 已移除作用域旗标（`service` 不再接受 `--system` / `--user`）：仍然传它会把
+    // 安装卡在第 4 步（`unknown argument or command: --system`）。`--system` 在 0.3.x 上是默认值，
+    // 省略它对旧包也兼容。
+    assert!(!script.contains("SERVICE_SCOPE_ARG"));
+    assert!(!script.contains("--system"));
+    assert!(!script.contains("--user"));
+}
+
+#[tokio::test]
+async fn install_script_resolves_every_placeholder() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    // 漏替换的占位符会让安装端去请求一个字面量 URL（或写出一个叫 `{{...}}` 的文件），
+    // 而且只在目标主机上才爆出来 —— 这里当门禁。
+    assert!(
+        !script.contains("{{"),
+        "unresolved placeholder in install script"
+    );
+}
+
+#[tokio::test]
+async fn install_script_locks_down_config() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    assert!(script.contains("umask 077"));
+    assert!(script.contains("chmod 0700 \"$CONFIG_DIR\""));
+    assert!(script.contains("chmod 0600 \"$CONFIG_DIR/agentd.toml\""));
+}
+
+#[tokio::test]
+async fn install_script_registers_managed_service() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    // 装完必须交常驻托管（自启 + 崩溃拉起）；不传作用域旗标（系统级是 agentd 唯一且默认的作用域）。
+    // 注册与定义同一步完成，因此必须显式给出 bin / config-dir / 一次性 token。
+    assert!(script.contains("\"$BIN_DIR/wist-agentd\" service install \\"));
+    assert!(script.contains("--bin \"$BIN_DIR/wist-agentd\""));
+    assert!(script.contains("--config-dir \"$CONFIG_DIR\""));
+    assert!(script.contains("--enrollment-token \"$WIST_ENROLLMENT_TOKEN\""));
+    // --force 让重复执行等价于升级：换二进制后必须重建服务进程才会生效。
+    assert!(script.contains("--force"));
+    // 逃生口：只装二进制与配置、自行决定怎么跑。
+    assert!(script.contains("WIST_AGENTD_SERVICE"));
+}
+
+#[tokio::test]
+async fn install_script_supports_reinstall_replacing_the_certificate() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    // 重装模式默认关；页面在「重装」模式下导出 WIST_AGENTD_REINSTALL=1，自我提权时用
+    // `--reinstall` 参数回传（sudo 会清掉环境变量）。
+    assert!(script.contains("REINSTALL=\"${WIST_AGENTD_REINSTALL:-0}\""));
+    assert!(script.contains("--reinstall)"));
+    assert!(script.contains("sh \"$0\" --reinstall --enrollment-token \"$WIST_ENROLLMENT_TOKEN\""));
+
+    // 换证书那一步是 `enroll --force`（丢掉本地凭据 state + 客户端证书 + 续期台账，凭 token
+    // 重注册），而不是单纯重跑安装 —— 后者在已注册的机器上会被跳过，证书不会被换。
+    assert!(
+        script.contains("\"$BIN_DIR/wist-agentd\" enroll --force --config-dir \"$CONFIG_DIR\"")
+    );
+
+    // 换之前先停掉在跑的 agentd：否则它可能在新证书落盘之后又把旧状态写回去。
+    assert!(
+        script.contains("\"$BIN_DIR/wist-agentd\" service uninstall --config-dir \"$CONFIG_DIR\"")
+    );
+
+    // 装服务那一步在重装路径下不再带 token（身份已经就位）。
+    assert!(script.contains("service_install()"));
+    assert!(script.contains("if ! service_install >\"$TOOL_OUT\" 2>&1; then"));
+}
+
+/// `install.sh` 真跑一次的结果。
+#[cfg(unix)]
+struct HarnessRun {
+    root: std::path::PathBuf,
+    calls: Vec<String>,
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+#[cfg(unix)]
+impl HarnessRun {
+    /// agentd 收到的调用（去掉 `curl|` 下载与装完自检那一次 `version`）。
+    fn agentd_calls(&self) -> Vec<&str> {
+        self.calls
+            .iter()
+            .filter(|line| !line.starts_with("curl|") && line.as_str() != "version")
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// 装完有没有自检一次二进制能跑（`[2/4]` 末尾那次 `version`）。
+    fn ran_binary_smoke_test(&self) -> bool {
+        self.calls.iter().any(|line| line == "version")
+    }
+
+    fn expect_ok(&self, name: &str) {
+        assert!(
+            self.success,
+            "install.sh（{name}）应成功：\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.stdout, self.stderr
+        );
+        // 夹具自证：摘要必须真的被校验过。摘要为空时脚本会跳掉校验（少走一段真链路），
+        // 那会让用例的“跑通了”变得没意义。
+        assert!(
+            self.stdout.contains("sha256") && !self.stdout.contains("未设置校验摘要"),
+            "harness 夹具异常：安装包摘要没被校验：\n{}",
+            self.stdout
+        );
+    }
+
+    /// `$BIN_DIR` 里装了什么（拒绝的用例用它证明「一个字节都没写」）。
+    fn installed_binaries(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.root.join("bin"))
+            .expect("read bin dir")
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+/// 目标三元组 → 本机（`uname -s` / `uname -m`）该怎么回答。
+///
+/// 脚本第一步就核对平台（装错平台会把二进制换成跑不起来的那种），而用例渲染的是
+/// `TEST_PLATFORM` 的包 —— 开发机是 macOS、CI 是 Linux，所以 `uname` 必须用桩固定下来，
+/// 否则同一份用例换台机器跑法就不一样了。
+#[cfg(unix)]
+fn host_for(triple: &str) -> (&'static str, &'static str) {
+    if triple.contains("apple-darwin") {
+        ("Darwin", "arm64")
+    } else if triple.starts_with("x86_64") {
+        ("Linux", "x86_64")
+    } else {
+        ("Linux", "aarch64")
+    }
+}
+
+/// 跑一遍 `install.sh`（**真执行**），把脚本发出的调用按顺序记下来。
+///
+/// 做法：`curl` / `id` / `uname` 用桩替掉，「安装包」本身就是一段会记账的 agentd 桩 —— 装到
+/// `$BIN_DIR/wist-agentd` 之后它就把收到的参数追进 `CALLS_LOG`。于是这步**不联网、不装服务**，
+/// 只观察脚本真实发出的调用序列（`curl|…` 是下载，其余是 agentd 调用）。
+///
+/// 为什么不只断言脚本文本：「停服务在写完配置**之后**」「换证书不被跳过注册顺手跳过」
+/// 「平台不符时一个字节都不写」都是**行为**，文本顺序断言撞到注释里的同名词就会假失败/假通过。
+///
+/// `triple` 是**渲染用的包平台**，`host` 是**夹具假装的机器**：两者不一致就是「装错平台」那一幕。
+#[cfg(unix)]
+fn run_install_script_case(
+    env: &TestEnv,
+    name: &str,
+    triple: &str,
+    host: (&str, &str),
+    extra_env: &[(&str, &str)],
+) -> HarnessRun {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = env._root.join(format!("harness-{name}"));
+    for dir in ["conf", "bin", "stub"] {
+        std::fs::create_dir_all(root.join(dir)).expect("create harness dir");
+    }
+    let calls = root.join("calls.log");
+    std::fs::write(&calls, "").expect("init calls log");
+
+    let write_exec = |path: &std::path::Path, body: &str| {
+        std::fs::write(path, body).expect("write harness file");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x harness file");
+    };
+
+    // 「安装包」：装上去后就是 BIN_DIR/wist-agentd，负责记账。
+    let package = root.join("package-body");
+    write_exec(
+        &package,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALLS_LOG\"\n",
+    );
+
+    // 桩 curl：把 `-o` 的目标写出来（配置写个最小 toml，其余原样拷「安装包」），并记账。
+    write_exec(
+        &root.join("stub/curl"),
+        "#!/bin/sh\nprintf 'curl|%s\\n' \"$*\" >> \"$CALLS_LOG\"\nout=\"\"\n\
+         while [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o) out=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n\
+         [ -n \"$out\" ] || exit 0\n\
+         case \"$out\" in\n  *agentd.toml) printf 'schema_version = \"v1\"\\n' > \"$out\" ;;\n  *) cat \"$FAKE_PACKAGE\" > \"$out\" ;;\nesac\n",
+    );
+
+    // 桩 id：假装 root。否则脚本会去 sudo（CI 上非 root，会卡住/失败）。
+    write_exec(
+        &root.join("stub/id"),
+        "#!/bin/sh\nif [ \"${1:-}\" = \"-u\" ]; then printf '0\\n'; exit 0; fi\nexec /usr/bin/id \"$@\"\n",
+    );
+
+    // 桩 uname：把「本机是什么平台」固定下来（脚本第一步就据此核对包对不对得上）。
+    write_exec(
+        &root.join("stub/uname"),
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n  -s) printf '%s\\n' \"{}\" ;;\n  -m) printf '%s\\n' \"{}\" ;;\n  *) printf '%s\\n' \"{}\" ;;\nesac\n",
+            host.0, host.1, host.0
+        ),
+    );
+
+    // 桩 sysctl：脚本用 `hw.optional.arm64` 判硬件（避开 Rosetta 下 `uname -m` 报 x86_64）。
+    // 固定成夹具给的平台，否则这条用例的结果会跟跑测那台机器的真实硬件绑定。
+    write_exec(
+        &root.join("stub/sysctl"),
+        if host.1 == "arm64" {
+            "#!/bin/sh\nprintf '1\\n'\n"
+        } else {
+            "#!/bin/sh\nexit 1\n"
+        },
+    );
+
+    // 渲染并落盘 install.sh：摘要取这份「安装包」的真实 sha256，于是下载后的校验会真的通过。
+    let source = AgentPackageSource::from_local_file(
+        &env.config,
+        &env.config.public_base_url,
+        triple,
+        package.clone(),
+    )
+    .expect("local package source");
+    let script =
+        super::install::install_script(&env.config, triple, &source, &env.config.public_base_url);
+    let script_path = root.join("install.sh");
+    std::fs::write(&script_path, script).expect("write install script");
+
+    let path = std::env::var("PATH").expect("PATH");
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg(&script_path)
+        .env("PATH", format!("{}:{path}", root.join("stub").display()))
+        .env("WIST_AGENTD_HOME", root.join("conf"))
+        .env("WIST_AGENTD_BIN_DIR", root.join("bin"))
+        .env("WIST_ENROLLMENT_TOKEN", "tok-harness")
+        .env("CALLS_LOG", &calls)
+        .env("FAKE_PACKAGE", &package)
+        // 别让跑测试的那台机器的环境变量渗进来（否则本机设过 REINSTALL/SERVICE 就会串例）。
+        .env_remove("WIST_AGENTD_REINSTALL")
+        .env_remove("WIST_AGENTD_SERVICE");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+
+    let output = command.output().expect("run install.sh");
+
+    HarnessRun {
+        root,
+        calls: std::fs::read_to_string(&calls)
+            .expect("read calls log")
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn install_script_reinstall_swaps_the_certificate_in_the_right_order() {
+    let env = TestEnv::new().await;
+    let host = host_for(TEST_PLATFORM);
+    // 另一端平台（用来演「装错平台」）：本机假装是这个，包却是另一个。
+    let other_triple = if host.0 == "Darwin" {
+        "x86_64-unknown-linux-musl"
+    } else {
+        "aarch64-apple-darwin"
+    };
+    let at = |log: &[String], needle: &str| {
+        log.iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("调用序列里没有 {needle}：{log:?}"))
+    };
+
+    // ① 普通安装：装完自检一次，再一步注册（带 token），不碰本机已有身份。
+    let normal = run_install_script_case(&env, "normal", TEST_PLATFORM, host, &[]);
+    normal.expect_ok("normal");
+    assert!(
+        normal.ran_binary_smoke_test(),
+        "装完必须先自检二进制能跑：{:?}",
+        normal.calls
+    );
+    let calls = normal.agentd_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "普通安装只应调 agentd 一次：{:?}",
+        normal.calls
+    );
+    assert!(calls[0].starts_with("service install "), "{:?}", calls[0]);
+    assert!(
+        calls[0].contains("--enrollment-token tok-harness"),
+        "{:?}",
+        calls[0]
+    );
+    assert!(calls[0].contains("--force"), "{:?}", calls[0]);
+
+    // ② 重装：**先停旧服务 → 再 enroll --force 换证书 → 最后装服务**（这一步不再带 token）。
+    let reinstall = run_install_script_case(
+        &env,
+        "reinstall",
+        TEST_PLATFORM,
+        host,
+        &[("WIST_AGENTD_REINSTALL", "1")],
+    );
+    reinstall.expect_ok("reinstall");
+    let calls = reinstall.agentd_calls();
+    assert_eq!(
+        calls.len(),
+        3,
+        "重装应停一次、换一次、装一次：{:?}",
+        reinstall.calls
+    );
+    assert!(calls[0].starts_with("service uninstall "), "{:?}", calls[0]);
+    assert!(calls[1].starts_with("enroll --force "), "{:?}", calls[1]);
+    assert!(calls[1].contains("--token tok-harness"), "{:?}", calls[1]);
+    assert!(calls[2].starts_with("service install "), "{:?}", calls[2]);
+    assert!(
+        !calls[2].contains("--enrollment-token"),
+        "身份已就位，装服务不该再带 token：{:?}",
+        calls[2]
+    );
+    // 停服务必须发生在**写完配置之后**：[1/4]~[3/4] 失败时机器上在跑的 agentd 不受影响，
+    // 停服务只落在「不可回头」那一点。
+    assert!(
+        at(&reinstall.calls, "initial-config") < at(&reinstall.calls, "service uninstall"),
+        "先写配置、后停服务：{:?}",
+        reinstall.calls
+    );
+
+    // ③ 重装 + 跳过服务注册：证书**照样换**（换证书不该被 `WIST_AGENTD_SERVICE=0` 顺手跳过）。
+    let skipped = run_install_script_case(
+        &env,
+        "reinstall-no-service",
+        TEST_PLATFORM,
+        host,
+        &[("WIST_AGENTD_REINSTALL", "1"), ("WIST_AGENTD_SERVICE", "0")],
+    );
+    skipped.expect_ok("reinstall-no-service");
+    let calls = skipped.agentd_calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "跳过注册只该少一次 service install：{:?}",
+        skipped.calls
+    );
+    assert!(calls[0].starts_with("service uninstall "), "{:?}", calls[0]);
+    assert!(
+        calls[1].starts_with("enroll --force "),
+        "跳过注册也必须换证书：{:?}",
+        skipped.calls
+    );
+
+    // ④ 平台不符：包与机器对不上时必须**就地拒绝** —— 不下包、不装二进制、不动服务，一个字节都不写。
+    //    两个方向都钉：
+    //      a) 机器是另一端（包与 `TEST_PLATFORM` 一致）；
+    //      b) 包的平台是另一端、机器是本机 —— **现场那一幕**：Linux 的 ELF 往 macOS 上装。
+    for (name, triple, wrong_host) in [
+        ("wrong-host", TEST_PLATFORM, opposite_host(host)),
+        ("wrong-package", other_triple, host),
+    ] {
+        let refused = run_install_script_case(&env, name, triple, wrong_host, &[]);
+        assert!(
+            !refused.success,
+            "{name}：平台不符必须拒绝（退出码非 0）：{}",
+            refused.stderr
+        );
+        assert!(
+            refused.calls.is_empty(),
+            "{name}：拒绝时不该有任何动作（含下载）：{:?}",
+            refused.calls
+        );
+        assert!(
+            refused.installed_binaries().is_empty(),
+            "{name}：拒绝时不该写 $BIN_DIR：{:?}",
+            refused.installed_binaries()
+        );
+        assert!(
+            refused.stderr.contains("已中止"),
+            "{name}：要说清为什么拒绝：{}",
+            refused.stderr
+        );
+    }
+}
+
+/// 另一端的平台（macOS ↔ Linux），用来演「装错平台」。
+#[cfg(unix)]
+fn opposite_host(host: (&str, &str)) -> (&'static str, &'static str) {
+    if host.0 == "Darwin" {
+        ("Linux", "x86_64")
+    } else {
+        ("Darwin", "arm64")
+    }
+}
+
+#[tokio::test]
+async fn install_script_reports_numbered_steps() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    // 输出要能一眼看出「现在在哪一步、卡在哪一步」，而不是一堆并列的 key=value：
+    // 脚本自己的步骤行带序号，外部工具的输出统一缩进到步骤下面。
+    for stage in ["[1/4]", "[2/4]", "[3/4]", "[4/4]"] {
+        assert!(
+            script.contains(&format!("step \"{stage}")),
+            "missing {stage}"
+        );
+    }
+    assert!(script.contains("indent_tool_output <\"$1\""));
+    assert!(script.contains("show_tool_output \"$TOOL_OUT\""));
+    assert!(script.contains("安装完成：wist-agentd 已交给"));
+    // 颜色只在交互终端上生效，重定向到日志 / CM 时必须是纯文本。
+    assert!(script.contains("if [ -t 1 ]"));
+}
+
+#[tokio::test]
+async fn install_script_braces_variables_before_cjk() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    // macOS 的 sh 会把紧跟在 `$VAR` 后面的多字节字符吃进变量名（`$X，` 找的是变量 `X，`，
+    // 报 unbound variable），而脚本里中文输出很多，极易踩到；紧邻非 ASCII 时必须写 `${X}`。
+    let bytes = script.as_bytes();
+    let mut offenders = Vec::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'$' || bytes.get(index + 1) == Some(&b'{') {
+            continue;
+        }
+        let mut end = index + 1;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end > index + 1 && bytes.get(end).is_some_and(|next| !next.is_ascii()) {
+            offenders.push(String::from_utf8_lossy(&bytes[index..end]).into_owned());
+        }
+    }
+    assert!(offenders.is_empty(), "needs braces: {offenders:?}");
+}
+
+#[tokio::test]
+async fn local_package_requires_readable_file() {
+    let env = TestEnv::new().await;
+    let package_path = env.package_file.clone();
     std::fs::remove_file(&package_path).expect("remove package");
 
-    let err = super::install::install_script(&env.config, "x86").expect_err("unreadable package");
+    // 从本地文件构造来源需要读制品算摘要；制品不在就必须显式失败，
+    // 而不是把空摘要发下去（那会让安装端跳过校验）。
+    let err = AgentPackageSource::from_local_file(
+        &env.config,
+        &env.config.public_base_url,
+        TEST_PLATFORM,
+        package_path,
+    )
+    .expect_err("unreadable package");
 
     assert!(!err.is_empty());
 }
 
-#[test]
-fn install_command_verifies_script_signature_before_execution() {
-    let env = TestEnv::new();
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(900);
-    let install_code =
-        agent_install_code(&env.config, "token-a", expires_at).expect("install code");
-    let command = install_code.x86_linux_install_code;
-
-    assert!(command.contains("mktemp -d"));
-    assert!(command.contains("working dir: $D"));
-    assert!(command.contains(
-        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/x86/install.sh.sig\" -o \"$D/sig\""
-    ));
-    assert!(command.contains(&env.config.install_script_signing_public_key_pem));
-    assert!(command.contains(
-        "openssl pkeyutl -verify -pubin -inkey \"$D/key.pem\" -rawin -in \"$D/s\" -sigfile \"$D/sig\""
-    ));
-    assert!(command.contains("sh \"$D/s\""));
-    assert!(!command.contains("| sh"));
-    assert!(!command.contains("token-a"));
-}
-
-#[test]
-fn install_script_signature_matches_script_body() {
-    let env = TestEnv::new();
-    let script = super::install::install_script(&env.config, "x86").expect("install script");
-    let signature =
-        super::install::install_script_signature(&env.config, "x86").expect("sign script");
-
-    signature::UnparsedPublicKey::new(&signature::ED25519, &env.install_public_key_bytes)
-        .verify(script.as_bytes(), &signature)
-        .expect("signature verifies");
-}
-
-#[test]
-fn install_script_signature_rejects_modified_script_body() {
-    let env = TestEnv::new();
-    let signature =
-        super::install::install_script_signature(&env.config, "x86").expect("sign script");
-
-    let err = signature::UnparsedPublicKey::new(&signature::ED25519, &env.install_public_key_bytes)
-        .verify(b"tampered install script", &signature)
-        .expect_err("tampered script rejected");
-
-    assert_eq!(format!("{err:?}"), "Unspecified");
-}
-
-#[test]
-fn initial_config_is_valid_agent_config_contract_with_scoped_token() {
-    let env = TestEnv::new();
-    let text = agent_initial_config_toml(&env.config, "install-token-a");
-    let parsed: wist_contracts::agent_config::AgentConfig =
-        toml::from_str(&text).expect("valid agent config toml");
-
-    assert_eq!(parsed.schema_version, "v1");
-    assert_eq!(parsed.agent.environment_id.as_deref(), Some("env-default"));
-    assert!(parsed.control_plane.enabled);
+#[tokio::test]
+async fn initial_config_matches_agent_config_contract() {
+    let env = TestEnv::new().await;
+    let text = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        None,
+        &env.config.public_base_url,
+    );
+    // 只做**结构化**断言（`toml::Value`），不引 agentd 的配置契约类型 —— 契约一致性由 agentd
+    // 自己解析校验；网关只保证它生成的 TOML 键值符合约定。
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    assert_eq!(parsed["schema_version"].as_str(), Some("v1"));
     assert_eq!(
-        parsed.control_plane.endpoint.as_deref(),
+        parsed["agent"]["environment_id"].as_str(),
+        Some("env-default")
+    );
+    assert_eq!(parsed["control_plane"]["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        parsed["control_plane"]["endpoint"].as_str(),
         Some("https://127.0.0.1:3000")
     );
     assert_eq!(
-        parsed.control_plane.enrollment_token.as_deref(),
+        parsed["control_plane"]["enrollment_token"].as_str(),
         Some("install-token-a")
     );
     assert_eq!(
-        parsed.control_plane.credential_request.as_deref(),
-        Some("bearer")
+        parsed["control_plane"]["credential_request"].as_str(),
+        Some("csr")
     );
     assert_eq!(
-        parsed.control_plane.trust_bundle.as_deref(),
+        parsed["control_plane"]["trust_bundle"].as_str(),
         Some("internal-ca-stub")
     );
-    assert_eq!(parsed.paths.root_dir, "..");
+    // 模板不声明 [paths] / [telemetry.logs.output.file]：布局由 agentd 按配置目录推导，
+    // 系统级（/etc/wist-agentd）才能落到 /var/lib/wist-agentd 与 /var/log/wist-agentd。
+    // 一旦在此声明（即使值等于默认），agentd 就不再填默认值，系统级安装会退回配置目录下。
+    // 只看真正的 section 头，模板注释里会提到这些名字。
+    let has_section = |name: &str| text.lines().any(|line| line.trim() == name);
+    assert!(!has_section("[paths]"));
+    assert!(!has_section("[telemetry.logs.output.file]"));
+    // 未声明 [paths] → 该键不该出现（布局留给 agentd 推导）。
+    assert!(parsed.get("paths").is_none());
 }
 
-#[test]
-fn initial_config_includes_unique_instance_name_per_token() {
-    let env = TestEnv::new();
-    let first = agent_initial_config_toml(&env.config, "install-token-a");
-    let second = agent_initial_config_toml(&env.config, "install-token-b");
+/// 新装 Agent 拿到初始配置时就有上送目标（同一域名 + 数据面端口），**不必先有人录入地址**；
+/// 但默认仍待命（`enabled = false`）——派活后控制面才在 `uplink:poll` 上下发启用。
+#[tokio::test]
+async fn initial_config_route_records_the_derived_uplink_target() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let response = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/agent/initial-config")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = decode_text_response(response).await;
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    let output = &parsed["telemetry"]["logs"]["output"];
+    assert_eq!(output["kind"].as_str(), Some("tcp"));
+    assert_eq!(output["tcp"]["addr"].as_str(), Some("127.0.0.1"));
+    assert_eq!(
+        output["tcp"]["port"].as_integer(),
+        Some(DEFAULT_AGENT_UPLINK_PORT as i64)
+    );
+    assert_eq!(output["enabled"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn initial_config_without_uplink_keeps_local_only_output() {
+    let env = TestEnv::new().await;
+    let text = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        None,
+        &env.config.public_base_url,
+    );
+
+    // 待命：enabled = false（不是靠 kind）。没有上送地址就没有目标，用 kind = "file" 表示。
+    // `enabled = false` 下事实帧不会被上送，所以也不会再产生 fact summary uplink failed 噪声。
+    assert!(text.contains("kind = \"file\""));
+    assert!(text.contains("enabled = false"));
+    assert!(!text.contains("file_inputs_file"));
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    let output = &parsed["telemetry"]["logs"]["output"];
+    assert_eq!(output["enabled"].as_bool(), Some(false));
+    assert_eq!(output["kind"].as_str(), Some("file"));
+    // 未声明 file_inputs / file_inputs_file → 不该出现。
+    assert!(parsed["telemetry"]["logs"].get("file_inputs").is_none());
+    assert!(
+        parsed["telemetry"]["logs"]
+            .get("file_inputs_file")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn initial_config_records_uplink_target_stays_idle() {
+    let env = TestEnv::new().await;
+    let uplink = StoredAgentUplinkAddress {
+        setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
+        host: "10.0.1.9".to_string(),
+        port: 9100,
+        enabled: false,
+        updated_by: "ops".to_string(),
+        updated_at: "2026-09-21T00:00:00+00:00".to_string(),
+    };
+    let text = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        Some(&uplink),
+        &env.config.public_base_url,
+    );
+
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    let output = &parsed["telemetry"]["logs"]["output"];
+    // 上送目标记录下来（kind = tcp）...
+    assert_eq!(output["tcp"]["addr"].as_str(), Some("10.0.1.9"));
+    assert_eq!(output["tcp"]["port"].as_integer(), Some(9100));
+    assert_eq!(output["tcp"]["framing"].as_str(), Some("line"));
+    assert_eq!(output["kind"].as_str(), Some("tcp"));
+    // ...但 enabled = false：设了地址也不等于开始干活。
+    assert_eq!(output["enabled"].as_bool(), Some(false));
+    assert!(parsed["telemetry"]["logs"].get("file_inputs").is_none());
+    assert!(
+        parsed["telemetry"]["logs"]
+            .get("file_inputs_file")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn initial_config_derives_instance_name_from_token() {
+    let env = TestEnv::new().await;
+    let first = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        None,
+        &env.config.public_base_url,
+    );
+    let second = agent_initial_config_toml(
+        &env.config,
+        "install-token-b",
+        None,
+        &env.config.public_base_url,
+    );
 
     let extract = |text: &str| {
         text.lines()
@@ -280,35 +1370,44 @@ fn initial_config_includes_unique_instance_name_per_token() {
     assert_ne!(first_name, second_name);
 }
 
-#[test]
-fn initial_config_preserves_multiline_trust_bundle_as_valid_toml() {
-    let mut env = TestEnv::new();
+#[tokio::test]
+async fn initial_config_preserves_multiline_trust_bundle() {
+    let mut env = TestEnv::new().await;
     let trust_bundle =
         "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n".to_string();
     env.config.trust_bundle = trust_bundle.clone();
 
-    let text = agent_initial_config_toml(&env.config, "install-token-a");
+    let text = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        None,
+        &env.config.public_base_url,
+    );
     let trust_bundle_line = text
         .lines()
         .find(|line| line.starts_with("trust_bundle = "))
         .expect("trust_bundle line");
     assert!(trust_bundle_line.contains("\\n"));
 
-    let parsed: wist_contracts::agent_config::AgentConfig =
-        toml::from_str(&text).expect("valid agent config toml");
-    assert_eq!(parsed.control_plane.trust_bundle, Some(trust_bundle));
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    assert_eq!(
+        parsed["control_plane"]["trust_bundle"].as_str(),
+        Some(trust_bundle.as_str())
+    );
 }
 
-#[test]
-fn enrollment_accepts_valid_token_and_issues_identity() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
+#[tokio::test]
+async fn enrollment_accepts_valid_token_and_issues_identity() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
     let result = agent_enrollment_result(
         &env.config,
-        &env.store,
+        &env.store_handle,
+        Some(&env_agent_ca(&env)),
         enrollment_request(&token),
         "v0.1.0",
-    );
+    )
+    .await;
 
     assert_eq!(result.status, EnrollmentStatus::Accepted);
     assert_eq!(result.agent_id.as_deref(), Some("agent-node-a"));
@@ -319,25 +1418,22 @@ fn enrollment_accepts_valid_token_and_issues_identity() {
     assert_eq!(identity.tenant_id, "tenant-default");
     assert_eq!(identity.status, AgentIdentityStatus::Active);
     let credential = result.credential_bundle.expect("credential bundle");
-    assert_eq!(credential.auth_scheme.as_deref(), Some("bearer"));
-    assert!(
-        credential
-            .bearer_token
-            .as_deref()
-            .is_some_and(|token| token.starts_with("wic_"))
-    );
+    // mTLS 是唯一凭据路径：注册必须换回一张客户端证书。
+    assert!(credential.certificate.contains("BEGIN CERTIFICATE"));
     assert!(credential.not_after.is_some());
 }
 
-#[test]
-fn enrollment_rejects_invalid_token_without_identity() {
-    let env = TestEnv::new();
+#[tokio::test]
+async fn enrollment_rejects_invalid_token_without_identity() {
+    let env = TestEnv::new().await;
     let result = agent_enrollment_result(
         &env.config,
-        &env.store,
+        &env.store_handle,
+        None,
         enrollment_request("bad-token"),
         "v0.1.0",
-    );
+    )
+    .await;
 
     assert_eq!(result.status, EnrollmentStatus::Rejected);
     assert_eq!(
@@ -348,16 +1444,17 @@ fn enrollment_rejects_invalid_token_without_identity() {
     assert!(result.issued_identity.is_none());
 }
 
-#[test]
-fn enrollment_rejects_invalid_token_before_generating_credential() {
-    let env = TestEnv::new();
-    let result = agent_enrollment_result_with_token_issuer(
+#[tokio::test]
+async fn enrollment_rejects_invalid_token_before_generating_credential() {
+    let env = TestEnv::new().await;
+    let result = agent_enrollment_result(
         &env.config,
-        &env.store,
+        &env.store_handle,
+        Some(&env_agent_ca(&env)),
         enrollment_request("bad-token"),
         "v0.1.0",
-        |_| panic!("credential generation must not run for an invalid token"),
-    );
+    )
+    .await;
 
     assert_eq!(result.status, EnrollmentStatus::Rejected);
     assert_eq!(
@@ -367,78 +1464,98 @@ fn enrollment_rejects_invalid_token_before_generating_credential() {
     assert!(result.credential_bundle.is_none());
 }
 
-#[test]
-fn enrollment_rolls_back_token_reservation_when_credential_generation_fails() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    let result = agent_enrollment_result_with_token_issuer(
+#[tokio::test]
+async fn enrollment_rolls_back_reservation_on_credential_failure() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    // 预留成功后才失败的时刻：CSR 坏了 → 签不出证书 → 拒绝，并回滚 token 预留。
+    let mut request = enrollment_request(&token);
+    request.certificate_signing_request = "not a csr".to_string();
+    let result = agent_enrollment_result(
         &env.config,
-        &env.store,
-        enrollment_request(&token),
+        &env.store_handle,
+        Some(&env_agent_ca(&env)),
+        request,
         "v0.1.0",
-        |_| Err("injected_random_failure".to_string()),
-    );
+    )
+    .await;
 
     assert_eq!(result.status, EnrollmentStatus::Rejected);
-    assert_eq!(
-        result.reason_code.as_deref(),
-        Some("injected_random_failure")
+    assert!(
+        result
+            .reason_code
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("invalid_certificate_signing_request"),
+        "{:?}",
+        result.reason_code
     );
-    validate_bootstrap_token_for_config(&env.config, &env.store, &token).expect("token active");
-    let snapshot = env.store.load().expect("store load");
-    let stored = snapshot
-        .enrollment_tokens
-        .get(&token_hash(&token))
+    validate_bootstrap_token_for_config(&env.config, &env.store_handle, &token)
+        .await
+        .expect("token active");
+    let stored = env
+        .store
+        .get_enrollment_token(&token_hash(&token))
+        .await
+        .expect("store read")
         .expect("stored enrollment token");
     assert_eq!(stored.used_count, 0);
     assert_eq!(stored.status, StoredEnrollmentTokenStatus::Active);
 }
 
-#[test]
-fn bootstrap_token_validation_recovers_expired_reservation() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    env.store
-        .update(|snapshot| {
-            let stored = snapshot
-                .enrollment_tokens
-                .get_mut(&token_hash(&token))
-                .expect("stored token");
-            stored.used_count = 1;
-            stored.status = StoredEnrollmentTokenStatus::Reserved;
-            stored.reserved_at =
-                Some((chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339());
-        })
-        .expect("reserve token");
+#[tokio::test]
+async fn bootstrap_token_validation_recovers_expired_reservation() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let token_hash = token_hash(&token);
+    // Test-only seam: the public Store API intentionally never exposes raw writes
+    // to token internals, so a stale reservation is forced directly via SQL.
+    let reserved_at = (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+    sqlx::query(
+        "UPDATE enrollment_tokens SET status = 'reserved', used_count = 1, reserved_at = ?1 \
+         WHERE token_hash = ?2",
+    )
+    .bind(&reserved_at)
+    .bind(&token_hash)
+    .execute(env.store.pool())
+    .await
+    .expect("seed stale reservation");
 
-    validate_bootstrap_token_for_config(&env.config, &env.store, &token).expect("token recovered");
+    validate_bootstrap_token_for_config(&env.config, &env.store_handle, &token)
+        .await
+        .expect("token recovered");
 
-    let snapshot = env.store.load().expect("store load");
-    let stored = snapshot
-        .enrollment_tokens
-        .get(&token_hash(&token))
+    let stored = env
+        .store
+        .get_enrollment_token(&token_hash)
+        .await
+        .expect("store read")
         .expect("stored token");
     assert_eq!(stored.used_count, 0);
     assert_eq!(stored.status, StoredEnrollmentTokenStatus::Active);
     assert!(stored.reserved_at.is_none());
 }
 
-#[test]
-fn enrollment_consumes_token_and_rejects_replay() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
+#[tokio::test]
+async fn enrollment_consumes_token_and_rejects_replay() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
     let first = agent_enrollment_result(
         &env.config,
-        &env.store,
+        &env.store_handle,
+        Some(&env_agent_ca(&env)),
         enrollment_request(&token),
         "v0.1.0",
-    );
+    )
+    .await;
     let second = agent_enrollment_result(
         &env.config,
-        &env.store,
+        &env.store_handle,
+        Some(&env_agent_ca(&env)),
         enrollment_request(&token),
         "v0.1.0",
-    );
+    )
+    .await;
 
     assert_eq!(first.status, EnrollmentStatus::Accepted);
     assert_eq!(second.status, EnrollmentStatus::Rejected);
@@ -448,23 +1565,27 @@ fn enrollment_consumes_token_and_rejects_replay() {
     );
 }
 
-#[test]
-fn enrollment_rejects_duplicate_agent_registration_without_consuming_token() {
-    let env = TestEnv::new();
-    let first_token = env.issue_token();
-    let second_token = env.issue_token();
+#[tokio::test]
+async fn enrollment_rejects_duplicate_agent_without_consuming_token() {
+    let env = TestEnv::new().await;
+    let first_token = env.issue_token().await;
+    let second_token = env.issue_token().await;
     let first = agent_enrollment_result(
         &env.config,
-        &env.store,
+        &env.store_handle,
+        Some(&env_agent_ca(&env)),
         enrollment_request(&first_token),
         "v0.1.0",
-    );
+    )
+    .await;
     let duplicate = agent_enrollment_result(
         &env.config,
-        &env.store,
+        &env.store_handle,
+        Some(&env_agent_ca(&env)),
         enrollment_request(&second_token),
         "v0.1.0",
-    );
+    )
+    .await;
 
     assert_eq!(first.status, EnrollmentStatus::Accepted);
     assert_eq!(duplicate.status, EnrollmentStatus::Rejected);
@@ -472,35 +1593,45 @@ fn enrollment_rejects_duplicate_agent_registration_without_consuming_token() {
         duplicate.reason_code.as_deref(),
         Some("duplicate_agent_registration")
     );
-    validate_bootstrap_token_for_config(&env.config, &env.store, &second_token)
+    validate_bootstrap_token_for_config(&env.config, &env.store_handle, &second_token)
+        .await
         .expect("duplicate registration does not consume token");
 }
 
-#[test]
-fn enrollment_ignores_unknown_node_id_when_issuing_identity() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
+#[tokio::test]
+async fn enrollment_ignores_unknown_node_id() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
     let mut request = enrollment_request(&token);
     request.host_profile.node_id = "unknown".to_string();
     request.host_profile.hostname = "host-a".to_string();
 
-    let result = agent_enrollment_result(&env.config, &env.store, request, "v0.1.0");
+    let result = agent_enrollment_result(
+        &env.config,
+        &env.store_handle,
+        Some(&env_agent_ca(&env)),
+        request,
+        "v0.1.0",
+    )
+    .await;
 
     assert_eq!(result.agent_id.as_deref(), Some("agent-host-a"));
     assert_eq!(result.instance_id.as_deref(), Some("host-a"));
 }
 
-#[test]
-fn enrollment_response_uses_contract_wire_status() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
+#[tokio::test]
+async fn enrollment_response_uses_contract_wire_status() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
     let returned = EnrollmentEnvelope {
         result: agent_enrollment_result(
             &env.config,
-            &env.store,
+            &env.store_handle,
+            Some(&env_agent_ca(&env)),
             enrollment_request(&token),
             "v0.1.0",
-        ),
+        )
+        .await,
     };
     let encoded = serde_json::to_string(&returned).expect("encode");
 
@@ -510,8 +1641,8 @@ fn enrollment_response_uses_contract_wire_status() {
 
 #[tokio::test]
 async fn enrollment_handler_returns_created_contract_response() {
-    let state = test_state();
-    let token = issue_token_for_state(&state);
+    let state = test_state().await;
+    let token = issue_token_for_state(&state).await;
     let response = enroll_agent(
         State(state),
         super::rate_limit::OptionalConnectInfo(None),
@@ -529,9 +1660,14 @@ async fn enrollment_handler_returns_created_contract_response() {
 
 #[tokio::test]
 async fn enrollment_route_accepts_valid_contract_request() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    let response = post_enrollment_to_router(&env.config, enrollment_request_json(&token)).await;
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let response = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&token),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::CREATED);
     let returned = decode_enrollment_response(response).await;
@@ -539,58 +1675,68 @@ async fn enrollment_route_accepts_valid_contract_request() {
     assert_eq!(returned.result.agent_id.as_deref(), Some("agent-node-a"));
     assert_eq!(returned.result.instance_id.as_deref(), Some("node-a"));
     assert!(returned.result.issued_identity.is_some());
-    assert!(
-        returned
-            .result
-            .credential_bundle
-            .as_ref()
-            .and_then(|credential| credential.bearer_token.as_deref())
-            .is_some_and(|token| token.starts_with("wic_"))
-    );
+    let bundle = returned
+        .result
+        .credential_bundle
+        .expect("credential bundle");
+    // mTLS 是唯一凭据路径：回包里必须是一张客户端证书。
+    assert!(bundle.certificate.contains("BEGIN CERTIFICATE"));
 }
 
 #[tokio::test]
-async fn agent_status_route_requires_bearer_credential() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    let enrollment = post_enrollment_to_router(&env.config, enrollment_request_json(&token)).await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
+async fn agent_status_route_requires_a_client_certificate() {
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
 
-    let accepted = post_json_to_router(
+    let accepted = post_agent_json_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/status",
-        Some(&credential),
+        Some(&agent_id),
         &AgentStatusReport {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
             memory_bytes: None,
             cpu_percent: None,
+            cpu_cores: None,
             admin_latency_ms: None,
+            discovery_policy_version: None,
             work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+            certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
 
-    let rejected = post_json_to_router(
+    let rejected = post_agent_json_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/status",
         None,
         &AgentStatusReport {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
             memory_bytes: None,
             cpu_percent: None,
+            cpu_cores: None,
             admin_latency_ms: None,
+            discovery_policy_version: None,
             work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+            certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
@@ -599,78 +1745,2728 @@ async fn agent_status_route_requires_bearer_credential() {
 
 #[tokio::test]
 async fn agent_status_route_persists_reported_metrics() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    let enrollment = post_enrollment_to_router(&env.config, enrollment_request_json(&token)).await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
 
-    let status = post_json_to_router(
+    let status = post_agent_json_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/status",
-        Some(&credential),
+        Some(&agent_id),
         &AgentStatusReport {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
             memory_bytes: Some(12_345_678),
             cpu_percent: Some(7.5),
+            cpu_cores: Some(4),
             admin_latency_ms: Some(42),
+            discovery_policy_version: None,
             work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+            certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
     assert_eq!(status.status(), StatusCode::ACCEPTED);
 
-    let snapshot = env.store.load().expect("load store");
-    let stored = snapshot.agents.get("agent-node-a").expect("agent");
+    let stored = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("agent");
     assert_eq!(stored.last_memory_bytes, Some(12_345_678));
     assert_eq!(stored.last_cpu_percent, Some(7.5));
+    assert_eq!(stored.last_cpu_cores, Some(4));
     assert_eq!(stored.last_admin_latency_ms, Some(42));
+}
+
+/// 发一次带 CPU 字段的状态上报（只关心 `cpu_percent` / `cpu_cores`）。
+async fn post_agent_status_cpu(
+    env: &TestEnv,
+    agent_id: &str,
+    cpu_percent: Option<f64>,
+    cpu_cores: Option<u32>,
+) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(agent_id),
+        &AgentStatusReport {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            machine_profile: None,
+            agent_id: "agent-node-a".to_string(),
+            instance_id: "node-a".to_string(),
+            version: "v0.2.0".to_string(),
+            memory_bytes: None,
+            cpu_percent,
+            cpu_cores,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+            certificate_status: None,
+            command_acks: Vec::new(),
+        },
+    )
+    .await
+}
+
+/// GET 管理面 Agent 列表（已带 admin token）。
+async fn admin_agent_list(env: &TestEnv) -> serde_json::Value {
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+#[tokio::test]
+async fn admin_agent_list_derives_machine_cpu_percent_from_cores() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_at_node(&env, "node-a").await;
+
+    // 单核口径 50% ÷ 4 核 = 整机 12.5%。
+    let accepted = post_agent_status_cpu(&env, &credential, Some(50.0), Some(4)).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let body = admin_agent_list(&env).await;
+    assert_eq!(body["agents"][0]["cpu_percent"], 50.0);
+    assert_eq!(body["agents"][0]["cpu_cores"], 4);
+    assert_eq!(body["agents"][0]["cpu_percent_of_machine"], 12.5);
+
+    // 老版本 agentd 没报核数（None）→ 算不出，返回 null，而不是 0。
+    let accepted = post_agent_status_cpu(&env, &credential, Some(50.0), None).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let body = admin_agent_list(&env).await;
+    assert!(body["agents"][0]["cpu_cores"].is_null());
+    assert!(body["agents"][0]["cpu_percent_of_machine"].is_null());
+
+    // 核数为 0（非法）→ 不除零，同样返回 null。
+    let accepted = post_agent_status_cpu(&env, &credential, Some(50.0), Some(0)).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let body = admin_agent_list(&env).await;
+    assert_eq!(body["agents"][0]["cpu_cores"], 0);
+    assert!(body["agents"][0]["cpu_percent_of_machine"].is_null());
+}
+
+// ── 事实上报（摘要）与用途推断 ──────────────────────────────────────────
+
+/// 精简规则表：只留推得动最小闭环的几条（完整策展数据在 jumo 模型仓）。
+const TEST_PURPOSE_RULES: &str = r#"
+purpose_version = 1
+[[rule_set]]
+rule_set_id = "macos-v1"
+platform = "macos"
+baseline_class = "MacDaily"
+weak_score = 20
+
+[[rule_set.rules]]
+rule_id = "mac-dev-xcodebuild"
+kind = "process"
+pattern = "xcodebuild"
+machine_class = "MacDev"
+weight = 40
+
+[[rule_set.rules]]
+rule_id = "mac-dev-homebrew-arm"
+kind = "process_path"
+pattern = "/opt/homebrew"
+machine_class = "MacDev"
+weight = 30
+"#;
+
+/// 报文骨架（`content_digest` 先空着，由调用方填）。
+///
+/// 注意它造的是**声明**：网关会用 `wist_contracts::fact_summary` 自己重算一份，
+/// 声明不一致只记告警，不影响判重。
+fn raw_fact_report(processes: &[&str]) -> ReportAgentFactSummary {
+    ReportAgentFactSummary::new_agent_facts(
+        "report-1".to_string(),
+        "agent-node-a".to_string(),
+        "node-a".to_string(),
+        String::new(),
+        7,
+        "2026-09-22T00:00:00Z".to_string(),
+        "macos".to_string(),
+        "arm64".to_string(),
+        processes.len() as i64,
+        processes.iter().map(|value| value.to_string()).collect(),
+        Vec::new(),
+        Vec::new(),
+        "2026-09-22T00:00:01Z".to_string(),
+    )
+}
+
+/// 网关会算出的内容摘要（与生产代码同一实现）。
+fn digest_of(report: &ReportAgentFactSummary) -> String {
+    FactContent::new(
+        report.os.clone(),
+        report.arch.clone(),
+        report.process_executables.clone(),
+        report.packages.clone(),
+        report.listen_ports.clone(),
+        report.probed_paths.clone(),
+        report.present_paths.clone(),
+    )
+    .content_digest()
+}
+
+/// 一份「声明正确」的报文：`content_digest` 与网关自算一致。
+fn fact_report(processes: &[&str]) -> ReportAgentFactSummary {
+    let mut report = raw_fact_report(processes);
+    report.content_digest = digest_of(&report);
+    report
+}
+
+/// 指定 agent / 平台的「声明正确」事实报文（多平台机队用例用）。
+fn fact_report_for(
+    agent_id: &str,
+    node_id: &str,
+    os: &str,
+    arch: &str,
+    processes: &[&str],
+) -> ReportAgentFactSummary {
+    let mut report = ReportAgentFactSummary::new_agent_facts(
+        "report-1".to_string(),
+        agent_id.to_string(),
+        node_id.to_string(),
+        String::new(),
+        7,
+        "2026-09-22T00:00:00Z".to_string(),
+        os.to_string(),
+        arch.to_string(),
+        processes.len() as i64,
+        processes.iter().map(|value| value.to_string()).collect(),
+        Vec::new(),
+        Vec::new(),
+        "2026-09-22T00:00:01Z".to_string(),
+    );
+    report.content_digest = digest_of(&report);
+    report
+}
+
+/// 一份「声明被写错」的报文：用来验证判重不看声明。
+fn fact_report_declaring(processes: &[&str], declared: &str) -> ReportAgentFactSummary {
+    let mut report = raw_fact_report(processes);
+    report.content_digest = declared.to_string();
+    report
+}
+
+/// 一份带发现展示字段的报文（主机标识 / 主机名 / 网卡地址）。
+///
+/// 展示字段不进内容摘要，所以摘要仍按内容字段算 —— 这正是要锁住的前提。
+fn fact_report_with_display(
+    processes: &[&str],
+    host_id: &str,
+    host_name: &str,
+    network_addresses: &[&str],
+) -> ReportAgentFactSummary {
+    fact_report(processes).with_display(
+        host_id.to_string(),
+        host_name.to_string(),
+        network_addresses
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+    )
+}
+
+/// 注册一个 Agent 并拿回 bearer 凭据（事实上报路径要它）。
+async fn enroll_agent_credential(env: &TestEnv) -> String {
+    let token = env.issue_token().await;
+    let enrollment = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&token),
+    )
+    .await;
+    // 返回的是 **agent_id**（不是 bearer token）：agent 侧现在**只有证书**这一条凭据路径，
+    // 测试里就用它当「握手期注入的证书身份」（`post_agent_json_to_router`）。
+    decode_enrollment_response(enrollment)
+        .await
+        .result
+        .agent_id
+        .expect("agent id")
+}
+
+/// 把一份摘要当作**数据面转发来的记录**投给网关（这是事实唯一的入口）。
+///
+/// 控制面那条直报路由已删（`POST /api/v1/agent/facts`，见 doc/design/center/
+/// agent-work-delivery-plan.md §4.1）。
+/// 注意：本函数**不消费凭据** —— 数据面这条路没有身份校验（挂起中，见 §8 #17）。
+/// 测试里仍需要先把 agent 注册进登记表（`enroll_agent_credential`），否则会被拒。
+async fn post_facts(env: &TestEnv, report: &ReportAgentFactSummary) -> Response {
+    post_to_ingest_router(env, &data_plane_record(&report.agent_id, report)).await
+}
+
+async fn get_purpose_view(env: &TestEnv, agent_id: &str) -> serde_json::Value {
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/agents/{agent_id}/purpose"),
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_rejects_an_unparseable_body() {
+    // 控制面那条路由删了，但「不可解析的上报必须显形」这条不能丢：数据面这条路同样要有。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+
+    let rejected = post_to_ingest_router(
+        &env,
+        &serde_json::json!({ "agent_id": "agent-node-a", "body": "{ not json" }),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_keeps_path_probe_results() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let mut report = fact_report(&["/usr/bin/xcodebuild"]);
+    report.probed_paths = vec![
+        "/var/log/sudo.log".to_string(),
+        "/var/log/not-here.log".to_string(),
+    ];
+    report.present_paths = vec!["/var/log/sudo.log".to_string()];
+    report.content_digest = digest_of(&report);
+
+    let accepted = post_facts(&env, &report).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    assert_eq!(stored.probed_paths, report.probed_paths);
+    assert_eq!(stored.present_paths, report.present_paths);
+    // 路径参与摘要：存的就是网关自算的那一份。
+    assert_eq!(stored.content_digest, digest_of(&report));
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_rejects_present_paths_that_were_not_probed() {
+    // 子集关系不成立 = 上报方坏了。静默丢弃会把它的 bug 当成一次正常上报，
+    // 求值也会读到一套自相矛盾的事实。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let mut report = fact_report(&["/usr/bin/xcodebuild"]);
+    report.probed_paths = vec!["/var/log/present.log".to_string()];
+    report.present_paths = vec!["/var/log/never-probed.log".to_string()];
+
+    let response = post_facts(&env, &report).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_stores_the_summary_and_produces_a_suggestion() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    let report = fact_report(&["/usr/bin/xcodebuild", "launchd"]);
+
+    let accepted = post_facts(&env, &report).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    // 存的是**网关自算**的摘要，不是照抄声明（数据面那条回执不回转发的载荷）。
+    assert_eq!(stored.content_digest, digest_of(&report));
+    assert_eq!(stored.process_count, 2);
+    assert_eq!(
+        stored.process_executables,
+        vec!["/usr/bin/xcodebuild", "launchd"]
+    );
+
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["agent_id"], "agent-node-a");
+    // 建议确实**落库**了（不再看回执里带不带 suggestion_id：
+    // 数据面的回执只报“这批记录处理结果”，不带业务字段）。
+    assert!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .is_some()
+    );
+    assert_eq!(view["fact_summary"]["content_digest"], digest_of(&report));
+    assert_eq!(view["suggestion"]["suggested_class"], "MacDev");
+    // 单类命中（无次高分）→ 100；40 >= weak_score(20) 不打折。
+    assert_eq!(view["suggestion"]["confidence"], 100);
+    assert_eq!(view["suggestion"]["method"], "rule");
+    assert_eq!(view["suggestion"]["rule_set_id"], "macos-v1");
+    assert_eq!(
+        view["suggestion"]["signals"][0]["rule_id"],
+        "mac-dev-xcodebuild"
+    );
+    assert_eq!(
+        view["suggestion"]["signals"][0]["value"],
+        "/usr/bin/xcodebuild"
+    );
+    // 没写过判定 → classification 为空（页面看到的是「还没人定」，不是默认值）。
+    assert!(view["classification"].is_null());
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_is_idempotent_on_the_content_digest() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    let report = fact_report(&["/usr/bin/xcodebuild"]);
+
+    assert_eq!(
+        post_facts(&env, &report).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let first = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
+
+    // 重发同一份内容：不重写、不重算，建议 id 不变（而不是被重新算成新 id）。
+    assert_eq!(
+        post_facts(&env, &report).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let second = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
+    assert_eq!(second.suggestion_id, first.suggestion_id);
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_dedupes_on_its_own_digest_not_the_declaration() {
+    // 恶意/退化的 agent 声明一个**常量**摘要：若判重用声明，第二份不同内容就会被当重复，
+    // 视图静默停在旧内容上。网关自算，所以必须识别出内容变了。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_declaring(&["launchd"], "sha256:constant")
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_declaring(&["xcodebuild"], "sha256:constant")
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    // 存的是网关自算的摘要，不是被声明的常量；且第二份内容真的覆盖进去了。
+    assert_ne!(stored.content_digest, "sha256:constant");
+    assert_eq!(stored.process_executables, vec!["xcodebuild"]);
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_refreshes_only_marks_on_duplicate() {
+    // 内容没变、只是又采了一轮：只刷留痕（revision/observed_at/process_count/received_at），
+    // 内容列与幂等键不动，也不重算建议。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    let report = fact_report(&["/usr/bin/xcodebuild"]);
+
+    assert_eq!(
+        post_facts(&env, &report).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let first_suggestion = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
+    let digest = digest_of(&report);
+
+    let mut rerun = report.clone();
+    rerun.revision = 999;
+    rerun.observed_at = "2026-09-22T01:00:00Z".to_string();
+    rerun.process_count = 42;
+    rerun.reported_at = "2026-09-22T01:00:01Z".to_string();
+    assert_eq!(
+        post_facts(&env, &rerun).await.status(),
+        StatusCode::ACCEPTED
+    );
+    // 建议不重算（id 不变）。
+    assert_eq!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .expect("suggestion")
+            .suggestion_id,
+        first_suggestion.suggestion_id
+    );
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    // 留痕被刷新。
+    assert_eq!(stored.revision, 999);
+    assert_eq!(stored.observed_at, "2026-09-22T01:00:00Z");
+    assert_eq!(stored.process_count, 42);
+    // 内容与幂等键不变。
+    assert_eq!(stored.content_digest, digest);
+    assert_eq!(stored.process_executables, vec!["/usr/bin/xcodebuild"]);
+}
+
+#[tokio::test]
+async fn agent_facts_route_stores_host_and_network_discovery_fields() {
+    // agentd 一直在采集发现方向的 host.id / host.name 与网卡地址，以前不上传：
+    // 这三个字段是**展示用留痕**，运维要在用途页上看得见「这台到底是谁」。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    let report = fact_report_with_display(
+        &["/usr/bin/xcodebuild"],
+        "machine-id-abc123",
+        "macbook-pro",
+        &["en0 192.168.1.5/24", "utun3 10.8.0.2/32"],
+    );
+
+    let accepted = post_facts(&env, &report).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    assert_eq!(stored.host_id, "machine-id-abc123");
+    assert_eq!(stored.host_name, "macbook-pro");
+    assert_eq!(
+        stored.network_addresses,
+        vec!["en0 192.168.1.5/24", "utun3 10.8.0.2/32"]
+    );
+
+    // 管理面直接序列化同一个结构：这里锁住「自动流过去」，而不是另加一个响应字段。
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["fact_summary"]["host_id"], "machine-id-abc123");
+    assert_eq!(view["fact_summary"]["host_name"], "macbook-pro");
+    assert_eq!(
+        view["fact_summary"]["network_addresses"],
+        serde_json::json!(["en0 192.168.1.5/24", "utun3 10.8.0.2/32"])
+    );
+    // 展示字段没进内容摘要：摘要仍是内容字段算出来的那一份。
+    assert_eq!(view["fact_summary"]["content_digest"], digest_of(&report));
+}
+
+#[tokio::test]
+async fn agent_facts_route_stores_empty_display_fields_for_legacy_agents() {
+    // 旧 agentd 的报文里**根本没有**这三个键：`serde(default)` 必须让上报照常成功，
+    // 库里留空值（页面显示「—」并注明旧版 agentd 不带这些字段）。
+    // 这里走数据面记录的 body（契约对象原样透传），所以直接把 legacy 对象序列化进 body。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    let mut legacy = serde_json::to_value(fact_report(&["/usr/bin/xcodebuild"])).expect("json");
+    let object = legacy.as_object_mut().expect("report object");
+    object.remove("host_id");
+    object.remove("host_name");
+    object.remove("network_addresses");
+
+    let accepted = post_to_ingest_router(
+        &env,
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "body": serde_json::to_string(&legacy).expect("legacy body"),
+        }),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    assert_eq!(stored.host_id, "");
+    assert_eq!(stored.host_name, "");
+    assert!(stored.network_addresses.is_empty());
+
+    // 管理面也照原样给空值（不是缺键）：页面自己决定怎么显示空。
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["fact_summary"]["host_id"], "");
+    assert_eq!(
+        view["fact_summary"]["network_addresses"],
+        serde_json::json!([])
+    );
+}
+
+// ── 数据面订阅端点（warp-parse → 网关内部接入）────────────────────────────
+//
+// 与上面「控制面直报」共用同一个核心（`agent_ops::ingest_fact_summary`），所以这里
+// **不**重复测入库/判重/推断语义，只测这一层独有的东西：记录形状、身份对不上、批次。
+
+/// 把一份摘要包装成 warp-parse 记录（`agent-facts/json` sink 的落盘形状）。
+/// 形状取自真实输出：`{"schema","agent_id","observed_at","seq","category","log_desc","body",…}`，
+/// 其中 `body` 是契约对象的 **JSON 文本**（WPL/OML 不做字段建模）。
+fn data_plane_record(envelope_agent: &str, report: &ReportAgentFactSummary) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "v1",
+        "agent_id": envelope_agent,
+        "observed_at": "2026-09-22T00:00:00Z",
+        "seq": 4242,
+        "category": "agent.fact",
+        "log_desc": "Agent 事实",
+        "body": serde_json::to_string(report).expect("serialize report"),
+    })
+}
+
+async fn post_to_ingest_router(env: &TestEnv, payload: &serde_json::Value) -> Response {
+    post_to_ingest_uri(env, "/api/v1/ingest/agent-facts", payload).await
+}
+
+async fn post_logs_to_ingest_router(env: &TestEnv, payload: &serde_json::Value) -> Response {
+    post_to_ingest_uri(env, "/api/v1/ingest/agent-logs", payload).await
+}
+
+async fn post_to_ingest_uri(env: &TestEnv, uri: &str, payload: &serde_json::Value) -> Response {
+    super::ingest_router(super::build_state(
+        env.config.clone(),
+        Arc::clone(&env.store_handle),
+    ))
+    .oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(payload).expect("body")))
+            .expect("request"),
+    )
+    .await
+    .expect("route response")
+}
+
+#[tokio::test]
+async fn ingest_endpoint_stores_fact_summary_forwarded_by_the_data_plane() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    // 这条路径**不带 agent 凭据**：只要 agent 在登记表里、instance 对得上就收。
+    enroll_agent_credential(&env).await;
+    let report = fact_report(&["/usr/bin/xcodebuild", "launchd"]);
+    let record = data_plane_record("agent-node-a", &report);
+
+    let response = post_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    // 判重键仍是**网关自算**的那一份，不是转发链路上那一份。
+    assert_eq!(stored.content_digest, digest_of(&report));
+    assert_eq!(stored.process_count, 2);
+
+    // 入库后用途推断照常跑（与直报路径同一个核心）——这才算链路通了。
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["suggestion"]["suggested_class"], "MacDev");
+}
+
+#[tokio::test]
+async fn ingest_endpoint_accepts_a_batch_of_records() {
+    // sink 的 `batch_size` 将来调大就会出现数组，这里先钉住形状。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = data_plane_record("agent-node-a", &fact_report(&["/usr/bin/xcodebuild"]));
+
+    let response = post_to_ingest_router(&env, &serde_json::json!([record])).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["ingested"], 1);
+    assert_eq!(body["rejected"], 0);
+}
+
+/// 数据面累计计数：接收事实后，自述面（admin 读口）的 `ingest_accepted_total` / `last_ingest_at` 要动。
+#[tokio::test]
+async fn ingest_bumps_self_state_data_plane_counters() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    // **同一份 state** 串内两点（接入 + 自述面），否则计数随每次 build_state 重置。
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+
+    let before: serde_json::Value =
+        decode_json_response(get_from_state(&state, "/api/v1/admin/gateway/self-state").await)
+            .await;
+    assert_eq!(before["ingest_accepted_total"], 0);
+    assert_eq!(before["last_ingest_at"], serde_json::Value::Null);
+
+    let record = data_plane_record("agent-node-a", &fact_report(&["/usr/bin/xcodebuild"]));
+    let response = super::ingest_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ingest/agent-facts")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&record).expect("body")))
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let after: serde_json::Value =
+        decode_json_response(get_from_state(&state, "/api/v1/admin/gateway/self-state").await)
+            .await;
+    assert_eq!(after["ingest_accepted_total"], 1, "收到一条事实应 +1");
+    assert_eq!(after["ingest_rejected_total"], 0);
+    assert!(
+        !after["last_ingest_at"].is_null(),
+        "last_ingest_at 应被记下"
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_an_unregistered_agent() {
+    // 「不存在的机器」不得被写进库：登记表是这条路径唯一的身份锚。
+    let env = TestEnv::new().await;
+    // 信封与正文都自称同一台**未注册**的 agent：先排除「自称不一致」那条分支。
+    let mut report = fact_report(&["/usr/bin/xcodebuild"]);
+    report.agent_id = "agent-ghost".to_string();
+    let record = data_plane_record("agent-ghost", &report);
+
+    let response = post_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["rejected"], 1);
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("unknown agent_id"),
+        "got {body}"
+    );
+    assert!(
+        env.store
+            .get_agent_fact_summary("agent-ghost")
+            .await
+            .expect("store read")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_an_instance_id_mismatch() {
+    // agentd 重装后 instance_id 会变。若照收，两台机器的观测会混进同一行。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let mut report = fact_report(&["/usr/bin/xcodebuild"]);
+    report.instance_id = "node-b".to_string();
+
+    let response = post_to_ingest_router(&env, &data_plane_record("agent-node-a", &report)).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("instance_id mismatch"),
+        "got {body}"
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_an_envelope_body_disagreement() {
+    // 信封与正文的自称不一致，说明中间环节出了问题 —— 现在两边都不是身份依据，
+    // 但不一致必须显形，而不是挑一个信。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = data_plane_record("agent-other", &fact_report(&["/usr/bin/xcodebuild"]));
+
+    let response = post_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("disagrees with body agent_id"),
+        "got {body}"
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_reports_the_shape_it_received_when_the_record_is_wrong() {
+    // 数据面的记录结构一变，这条错误要能直接指出收到了什么（否则只能靠翻代码猜）。
+    let env = TestEnv::new().await;
+
+    let response = post_to_ingest_router(&env, &serde_json::json!({"hello": "world"})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let failure = body["failures"][0].as_str().expect("failure text");
+    assert!(
+        failure.contains("not a data-plane fact record") && failure.contains("hello"),
+        "got {failure}"
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_a_body_that_is_not_a_fact_summary() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = serde_json::json!({
+        "agent_id": "agent-node-a",
+        "body": "{\"unexpected\": true}",
+    });
+
+    let response = post_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("body is not a ReportAgentFactSummary"),
+        "got {body}"
+    );
+}
+
+// ── 采集日志的本地落盘（数据面 → 网关内部接入）────────────────────────────
+//
+// 日志与事实走同一条上行通道，但**落点不同**：事实进 SQLite，日志落本地 NDJSON 文件。
+// 这里测的是「文件真的写进去了、能按台筛、读得回来」。
+
+/// 一份日志记录的数据面落盘形状（`macos-agent/json` sink）。
+/// 形状取自真实输出：`{"schema","agent_id","observed_at","seq","category","log_desc","raw",…}`。
+fn data_plane_log_record(envelope_agent: &str, raw: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "v1",
+        "agent_id": envelope_agent,
+        "observed_at": "2026-09-23T12:24:27.734612Z",
+        "seq": 292,
+        "category": "agent.log",
+        "log_desc": "Agent 日志-原文",
+        "raw": raw,
+    })
+}
+
+/// 读回落盘的日志记录（文件不存在 = 空）。
+fn log_file_records(env: &TestEnv) -> Vec<crate::infra::AgentLogRecord> {
+    let path = env.config.agent_log_file();
+    if !path.is_file() {
+        return Vec::new();
+    }
+    std::fs::read_to_string(&path)
+        .expect("read log file")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log record"))
+        .collect()
+}
+
+/// 数据面记录（**新版 agentd**：信封里带 `family`/`unit`，落到记录的这两个字段）。
+fn data_plane_log_record_with_family(
+    envelope_agent: &str,
+    family: &str,
+    unit: &str,
+    raw: &str,
+) -> serde_json::Value {
+    let mut record = data_plane_log_record(envelope_agent, raw);
+    let object = record.as_object_mut().expect("record object");
+    object.insert("family".to_string(), serde_json::json!(family));
+    object.insert("unit".to_string(), serde_json::json!(unit));
+    record
+}
+
+async fn get_admin(env: &TestEnv, uri: &str) -> Response {
+    get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn ingest_endpoint_appends_agent_logs_to_the_local_file() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let raw = "2026-09-23 20:24:24+08 MacBook-Pro-2 softwareupdated[565]: SUOSUPowerEventObserver: System will sleep";
+
+    let response =
+        post_logs_to_ingest_router(&env, &data_plane_log_record("agent-node-a", raw)).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["ingested"], 1);
+    assert_eq!(body["rejected"], 0);
+
+    let stored = log_file_records(&env);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].agent_id, "agent-node-a");
+    assert_eq!(stored[0].raw, raw);
+    assert_eq!(stored[0].seq, 292);
+    assert_eq!(stored[0].category, "agent.log");
+    assert_eq!(stored[0].log_desc, "Agent 日志-原文");
+    assert_eq!(stored[0].observed_at, "2026-09-23T12:24:27.734612Z");
+    assert!(!stored[0].received_at.is_empty());
+}
+
+#[tokio::test]
+async fn ingest_endpoint_keeps_a_multiline_record_on_a_single_ndjson_line() {
+    // 一条多行记录在文件里仍占**一行** NDJSON：`raw` 里的换行被 JSON 转义，
+    // 读回来还是多行 —— 这正是「一条记录」在落盘层的形状。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let raw = "REC-A start\n\tcontinuation A1\n\tcontinuation A2";
+
+    let response =
+        post_logs_to_ingest_router(&env, &data_plane_log_record("agent-node-a", raw)).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let text = std::fs::read_to_string(env.config.agent_log_file()).expect("read log file");
+    assert_eq!(text.lines().count(), 1, "one record must be one line");
+    assert_eq!(log_file_records(&env)[0].raw, raw);
+}
+
+#[tokio::test]
+async fn ingest_endpoint_accepts_a_batch_of_log_records() {
+    // sink 的 `batch_size` 将来调大就会出现数组，这里先钉住形状。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let batch = serde_json::json!([
+        data_plane_log_record("agent-node-a", "first"),
+        data_plane_log_record("agent-node-a", "second"),
+    ]);
+
+    let response = post_logs_to_ingest_router(&env, &batch).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(log_file_records(&env).len(), 2);
+}
+
+#[tokio::test]
+async fn ingest_endpoint_accepts_the_normalized_field_names() {
+    // 当前模型（wp-rules ≥ 1.0.18）输出的是 `agent` / `ts` / `log_type`，而且**不再保留整行**：
+    // 可读正文在 `log` 里。旧字段名要兼容，新字段名也要能解析 —— 否则整批 400，
+    // 数据面会把每条都写进 rescue（现场实测 1 分钟 ~350 MB）。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = serde_json::json!({
+        "schema": "v1",
+        "agent": "agent-node-a",
+        "ts": "2026-10-27T18:00:00Z",
+        "seq": 7,
+        "family": "ServiceLifecycle",
+        "unit": "linux-service-lifecycle",
+        "log_type": "agent.log",
+        "log_desc": "Agent 日志",
+        "log": "systemd: started demo.service",
+    });
+
+    let response = post_logs_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let stored = log_file_records(&env);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].agent_id, "agent-node-a");
+    assert_eq!(stored[0].observed_at, "2026-10-27T18:00:00Z");
+    assert_eq!(stored[0].category, "agent.log");
+    assert_eq!(stored[0].raw, "systemd: started demo.service");
+    assert_eq!(stored[0].family, "ServiceLifecycle");
+}
+
+#[tokio::test]
+async fn ingest_endpoint_falls_back_to_the_content_fields_when_raw_and_log_are_absent() {
+    // 结构化规则拆完字段后既没有 `raw` 也没有 `log`（实测占 ~16%）：把**内容字段**压成 JSON
+    // 作为展示正文，而不是拒收 —— 但信封字段（agent/ts/dev_ip/tenant_id…）不能混进去。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = serde_json::json!({
+        "schema": "v1",
+        "agent": "agent-node-a",
+        "ts": "2026-10-27T18:00:00Z",
+        "seq": 8,
+        "log_type": "host_audit_execve",
+        "dev_ip": "10.0.0.1",
+        "tenant_id": "t-1",
+        "body_program": "/usr/bin/sudo",
+        "body_host": "lab-target-01",
+    });
+
+    let response = post_logs_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let stored = log_file_records(&env);
+    assert_eq!(stored.len(), 1);
+    assert!(
+        stored[0].raw.contains("body_program"),
+        "got {}",
+        stored[0].raw
+    );
+    assert!(
+        stored[0].raw.contains("lab-target-01"),
+        "got {}",
+        stored[0].raw
+    );
+    assert!(
+        !stored[0].raw.contains("tenant_id"),
+        "信封字段不该进正文：{}",
+        stored[0].raw
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_contract_frames_that_fall_into_the_log_channel() {
+    // 安全网：事实 / 快照帧误投到 `gateway-logs`（oml=["*"] 兑底）时必须拒收。
+    // 否则 `raw` 改为可选后，它们会被当成一条「日志」写进去（快照一帧数百 KB）。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    for kind in [
+        "agent_uplink_obs_fact",
+        "agent_uplink_obs_dsnap",
+        "agent_uplink_metrics_frame",
+    ] {
+        let record = serde_json::json!({
+            "schema": "v1",
+            "agent": "agent-node-a",
+            "ts": "2026-10-27T18:00:00Z",
+            "seq": 9,
+            "log_type": kind,
+            "body": "{\"kind\":\"report_discovery_snapshot\"}",
+        });
+        let response = post_logs_to_ingest_router(&env, &record).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{kind} 必须被拒"
+        );
+        let body: serde_json::Value = decode_json_response(response).await;
+        assert!(
+            body["failures"][0]
+                .as_str()
+                .expect("failure text")
+                .contains("must not be ingested as a log"),
+            "got {body}"
+        );
+    }
+    assert!(log_file_records(&env).is_empty(), "契约帧不得进日志文件");
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_logs_from_an_unregistered_agent() {
+    // 登记表是这条路径唯一的身份锚：不存在的机器不得被写进日志文件。
+    let env = TestEnv::new().await;
+
+    let response =
+        post_logs_to_ingest_router(&env, &data_plane_log_record("agent-ghost", "hello")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("unknown agent_id agent-ghost"),
+        "got {body}"
+    );
+    assert!(
+        log_file_records(&env).is_empty(),
+        "a rejected record must not reach the file"
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_reports_the_shape_it_received_when_the_log_record_is_wrong() {
+    let env = TestEnv::new().await;
+
+    let response = post_logs_to_ingest_router(&env, &serde_json::json!({"hello": "world"})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let failure = body["failures"][0].as_str().expect("failure text");
+    assert!(
+        failure.contains("not a data-plane log record") && failure.contains("hello"),
+        "got {failure}"
+    );
+}
+
+#[tokio::test]
+async fn ingest_endpoint_rejects_a_log_record_without_a_body() {
+    // 没有 `raw` 的「日志」没有意义：宁可显形，也不要写一行空正文进去。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = serde_json::json!({ "agent_id": "agent-node-a", "category": "agent.log" });
+
+    let response = post_logs_to_ingest_router(&env, &record).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .expect("failure text")
+            .contains("not a data-plane log record"),
+        "got {body}"
+    );
+    assert!(log_file_records(&env).is_empty());
+}
+
+#[tokio::test]
+async fn admin_logs_route_requires_admin_bearer() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(&env.config, &env.store_handle, "/api/v1/admin/logs", None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_logs_route_returns_the_stored_records() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    for raw in ["first", "second", "third"] {
+        let response =
+            post_logs_to_ingest_router(&env, &data_plane_log_record("agent-node-a", raw)).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/logs").await).await;
+    assert_eq!(body["limit"], 200);
+    assert_eq!(body["truncated"], false);
+    assert_eq!(
+        body["logs"]
+            .as_array()
+            .expect("logs")
+            .iter()
+            .map(|log| log["raw"].as_str().expect("raw"))
+            .collect::<Vec<_>>(),
+        vec!["first", "second", "third"]
+    );
+    assert!(
+        body["file"]
+            .as_str()
+            .expect("file")
+            .ends_with("agent-logs.ndjson"),
+        "ops needs to know where the file is: {body}"
+    );
+}
+
+#[tokio::test]
+async fn admin_logs_route_filters_by_agent_and_keeps_the_newest_limit() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    for raw in ["first", "second", "third"] {
+        let response =
+            post_logs_to_ingest_router(&env, &data_plane_log_record("agent-node-a", raw)).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    // 没采过的这台给空表，而不是 404：这里是筛选，不是按 id 取某一台的视图。
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/logs?agent_id=agent-other").await)
+            .await;
+    assert_eq!(body["logs"], serde_json::json!([]));
+
+    // limit 取**最新** N 条，且按写入顺序回给调用方。
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/logs?limit=2").await).await;
+    assert_eq!(body["limit"], 2);
+    assert_eq!(
+        body["logs"]
+            .as_array()
+            .expect("logs")
+            .iter()
+            .map(|log| log["raw"].as_str().expect("raw"))
+            .collect::<Vec<_>>(),
+        vec!["second", "third"]
+    );
+}
+
+#[tokio::test]
+async fn the_collection_family_travels_with_the_record_and_can_be_filtered_on() {
+    // 正文规则未就绪时 `category` 恒为泛化的 `agent.log`（两个面长一模一样），
+    // **面是唯一能把它们分开的字段** —— 它得一路落盘、能筛。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    for (family, unit, raw) in [
+        ("ServiceLifecycle", "mac-launchd-service", "from launchd"),
+        ("NetworkFirewall", "mac-network-wifi", "from wifi"),
+    ] {
+        let response = post_logs_to_ingest_router(
+            &env,
+            &data_plane_log_record_with_family("agent-node-a", family, unit, raw),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    let stored = log_file_records(&env);
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].family, "ServiceLifecycle");
+    assert_eq!(stored[0].unit, "mac-launchd-service");
+
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/logs?family=NetworkFirewall").await)
+            .await;
+    let logs = body["logs"].as_array().expect("logs");
+    assert_eq!(logs.len(), 1, "{body}");
+    assert_eq!(logs[0]["raw"], "from wifi");
+    assert_eq!(logs[0]["unit"], "mac-network-wifi");
+}
+
+#[tokio::test]
+async fn a_record_without_a_family_still_lands_and_matches_no_family_filter() {
+    // 旧版 agentd、以及本机运维手工配置的输入都不带这两个字段：**不能因此被拒收**，
+    // 但要如实留空（“不是平台派活来的”本身就是信息），并且按面筛时不该被任何面捞出来。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let response =
+        post_logs_to_ingest_router(&env, &data_plane_log_record("agent-node-a", "legacy")).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(log_file_records(&env)[0].family, "");
+
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/logs?family=ServiceLifecycle").await)
+            .await;
+    assert_eq!(body["logs"], serde_json::json!([]));
+}
+
+// ── 数据面输出文件 tail（页面「采集日志」）────────────────────────
+
+#[tokio::test]
+async fn admin_data_plane_output_routes_require_admin_bearer() {
+    let env = TestEnv::new().await;
+    for uri in [
+        "/api/v1/admin/data-plane/output/files",
+        "/api/v1/admin/data-plane/output/tail?path=gateway.json",
+    ] {
+        let response = get_to_router(&env.config, &env.store_handle, uri, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "uri {uri}");
+    }
+}
+
+#[tokio::test]
+async fn admin_data_plane_output_tail_follows_new_bytes() {
+    let mut env = TestEnv::new().await;
+    env.config.data_plane_work_dir = Some(env._root.clone());
+    let out = env._root.join("data/out_dat");
+    std::fs::create_dir_all(&out).expect("create output dir");
+    std::fs::write(out.join("gateway.json"), "one\ntwo\n").expect("write output");
+    std::fs::write(out.join("blob.bin"), [0xff, 0x00]).expect("write binary");
+
+    let body: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/data-plane/output/files").await).await;
+    assert_eq!(body["available"], true);
+    assert!(
+        body["dir"].as_str().expect("dir").ends_with("data/out_dat"),
+        "got {body}"
+    );
+    let paths: Vec<&str> = body["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|file| file["path"].as_str().expect("path"))
+        .collect();
+    assert!(paths.contains(&"gateway.json"), "got {paths:?}");
+    assert!(!paths.contains(&"blob.bin"), "binary must be excluded");
+
+    let body: serde_json::Value = decode_json_response(
+        get_admin(
+            &env,
+            "/api/v1/admin/data-plane/output/tail?path=gateway.json",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(body["content"], "one\ntwo\n");
+    assert_eq!(body["next_offset"], 8);
+    assert_eq!(body["reset"], false);
+    let offset = body["next_offset"].as_u64().expect("offset");
+
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(out.join("gateway.json"))
+            .expect("open output");
+        file.write_all(b"three\n").expect("append");
+    }
+
+    let uri = format!("/api/v1/admin/data-plane/output/tail?path=gateway.json&offset={offset}");
+    let body: serde_json::Value = decode_json_response(get_admin(&env, &uri).await).await;
+    assert_eq!(body["content"], "three\n");
+    assert_eq!(body["next_offset"], 14);
+}
+
+#[tokio::test]
+async fn admin_data_plane_output_tail_rejects_binary_files() {
+    let mut env = TestEnv::new().await;
+    env.config.data_plane_work_dir = Some(env._root.clone());
+    let out = env._root.join("data/out_dat");
+    std::fs::create_dir_all(&out).expect("create output dir");
+    std::fs::write(out.join("blob.bin"), [0xff, 0x00]).expect("write binary");
+
+    let body: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/data-plane/output/tail?path=blob.bin").await,
+    )
+    .await;
+    assert_eq!(body["error"]["code"], "data_plane_file_not_text");
+}
+
+// ── L1a 机械资产清单（从事实摘要派生）────────────────────────────
+
+#[tokio::test]
+async fn software_routes_require_admin_bearer() {
+    let env = TestEnv::new().await;
+    for uri in [
+        "/api/v1/admin/software",
+        "/api/v1/admin/agents/agent-node-a/software",
+    ] {
+        let response = get_to_router(&env.config, &env.store_handle, uri, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "uri {uri}");
+    }
+}
+
+#[tokio::test]
+async fn agent_software_route_differentiates_unknown_agent_from_empty_inventory() {
+    // 「agent 不存在」与「存在但没上报过清单」必须能区分，否则运维分不清打错 id 与没采到。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+
+    let unknown = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-nobody/software",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    let empty = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/software",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(empty).await;
+    assert_eq!(body["paths"], 0);
+    assert_eq!(body["apps"], 0);
+    assert_eq!(body["entries"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn software_inventory_is_derived_from_the_fact_summary() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let report = fact_report(&[
+        "/Applications/Firefox.app/Contents/MacOS/firefox",
+        "/Applications/Firefox.app/Contents/MacOS/plugin-container",
+        "/usr/bin/true",
+    ]);
+    let accepted = post_facts(&env, &report).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/software",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    // 三条路径，其中两条归到同一个 `.app` 键。
+    assert_eq!(body["paths"], 3);
+    assert_eq!(body["apps"], 2);
+    let entries = body["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 3);
+    // 排序：`kind` 在前，所以 app 条目先出。
+    assert_eq!(entries[0]["software_key"], "/Applications/Firefox.app");
+    assert_eq!(entries[0]["name"], "Firefox");
+    assert_eq!(entries[0]["kind"], "app");
+    assert_eq!(entries[0]["matched_rule"], "macos-app-bundle");
+    assert_eq!(entries[2]["kind"], "binary");
+    assert_eq!(entries[2]["matched_rule"], "unix-path");
+
+    // 「按软件看机器」：`.app` 键持有 2 条路径，但只有 1 台机器。
+    let holdings = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/software",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(holdings.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(holdings).await;
+    assert_eq!(body["truncated"], false);
+    let software = body["software"].as_array().expect("software");
+    assert_eq!(software.len(), 2);
+    let firefox = software
+        .iter()
+        .find(|view| view["software_key"] == "/Applications/Firefox.app")
+        .expect("firefox holding");
+    assert_eq!(firefox["agent_count"], 1);
+    assert_eq!(firefox["holders"].as_array().expect("holders").len(), 2);
+    assert_eq!(firefox["holders"][0]["agent_id"], "agent-node-a");
+}
+
+#[tokio::test]
+async fn software_inventory_self_heals_on_a_duplicate_report() {
+    // 内容没变时清单不重算（投影相同），但若上次重建没写成（进程被杀 / 库锁），
+    // 重复上报要能补上 —— 否则清单会一直空着而没人知道。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let report = fact_report(&["/usr/bin/true"]);
+    assert_eq!(
+        post_facts(&env, &report).await.status(),
+        StatusCode::ACCEPTED
+    );
+
+    // 模拟「上次重建没写成」：把已建好的清单删掉，内容与 digest 都不动。
+    env.store
+        .replace_agent_software_inventory("agent-node-a", &[])
+        .await
+        .expect("clear inventory");
+    assert!(
+        !env.store
+            .agent_has_software_inventory("agent-node-a")
+            .await
+            .expect("has inventory")
+    );
+
+    // 同一份内容再报一次：走 duplicate 分支（不重算 digest），但清单必须回来。
+    assert_eq!(
+        post_facts(&env, &report).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let entries = env
+        .store
+        .list_agent_software("agent-node-a")
+        .await
+        .expect("list inventory");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "/usr/bin/true");
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_refreshes_display_fields_on_duplicate() {
+    // 内容（可执行标识集合）没变，机器却换了网、改了名：这是 **duplicate**。
+    // 展示字段必须跟着刷 —— 否则页面上的 IP 会停在几天前那一轮，而旁边「入库时间」
+    // 写着刚刚，运维会以为采集坏了。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    let first = fact_report_with_display(
+        &["/usr/bin/xcodebuild"],
+        "machine-id-abc123",
+        "macbook-pro",
+        &["en0 192.168.1.5/24"],
+    );
+    let digest = digest_of(&first);
+    assert_eq!(
+        post_facts(&env, &first).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let first_suggestion = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
+
+    let renamed = first.with_display(
+        "machine-id-abc123".to_string(),
+        "macbook-pro-renamed".to_string(),
+        vec!["en0 10.0.0.9/24".to_string()],
+    );
+    assert_eq!(
+        post_facts(&env, &renamed).await.status(),
+        StatusCode::ACCEPTED
+    );
+    // 只有留痕刷新：建议不重算。
+    assert_eq!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .expect("suggestion")
+            .suggestion_id,
+        first_suggestion.suggestion_id
+    );
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    assert_eq!(stored.host_name, "macbook-pro-renamed");
+    assert_eq!(stored.network_addresses, vec!["en0 10.0.0.9/24"]);
+    // 内容列与幂等键一格不动。
+    assert_eq!(stored.content_digest, digest);
+    assert_eq!(stored.process_executables, vec!["/usr/bin/xcodebuild"]);
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_recomputes_when_the_content_changes() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+
+    assert_eq!(
+        post_facts(&env, &fact_report(&["launchd"])).await.status(),
+        StatusCode::ACCEPTED
+    );
+    // 只有 launchd：没命中规则 → 回落到基线 MacDaily。
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["suggestion"]["suggested_class"], "MacDaily");
+    assert_eq!(view["suggestion"]["confidence"], 0);
+    let first_suggestion = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
+
+    // 内容变了：覆盖式入库并重算，建议 id 也应是新的。
+    let changed = fact_report(&["xcodebuild"]);
+    assert_eq!(
+        post_facts(&env, &changed).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let second_suggestion = env
+        .store
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("suggestion");
+    assert_ne!(
+        second_suggestion.suggestion_id,
+        first_suggestion.suggestion_id
+    );
+
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["fact_summary"]["content_digest"], digest_of(&changed));
+    assert_eq!(view["suggestion"]["suggested_class"], "MacDev");
+}
+
+#[tokio::test]
+async fn agent_facts_route_rejects_an_overlong_content_digest() {
+    // 声明会进告警日志：不限长就能让一条上报写出几 MB 的单行日志。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    let report = fact_report_declaring(&["xcodebuild"], &"d".repeat(1024));
+
+    let response = post_facts(&env, &report).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn agent_facts_route_rejects_an_overlong_host_id() {
+    // 上报体是**被管机器**给的内容，网关必须自己封顶，不能指望 agent 守规矩。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    let report = fact_report_with_display(&["xcodebuild"], &"h".repeat(1024), "macbook-pro", &[]);
+
+    let response = post_facts(&env, &report).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn agent_facts_route_rejects_too_many_network_addresses() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    let addresses: Vec<String> = (0..300)
+        .map(|index| format!("en{index} 10.0.0.1/24"))
+        .collect();
+    let report = fact_report(&["xcodebuild"]).with_display(
+        "machine-id".to_string(),
+        "macbook-pro".to_string(),
+        addresses,
+    );
+
+    let response = post_facts(&env, &report).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn agent_facts_route_refuses_an_unknown_envelope() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    let mut report = fact_report(&["xcodebuild"]);
+    report.kind = "something_else".to_string();
+
+    let response = post_facts(&env, &report).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        env.store
+            .get_agent_fact_summary("agent-node-a")
+            .await
+            .expect("store read")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_stores_facts_even_without_a_rule_table() {
+    // 未配置规则表：事实是 Agent 的数据，必须落库；只是不产出建议。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+
+    assert_eq!(
+        post_facts(&env, &fact_report(&["xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(
+        env.store
+            .get_agent_fact_summary("agent-node-a")
+            .await
+            .expect("store read")
+            .is_some()
+    );
+    // 没有规则表 → 确实没有建议。
+    assert!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .is_none()
+    );
+
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert!(!view["fact_summary"].is_null());
+    assert!(view["suggestion"].is_null());
+}
+
+#[tokio::test]
+async fn agent_purpose_route_clears_a_stale_suggestion_when_nothing_should_be_suggested() {
+    // 平台没有规则册 → 这次确实不该有建议；旧建议是照着旧事实算的，必须清掉。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    post_facts(&env, &fact_report(&["xcodebuild"])).await;
+    assert!(get_purpose_view(&env, "agent-node-a").await["suggestion"].is_object());
+
+    let mut linux_report = fact_report(&["postgres"]);
+    linux_report.os = "linux".to_string();
+    assert_eq!(
+        post_facts(&env, &linux_report).await.status(),
+        StatusCode::ACCEPTED
+    );
+    // 平台无规则册 → 确实不该有建议，库里必须是空的（旧建议不清掉才是错的）。
+    assert!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .is_none()
+    );
+
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(
+        view["fact_summary"]["content_digest"],
+        digest_of(&linux_report)
+    );
+    assert!(view["suggestion"].is_null());
+}
+
+#[tokio::test]
+async fn agent_purpose_route_requires_admin_bearer() {
+    let env = TestEnv::new().await;
+
+    let rejected = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/purpose",
+        None,
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn agent_purpose_view_is_empty_before_any_facts() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    // 「还没报过事实」与「这台机器不存在」是两回事：这里 200 + 空视图，不是 404。
+    assert!(view["fact_summary"].is_null());
+    assert!(view["suggestion"].is_null());
+    assert!(view["classification"].is_null());
+}
+
+#[tokio::test]
+async fn agent_purpose_route_returns_404_for_an_unknown_agent() {
+    let env = TestEnv::new().await;
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-nobody/purpose",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// 用**真实策展规则表**跑通全链：上报 → 入库 → 按规则打一分 → 页面读得到依据。
+///
+/// 这是“用夹具数据验证计算”的那份证据；数据来自知识库仓 `wist-knowledge`（缺则失败）。
+#[tokio::test]
+async fn fact_summary_ingest_infers_with_the_checked_in_rule_table() {
+    let rules = std::fs::read_to_string(crate::test_support::knowledge_file("purpose-rules.toml"))
+        .expect("read checked-in rule table");
+
+    let env = TestEnv::new_with_purpose_rules(Some(&rules)).await;
+    enroll_agent_credential(&env).await;
+    // 一台真开发机上的典型进程（含一条 Electron 应用自带的 node_modules，应当被排除）。
+    let processes = [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild",
+        "/opt/homebrew/bin/mise",
+        "/Applications/OrbStack.app/Contents/MacOS/OrbStack",
+        "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/node_modules/x",
+    ];
+    assert_eq!(
+        post_facts(&env, &fact_report(&processes)).await.status(),
+        StatusCode::ACCEPTED
+    );
+
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["suggestion"]["suggested_class"], "MacDev");
+    assert_eq!(view["suggestion"]["rule_set_id"], "macos-v1");
+    assert_eq!(view["suggestion"]["method"], "rule");
+    // Xcode(40) + homebrew(30) + OrbStack(25) = 95，无次高分 → 100。
+    assert_eq!(view["suggestion"]["confidence"], 100);
+
+    let rule_ids: Vec<&str> = view["suggestion"]["signals"]
+        .as_array()
+        .expect("signals array")
+        .iter()
+        .map(|signal| signal["rule_id"].as_str().expect("rule_id"))
+        .collect();
+    assert!(rule_ids.contains(&"mac-dev-xcodebuild"));
+    assert!(rule_ids.contains(&"mac-dev-homebrew-arm"));
+    assert!(rule_ids.contains(&"mac-dev-orbstack"));
+    // 排除规则在真实数据上生效：App bundle 里的 node_modules 不算开发特征。
+    assert!(!rule_ids.contains(&"mac-dev-node_modules"));
+}
+
+// ── 审查发现的缺陷对应的回归测试 ──────────────────────────────────────
+
+/// 建一份带规则表的配置副本（同一个库），用来模拟“规则表后来才配上 / 换了版本”。
+fn config_with_purpose_rules(env: &TestEnv, rules: &str) -> AdminConfig {
+    let path = std::env::temp_dir().join(format!("wist-gateway-purpose-{}.toml", unique_suffix()));
+    std::fs::write(&path, rules).expect("write purpose rules");
+    let mut config = env.config.clone();
+    config.purpose_rules_file = Some(path);
+    config
+}
+
+// ── 发现方向策略表（装载校验 + 下发 + 管理视图）──────────────────────
+
+/// 精简策略表：七个方向各一条（校验要求不许缺/重）。版本号特意取 7，便于断言下发的是这一版。
+const TEST_DISCOVERY_POLICIES: &str = r#"
+policy_version = 7
+published_at = "2026-09-22T00:00:00Z"
+policies = [
+  { aspect = "host", default_interval_seconds = 900, min_interval_seconds = 300, max_interval_seconds = 3600, baseline = true, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "network", default_interval_seconds = 900, min_interval_seconds = 300, max_interval_seconds = 3600, baseline = false, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "process", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "endpoint", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = true, platforms = ["linux"] },
+  { aspect = "container", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = false, platforms = ["macos", "linux"] },
+  { aspect = "k8s", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = false, platforms = ["macos", "linux"] },
+  { aspect = "package", default_interval_seconds = 1800, min_interval_seconds = 900, max_interval_seconds = 21600, baseline = false, enabled_by_default = true, platforms = ["linux"] },
+]
+"#;
+
+/// 建一份带策略表的配置副本（同一个库），用来模拟“策略表后来才配上”。
+fn config_with_discovery_policies(env: &TestEnv, policies: &str) -> AdminConfig {
+    let path =
+        std::env::temp_dir().join(format!("wist-gateway-discovery-{}.toml", unique_suffix()));
+    std::fs::write(&path, policies).expect("write discovery policies");
+    let mut config = env.config.clone();
+    config.discovery_policies_file = Some(path);
+    config
+}
+
+fn discovery_poll_request() -> PollDiscoveryPolicies {
+    PollDiscoveryPolicies {
+        api_version: "v1".to_string(),
+        kind: POLL_DISCOVERY_POLICIES_KIND.to_string(),
+        agent_id: "agent-node-a".to_string(),
+        instance_id: "node-a".to_string(),
+        requested_at: "2026-09-22T00:00:00Z".to_string(),
+    }
+}
+
+async fn post_discovery_poll(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    credential: Option<&str>,
+    request: &PollDiscoveryPolicies,
+) -> Response {
+    post_agent_json_to_router(
+        config,
+        store,
+        "/api/v1/agent/discovery-policies:poll",
+        credential,
+        request,
+    )
+    .await
+}
+
+async fn get_discovery_view(env: &TestEnv, admin_token: Option<&str>) -> Response {
+    get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/discovery-policies",
+        admin_token,
+    )
+    .await
+}
+
+/// 注册一台指定 `node_id` 的 Agent 并拿回 bearer 凭据。
+///
+/// `agent_id` 由网关按 `node_id` 派生（`agent-<node_id>`），所以换个 node 就是一台不同的机器。
+async fn enroll_agent_at_node(env: &TestEnv, node_id: &str) -> String {
+    let token = env.issue_token().await;
+    let mut request = enrollment_request(&token);
+    request.host_profile.node_id = node_id.to_string();
+    let response = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        serde_json::to_string(&request).expect("serialize enrollment"),
+    )
+    .await;
+    // 返回 **agent_id**（agent 侧只有证书这一条凭据路径；测试里拿它当握手期注入的身份）。
+    decode_enrollment_response(response)
+        .await
+        .result
+        .credential_bundle
+        .expect("credential bundle")
+        .agent_id
+}
+
+/// 发一次状态上报。
+///
+/// `policy_version=None` 造一份**不带**该字段的报文（旧 agentd 不知道它），
+/// 而不是显式建 `"discovery_policy_version": null` —— 后者是「知道字段但没值」，
+/// 前者才是要验的向后兼容场景。
+async fn post_agent_status(
+    env: &TestEnv,
+    credential: &str,
+    instance_id: &str,
+    policy_version: Option<i64>,
+) -> Response {
+    let agent_id = format!("agent-{instance_id}");
+    let body = match policy_version {
+        Some(version) => serde_json::to_value(AgentStatusReport {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            agent_id,
+            instance_id: instance_id.to_string(),
+            version: "v0.2.0".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: Some(version),
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+            certificate_status: None,
+            command_acks: Vec::new(),
+            machine_profile: None,
+        })
+        .expect("serialize status"),
+        None => serde_json::json!({
+            "agent_id": agent_id,
+            "instance_id": instance_id,
+            "version": "v0.1.0",
+        }),
+    };
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(credential),
+        &body,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn discovery_policies_poll_requires_bearer_credential() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+
+    let response = post_discovery_poll(
+        &env.config,
+        &env.store_handle,
+        None,
+        &discovery_poll_request(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn discovery_policies_poll_refuses_an_unknown_envelope() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+    let credential = enroll_agent_credential(&env).await;
+    let mut request = discovery_poll_request();
+    request.kind = "something_else".to_string();
+
+    let response =
+        post_discovery_poll(&env.config, &env.store_handle, Some(&credential), &request).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn discovery_policies_poll_serves_the_configured_table() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_discovery_poll(
+        &env.config,
+        &env.store_handle,
+        Some(&credential),
+        &discovery_poll_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned: DiscoveryPoliciesReturned = decode_json_response(response).await;
+
+    assert_eq!(returned.policy_version, 7);
+    assert_eq!(returned.published_at, "2026-09-22T00:00:00Z");
+    assert_eq!(returned.policies.len(), 7);
+    // 测试内容目录没有 `path_exists` 条件 → 白名单为空（不影响旧行为）。
+    assert!(
+        returned.probe_paths.is_empty(),
+        "fixture 没有路径条件时不应凭空下发探测项"
+    );
+    let host = returned
+        .policies
+        .iter()
+        .find(|policy| policy.aspect == "host")
+        .expect("host policy");
+    assert!(host.baseline);
+    assert!(host.supports("macos"));
+}
+
+#[tokio::test]
+async fn discovery_policies_poll_is_unavailable_when_unconfigured() {
+    // 未配置时回 503 而不是空表：空表会让「平台没发布策略」与「从未配置」无法区分。
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_discovery_poll(
+        &env.config,
+        &env.store_handle,
+        Some(&credential),
+        &discovery_poll_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8 body");
+    assert!(body.contains("not configured"), "{body}");
+}
+
+#[tokio::test]
+async fn admin_discovery_view_reports_configured() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+
+    let response = get_discovery_view(&env, Some(TEST_ADMIN_API_TOKEN)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+
+    assert_eq!(view["configured"], serde_json::Value::Bool(true));
+    assert_eq!(view["policy"]["policy_version"], 7);
+    assert_eq!(
+        view["policy"]["policies"]
+            .as_array()
+            .expect("policies")
+            .len(),
+        7
+    );
+}
+
+#[tokio::test]
+async fn admin_discovery_view_shows_the_probe_paths_agents_actually_get() {
+    // 管理面与 Agent 的 poll 必须回**同一份**白名单。
+    // 以前管理面回的是策略表原样（`probe_paths` 恒空）：运维看到“网关什么都没让探”，
+    // 真机上却可能是另一回事 —— 而这一项恰好决定了 `path_exists:` 的面能不能授权。
+    let mut env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+    // 夹具目录只有 metrics 单元（`match = ""`），`probe_paths()` 必然为空 ——
+    // 要验“白名单确实从目录推导出来了”，必须换成真实知识目录。
+    // `test_support::knowledge_file` 在缺同级仓时直接 panic（CI 会 checkout），不会假绿。
+    env.config.content_catalog_file = Some(crate::test_support::knowledge_file("catalog.toml"));
+    env.config.content_packs_file = Some(crate::test_support::knowledge_file("packs.toml"));
+    env.config.content_templates_file = Some(crate::test_support::knowledge_file("templates.toml"));
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_discovery_poll(
+        &env.config,
+        &env.store_handle,
+        Some(&credential),
+        &discovery_poll_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned: DiscoveryPoliciesReturned = decode_json_response(response).await;
+
+    let view: serde_json::Value =
+        decode_json_response(get_discovery_view(&env, Some(TEST_ADMIN_API_TOKEN)).await).await;
+
+    assert!(
+        !returned.probe_paths.is_empty(),
+        "真实目录应推导出非空白名单：{returned:?}"
+    );
+    let actual: Vec<String> = serde_json::from_value(view["policy"]["probe_paths"].clone())
+        .expect("admin 视图里的 probe_paths 应是字符串数组");
+    assert_eq!(
+        actual, returned.probe_paths,
+        "管理面与 Agent 必须看到同一份"
+    );
+    // 钉住一项有业务含义的：数据库面的路径条件必须进白名单，
+    // 否则 agent 不探测，那个面永远 `fact_not_collected`。
+    assert!(
+        returned
+            .probe_paths
+            .iter()
+            .any(|path| path == "/var/log/postgresql"),
+        "{:?}",
+        returned.probe_paths
+    );
+}
+
+#[tokio::test]
+async fn admin_discovery_view_reports_unconfigured() {
+    let env = TestEnv::new().await;
+
+    let response = get_discovery_view(&env, Some(TEST_ADMIN_API_TOKEN)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+
+    assert_eq!(view["configured"], serde_json::Value::Bool(false));
+    assert!(view["policy"].is_null());
+}
+
+#[tokio::test]
+async fn admin_discovery_view_requires_admin_bearer() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+
+    let response = get_discovery_view(&env, None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn agent_status_persists_the_applied_discovery_policy_version() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_agent_status(&env, &credential, "node-a", Some(2)).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("agent");
+    assert_eq!(stored.last_discovery_policy_version, Some(2));
+}
+
+#[tokio::test]
+async fn admin_fact_refresh_is_delivered_on_the_status_ack_and_cleared_by_the_agent_result() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    // 1) 管理面发起命令。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/fact-refresh",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let command_id = body["command_id"].as_str().expect("command id").to_string();
+    assert_eq!(body["kind"], "refresh_facts");
+    assert!(body["requested_at"].is_string());
+    assert!(body["acknowledged_at"].is_null());
+    assert!(body["outcome"].is_null());
+
+    let status_report = |acks: serde_json::Value| {
+        serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.9.11",
+            "command_acks": acks,
+        })
+    };
+
+    // 2) 下一次状态上报的回执把命令带给 agent。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_report(serde_json::json!([])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(ack.commands.len(), 1);
+    assert_eq!(ack.commands[0].command_id, command_id);
+    assert_eq!(ack.commands[0].kind, "refresh_facts");
+
+    // 3) agent 回传结果后不再下发，管理面看到结果。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_report(serde_json::json!([{
+            "command_id": command_id,
+            "outcome": "succeeded",
+            "detail": "probes=6 failed=0",
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert!(ack.commands.is_empty());
+
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/fact-refresh").await,
+    )
+    .await;
+    assert_eq!(view["command_id"], command_id);
+    assert_eq!(view["outcome"], "succeeded");
+    assert!(view["acknowledged_at"].is_string());
+    assert_eq!(view["detail"], "probes=6 failed=0");
+}
+
+#[tokio::test]
+async fn repeated_fact_refresh_requests_supersede_the_pending_one() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let first: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-node-a/fact-refresh",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({}),
+        )
+        .await,
+    )
+    .await;
+    let second: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-node-a/fact-refresh",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({}),
+        )
+        .await,
+    )
+    .await;
+    let first_id = first["command_id"].as_str().expect("first id");
+    let second_id = second["command_id"].as_str().expect("second id");
+    assert_ne!(first_id, second_id);
+
+    // 只下发最新的一条（旧的被标成 superseded，不再排队）。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.9.11",
+            "command_acks": [],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(ack.commands.len(), 1);
+    assert_eq!(ack.commands[0].command_id, second_id);
+
+    // 管理面看到的也是最近一条。
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/fact-refresh").await,
+    )
+    .await;
+    assert_eq!(view["command_id"], second_id);
+}
+
+#[tokio::test]
+async fn stale_fact_refresh_commands_are_expired_instead_of_delivered_forever() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    // 旧 agent 不解析回执、或机器长期离线：命令一直不确认。
+    // 必须有一个收口，否则每次 3s 心跳都把同一条重发一遍，永不结束。
+    env.store
+        .enqueue_agent_command(
+            &StoredAgentCommand {
+                command_id: "cmd-stale".to_string(),
+                agent_id: "agent-node-a".to_string(),
+                kind: "refresh_facts".to_string(),
+                params: String::new(),
+                requested_at_ms: chrono::Utc::now().timestamp_millis() - 2 * 60 * 60 * 1000,
+                acked_at: None,
+                claimed_at: None,
+                outcome: None,
+                detail: None,
+                requested_by: String::new(),
+            },
+            false,
+        )
+        .await
+        .expect("enqueue command");
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.9.11",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert!(ack.commands.is_empty(), "过期命令不应再下发");
+
+    // 管理面能看到「为什么没执行」，而不是永远停在「待认领」。
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/fact-refresh").await,
+    )
+    .await;
+    assert_eq!(view["command_id"], "cmd-stale");
+    assert_eq!(view["outcome"], "expired");
+    assert!(view["acknowledged_at"].is_string());
+}
+
+#[tokio::test]
+async fn a_fresh_fact_refresh_command_survives_the_expiry_sweep() {
+    // 与上一条成对：收口只吃「超出窗口」的，正常下达的命令不能被误杀。
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let posted: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-node-a/fact-refresh",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({}),
+        )
+        .await,
+    )
+    .await;
+    let command_id = posted["command_id"].as_str().expect("command id");
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.9.11",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(ack.commands.len(), 1);
+    assert_eq!(ack.commands[0].command_id, command_id);
+}
+
+#[tokio::test]
+async fn viewing_a_fact_refresh_sweeps_commands_of_an_agent_that_never_reports() {
+    // 状态上报里的收口只发生在「这台机器还在上报」时。一台长期离线的机器
+    // 不能在页面上永远显示「等待认领」。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+
+    env.store
+        .enqueue_agent_command(
+            &StoredAgentCommand {
+                command_id: "cmd-abandoned".to_string(),
+                agent_id: "agent-node-a".to_string(),
+                kind: "refresh_facts".to_string(),
+                params: String::new(),
+                requested_at_ms: chrono::Utc::now().timestamp_millis() - 2 * 60 * 60 * 1000,
+                acked_at: None,
+                claimed_at: None,
+                outcome: None,
+                detail: None,
+                requested_by: String::new(),
+            },
+            false,
+        )
+        .await
+        .expect("enqueue command");
+
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/fact-refresh").await,
+    )
+    .await;
+    assert_eq!(view["command_id"], "cmd-abandoned");
+    assert_eq!(view["outcome"], "expired");
+    assert!(view["acknowledged_at"].is_string());
+}
+
+#[tokio::test]
+async fn admin_fact_refresh_requires_admin_bearer() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/fact-refresh",
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn agent_status_without_the_policy_version_keeps_it_null() {
+    // 旧 agentd 的报文里没有这个 key：既不能因此回 400，也不能把它当成 0。
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_agent_status(&env, &credential, "node-a", None).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("agent");
+    assert_eq!(stored.last_discovery_policy_version, None);
+}
+
+#[tokio::test]
+async fn admin_discovery_view_lists_per_agent_applied_versions() {
+    let env = TestEnv::new_with_discovery_policies(Some(TEST_DISCOVERY_POLICIES)).await;
+    // a 报上生效版本 2；b 报了状态但不带版本；c 注册后从没报过 —— 三台都必须出现。
+    let credential_a = enroll_agent_at_node(&env, "node-a").await;
+    let credential_b = enroll_agent_at_node(&env, "node-b").await;
+    let _credential_c = enroll_agent_at_node(&env, "node-c").await;
+    assert_eq!(
+        post_agent_status(&env, &credential_a, "node-a", Some(2))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        post_agent_status(&env, &credential_b, "node-b", None)
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+
+    let view: serde_json::Value =
+        decode_json_response(get_discovery_view(&env, Some(TEST_ADMIN_API_TOKEN)).await).await;
+    // 未配置/已配置两路都带上 agents；这里策略表是配了的，顺带确认旧字段语义没变。
+    assert_eq!(view["configured"], serde_json::Value::Bool(true));
+
+    let agents = view["agents"].as_array().expect("agents array");
+    let ids: Vec<&str> = agents
+        .iter()
+        .map(|agent| agent["agent_id"].as_str().expect("agent_id"))
+        .collect();
+    assert_eq!(ids, vec!["agent-node-a", "agent-node-b", "agent-node-c"]);
+
+    assert_eq!(agents[0]["applied_policy_version"], 2);
+    assert_eq!(agents[0]["instance_id"], "node-a");
+    assert!(
+        agents[0]["last_seen_at"]
+            .as_str()
+            .expect("last_seen_at")
+            .starts_with("20"),
+        "{agents:?}"
+    );
+
+    // b 上报过但没带版本：null，不是 0，也不是缺行。
+    assert!(agents[1]["applied_policy_version"].is_null());
+    assert_eq!(agents[1]["instance_id"], "node-b");
+    assert!(!agents[1]["last_seen_at"].as_str().unwrap().is_empty());
+
+    // c 从没上报：仍在列表里（运维要看的正是「谁还没生效」），last_seen_at 为 null。
+    assert!(agents[2]["applied_policy_version"].is_null());
+    assert!(agents[2]["last_seen_at"].is_null(), "{agents:?}");
+}
+
+#[tokio::test]
+async fn agent_status_metric_reports_policy_version_only_when_present() {
+    // 缺值不能补 0：0 是「确实生效了第 0 版」，与「还没拉到策略表」在图上必须分开。
+    let with = super::agent_ops::agent_status_metric_lines(
+        "agent-node-a",
+        None,
+        None,
+        None,
+        None,
+        Some(2),
+        1_700_000_000_000,
+    );
+    let version_line = with
+        .iter()
+        .find(|line| line["metric"]["__name__"] == "agent_discovery_policy_version")
+        .expect("discovery policy version metric line");
+    assert_eq!(version_line["values"][0], 2.0);
+    assert_eq!(version_line["metric"]["agent"], "agent-node-a");
+    assert_eq!(with.len(), 1);
+
+    let without = super::agent_ops::agent_status_metric_lines(
+        "agent-node-a",
+        None,
+        None,
+        None,
+        None,
+        None,
+        1_700_000_000_000,
+    );
+    assert!(without.is_empty(), "{without:?}");
+}
+
+#[tokio::test]
+async fn agent_status_metric_reports_cpu_cores_when_present() {
+    // 核数是整机占比的分母，随状态上报一起进时序；缺值同样不发线（与 cpu.percent 同一规矩）。
+    let with = super::agent_ops::agent_status_metric_lines(
+        "agent-node-a",
+        None,
+        Some(50.0),
+        Some(4),
+        None,
+        None,
+        1_700_000_000_000,
+    );
+    let cores_line = with
+        .iter()
+        .find(|line| line["metric"]["__name__"] == "agent_cpu_cores")
+        .expect("cpu cores metric line");
+    assert_eq!(cores_line["values"][0], 4.0);
+    assert_eq!(cores_line["metric"]["agent"], "agent-node-a");
+
+    let without = super::agent_ops::agent_status_metric_lines(
+        "agent-node-a",
+        None,
+        Some(50.0),
+        None,
+        None,
+        None,
+        1_700_000_000_000,
+    );
+    assert!(
+        without
+            .iter()
+            .all(|line| line["metric"]["__name__"] != "agent_cpu_cores"),
+        "{without:?}"
+    );
+}
+
+#[tokio::test]
+async fn agent_status_metric_scales_cpu_and_latency_into_spec_units() {
+    // 规范单位：CPU 是 0–1 比例（单核口径），延迟是秒；上报入参仍是百分比 / 毫秒。
+    let lines = super::agent_ops::agent_status_metric_lines(
+        "agent-node-a",
+        None,
+        Some(50.0),
+        Some(4),
+        Some(250),
+        None,
+        1_700_000_000_000,
+    );
+    let find = |name: &str| {
+        lines
+            .iter()
+            .find(|line| line["metric"]["__name__"] == name)
+            .unwrap_or_else(|| panic!("missing metric line {name}"))
+            .clone()
+    };
+
+    assert_eq!(find("agent_cpu_ratio")["values"][0], 0.5);
+    assert_eq!(find("agent_admin_latency_seconds")["values"][0], 0.25);
+    assert_eq!(find("agent_cpu_cores")["values"][0], 4.0);
+}
+
+/// 用**真实策展策略表**跑通下发：装载校验通过，且下发的是七个方向那一版。
+///
+/// 这是“用夹具数据验证契约”的那份证据；数据来自知识库仓 `wist-knowledge`（缺则失败）。
+#[tokio::test]
+async fn discovery_policies_poll_serves_the_checked_in_table() {
+    let policies =
+        std::fs::read_to_string(crate::test_support::knowledge_file("aspect-policies.toml"))
+            .expect("read checked-in policy table");
+    // 换个实现就能在这里早失败：装载校验不过不会走到端点。
+    let env = TestEnv::new().await;
+    let config = config_with_discovery_policies(&env, &policies);
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_discovery_poll(
+        &config,
+        &env.store_handle,
+        Some(&credential),
+        &discovery_poll_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned: DiscoveryPoliciesReturned = decode_json_response(response).await;
+
+    assert!(returned.policy_version >= 1);
+    assert_eq!(returned.policies.len(), 7);
+}
+
+#[tokio::test]
+async fn fact_summary_ingest_survives_a_corrupt_json_column() {
+    // 判重路径若顺带反序列化三个 JSON 列，一旦某列仕掉就会把**新摘要永远挡在门外**
+    // （upsert 根本走不到），坏行无法被覆盖自愈。这里把列真的写坏来验。
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    assert_eq!(
+        post_facts(&env, &fact_report(&["xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", env.config.sqlite_path.display()))
+        .await
+        .expect("open raw pool");
+    sqlx::query("UPDATE agent_fact_summary SET process_executables = ?1 WHERE agent_id = ?2")
+        .bind("not json")
+        .bind("agent-node-a")
+        .execute(&pool)
+        .await
+        .expect("corrupt the column");
+    pool.close().await;
+
+    // 1）同一份内容再报：判重只读 digest，不该 500。
+    assert_eq!(
+        post_facts(&env, &fact_report(&["xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+
+    // 2）换一份内容：必须能覆盖写入，坏列随之自愈。
+    assert_eq!(
+        post_facts(&env, &fact_report(&["/opt/homebrew/bin/mise"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("read summary")
+        .expect("summary");
+    assert_eq!(
+        stored.process_executables,
+        vec!["/opt/homebrew/bin/mise".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn agent_facts_route_rejects_oversized_and_invalid_input() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+
+    // 条数超限（被管机器可以自己控制数组长度，网关必须自己封顶）。
+    let mut too_many = fact_report(&["xcodebuild"]);
+    too_many.process_executables = vec!["x".to_string(); 10_001];
+    assert_eq!(
+        post_facts(&env, &too_many).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // 单元素超长。
+    let mut too_long = fact_report(&["xcodebuild"]);
+    too_long.process_executables = vec!["x".repeat(4097)];
+    assert_eq!(
+        post_facts(&env, &too_long).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // 负数留痕字段。
+    let mut negative = fact_report(&["xcodebuild"]);
+    negative.process_count = -1;
+    assert_eq!(
+        post_facts(&env, &negative).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // 被拒的上报不该落库。
+    assert!(
+        env.store
+            .get_agent_fact_summary("agent-node-a")
+            .await
+            .expect("read")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn agent_purpose_route_recomputes_a_missing_suggestion() {
+    // 首次上报时还没配规则表：只入库、无建议。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    assert_eq!(
+        post_facts(&env, &fact_report(&["xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    // 首次上报时还没配规则表：只入库、无建议。
+    assert!(
+        env.store
+            .get_purpose_suggestion("agent-node-a")
+            .await
+            .expect("store read")
+            .is_none()
+    );
+
+    // 之后配上规则表（重启生效）。事实没变、agentd 不会再报 ——
+    // 读取路径必须自愈，否则「有事实、无建议」会无限期留着。
+    let with_rules = config_with_purpose_rules(&env, TEST_PURPOSE_RULES);
+    let response = get_to_router(
+        &with_rules,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/purpose",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["suggestion"]["suggested_class"], "MacDev");
+    assert_eq!(view["suggestion"]["rule_set_id"], "macos-v1");
+
+    // 自愈是**落库**的，不只影响这一响；而且未配规则表的那份配置读它时
+    // 不该把它清掉（不推断 ≠ 清空）。
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["suggestion"]["rule_set_id"], "macos-v1");
+}
+
+#[tokio::test]
+async fn agent_purpose_route_recomputes_when_the_rule_set_version_changes() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    post_facts(&env, &fact_report(&["xcodebuild"])).await;
+    assert_eq!(
+        get_purpose_view(&env, "agent-node-a").await["suggestion"]["rule_set_id"],
+        "macos-v1"
+    );
+
+    // 规则册换版本：同一份事实、agentd 不会再报，只能靠读取路径看出来并重算。
+    let v2 = TEST_PURPOSE_RULES.replace("macos-v1", "macos-v2");
+    let with_v2 = config_with_purpose_rules(&env, &v2);
+    let response = get_to_router(
+        &with_v2,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/purpose",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["suggestion"]["rule_set_id"], "macos-v2");
 }
 
 #[tokio::test]
 async fn agent_status_route_persists_work_state_changes() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    let enrollment = post_enrollment_to_router(&env.config, enrollment_request_json(&token)).await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
 
-    let status = post_json_to_router(
+    let status = post_agent_json_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
             memory_bytes: None,
             cpu_percent: None,
+            cpu_cores: None,
             admin_latency_ms: None,
+            discovery_policy_version: None,
             work_state_changes: Some(vec![AgentWorkStateChange {
                 input_id: "app".to_string(),
                 state: AgentWorkState::Paused,
                 reason: "spool over limit".to_string(),
                 at: "now".to_string(),
             }]),
+            local_work: None,
+            uplink_state: None,
+            certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
     assert_eq!(status.status(), StatusCode::ACCEPTED);
 
-    let snapshot = env.store.load().expect("load store");
-    let stored = snapshot.agents.get("agent-node-a").expect("agent");
+    let stored = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("agent");
     let changes = stored
         .work_state_changes
         .as_deref()
@@ -682,131 +4478,567 @@ async fn agent_status_route_persists_work_state_changes() {
 }
 
 #[tokio::test]
-async fn agent_status_route_rejects_expired_bearer_credential() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    let enrollment = post_enrollment_to_router(&env.config, enrollment_request_json(&token)).await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
-    env.store
-        .update(|snapshot| {
-            let agent = snapshot
-                .agents
-                .get_mut("agent-node-a")
-                .expect("stored agent");
-            agent.credential_expires_at = "2026-07-01T00:00:00Z".to_string();
-        })
-        .expect("expire credential");
+async fn the_work_view_exposes_the_agents_local_work_report() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
 
-    let response = post_json_to_router(
+    // 还没上报过：`local` 是 null（不是空对象）—— 与「上报了但没东西」区分开。
+    let before = get_agent_work(&env).await;
+    assert!(before["local"].is_null(), "{before}");
+
+    // 上报本机工作视图：一份常驻工作（盯一个文件）+ 一条手工输入。
+    let local_work = wist_contracts::local_work::AgentLocalWork {
+        recorded_at: "2026-09-26T08:00:00Z".to_string(),
+        gateway_sequence: 7,
+        standing: vec![wist_contracts::local_work::AgentLocalStandingWork {
+            work_id: "work-1".to_string(),
+            family: "SystemLogs".to_string(),
+            status: "active".to_string(),
+            plan_version: 3,
+            acknowledged_version: Some(3),
+            effective_from: "2026-09-25T00:00:00Z".to_string(),
+            tasks: vec![wist_contracts::local_work::AgentLocalTask {
+                input_id: "work-SystemLogs-syslog".to_string(),
+                path: "/var/log/system.log".to_string(),
+                startup_position: "tail".to_string(),
+            }],
+        }],
+        one_shot: Vec::new(),
+        local_inputs: vec![wist_contracts::local_work::AgentLocalTask {
+            input_id: "manual-app".to_string(),
+            path: "/var/log/app.log".to_string(),
+            startup_position: "tail".to_string(),
+        }],
+        metrics_interval_seconds: Some(15),
+    };
+    let status = post_agent_json_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            machine_profile: None,
             agent_id: "agent-node-a".to_string(),
             instance_id: "node-a".to_string(),
             version: "v0.2.0".to_string(),
             memory_bytes: None,
             cpu_percent: None,
+            cpu_cores: None,
             admin_latency_ms: None,
+            discovery_policy_version: None,
             work_state_changes: None,
+            local_work: Some(local_work),
+            uplink_state: None,
+            certificate_status: None,
+            command_acks: Vec::new(),
         },
     )
     .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
 
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // 工作视图（管理面）把 agent 上报的本机事实一并带出来。
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["local"]["gateway_sequence"], 7);
+    assert_eq!(
+        view["local"]["standing"][0]["tasks"][0]["path"],
+        "/var/log/system.log"
+    );
+    assert_eq!(view["local"]["local_inputs"][0]["path"], "/var/log/app.log");
+    assert_eq!(view["local"]["metrics_interval_seconds"], 15);
+}
+
+/// 上报实际生效的上送状态后，运行状态响应能逐个字段读到它。
+///
+/// 运维问「这台为什么不上送」时查的就是运行状态响应：待命 / 本机 file 出口 / 目标是谁 /
+/// 控制面下发还是本机 / 出口是否在失败，都得能在这一个响应里看到。
+#[tokio::test]
+async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    // 还没上报过：`uplink_state` 是 null（不是全 false 的对象）。
+    let before = get_agent_runtime_status(&env).await;
+    assert!(before["uplink_state"].is_null(), "{before}");
+
+    // 上报实际生效的上送状态：控制面下发的 tcp 目标，且出口正在写失败。
+    let status = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &AgentStatusReport {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            machine_profile: None,
+            agent_id: "agent-node-a".to_string(),
+            instance_id: "node-a".to_string(),
+            version: "v0.2.0".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: Some(wist_contracts::agent_uplink::AgentUplinkState {
+                enabled: true,
+                kind: "tcp".to_string(),
+                target: Some("10.0.1.9:9000".to_string()),
+                source: "grant".to_string(),
+                output_write_failing: true,
+            }),
+            certificate_status: None,
+            command_acks: Vec::new(),
+        },
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+
+    let view = get_agent_runtime_status(&env).await;
+    assert_eq!(view["uplink_state"]["enabled"], true);
+    assert_eq!(view["uplink_state"]["kind"], "tcp");
+    assert_eq!(view["uplink_state"]["target"], "10.0.1.9:9000");
+    assert_eq!(view["uplink_state"]["source"], "grant");
+    assert_eq!(view["uplink_state"]["output_write_failing"], true);
+
+    // 关键语义：下一次心跳没带这个字段（旧版本 agentd）时保持上一次的值，不清空。
+    let status = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &AgentStatusReport {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            machine_profile: None,
+            agent_id: "agent-node-a".to_string(),
+            instance_id: "node-a".to_string(),
+            version: "v0.2.0".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+            certificate_status: None,
+            command_acks: Vec::new(),
+        },
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+
+    let view = get_agent_runtime_status(&env).await;
+    assert_eq!(view["uplink_state"]["kind"], "tcp");
+    assert_eq!(view["uplink_state"]["target"], "10.0.1.9:9000");
+    assert_eq!(view["uplink_state"]["source"], "grant");
+    assert_eq!(view["uplink_state"]["output_write_failing"], true);
+}
+
+/// 状态上报携带机器画像 → 运行状态视图能读到主机名与 IP；而且**空值不覆盖**已知画像。
+#[tokio::test]
+async fn a_status_report_with_a_machine_profile_backfills_the_registry() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let report = |profile: Option<wist_contracts::enrollment::HostProfile>| AgentStatusReport {
+        logs_capabilities: None,
+        investigation_capabilities: None,
+        machine_profile: profile,
+        agent_id: "agent-node-a".to_string(),
+        instance_id: "node-a".to_string(),
+        version: "v0.3.0".to_string(),
+        memory_bytes: None,
+        cpu_percent: None,
+        cpu_cores: None,
+        admin_latency_ms: None,
+        discovery_policy_version: None,
+        work_state_changes: None,
+        local_work: None,
+        uplink_state: None,
+        certificate_status: None,
+        command_acks: Vec::new(),
+    };
+    let profile = wist_contracts::enrollment::HostProfile {
+        node_id: "node-1".to_string(),
+        hostname: "host-1".to_string(),
+        os: "linux".to_string(),
+        arch: "x86_64".to_string(),
+        machine_id: "mid-1".to_string(),
+        cloud_instance_id: None,
+        k8s_node_uid: None,
+        ip_addresses: vec!["en0 10.0.0.5/24".to_string()],
+    };
+
+    let status = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &report(Some(profile)),
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+
+    let view = get_agent_runtime_status(&env).await;
+    assert_eq!(view["hostname"], "host-1");
+    assert_eq!(view["node_id"], "node-1");
+    assert_eq!(view["ip_addresses"], serde_json::json!(["en0 10.0.0.5/24"]));
+
+    // 下一次心跳没带机器画像（旧版本 agentd）：保留上一次的值，不擦掉。
+    let status = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &report(None),
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+    let view = get_agent_runtime_status(&env).await;
+    assert_eq!(view["hostname"], "host-1", "空值不得擦掉已知画像");
+    assert_eq!(
+        view["ip_addresses"],
+        serde_json::json!(["en0 10.0.0.5/24"]),
+        "省略不得擦掉已知地址"
+    );
+}
+
+/// 注册 `agent-node-a` 并上报一次带机器画像的状态：注册表里就有 hostname / node_id / ip_addresses。
+async fn enroll_agent_with_machine_profile(env: &TestEnv, ip_addresses: Vec<String>) {
+    let credential = enroll_agent_credential(env).await;
+    let report = AgentStatusReport {
+        logs_capabilities: None,
+        investigation_capabilities: None,
+        machine_profile: Some(wist_contracts::enrollment::HostProfile {
+            node_id: "node-1".to_string(),
+            hostname: "host-1".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            machine_id: "mid-1".to_string(),
+            cloud_instance_id: None,
+            k8s_node_uid: None,
+            ip_addresses,
+        }),
+        agent_id: "agent-node-a".to_string(),
+        instance_id: "node-a".to_string(),
+        version: "v0.3.0".to_string(),
+        memory_bytes: None,
+        cpu_percent: None,
+        cpu_cores: None,
+        admin_latency_ms: None,
+        discovery_policy_version: None,
+        work_state_changes: None,
+        local_work: None,
+        uplink_state: None,
+        certificate_status: None,
+        command_acks: Vec::new(),
+    };
+    let status = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &report,
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+}
+
+/// 主机指标端点：指标本身来自数据面 VictoriaMetrics，主机名 / `node_id` / IP 由网关
+/// join **注册表**补齐。数据面用一个本地桩顶替（`query` / `query_range` 返回固定 JSON）。
+#[tokio::test]
+async fn host_metrics_routes_join_registry_identity_onto_data_plane_metrics() {
+    let mut env = TestEnv::new().await;
+    enroll_agent_with_machine_profile(
+        &env,
+        vec![
+            "en0 10.0.0.5/24".to_string(),
+            "utun100 100.64.0.9/32".to_string(),
+        ],
+    )
+    .await;
+
+    // 把管理面的 VM 地址指向本地桩（随机端口）。
+    env.config.victoria_metrics_url = spawn_victoria_metrics_stub("agent-node-a", 1.5).await;
+
+    // 详情：指标值来自数据面桩，身份 join 自注册表（多地址原样带出）。
+    let detail = get_admin(&env, "/api/v1/admin/agents/agent-node-a/host-metrics").await;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(detail).await;
+    assert_eq!(view["agentId"], "agent-node-a");
+    assert_eq!(view["hostname"], "host-1", "主机名必须 join 自注册表");
+    assert_eq!(view["nodeId"], "node-1");
+    assert_eq!(
+        view["ipAddresses"],
+        serde_json::json!(["en0 10.0.0.5/24", "utun100 100.64.0.9/32"])
+    );
+    assert_eq!(view["loadAverage1m"], 1.5);
+    assert_eq!(view["memoryTotalKb"], 1024);
+
+    // 列表：一行一台有指标上报的主机，同样带身份。
+    let list = get_admin(&env, "/api/v1/admin/agents/host-metrics").await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let rows: serde_json::Value = decode_json_response(list).await;
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 1, "只保留注册表里认识、且真有指标的机器");
+    assert_eq!(rows[0]["agentId"], "agent-node-a");
+    assert_eq!(rows[0]["hostname"], "host-1");
+    assert_eq!(rows[0]["nodeId"], "node-1");
+    assert_eq!(
+        rows[0]["ipAddresses"],
+        serde_json::json!(["en0 10.0.0.5/24", "utun100 100.64.0.9/32"])
+    );
+    assert_eq!(rows[0]["memoryAvailableKb"], 512);
+    // 比例 → 百分比在展示层换算；旧字段只读 system 角色，不被 data 覆盖。
+    assert_eq!(rows[0]["diskUsagePercent"], 60.0);
+    assert_eq!(rows[0]["maxFilesystemUsagePercent"], 95.0);
+    assert_eq!(rows[0]["maxFilesystemUsageMount"], "/var");
+
+    // 未知 agent：404（存在性走注册表，与指标无关）。
+    let missing = get_admin(&env, "/api/v1/admin/agents/agent-missing/host-metrics").await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+/// 数据面有指标、但**注册表不认识**的 agent：列表必须丢掉它（`/hosts` 只说「已注册且有指标」）。
+#[tokio::test]
+async fn host_metrics_list_drops_metrics_from_agents_outside_the_registry() {
+    let mut env = TestEnv::new().await;
+    enroll_agent_with_machine_profile(&env, vec!["en0 10.0.0.5/24".to_string()]).await;
+
+    let instant = serde_json::json!({
+        "status": "success",
+        "data": {
+            "resultType": "vector",
+            "result": [
+                {
+                    "metric": { "__name__": "system_load_average_1m", "agent": "agent-node-a" },
+                    "value": [1_700_000_000, "1.5"],
+                },
+                {
+                    "metric": { "__name__": "system_load_average_1m", "agent": "ghost-agent" },
+                    "value": [1_700_000_000, "9.9"],
+                },
+            ],
+        },
+    });
+    let range = serde_json::json!({
+        "status": "success",
+        "data": { "resultType": "matrix", "result": [] },
+    });
+    env.config.victoria_metrics_url = spawn_victoria_metrics_stub_bodies(instant, range).await;
+
+    let list = get_admin(&env, "/api/v1/admin/agents/host-metrics").await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let rows: serde_json::Value = decode_json_response(list).await;
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 1, "注册表不认识的 agent 不该出现：{rows:?}");
+    assert_eq!(rows[0]["agentId"], "agent-node-a");
+}
+
+/// 数据面**没有**这台机器的指标：详情仍要带上注册表里的身份 —— 「没数据」不等于「不知道是谁」。
+#[tokio::test]
+async fn host_metrics_detail_keeps_registry_identity_when_data_plane_is_empty() {
+    let mut env = TestEnv::new().await;
+    enroll_agent_with_machine_profile(&env, vec!["en0 10.0.0.5/24".to_string()]).await;
+
+    let empty = serde_json::json!({
+        "status": "success",
+        "data": { "resultType": "vector", "result": [] },
+    });
+    let empty_range = serde_json::json!({
+        "status": "success",
+        "data": { "resultType": "matrix", "result": [] },
+    });
+    env.config.victoria_metrics_url = spawn_victoria_metrics_stub_bodies(empty, empty_range).await;
+
+    let detail = get_admin(&env, "/api/v1/admin/agents/agent-node-a/host-metrics").await;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(detail).await;
+    assert_eq!(view["hostname"], "host-1");
+    assert_eq!(view["nodeId"], "node-1");
+    assert_eq!(view["ipAddresses"], serde_json::json!(["en0 10.0.0.5/24"]));
+    // 没有指标就不要编一个值：缺失字段被 skip，`loadAverage1m` 不该出现。
+    assert!(
+        view.get("loadAverage1m").is_none(),
+        "无数据时不该伪造负载读数：{view:?}"
+    );
+}
+
+/// 一个最小的 VictoriaMetrics 桩：`/api/v1/query`（即时）与 `/api/v1/query_range`（区间）返回
+/// 给定的 JSON 体。绑随机端口，返回 base URL。仅测试用。
+async fn spawn_victoria_metrics_stub_bodies(
+    instant: serde_json::Value,
+    range: serde_json::Value,
+) -> String {
+    let app = axum::Router::new()
+        .route(
+            "/api/v1/query",
+            axum::routing::get(move || {
+                let body = instant.clone();
+                async move { Json(body) }
+            }),
+        )
+        .route(
+            "/api/v1/query_range",
+            axum::routing::get(move || {
+                let body = range.clone();
+                async move { Json(body) }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind victoria metrics stub");
+    let addr = listener.local_addr().expect("stub addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// 单台主机的固定读数桩：负载 1m + 内存总量/可用量（即时），负载趋势（区间）。
+async fn spawn_victoria_metrics_stub(agent_id: &str, load_1m: f64) -> String {
+    let agent = agent_id.to_string();
+    let instant = serde_json::json!({
+        "status": "success",
+        "data": {
+            "resultType": "vector",
+            "result": [
+                {
+                    "metric": { "__name__": "system_load_average_1m", "agent": agent },
+                    "value": [1_700_000_000, load_1m.to_string()],
+                },
+                {
+                    "metric": { "__name__": "system_memory_total_bytes", "agent": agent },
+                    "value": [1_700_000_000, "1048576"],
+                },
+                {
+                    "metric": { "__name__": "system_memory_available_bytes", "agent": agent },
+                    "value": [1_700_000_000, "524288"],
+                },
+                {
+                    "metric": { "__name__": "system_disk_usage_ratio", "agent": agent, "disk_role": "system" },
+                    "value": [1_700_000_000, "0.6"],
+                },
+                {
+                    "metric": { "__name__": "system_disk_usage_ratio", "agent": agent, "disk_role": "data" },
+                    "value": [1_700_000_000, "0.95"],
+                },
+                {
+                    "metric": { "__name__": "system_filesystem_usage_ratio", "agent": agent, "mountpoint": "/" },
+                    "value": [1_700_000_000, "0.6"],
+                },
+                {
+                    "metric": { "__name__": "system_filesystem_usage_ratio", "agent": agent, "mountpoint": "/var" },
+                    "value": [1_700_000_000, "0.95"],
+                },
+            ],
+        },
+    });
+    let range = serde_json::json!({
+        "status": "success",
+        "data": {
+            "resultType": "matrix",
+            "result": [
+                {
+                    "metric": { "__name__": "system_load_average_1m", "agent": agent },
+                    "values": [
+                        [1_700_000_000, load_1m.to_string()],
+                        [1_700_000_030, load_1m.to_string()],
+                    ],
+                },
+            ],
+        },
+    });
+    spawn_victoria_metrics_stub_bodies(instant, range).await
 }
 
 #[tokio::test]
-async fn agent_credential_renewal_rotates_bearer_and_rejects_old_token() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    let enrollment = post_enrollment_to_router(&env.config, enrollment_request_json(&token)).await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let old_bearer = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
+async fn credential_renewal_issues_a_new_certificate_and_rotates_the_stored_credential() {
+    let mut env = TestEnv::new().await;
+    let (_ca, ca_cert_path, ca_key_path) = test_agent_ca();
+    env.config.agent_ca_cert_file = Some(ca_cert_path);
+    env.config.agent_ca_key_file = Some(ca_key_path);
 
-    let renewed = post_json_to_router(
+    let agent_id = enroll_agent_credential(&env).await;
+    let before = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("stored agent");
+
+    let renewed = post_agent_json_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/credentials:renew",
-        Some(&old_bearer),
+        Some(&agent_id),
         &CredentialRenewal::new(
             "agent-node-a".to_string(),
             "node-a".to_string(),
-            "bearer".to_string(),
+            "csr".to_string(),
+            certificate_signing_request(),
             "2026-07-29T00:00:00Z".to_string(),
         ),
     )
     .await;
     assert_eq!(renewed.status(), StatusCode::OK);
     let renewed: CredentialRenewed = decode_json_response(renewed).await;
-    let new_bearer = renewed
-        .credential_bundle
-        .bearer_token
-        .as_deref()
-        .expect("renewed bearer");
-    assert!(new_bearer.starts_with("wic_"));
-    assert_ne!(new_bearer, old_bearer);
+    let bundle = renewed.credential_bundle;
+    assert!(
+        bundle.certificate.contains("BEGIN CERTIFICATE"),
+        "续期应换发新证书"
+    );
 
-    let old_rejected = post_json_to_router(
+    // 库里当前凭据轮换到新的一行（旧行置 revoked），管理视图/吊销仍按 credential_id 定位。
+    let after = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("stored agent");
+    assert_ne!(after.credential_id, before.credential_id);
+    assert_eq!(after.credential_status, StoredCredentialStatus::Active);
+
+    // 续期后证书身份照常能用（续期不会把机器锁死）。
+    let accepted = post_agent_json_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/status",
-        Some(&old_bearer),
-        &AgentStatusReport {
-            agent_id: "agent-node-a".to_string(),
-            instance_id: "node-a".to_string(),
-            version: "v0.2.0".to_string(),
-            memory_bytes: None,
-            cpu_percent: None,
-            admin_latency_ms: None,
-            work_state_changes: None,
-        },
+        Some(&agent_id),
+        &status_body("agent-node-a", "node-a"),
     )
     .await;
-    assert_eq!(old_rejected.status(), StatusCode::UNAUTHORIZED);
-
-    let new_accepted = post_json_to_router(
-        &env.config,
-        "/api/v1/agent/status",
-        Some(new_bearer),
-        &AgentStatusReport {
-            agent_id: "agent-node-a".to_string(),
-            instance_id: "node-a".to_string(),
-            version: "v0.2.0".to_string(),
-            memory_bytes: None,
-            cpu_percent: None,
-            admin_latency_ms: None,
-            work_state_changes: None,
-        },
-    )
-    .await;
-    assert_eq!(new_accepted.status(), StatusCode::ACCEPTED);
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
 }
 
 #[tokio::test]
-async fn agent_credential_renewal_requires_current_bearer() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    let enrollment = post_enrollment_to_router(&env.config, enrollment_request_json(&token)).await;
+async fn agent_credential_renewal_requires_a_client_certificate() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let enrollment = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&token),
+    )
+    .await;
     assert_eq!(enrollment.status(), StatusCode::CREATED);
 
-    let response = post_json_to_router(
+    // 不带客户端证书 → 401（续期也不能靠 bearer / 裸奔）。
+    let response = post_agent_json_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/credentials:renew",
         None,
         &CredentialRenewal::new(
             "agent-node-a".to_string(),
             "node-a".to_string(),
-            "bearer".to_string(),
+            "csr".to_string(),
+            certificate_signing_request(),
             "2026-07-29T00:00:00Z".to_string(),
         ),
     )
@@ -816,22 +5048,15 @@ async fn agent_credential_renewal_requires_current_bearer() {
 }
 
 #[tokio::test]
-async fn agent_control_and_action_result_routes_accept_bearer_credential() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    let enrollment = post_enrollment_to_router(&env.config, enrollment_request_json(&token)).await;
-    let returned = decode_enrollment_response(enrollment).await;
-    let credential = returned
-        .result
-        .credential_bundle
-        .expect("credential bundle")
-        .bearer_token
-        .expect("bearer token");
+async fn agent_routes_accept_a_client_certificate() {
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
 
-    let poll = post_json_to_router(
+    let poll = post_agent_json_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/control-commands:poll",
-        Some(&credential),
+        Some(&agent_id),
         &PollControlCommands {
             requested_at: DateTime::now(),
             last_seen_sequence: 7,
@@ -843,10 +5068,11 @@ async fn agent_control_and_action_result_routes_accept_bearer_credential() {
     .await;
     assert_eq!(poll.status(), StatusCode::OK);
 
-    let report = post_json_to_router(
+    let report = post_agent_json_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/action-results",
-        Some(&credential),
+        Some(&agent_id),
         &ReportActionResult::new(
             "report-1".to_string(),
             "action-1".to_string(),
@@ -875,10 +5101,14 @@ async fn agent_control_and_action_result_routes_accept_bearer_credential() {
 }
 
 #[tokio::test]
-async fn enrollment_route_rejects_invalid_token_as_contract_result() {
-    let env = TestEnv::new();
-    let response =
-        post_enrollment_to_router(&env.config, enrollment_request_json("bad-token")).await;
+async fn enrollment_route_rejects_invalid_token() {
+    let env = TestEnv::new().await;
+    let response = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json("bad-token"),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::CREATED);
     let returned = decode_enrollment_response(response).await;
@@ -893,23 +5123,31 @@ async fn enrollment_route_rejects_invalid_token_as_contract_result() {
 
 #[tokio::test]
 async fn enrollment_route_rejects_unknown_contract_fields() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
     let mut payload = serde_json::to_value(enrollment_request(&token)).expect("serialize request");
     payload["unexpected"] = serde_json::json!("not-in-contract");
-    let response = post_enrollment_to_router(&env.config, payload.to_string()).await;
+    let response =
+        post_enrollment_to_router(&env.config, &env.store_handle, payload.to_string()).await;
 
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
 async fn install_code_route_requires_admin_bearer_token() {
-    let env = TestEnv::new();
-    let missing = get_to_router(&env.config, "/api/v1/agent/install-code", None).await;
+    let env = TestEnv::new().await;
+    let missing = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/install-code",
+        None,
+    )
+    .await;
     assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
     let accepted = get_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/install-code",
         Some(TEST_ADMIN_API_TOKEN),
     )
@@ -919,70 +5157,44 @@ async fn install_code_route_requires_admin_bearer_token() {
 }
 
 #[tokio::test]
-async fn install_script_signature_route_returns_matching_signature() {
-    let env = TestEnv::new();
-    let script_response =
-        get_to_router(&env.config, "/api/v1/agent/install/x86/install.sh", None).await;
-    assert_eq!(script_response.status(), StatusCode::OK);
-    assert_no_store(&script_response);
-    let script = body_bytes(script_response).await;
-
-    let signature_response = get_to_router(
+async fn install_script_route_rejects_bad_arch() {
+    let env = TestEnv::new().await;
+    let unknown = get_to_router(
         &env.config,
-        "/api/v1/agent/install/x86/install.sh.sig",
+        &env.store_handle,
+        "/api/v1/agent/install/mips/install.sh",
         None,
     )
     .await;
-    assert_eq!(signature_response.status(), StatusCode::OK);
-    assert_no_store(&signature_response);
-    assert_eq!(
-        signature_response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("application/octet-stream")
-    );
-    let signature = body_bytes(signature_response).await;
-
-    signature::UnparsedPublicKey::new(&signature::ED25519, &env.install_public_key_bytes)
-        .verify(&script, &signature)
-        .expect("route signature verifies script body");
-}
-
-#[tokio::test]
-async fn install_script_route_rejects_unknown_or_injected_arch() {
-    let env = TestEnv::new();
-    let unknown = get_to_router(&env.config, "/api/v1/agent/install/mips/install.sh", None).await;
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     assert_no_store(&unknown);
 
     let injected_script = get_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/agent/install/x86%22%0Aecho%20pwned%0A%23/install.sh",
         None,
     )
     .await;
     assert_eq!(injected_script.status(), StatusCode::NOT_FOUND);
     assert_no_store(&injected_script);
-
-    let injected_signature = get_to_router(
-        &env.config,
-        "/api/v1/agent/install/x86%22%0Aecho%20pwned%0A%23/install.sh.sig",
-        None,
-    )
-    .await;
-    assert_eq!(injected_signature.status(), StatusCode::NOT_FOUND);
-    assert_no_store(&injected_signature);
 }
 
 #[tokio::test]
 async fn admin_overview_route_requires_admin_bearer_token() {
-    let env = TestEnv::new();
-    let missing = get_to_router(&env.config, "/api/v1/admin/agents/overview", None).await;
+    let env = TestEnv::new().await;
+    let missing = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/overview",
+        None,
+    )
+    .await;
     assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
     let accepted = get_to_router(
         &env.config,
+        &env.store_handle,
         "/api/v1/admin/agents/overview",
         Some(TEST_ADMIN_API_TOKEN),
     )
@@ -992,8 +5204,8 @@ async fn admin_overview_route_requires_admin_bearer_token() {
 
 #[tokio::test]
 async fn admin_routes_rate_limit_failed_bearer_attempts() {
-    let env = TestEnv::new();
-    let app = router(env.config);
+    let env = TestEnv::new().await;
+    let app = router(env.config.clone(), env.store_handle.clone());
 
     for _ in 0..5 {
         let response = app
@@ -1032,8 +5244,8 @@ async fn admin_routes_rate_limit_failed_bearer_attempts() {
 
 #[tokio::test]
 async fn admin_rate_limit_ignores_missing_bearer_requests() {
-    let env = TestEnv::new();
-    let app = router(env.config);
+    let env = TestEnv::new().await;
+    let app = router(env.config.clone(), env.store_handle.clone());
 
     // An unauthenticated client (e.g. the web UI polling the overview before a
     // token is entered) must not accumulate rate-limit failures. Send several
@@ -1072,8 +5284,8 @@ async fn admin_rate_limit_ignores_missing_bearer_requests() {
 
 #[tokio::test]
 async fn admin_rate_limit_ignores_spoofed_forwarded_headers() {
-    let env = TestEnv::new();
-    let app = router(env.config);
+    let env = TestEnv::new().await;
+    let app = router(env.config.clone(), env.store_handle.clone());
 
     for index in 0..5 {
         let response = app
@@ -1112,13 +5324,13 @@ async fn admin_rate_limit_ignores_spoofed_forwarded_headers() {
 }
 
 #[tokio::test]
-async fn admin_rate_limit_buckets_failures_per_client_ip() {
+async fn admin_rate_limit_buckets_per_client_ip() {
     use std::net::SocketAddr;
 
     use axum::extract::connect_info::MockConnectInfo;
 
-    let env = TestEnv::new();
-    let app = router(env.config);
+    let env = TestEnv::new().await;
+    let app = router(env.config.clone(), env.store_handle.clone());
 
     let request_from = |ip: [u8; 4], port: u16| {
         let mut request = Request::builder()
@@ -1161,9 +5373,9 @@ async fn admin_rate_limit_buckets_failures_per_client_ip() {
 
 #[tokio::test]
 async fn initial_config_route_requires_valid_token() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    let response = router(env.config.clone())
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let response = router(env.config.clone(), env.store_handle.clone())
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -1178,7 +5390,7 @@ async fn initial_config_route_requires_valid_token() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_no_store(&response);
 
-    let query_token = router(env.config.clone())
+    let query_token = router(env.config.clone(), env.store_handle.clone())
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -1190,7 +5402,7 @@ async fn initial_config_route_requires_valid_token() {
         .expect("route response");
     assert_eq!(query_token.status(), StatusCode::UNAUTHORIZED);
 
-    let missing = router(env.config)
+    let missing = router(env.config.clone(), env.store_handle.clone())
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -1204,9 +5416,48 @@ async fn initial_config_route_requires_valid_token() {
 }
 
 #[tokio::test]
+async fn initial_config_route_401_is_uniform_across_token_failure_modes() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/agent/initial-config";
+    // 与安装包分发端点同一口径：未知 / 过期 / 已消费都不区分，不暴露「存在但过期」。
+    const GENERIC_BOOTSTRAP_BODY: &str = "invalid bootstrap bearer token";
+
+    let unknown = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some("wit_does_not_exist"),
+    )
+    .await;
+    assert_auth_rejected(unknown, GENERIC_BOOTSTRAP_BODY).await;
+
+    let expired = env.issue_token().await;
+    sqlx::query("UPDATE enrollment_tokens SET expires_at = ?1 WHERE token_hash = ?2")
+        .bind("2020-01-01T00:00:00+00:00")
+        .bind(token_hash(&expired))
+        .execute(env.store.pool())
+        .await
+        .expect("expire token");
+    let expired_response = get_to_router(&env.config, &env.store_handle, uri, Some(&expired)).await;
+    assert_auth_rejected(expired_response, GENERIC_BOOTSTRAP_BODY).await;
+
+    let consumed = env.issue_token().await;
+    let enrolled = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&consumed),
+    )
+    .await;
+    assert_eq!(enrolled.status(), StatusCode::CREATED);
+    let consumed_response =
+        get_to_router(&env.config, &env.store_handle, uri, Some(&consumed)).await;
+    assert_auth_rejected(consumed_response, GENERIC_BOOTSTRAP_BODY).await;
+}
+
+#[tokio::test]
 async fn bootstrap_routes_rate_limit_failed_bearer_attempts() {
-    let env = TestEnv::new();
-    let app = router(env.config);
+    let env = TestEnv::new().await;
+    let app = router(env.config.clone(), env.store_handle.clone());
 
     for _ in 0..5 {
         let response = app
@@ -1245,13 +5496,13 @@ async fn bootstrap_routes_rate_limit_failed_bearer_attempts() {
 
 #[tokio::test]
 async fn agent_package_route_requires_valid_token() {
-    let env = TestEnv::new();
-    let token = env.issue_token();
-    let response = router(env.config.clone())
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let response = router(env.config.clone(), env.store_handle.clone())
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/v1/agent/packages/current")
+                .uri("/api/v1/agent/packages/current?platform=aarch64-apple-darwin")
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .expect("request"),
@@ -1262,7 +5513,7 @@ async fn agent_package_route_requires_valid_token() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_no_store(&response);
 
-    let query_token = router(env.config.clone())
+    let query_token = router(env.config.clone(), env.store_handle.clone())
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -1274,11 +5525,11 @@ async fn agent_package_route_requires_valid_token() {
         .expect("route response");
     assert_eq!(query_token.status(), StatusCode::UNAUTHORIZED);
 
-    let missing = router(env.config)
+    let missing = router(env.config.clone(), env.store_handle.clone())
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/v1/agent/packages/current")
+                .uri("/api/v1/agent/packages/current?platform=aarch64-apple-darwin")
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -1287,39 +5538,46 @@ async fn agent_package_route_requires_valid_token() {
     assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 }
 
-#[tokio::test]
-async fn enrollment_route_uses_no_store_and_rate_limits_rejections() {
-    let env = TestEnv::new();
-    let app = router(env.config);
+fn enrollment_attempt_request(ip: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/v1/agent/enroll")
+        .header("x-real-ip", ip)
+        .header("content-type", "application/json")
+        .body(Body::from(enrollment_request_json("bad-token")))
+        .expect("request")
+}
 
+#[tokio::test]
+async fn enrollment_route_marks_rejections_no_store() {
+    let env = TestEnv::new().await;
+
+    let response = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(enrollment_attempt_request("192.0.2.12"))
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_no_store(&response);
+}
+
+#[tokio::test]
+async fn enrollment_route_rate_limits_repeated_rejections() {
+    let env = TestEnv::new().await;
+    let app = router(env.config.clone(), env.store_handle.clone());
+
+    // 前 5 次都走拒绝路径（契约上仍是 201），第 6 次被限流。
     for _ in 0..5 {
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/agent/enroll")
-                    .header("x-real-ip", "192.0.2.12")
-                    .header("content-type", "application/json")
-                    .body(Body::from(enrollment_request_json("bad-token")))
-                    .expect("request"),
-            )
+            .oneshot(enrollment_attempt_request("192.0.2.12"))
             .await
             .expect("route response");
         assert_eq!(response.status(), StatusCode::CREATED);
-        assert_no_store(&response);
     }
 
     let blocked = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/agent/enroll")
-                .header("x-real-ip", "192.0.2.12")
-                .header("content-type", "application/json")
-                .body(Body::from(enrollment_request_json("bad-token")))
-                .expect("request"),
-        )
+        .oneshot(enrollment_attempt_request("192.0.2.12"))
         .await
         .expect("route response");
 
@@ -1330,7 +5588,7 @@ async fn enrollment_route_uses_no_store_and_rate_limits_rejections() {
 
 #[tokio::test]
 async fn agent_overview_is_empty_before_enrollment() {
-    let state = test_state();
+    let state = test_state().await;
     let overview = agent_overview(&state).await;
 
     assert_eq!(overview.metrics.total_agents, 0);
@@ -1339,10 +5597,49 @@ async fn agent_overview_is_empty_before_enrollment() {
     assert!(overview.abnormal_agents.is_empty());
 }
 
+/// 总览的卡片列表要**列全**最近上线的 Agent，而不是截断到 6 张。
+///
+/// 这里以前是 6（前端卡片网格的老上限）：7 台的网关会出现「已接入 Agent = 7、下面只列 6」，
+/// 而且没有任何提示说少了一台 —— 多出来的那台在总览页看不到。这条测试就是钉住那次修复。
+#[tokio::test]
+async fn agent_overview_lists_every_recently_registered_agent() {
+    let state = test_state().await;
+    let registered = 7;
+    for index in 0..registered {
+        record_recent_online_agent(
+            &state.runtime,
+            &format!("agent-host-{index}"),
+            &format!("host-{index}"),
+            "v0.9.1",
+            "2026-07-28T00:00:00Z",
+        );
+    }
+
+    // 内存环形缓冲自身也得留住这么多，否则卡片会缺指标历史。
+    let ring_len = state
+        .runtime
+        .lock()
+        .expect("runtime state poisoned")
+        .recent_online_agents
+        .len();
+    assert_eq!(ring_len, registered);
+
+    let overview = agent_overview(&state).await;
+    assert_eq!(
+        overview.recent_online_agents.len(),
+        registered,
+        "总览要把最近上线的每一台都列出来，不能只给 6 张卡片"
+    );
+    assert!(
+        registered < OVERVIEW_RECENT_AGENT_LIMIT,
+        "这条测试的前提是机队规模远小于上限"
+    );
+}
+
 #[tokio::test]
 async fn agent_overview_reflects_successful_enrollment() {
-    let state = test_state();
-    let token = issue_token_for_state(&state);
+    let state = test_state().await;
+    let token = issue_token_for_state(&state).await;
     let mut request = enrollment_request(&token);
     request.capability_summary = "wist-agentd:test,version=v0.9.1".to_string();
 
@@ -1366,12 +5663,3273 @@ async fn agent_overview_reflects_successful_enrollment() {
     );
 }
 
+/// 注册一个 Agent 后的 TestEnv：admin Agent 列表相关测试的公共前置。
+async fn env_with_enrolled_agent() -> TestEnv {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let enrolled = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&token),
+    )
+    .await;
+    assert_eq!(enrolled.status(), StatusCode::CREATED);
+    env
+}
+
+#[tokio::test]
+async fn admin_agent_list_requires_admin_bearer() {
+    let env = env_with_enrolled_agent().await;
+
+    let unauthorized =
+        get_to_router(&env.config, &env.store_handle, "/api/v1/admin/agents", None).await;
+
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_agent_list_returns_enrolled_agents() {
+    let env = env_with_enrolled_agent().await;
+
+    let listed = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(listed).await;
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["limit"], 100);
+    assert_eq!(body["offset"], 0);
+    assert_eq!(body["agents"][0]["agent_id"], "agent-node-a");
+    assert_eq!(body["agents"][0]["tenant_id"], "tenant-default");
+    assert_eq!(body["agents"][0]["environment_id"], "env-default");
+    assert_eq!(body["agents"][0]["credential_status"], "active");
+}
+
+/// 列表的**形状**是前端机队索引页的契约。
+///
+/// 为什么单列一条：升级页 / 采集工作页靠 `list_agents` 拿机队（不是“有主机指标的 Agent”
+/// —— 那个口径会把待命 / 新装的机器漏掉）。前端只读 `agents[].{agent_id,instance_id,
+/// hostname,version,status,health}`，所以这些键必须**存在且是字符串**，否则一次后端改名
+/// 就会惄悄把页面变成空机队（比报错更难查）。
+///
+/// 同时钉住「注册表口径」：这台 Agent 只注册过、**没上报过任何状态或指标**，仍必须在列。
+#[tokio::test]
+async fn admin_agent_list_shape_is_the_registry_contract() {
+    let env = env_with_enrolled_agent().await;
+
+    let listed = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(listed).await;
+
+    // 外层分页字段。
+    assert!(body["total"].is_number(), "total must be a number: {body}");
+    assert!(body["limit"].is_number(), "limit must be a number: {body}");
+    assert!(
+        body["offset"].is_number(),
+        "offset must be a number: {body}"
+    );
+
+    // 注册表口径：刚注册、什么都没上报过的那台也要在。
+    let agents = body["agents"].as_array().expect("agents array");
+    assert_eq!(agents.len(), 1, "enrolled agent must be listed: {body}");
+    assert_eq!(agents[0]["agent_id"], "agent-node-a");
+
+    // 前端解析的字段：缺一个或类型不对，页面就读不出机队。
+    for key in [
+        "agent_id",
+        "instance_id",
+        "hostname",
+        "version",
+        "status",
+        "health",
+    ] {
+        assert!(
+            agents[0].get(key).is_some_and(serde_json::Value::is_string),
+            "{key} must be a string in {}",
+            agents[0]
+        );
+    }
+}
+
+/// 页大小越界必须**夹紧**，而不是回一个空页。
+///
+/// 前端取 `limit=500`（正好是 `MAX_AGENT_PAGE_LIMIT`）；若网关回一个空列表，页面会
+/// 把它读成“机队没了”—— 比回错页数难查得多。
+#[tokio::test]
+async fn admin_agent_list_clamps_the_page_size() {
+    let env = env_with_enrolled_agent().await;
+
+    for (query, expected) in [
+        ("/api/v1/admin/agents?limit=500", 500),  // 前端正在用的值
+        ("/api/v1/admin/agents?limit=9999", 500), // 越过上限 → 夹到上限
+        ("/api/v1/admin/agents?limit=0", 1),      // 非正 → 至少 1
+    ] {
+        let response = get_to_router(
+            &env.config,
+            &env.store_handle,
+            query,
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{query}");
+        let body: serde_json::Value = decode_json_response(response).await;
+        assert_eq!(body["limit"], expected, "{query}");
+        // 夹紧后仍能列出那台机器（不是空页）。
+        assert_eq!(body["agents"].as_array().map(Vec::len), Some(1), "{query}");
+    }
+}
+
+/// **离线的机器**在列表里必须被标成 `offline`，而不是一律 `online`。
+///
+/// 为什么：升级计划的目标列表要据此把离线机器排除掉 —— 一台几小时没上报的机器还报 "online"，
+/// 页面就会把升级派给它，然后那件工作一直挂到过期（或永远等不到）。判据与总览同一处
+/// （`agent_is_online`：`last_seen_at` 是否落在 300s 窗口内）。
+#[tokio::test]
+async fn admin_agent_list_marks_stale_agents_offline() {
+    let env = env_with_enrolled_agent().await;
+
+    // 直接写一次「很久以前」的状态上报：HTTP 路径总是把 `last_seen_at` 取当下，
+    // 造不出陈旧，所以这里走存储层把水位推老。
+    let stale = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    let recorded = env
+        .store_handle
+        .record_agent_status(&AgentStatusUpdate {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            agent_id: "agent-node-a",
+            instance_id: "node-a",
+            boot_id: "",
+            version: "v0.2.0",
+            last_seen_at: &stale,
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+        })
+        .await
+        .expect("record stale status");
+    assert!(recorded, "the enrolled agent must exist");
+
+    let body = admin_agent_list(&env).await;
+    assert_eq!(body["agents"][0]["status"], "offline", "{body}");
+
+    // 再来一次「刚刚」的上报：同一台机器必须回到 online —— 判据是水位，不是一次性快照。
+    let fresh = chrono::Utc::now().to_rfc3339();
+    env.store_handle
+        .record_agent_status(&AgentStatusUpdate {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            agent_id: "agent-node-a",
+            instance_id: "node-a",
+            boot_id: "",
+            version: "v0.2.0",
+            last_seen_at: &fresh,
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+        })
+        .await
+        .expect("record fresh status");
+
+    let body = admin_agent_list(&env).await;
+    assert_eq!(body["agents"][0]["status"], "online", "{body}");
+}
+
+/// **单台运行态的 `status` 与列表口径一致**：同一台机器，列表说离线，详情也必须说离线。
+///
+/// 曾经单台接口把 `status` 写死 `"online"`，而列表是按 `last_seen_at` 现算 —— 一台几小时
+/// 没上报的机器点进详情反而显示在线，运维会把活派给一台已经死掉的机器。
+#[tokio::test]
+async fn admin_agent_runtime_status_shares_the_online_verdict_with_the_list() {
+    let env = env_with_enrolled_agent().await;
+
+    // 直接把水位推老（HTTP 上报路径总是取当下，造不出陈旧）。
+    let stale = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    assert!(
+        env.store_handle
+            .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
+                investigation_capabilities: None,
+                agent_id: "agent-node-a",
+                instance_id: "node-a",
+                boot_id: "",
+                version: "v0.2.0",
+                last_seen_at: &stale,
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
+            })
+            .await
+            .expect("record stale status")
+    );
+
+    let list = admin_agent_list(&env).await;
+    let detail = get_agent_runtime_status(&env).await;
+    assert_eq!(list["agents"][0]["status"], "offline", "{list}");
+    assert_eq!(detail["status"], "offline", "{detail}");
+
+    // 刚上报过：两处都要回到 online。
+    let fresh = chrono::Utc::now().to_rfc3339();
+    env.store_handle
+        .record_agent_status(&AgentStatusUpdate {
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            agent_id: "agent-node-a",
+            instance_id: "node-a",
+            boot_id: "",
+            version: "v0.2.0",
+            last_seen_at: &fresh,
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+        })
+        .await
+        .expect("record fresh status");
+
+    let list = admin_agent_list(&env).await;
+    let detail = get_agent_runtime_status(&env).await;
+    assert_eq!(list["agents"][0]["status"], "online", "{list}");
+    assert_eq!(detail["status"], "online", "{detail}");
+}
+
+/// 删除只允许**离线**机器：在线 → 409，且机器分毫未动。
+#[tokio::test]
+async fn delete_agent_refuses_an_online_agent() {
+    let env = env_with_enrolled_agent().await;
+    // 刚注册就是 `last_seen_at = 注册时刻`（在线）；再写一条新鲜上报把它明确钉在在线。
+    let fresh = chrono::Utc::now().to_rfc3339();
+    assert!(
+        env.store_handle
+            .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
+                investigation_capabilities: None,
+                agent_id: "agent-node-a",
+                instance_id: "node-a",
+                boot_id: "",
+                version: "v0.2.0",
+                last_seen_at: &fresh,
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
+            })
+            .await
+            .expect("record fresh status")
+    );
+
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        env.store_handle
+            .get_agent("agent-node-a")
+            .await
+            .expect("get")
+            .is_some(),
+        "被拒的删除不能动到机器"
+    );
+}
+
+/// 离线机器可以删：204，且注册与凭据都消失（旧 token 不能再被认出来）。
+#[tokio::test]
+async fn delete_agent_removes_an_offline_agent_and_its_credential() {
+    let env = env_with_enrolled_agent().await;
+    // 把水位推老 → 判离线（HTTP 上报路径总是取当下，造不出陈旧）。
+    let stale = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    assert!(
+        env.store_handle
+            .record_agent_status(&AgentStatusUpdate {
+                logs_capabilities: None,
+                investigation_capabilities: None,
+                agent_id: "agent-node-a",
+                instance_id: "node-a",
+                boot_id: "",
+                version: "v0.2.0",
+                last_seen_at: &stale,
+                memory_bytes: None,
+                cpu_percent: None,
+                cpu_cores: None,
+                admin_latency_ms: None,
+                discovery_policy_version: None,
+                work_state_changes: None,
+                local_work: None,
+                uplink_state: None,
+            })
+            .await
+            .expect("record stale status")
+    );
+    let credential_hash = env
+        .store_handle
+        .get_agent("agent-node-a")
+        .await
+        .expect("get")
+        .expect("enrolled")
+        .credential_token_hash;
+
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["agent_id"], "agent-node-a", "{body}");
+    assert!(body["deleted_at"].is_string(), "{body}");
+
+    assert!(
+        env.store_handle
+            .get_agent("agent-node-a")
+            .await
+            .expect("get")
+            .is_none()
+    );
+    // 凭据行必须一并删掉，否则旧凭据还能被利用。
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_credentials WHERE token_hash = ?1")
+            .bind(&credential_hash)
+            .fetch_one(env.store.pool())
+            .await
+            .expect("count credentials");
+    assert_eq!(remaining, 0, "凭据必须一并删掉，否则旧凭据还能用");
+}
+
+#[tokio::test]
+async fn delete_agent_is_not_found_for_an_unknown_agent() {
+    let env = env_with_enrolled_agent().await;
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-nope",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// 删除是管理动作（会连凭据一起拿走）：没有 admin token 一律 401。
+#[tokio::test]
+async fn delete_agent_requires_admin_bearer() {
+    let env = env_with_enrolled_agent().await;
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 在线窗口的**边界**：`last_seen_at` 落在 `0..=300s` 内算在线。
+///
+/// 注意 `DateTime::seconds_until` 把负差**夹到 0**（`max(0)`）：所以「上报时间在未来」
+/// （机器时钟偏快 / 回拨）按 0 秒处理 = **在线**。这是刻意的 —— 一台刚上报、只是时钟
+/// 偏快的机器不该被当成离线排掉。
+#[test]
+fn agent_online_window_is_a_closed_three_hundred_second_boundary() {
+    let base = chrono::Utc::now();
+    let now = DateTime::from_rfc3339(&base.to_rfc3339()).expect("parse now");
+    // 同一时间源推差，避免 `Utc::now()` 与 `DateTime::now()` 的秒级偏差把边界测试弄成偶发。
+    let at = |secs_ago: i64| (base - chrono::Duration::seconds(secs_ago)).to_rfc3339();
+
+    assert!(agent_is_online(&at(0), &now), "刚上报：在线");
+    assert!(agent_is_online(&at(300), &now), "恰好在窗口上沿：仍算在线");
+    assert!(!agent_is_online(&at(301), &now), "越过窗口：离线");
+    assert!(
+        agent_is_online(&at(-30), &now),
+        "未来时间戳被夹到 0 秒 ⇒ 在线（时钟偏快的机器不该被当成离线）"
+    );
+    assert!(!agent_is_online("not-a-timestamp", &now), "坏时间戳：离线");
+}
+
+#[tokio::test]
+async fn admin_agent_list_filters_by_tenant() {
+    let env = env_with_enrolled_agent().await;
+
+    let filtered = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents?tenant_id=tenant-other",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+
+    let body: serde_json::Value = decode_json_response(filtered).await;
+    assert_eq!(body["total"], 0);
+    assert_eq!(body["agents"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn admin_agent_list_paginates() {
+    let env = env_with_enrolled_agent().await;
+
+    // offset 越过末尾：列表为空，但 total 仍反映整体数量。
+    let paged = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents?limit=1&offset=1",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+
+    let body: serde_json::Value = decode_json_response(paged).await;
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["agents"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn admin_revoke_agent_credential_locks_agent_out() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let enrolled = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&token),
+    )
+    .await;
+    assert_eq!(enrolled.status(), StatusCode::CREATED);
+
+    let agent = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("load agent")
+        .expect("agent exists");
+    let credential_id = agent.credential_id.clone();
+    assert_eq!(agent.credential_status, StoredCredentialStatus::Active);
+    let uri = "/api/v1/admin/agents/agent-node-a/credentials:revoke";
+
+    // 缺 admin 凭据：拒绝。
+    let unauthorized = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        None,
+        &serde_json::json!({ "credential_id": credential_id }),
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    // 未知凭据：404。
+    let unknown = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "credential_id": "cred-unknown" }),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    // 当前凭据：吊销成功。
+    let revoked = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "credential_id": credential_id }),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(revoked).await;
+    assert_eq!(body["status"], "revoked");
+    assert_eq!(body["credential_id"], credential_id);
+
+    // 已吊销：认证路径不再放行，且重复吊销返回 404。
+    let agent = env
+        .store
+        .get_agent("agent-node-a")
+        .await
+        .expect("load agent")
+        .expect("agent exists");
+    assert_eq!(agent.credential_status, StoredCredentialStatus::Revoked);
+    let again = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "credential_id": credential_id }),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn uplink_view_reports_the_target_derived_from_the_deployment_config() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/uplink";
+
+    let unauthorized = get_to_router(&env.config, &env.store_handle, uri, None).await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    // 管理面没设过：生效值是**部署配置派生**的 —— 与 Agent 拿到的控制面地址同域 + 数据面端口
+    // （「一台机器、一个域名」的部署不必再录一遍）。`updated_at == null` 即「不是管理面录入的值」，
+    // 页面据此显示「来自部署配置」。
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(view.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["host"], "127.0.0.1"); // 取 public_base_url 的主机名
+    assert_eq!(body["port"], 9000);
+    assert_eq!(body["updated_by"], "");
+    assert_eq!(body["updated_at"], serde_json::Value::Null);
+    // 派生只说明「能连到哪」，不说明「该不该连」：开关恒为关，
+    // 而且必须标出它是**派生的**（页面据此区分「没录入」与「录入过一次不开」）。
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["enabled_configured"], false);
+}
+
+/// 连派生都派不出（对外基址里取不出主机名）才是真的「未设置」：页面据此提示「没有上送目标」。
+#[tokio::test]
+async fn uplink_view_is_unset_when_the_base_url_yields_no_host() {
+    let mut env = TestEnv::new().await;
+    // 真实部署里配置校验挡得住这种基址，这里只钉住「派生不出就返回未设置」的兜底分支。
+    env.config.public_base_url = "https://".to_string();
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/uplink",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(view.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["host"], "");
+    assert_eq!(body["port"], 9000);
+    assert_eq!(body["updated_at"], serde_json::Value::Null);
+}
+
+/// 生效上送目标的两级来源：管理面设置优先，没设过用部署配置派生的。
+#[tokio::test]
+async fn effective_uplink_prefers_the_admin_setting_over_the_derived_target() {
+    let env = TestEnv::new().await;
+
+    let derived = super::install::effective_agent_uplink(&env.config, &env.store_handle)
+        .await
+        .expect("resolve")
+        .expect("derived target");
+    assert_eq!(derived.host, "127.0.0.1");
+    assert_eq!(derived.port, DEFAULT_AGENT_UPLINK_PORT);
+    // 派生值的 `updated_at` 为空 —— 它是「不是管理面录入的」的判据。
+    assert_eq!(derived.updated_at, "");
+
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, false).await;
+    let chosen = super::install::effective_agent_uplink(&env.config, &env.store_handle)
+        .await
+        .expect("resolve")
+        .expect("admin setting");
+    assert_eq!(chosen.host, "10.0.1.9");
+    assert_eq!(chosen.port, 9100);
+    assert_eq!(chosen.updated_by, "ops");
+}
+
+/// 派生只取主机名：丢 scheme、丢端口、丢路径；IPv6 字面量拼不出 `host:port`，判为派生不出。
+#[tokio::test]
+async fn derived_uplink_target_takes_only_the_host_name() {
+    let mut env = TestEnv::new().await;
+    for (base, expected) in [
+        ("https://gw.example.com", Some("gw.example.com")),
+        ("https://gw.example.com/", Some("gw.example.com")),
+        ("https://gw.example.com:8443/admin", Some("gw.example.com")),
+        (
+            "https://gw.example.com:8443/a/b?x=1#f",
+            Some("gw.example.com"),
+        ),
+        ("  https://gw.example.com  ", Some("gw.example.com")),
+        ("https://10.0.0.1", Some("10.0.0.1")),
+        ("https://gw-ex_1.example.com", Some("gw-ex_1.example.com")),
+        // 取不出**干净**的主机名就不猜（比派生错一个地址好）：
+        ("https://[::1]:8443", None),
+        ("https://::1", None),
+        ("https://user@gw.example.com", None),
+        ("https://gw example.com", None),
+        ("https://", None),
+        ("", None),
+    ] {
+        env.config.public_base_url = base.to_string();
+        let derived = super::install::derived_agent_uplink(&env.config, &env.store_handle).await;
+        match expected {
+            Some(host) => {
+                let setting = derived.expect("derived target");
+                assert_eq!(setting.host, host, "base {base}");
+                assert_eq!(setting.port, DEFAULT_AGENT_UPLINK_PORT, "base {base}");
+                // 派生值的判据：不是管理面录入的。
+                assert_eq!(setting.updated_at, "", "base {base}");
+                assert_eq!(setting.updated_by, "", "base {base}");
+            }
+            None => assert!(derived.is_none(), "base {base}"),
+        }
+    }
+}
+
+/// 读上送设置失败时的口径（三条路径各不相同，都是刻意的）：
+///   * 管理面看得到 —— 查看端点 500，不把「读不到」伪装成「未设置」；
+///   * 授权端点 500 让 agentd 重试 —— 待命是**实质决定**，不在读库失败时替它做；
+///   * 安装链路不因此中断 —— 按「没设过」用派生目标，只留告警。
+#[tokio::test]
+async fn uplink_store_failure_is_reported_but_does_not_break_install() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let credential = enroll_agent_credential(&env).await;
+    // 直接撤掉这张表：等价于读设置时出错。
+    sqlx::query("DROP TABLE agent_uplink")
+        .execute(env.store.pool())
+        .await
+        .expect("drop uplink table");
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/uplink",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(view.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let poll = poll_uplink(&env, Some(&credential)).await;
+    assert_eq!(poll.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let response = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/agent/initial-config")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = decode_text_response(response).await;
+    let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+    let output = &parsed["telemetry"]["logs"]["output"];
+    assert_eq!(output["tcp"]["addr"].as_str(), Some("127.0.0.1"));
+    assert_eq!(output["enabled"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn uplink_set_validates_and_round_trips() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/uplink";
+
+    // 带 scheme / 自带端口 / 空主机 / 端口越界的写法一律 400：agentd 是把
+    // `addr` 与 `port` 分开拼成 `addr:port` 的，收下这些值只会拼出连不上的地址。
+    for bad in [
+        serde_json::json!({ "host": "", "port": 9000 }),
+        serde_json::json!({ "host": "https://10.0.1.9", "port": 9000 }),
+        serde_json::json!({ "host": "10.0.1.9:9000", "port": 9000 }),
+        serde_json::json!({ "host": "10.0.1.9", "port": 0 }),
+        serde_json::json!({ "host": "10.0.1.9", "port": 70000 }),
+    ] {
+        let response = post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            uri,
+            Some(TEST_ADMIN_API_TOKEN),
+            &bad,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "input {bad}");
+    }
+    // 被拒的输入不落库。
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["updated_at"], serde_json::Value::Null);
+
+    let ok = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        // 故意**不带** `enabled`：老前端 / 老脚本只发地址，不得顺手把全队打开。
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9100, "requested_by": "ops" }),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let stored: serde_json::Value = decode_json_response(ok).await;
+    assert_eq!(stored["host"], "10.0.1.9");
+    assert_eq!(stored["port"], 9100);
+    assert_eq!(stored["updated_by"], "ops");
+    assert_eq!(stored["enabled"], false, "缺省必须落在「不启用」这侧");
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["host"], "10.0.1.9");
+    assert_eq!(body["port"], 9100);
+    assert_eq!(body["updated_at"], stored["updated_at"]);
+    assert_eq!(body["enabled"], false);
+    // 录入过一次（哪怕是 false）——「已配置」看的是**有没有录入**，不是那个布尔值本身。
+    assert_eq!(body["enabled_configured"], true);
+}
+
+/// 部署级启用开关：录入 → 立即被响应回带；再录一次能关上。
+#[tokio::test]
+async fn uplink_switch_round_trips_through_the_admin_route() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/uplink";
+
+    let on = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9100, "enabled": true }),
+    )
+    .await;
+    assert_eq!(on.status(), StatusCode::OK);
+    let stored: serde_json::Value = decode_json_response(on).await;
+    assert_eq!(stored["enabled"], true);
+    assert_eq!(stored["enabled_configured"], true);
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["enabled"], true);
+
+    // 关回去：开关是可逆的，不需要删设置（删了会回落到派生目标，那又是另一回事）。
+    let off = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9100, "enabled": false }),
+    )
+    .await;
+    let stored: serde_json::Value = decode_json_response(off).await;
+    assert_eq!(stored["enabled"], false);
+    assert_eq!(stored["enabled_configured"], true);
+}
+
+/// **缺省 `enabled` = 保持已存值**，不是「关掉」。
+///
+/// 两个方向都得是这个形状：
+///   * 已存值是 `true` → 老客户端/脚本只改地址，**不能**把全队的上送静默掉；
+///   * 从未录入过 → `false`，**不能**顺手把全队打开。
+/// 不钉住第二条就会出现「一台 curl 把整个机队掐了」这种没人能一眼看出的故障。
+#[tokio::test]
+async fn omitting_the_switch_keeps_the_stored_value_instead_of_turning_it_off() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/uplink";
+
+    // ① 从未录入过：不带 `enabled` 的旧式请求落 `false`。
+    let first = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9100 }),
+    )
+    .await;
+    let stored: serde_json::Value = decode_json_response(first).await;
+    assert_eq!(stored["enabled"], false, "缺省绝不可能把全队打开");
+
+    // ② 显式打开。
+    let on = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9100, "enabled": true }),
+    )
+    .await;
+    let stored: serde_json::Value = decode_json_response(on).await;
+    assert_eq!(stored["enabled"], true);
+
+    // ③ 再发一次**不带 `enabled`** 的旧式请求（典型：老客户端只改端口）→ 开关必须留着。
+    let legacy = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9200 }),
+    )
+    .await;
+    let stored: serde_json::Value = decode_json_response(legacy).await;
+    assert_eq!(stored["port"], 9200, "地址要按请求改掉");
+    assert_eq!(
+        stored["enabled"], true,
+        "缺省必须保留已打开的开关 —— 否则一次地址变更就静默掐掉全队上送"
+    );
+}
+
+#[tokio::test]
+async fn advertise_url_view_reports_config_fallback() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/advertise-url";
+
+    let unauthorized = get_to_router(&env.config, &env.store_handle, uri, None).await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    // 未设置过：url 为空，但 fallback 要给出网关当前**实际**用的基址 ——
+    // 否则页面只能显示一个空值，答不出「不设置的话 agent 会连到哪里」。
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(view.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["url"], "");
+    assert_eq!(body["fallback_url"], env.config.public_base_url);
+    assert_eq!(body["updated_by"], "");
+    assert_eq!(body["updated_at"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn advertise_url_set_validates_and_round_trips() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/advertise-url";
+
+    // 只收 https 基址：它会被拼进安装命令与 install.sh 的 URL，还会写成 Agent 的控制面
+    // endpoint。http、裸主机、只有 scheme、带 shell 元字符的写法一律 400。
+    for bad in [
+        serde_json::json!({ "url": "" }),
+        serde_json::json!({ "url": "http://gw.example.com" }),
+        serde_json::json!({ "url": "gw.example.com" }),
+        serde_json::json!({ "url": "https://" }),
+        serde_json::json!({ "url": "https://gw.example.com; touch /tmp/pwned" }),
+        serde_json::json!({ "url": "https://gw.example.com/$(id)" }),
+        serde_json::json!({ "url": "https://gw.example.com/a b" }),
+    ] {
+        let response = post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            uri,
+            Some(TEST_ADMIN_API_TOKEN),
+            &bad,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "input {bad}");
+    }
+    // 被拒的输入不落库。
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["updated_at"], serde_json::Value::Null);
+
+    // 尾斜杠允许，保存时裁掉 —— 拼路径时不会再出现双斜杠。
+    let ok = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "url": "https://gw.example.com/", "requested_by": "ops" }),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let stored: serde_json::Value = decode_json_response(ok).await;
+    assert_eq!(stored["url"], "https://gw.example.com");
+    assert_eq!(stored["updated_by"], "ops");
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["url"], "https://gw.example.com");
+    assert_eq!(body["updated_at"], stored["updated_at"]);
+}
+
+#[tokio::test]
+async fn advertise_url_drives_install_code_and_initial_config() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/advertise-url";
+
+    // 未设置时，安装命令 / 分发地址 / Agent 控制面 endpoint 全部来自配置里的
+    // server.public_base_url —— 既有行为不变。
+    let before = issue_agent_install_code(&env.config, &env.store_handle)
+        .await
+        .unwrap();
+    assert_eq!(
+        before.bootstrap_bundle.control_endpoint,
+        env.config.public_base_url
+    );
+    assert!(
+        before
+            .bootstrap_bundle
+            .platforms
+            .iter()
+            .all(|p| p.agent_package_url.starts_with(&env.config.public_base_url))
+    );
+
+    let ok = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "url": "https://gw.example.com" }),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    // 设置之后，同一批产物全部改用设置值 —— 这就是这个设置项的全部意义：
+    // agent 拿到的必须是它对目标主机可见的地址。
+    let after = issue_agent_install_code(&env.config, &env.store_handle)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.bootstrap_bundle.control_endpoint,
+        "https://gw.example.com"
+    );
+    assert!(after.bootstrap_bundle.platforms.iter().all(|p| {
+        p.install_script_url
+            .starts_with("https://gw.example.com/api/v1/agent/install/")
+    }));
+    assert!(
+        after
+            .bootstrap_bundle
+            .platforms
+            .iter()
+            .all(|p| p.agent_package_url.starts_with(
+                "https://gw.example.com/api/v1/agent/packages/current?platform=aarch64-apple-darwin"
+            ))
+    );
+    assert!(
+        after
+            .macos_install_code
+            .contains("https://gw.example.com/api/v1/agent/install/")
+    );
+    // 夹具里只录了 macOS 包：x86 侧没有包 → 算不出可校验的摘要，命令就不该再指向任何地址，
+    // 而是直接说明去哪补包。顺手钉住「旧基址不会残留在这条命令里」。
+    assert!(after.x86_linux_install_code.contains("安装包"));
+    assert!(!after.x86_linux_install_code.contains("https://"));
+    assert!(
+        !after
+            .x86_linux_install_code
+            .contains(env.config.public_base_url.as_str())
+    );
+
+    // 初始配置里的控制面 endpoint 与 tls_mode 同源派生自它。
+    let text = agent_initial_config_toml(
+        &env.config,
+        "install-token-a",
+        None,
+        "https://gw.example.com",
+    );
+    assert!(text.contains("endpoint = \"https://gw.example.com\""));
+    assert!(text.contains("tls_mode = \"https\""));
+    assert!(!text.contains(&env.config.public_base_url));
+}
+
+#[tokio::test]
+async fn install_package_view_starts_unset() {
+    let env = TestEnv::new_without_package().await;
+    let uri = "/api/v1/admin/agent/install-package";
+
+    let unauthorized = get_to_router(&env.config, &env.store_handle, uri, None).await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    // 未设置过：来源地址为空。安装端始终从网关取包，此处报的是网关的取包来源，
+    // 回填分发端点会误导操作者（那样存进去会让网关去请求它自己）。
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(view.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["packages"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn install_package_set_rejects_bad_input() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/install-package";
+
+    // 明文 http：安装包是 Agent 启动来源，不允许明文分发。
+    let insecure = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": "http://example.com/agentd.tar.gz",
+                "package_sha256": "a".repeat(64),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(insecure.status(), StatusCode::BAD_REQUEST);
+
+    let bad_digest = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": "https://example.com/agentd.tar.gz",
+                "package_sha256": "not-a-digest",
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(bad_digest.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn install_package_set_rejects_unfetchable_source() {
+    let env = TestEnv::new_without_package().await;
+    let missing = write_source_package(&env, "gone", b"x");
+    std::fs::remove_file(&missing).expect("remove source");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": missing,
+                "package_sha256": "a".repeat(64),
+            }],
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // 失败正文要能直接看懂：「哪个平台、哪个来源、为什么」。
+    // 这条消息会被 gwlinkd 原样摆进中心的任务日志，只写一句
+    // `failed to fetch agent install package from source` 等于什么都没说。
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8 body");
+    assert!(
+        body.contains("install_package_source_unavailable"),
+        "{body}"
+    );
+    assert!(body.contains(TEST_PLATFORM), "要带平台：{body}");
+    assert!(body.contains("gone"), "要带来源：{body}");
+    assert!(
+        env.store
+            .get_agent_install_package(TEST_PLATFORM)
+            .await
+            .unwrap()
+            .is_none(),
+        "a failed set must not persist"
+    );
+}
+
+#[tokio::test]
+async fn install_package_set_requires_a_digest() {
+    // 摘要必填：缺字段 → 请求体不合契约（422），**不是**默默放行。
+    let env = TestEnv::new_without_package().await;
+    let source = write_source_package(&env, "require-digest", b"x");
+
+    let missing = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{ "platform": TEST_PLATFORM, "package_url": source }],
+        }),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        env.store
+            .get_agent_install_package(TEST_PLATFORM)
+            .await
+            .unwrap()
+            .is_none(),
+        "a request without a digest must not persist"
+    );
+
+    // 空串 → 400（当成「没给」就跳过了校验，所以必须拒）。
+    let empty = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{ "platform": TEST_PLATFORM, "package_url": source, "package_sha256": "  " }],
+        }),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn install_package_set_rejects_mismatched_digest() {
+    let env = TestEnv::new_without_package().await;
+    let source = write_source_package(&env, "source", b"cached-package-bytes-v1");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": source,
+                "package_sha256": "b".repeat(64),
+            }],
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        env.store
+            .get_agent_install_package(TEST_PLATFORM)
+            .await
+            .unwrap()
+            .is_none(),
+        "a mismatched digest must not persist"
+    );
+}
+
+#[tokio::test]
+async fn install_package_rejects_a_package_that_requires_a_newer_gateway() {
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-9.9.9-aarch64-apple-darwin/compat.json",
+        br#"{"requires":{"wist-gateway":">=99.0.0"}}"#,
+    );
+    let source = write_source_package(&env, "incompatible-agent", &pkg);
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "install_package_incompatible");
+    assert_eq!(body["compatibility"]["status"], "error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("请先升级"),
+        "{body}"
+    );
+    // 兼容性不通过时**不能**先覆盖 `/agent/packages/current` 的缓存：否则被拒的包仍会被安装。
+    assert!(
+        !env.config
+            .install_package_cache_path(TEST_PLATFORM)
+            .exists(),
+        "rejected package must not become the current cache"
+    );
+}
+
+#[tokio::test]
+async fn install_package_records_and_reports_a_compatible_package() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-1.0.0-aarch64-apple-darwin/compat.json",
+        br#"{"requires":{"wist-gateway":">=0.0.1"}}"#,
+    );
+    let source = write_source_package(&env, "compatible-agent", &pkg);
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["compatibility"][0]["compatibility"]["status"], "ok");
+
+    let list = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-packages",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(list).await;
+    assert_eq!(body["packages"][0]["compatibility"]["status"], "ok");
+}
+
+#[tokio::test]
+async fn install_package_history_marks_a_package_without_a_manifest_unknown() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.4.0-aarch64-apple-darwin/wist-agentd",
+        b"agentd-0.4.0",
+    );
+    set_install_package_source(&env, "no-manifest", &pkg).await;
+
+    let list = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-packages",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(list).await;
+    assert_eq!(body["packages"][0]["compatibility"]["status"], "unknown");
+}
+
+#[tokio::test]
+async fn install_package_rejects_a_mixed_set_without_writing_any_cache() {
+    let env = TestEnv::new_without_package().await;
+    let compatible = tar_gz_with_entry(
+        "wist-agentd-1.0.0-aarch64-apple-darwin/compat.json",
+        br#"{"requires":{"wist-gateway":">=0.0.1"}}"#,
+    );
+    let incompatible = tar_gz_with_entry(
+        "wist-agentd-2.0.0-x86_64-unknown-linux-musl/compat.json",
+        br#"{"requires":{"wist-gateway":">=99.0.0"}}"#,
+    );
+    let compatible_source = write_source_package(&env, "compatible", &compatible);
+    let incompatible_source = write_source_package(&env, "incompatible", &incompatible);
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [
+                {
+                    "platform": TEST_PLATFORM,
+                    "package_url": compatible_source,
+                    "package_sha256": format!("sha256:{}", bytes_sha256_hex(&compatible)),
+                },
+                {
+                    "platform": PLATFORM_LINUX_X86,
+                    "package_url": incompatible_source,
+                    "package_sha256": format!("sha256:{}", bytes_sha256_hex(&incompatible)),
+                },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        !env.config
+            .install_package_cache_path(TEST_PLATFORM)
+            .exists(),
+        "compatible platform cache must not be written when the set is rejected"
+    );
+    assert!(
+        !env.config
+            .install_package_cache_path(PLATFORM_LINUX_X86)
+            .exists(),
+        "incompatible platform cache must not be written"
+    );
+}
+
+#[tokio::test]
+async fn install_package_set_stores_computed_digest() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/install-package";
+    let bytes = b"cached-package-bytes-v1";
+    let source = write_source_package(&env, "source", bytes);
+    let digest = bytes_sha256_hex(bytes);
+
+    // 期望摘要可带前缀与大写；落库的是网关按实际内容算出的小写 sha256:<hex>。
+    let set = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", digest.to_uppercase()),
+            }],
+            "requested_by": "platform-eng",
+        }),
+    )
+    .await;
+    assert_eq!(set.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(set).await;
+    assert_eq!(body["packages"][0]["platform"], TEST_PLATFORM);
+    assert_eq!(body["packages"][0]["package_url"], source);
+    assert_eq!(
+        body["packages"][0]["package_sha256"],
+        format!("sha256:{digest}")
+    );
+    assert_eq!(body["packages"][0]["updated_by"], "platform-eng");
+    assert!(body["packages"][0]["updated_at"].is_string());
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["packages"][0]["package_url"], source);
+    assert_eq!(body["packages"][0]["updated_by"], "platform-eng");
+}
+
+#[tokio::test]
+async fn install_package_set_caches_artifact_locally() {
+    let env = TestEnv::new().await;
+    let bytes = b"cached-package-bytes-v2";
+    set_install_package_source(&env, "mirror", bytes).await;
+
+    let cached = env.config.install_package_cache_path(TEST_PLATFORM);
+    assert!(cached.is_file(), "artifact should be cached locally");
+    assert_eq!(std::fs::read(&cached).expect("read cache"), bytes.to_vec());
+}
+
+#[tokio::test]
+async fn install_code_distributes_gateway_endpoint() {
+    let env = TestEnv::new().await;
+    let bytes = b"cached-package-bytes-v2";
+    let (_, digest) = set_install_package_source(&env, "mirror", bytes).await;
+
+    let install_code = issue_agent_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("install code");
+
+    // 分发地址恒为网关端点，摘要取自本地缓存：两者同源，安装端不会 mismatch。
+    let platform = &install_code.bootstrap_bundle.platforms[0];
+    assert_eq!(platform.platform, TEST_PLATFORM);
+    assert_eq!(
+        platform.agent_package_url,
+        env.config.agent_package_url(TEST_PLATFORM)
+    );
+    assert_eq!(platform.agent_package_sha256, digest);
+}
+
+#[tokio::test]
+async fn install_script_hides_source_address() {
+    let env = TestEnv::new().await;
+    let bytes = b"cached-package-bytes-v2";
+    let (source, digest) = set_install_package_source(&env, "mirror", bytes).await;
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/agent/install/{TEST_PLATFORM}/install.sh"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let script = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8 script");
+
+    assert!(script.contains(&env.config.agent_package_url(TEST_PLATFORM)));
+    assert!(script.contains(&digest));
+    assert!(
+        !script.contains(&source),
+        "install.sh must not expose the source address"
+    );
+}
+
+#[tokio::test]
+async fn package_download_serves_cached_artifact() {
+    let env = TestEnv::new().await;
+    let bytes = b"cached-package-bytes-v2";
+    set_install_package_source(&env, "mirror", bytes).await;
+    let token = env.issue_token().await;
+
+    let response = router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/agent/packages/current?platform=aarch64-apple-darwin")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.to_vec(), bytes.to_vec());
+}
+
+/// 构造一个最小可解析的 tar.gz：单个条目 `path_in_archive` → `contents`。
+fn tar_gz_with_entry(path_in_archive: &str, contents: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path_in_archive, contents)
+            .expect("append tar entry");
+        builder.finish().expect("finish tar");
+    }
+    encoder.finish().expect("finish gzip")
+}
+
+#[test]
+fn read_package_identity_parses_version_and_triple() {
+    let bytes = tar_gz_with_entry(
+        "wist-agentd-1.2.3-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd-binary",
+    );
+    assert_eq!(
+        read_package_identity(&bytes),
+        ("1.2.3".to_string(), "x86_64-unknown-linux-gnu".to_string())
+    );
+}
+
+#[test]
+fn read_package_identity_tolerates_non_packages() {
+    // 裸二进制/非 gzip/空字节：读不出身份但不 panic，留空串（行照记）。
+    for bytes in [b"not-a-package".as_slice(), &[], b"\x1f\x8b\x00".as_slice()] {
+        assert_eq!(read_package_identity(bytes), (String::new(), String::new()));
+    }
+    // 是合法 tar.gz、但顶层目录不是 wist-agentd-<version>-<triple>：同样留空。
+    let odd = tar_gz_with_entry("some-other-dir/file", b"x");
+    assert_eq!(read_package_identity(&odd), (String::new(), String::new()));
+}
+
+#[tokio::test]
+async fn install_package_history_lists_recorded_packages() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/install-packages";
+
+    // 无凭据 → 401。
+    let unauthorized = get_to_router(&env.config, &env.store_handle, uri, None).await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"agentd-v0.1.9",
+    );
+    let (source, digest) = set_install_package_source(&env, "history", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+
+    // 网关为这个包单独存了一份副本（升级按条目取包要用）。
+    let cached = env.config.install_package_history_path(&package_id);
+    assert_eq!(
+        std::fs::read(&cached).expect("per-package copy"),
+        pkg,
+        "each recorded package gets its own cached copy"
+    );
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let packages = body["packages"].as_array().expect("packages array");
+    assert_eq!(packages.len(), 1);
+    let entry = &packages[0];
+    assert_eq!(entry["package_id"], package_id);
+    assert_eq!(entry["source"], source);
+    assert_eq!(entry["package_sha256"], format!("sha256:{digest}"));
+    assert_eq!(entry["version"], "0.1.9");
+    assert_eq!(entry["arch"], "aarch64-apple-darwin");
+    assert_eq!(entry["created_by"], "platform-maintenance-engineer");
+    assert!(entry["created_at"].is_string());
+}
+
+#[tokio::test]
+async fn install_package_history_entry_carries_derived_download_url() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/install-packages";
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.2.0-aarch64-apple-darwin/wist-agentd",
+        b"agentd-v0.2.0",
+    );
+    let (_, digest) = set_install_package_source(&env, "url-derive", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+
+    // 未设 advertise-url：基址取 server.public_base_url。
+    let body: serde_json::Value = decode_json_response(
+        get_to_router(
+            &env.config,
+            &env.store_handle,
+            uri,
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        body["packages"][0]["agent_package_url"],
+        format!(
+            "{}/api/v1/agent/packages/{package_id}",
+            env.config.public_base_url
+        )
+    );
+
+    // 设置网关对外地址后，该字段跟随生效基址（与安装命令同一口径）。
+    let ok = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/advertise-url",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "url": "https://gw.example.com" }),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    let body: serde_json::Value = decode_json_response(
+        get_to_router(
+            &env.config,
+            &env.store_handle,
+            uri,
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        body["packages"][0]["agent_package_url"],
+        format!("https://gw.example.com/api/v1/agent/packages/{package_id}")
+    );
+}
+
+#[tokio::test]
+async fn package_download_by_id_accepts_bootstrap_token_or_client_certificate() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd-upgrade-bytes",
+    );
+    let (_, digest) = set_install_package_source(&env, "byid", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+    let uri = format!("/api/v1/agent/packages/{package_id}");
+
+    // 无凭据（也没证书）→ 401。
+    let unauthorized = get_agent_package(&env, &uri, None).await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    // bootstrap（注册）token → 200 + 字节。
+    let bootstrap = env.issue_token().await;
+    let response = get_to_router(&env.config, &env.store_handle, &uri, Some(&bootstrap)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.to_vec(), pkg);
+
+    // 客户端证书（升级路径，没 enrollment token）→ 200 + 字节。
+    let agent_id = enroll_agent_credential(&env).await;
+    let response = get_agent_package(&env, &uri, Some(&agent_id)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.to_vec(), pkg);
+
+    // 未知 id → 404（证书有效）。
+    let unknown = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/pkg-0000000000000000",
+        Some(&agent_id),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn current_package_download_accepts_a_client_certificate() {
+    let env = TestEnv::new().await;
+    let bytes = b"cached-package-current";
+    set_install_package_source(&env, "current", bytes).await;
+    let agent_id = enroll_agent_credential(&env).await;
+
+    let response = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&agent_id),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.to_vec(), bytes.to_vec());
+}
+
+/// 安装包分发端点「没带凭据」的对外口径（无 bootstrap token、也没客户端证书）。
+const PACKAGE_NO_CREDENTIAL_BODY: &str =
+    "agent package download requires a bootstrap token or a client certificate";
+/// 「带了 bootstrap token 但不合法」的统一口径：未知 / 过期 / 已消费 / 已吊销，
+/// 一律回这一句 —— 不区分「token 存在但过期」这类可被用来枚举的信息。
+const PACKAGE_INVALID_BOOTSTRAP_BODY: &str = "invalid bootstrap token";
+
+/// 用**原始** Authorization 头值发一次取包 GET（`get_to_router` 只能给合法 Bearer）。
+async fn get_package_with_raw_authorization(
+    env: &TestEnv,
+    uri: &str,
+    authorization: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method("GET").uri(uri);
+    if let Some(value) = authorization {
+        builder = builder.header("authorization", value);
+    }
+    router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("route response")
+}
+
+/// 断言一次取包鉴权失败：401 + `no-store` + 统一口径的响应体（不泄露细节）。
+async fn assert_auth_rejected(response: axum::response::Response, expected_body: &str) {
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_no_store(&response);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["message"], expected_body);
+}
+
+#[tokio::test]
+async fn package_download_rejects_missing_and_malformed_credentials_uniformly() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"credential-shape-bytes",
+    );
+    let (_, digest) = set_install_package_source(&env, "credential-shape", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+    let uri = format!("/api/v1/agent/packages/{package_id}");
+
+    // 根本没带 Authorization 头，也没客户端证书。
+    assert_auth_rejected(
+        get_package_with_raw_authorization(&env, &uri, None).await,
+        PACKAGE_NO_CREDENTIAL_BODY,
+    )
+    .await;
+    // `Bearer ` 后面是空 token：被当成「没带 token」（trim + filter 空串）。
+    assert_auth_rejected(
+        get_package_with_raw_authorization(&env, &uri, Some("Bearer ")).await,
+        PACKAGE_NO_CREDENTIAL_BODY,
+    )
+    .await;
+    // 非 Bearer 方案（Basic）：同样按「没带 token」处理，不解析。
+    assert_auth_rejected(
+        get_package_with_raw_authorization(&env, &uri, Some("Basic dXNlcjpwYXNz")).await,
+        PACKAGE_NO_CREDENTIAL_BODY,
+    )
+    .await;
+    // 未知的 bootstrap token：统一口径（不暴露「不存在」）。
+    assert_auth_rejected(
+        get_package_with_raw_authorization(&env, &uri, Some("Bearer wit_does_not_exist")).await,
+        PACKAGE_INVALID_BOOTSTRAP_BODY,
+    )
+    .await;
+    // 长得像 agent 凭据的 token（旧双轨遗留）：现在没有任何效力，按 bootstrap 校验失败统一口径。
+    assert_auth_rejected(
+        get_package_with_raw_authorization(&env, &uri, Some("Bearer wic_does_not_exist")).await,
+        PACKAGE_INVALID_BOOTSTRAP_BODY,
+    )
+    .await;
+}
+
+/// 拒绝名单同样拦升级取包：被吊销的 agent 连包也不该能取（§5.6）。
+#[tokio::test]
+async fn package_download_rejects_a_revoked_agent() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "revoked-agent", b"revoked-agent-bytes").await;
+    let agent_id = enroll_agent_credential(&env).await;
+
+    let before = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&agent_id),
+    )
+    .await;
+    assert_eq!(before.status(), StatusCode::OK);
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "cut off")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let after = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&agent_id),
+    )
+    .await;
+    assert_auth_rejected(after, "invalid agent client certificate").await;
+}
+
+#[tokio::test]
+async fn any_registered_agent_credential_can_fetch_any_package_by_id() {
+    let env = TestEnv::new().await;
+    let pkg_one = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"package-one-bytes",
+    );
+    let (_, digest_one) = set_install_package_source(&env, "any-agent-one", &pkg_one).await;
+    let id_one = package_id_for_sha256(&digest_one);
+    let pkg_two = tar_gz_with_entry(
+        "wist-agentd-0.2.0-x86_64-unknown-linux-gnu/wist-agentd",
+        b"package-two-bytes",
+    );
+    let (_, digest_two) = set_install_package_source(&env, "any-agent-two", &pkg_two).await;
+    let id_two = package_id_for_sha256(&digest_two);
+
+    // 单个 agent 凭据能取**任意**已录入的包：两个包都不是它录入的，也没有归属表。
+    // 这是当前**设计**：网关按配置单租户，安装包本身不是秘密（install.sh 内嵌地址与摘要），
+    // 端点上刻意不做按 agent 的归属/租户校验。本测试钉住现状，改语义前必须先改这里。
+    let credential = enroll_agent_credential(&env).await;
+    for (package_id, bytes) in [(&id_one, &pkg_one), (&id_two, &pkg_two)] {
+        let response = get_agent_package(
+            &env,
+            &format!("/api/v1/agent/packages/{package_id}"),
+            Some(&credential),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await.to_vec(), bytes.to_vec());
+    }
+}
+
+#[tokio::test]
+async fn package_download_by_id_rejects_path_traversal_ids_without_reading_disk() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"traversal-guard-bytes",
+    );
+    let (_, digest) = set_install_package_source(&env, "traversal", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+    let credential = enroll_agent_credential(&env).await;
+
+    // 在 history 目录的**上一级**放一个哨兵文件：若 handler 拿 package_id 去 join 磁盘路径，
+    // `..%2Fwist-sentinel` 会顺着目录穿越读到它。这里断言永远读不到、也不吐任何缓存字节。
+    let history_dir = env.config.install_package_history_path("pkg-placeholder");
+    let history_dir = history_dir.parent().expect("history dir");
+    let sentinel = history_dir
+        .parent()
+        .expect("install-package dir")
+        .join("wist-sentinel");
+    std::fs::write(&sentinel, b"sentinel-must-not-be-served").expect("write sentinel");
+
+    let variants = [
+        "..%2F..%2Fetc%2Fpasswd",
+        "..%2Fwist-sentinel",
+        "..%2Fagent-package",
+        "%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+        "a%00b",
+    ];
+    for variant in variants {
+        let uri = format!("/api/v1/agent/packages/{variant}");
+        let response = get_agent_package(&env, &uri, Some(&credential)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "traversal id {variant} must not resolve"
+        );
+        assert_no_store(&response);
+        let body = body_bytes(response).await.to_vec();
+        assert_ne!(
+            body, pkg,
+            "traversal id {variant} must not serve the cached package"
+        );
+        assert_ne!(
+            body,
+            b"sentinel-must-not-be-served".to_vec(),
+            "traversal id {variant} must not read the sentinel file"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(body["error"]["message"], "unknown agent package");
+    }
+
+    // 超长 id（>1KB）：不 panic、不读盘，按「库里没有」处理。
+    let long_uri = format!("/api/v1/agent/packages/{}", "a".repeat(2_000));
+    let long = get_agent_package(&env, &long_uri, Some(&credential)).await;
+    assert_eq!(long.status(), StatusCode::NOT_FOUND);
+
+    // 空 package_id（尾斜杠）：路由层没有可匹配的动态段，同样不是 200。
+    let empty = get_agent_package(&env, "/api/v1/agent/packages/", Some(&credential)).await;
+    assert_eq!(empty.status(), StatusCode::NOT_FOUND);
+
+    // 正常 id 仍能取到原字节（确认上面的 404 不是「整个端点坏了」）。
+    let ok = get_agent_package(
+        &env,
+        &format!("/api/v1/agent/packages/{package_id}"),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(body_bytes(ok).await.to_vec(), pkg);
+}
+
+/// 复用同一个 router 实例发一次取包 GET：限流状态挂在 state 上，必须共享才会累积。
+async fn package_get_with_bearer(app: &axum::Router, token: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/agent/packages/current?platform=aarch64-apple-darwin")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+}
+
+#[tokio::test]
+async fn package_routes_rate_limit_repeated_failed_auth_attempts() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "rate-limit", b"rate-limit-bytes").await;
+    let app = router(env.config.clone(), env.store_handle.clone());
+
+    // 前 5 次失败都以 401 回应（沿用 BOOTSTRAP_AUTH_SCOPE 的失败计数）。
+    for _ in 0..5 {
+        let response = package_get_with_bearer(&app, "wit_not-a-real-token").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // 第 6 次在同一桶上被限流：不能靠反复试错绕过。
+    let blocked = package_get_with_bearer(&app, "wit_not-a-real-token").await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(blocked.headers().contains_key(header::RETRY_AFTER));
+    assert_no_store(&blocked);
+}
+
+#[tokio::test]
+async fn recorded_package_with_a_missing_copy_is_unavailable() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    // 录入过，但网关那份副本丢了：没有可用包（不会回落到别的来源）。
+    std::fs::remove_file(env.config.install_package_cache_path(TEST_PLATFORM))
+        .expect("remove cached copy");
+
+    let current = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(current.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_no_store(&current);
+
+    // 安装脚本要嵌摘要，没有包就必须明确失败（而不是发一份空摘要的脚本下去）。
+    let script = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/install/x86_64-unknown-linux-musl/install.sh",
+        None,
+    )
+    .await;
+    assert_eq!(script.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = decode_json_response(script).await;
+    assert_eq!(body["error"]["code"], "install_package_unavailable");
+}
+
+#[tokio::test]
+async fn package_download_success_clears_the_failure_count() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "rate-limit-clear", b"rate-limit-clear-bytes").await;
+    let app = router(env.config.clone(), env.store_handle.clone());
+    let valid = env.issue_token().await;
+
+    for _ in 0..4 {
+        let response = package_get_with_bearer(&app, "wit_not-a-real-token").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // 一次成功必须清零失败计数：否则一次失败就会把客户端推向永久封禁。
+    let ok = package_get_with_bearer(&app, &valid).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    // 清零后重新计：再失败 5 次都还是 401（若没清零，这里第二次就该 429）。
+    for _ in 0..5 {
+        let response = package_get_with_bearer(&app, "wit_not-a-real-token").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let blocked = package_get_with_bearer(&app, "wit_not-a-real-token").await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn package_download_without_a_recorded_package_is_no_store() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    // 抹掉「已录入的安装包」这一行：缓存副本还在，但没有来源就是**没有可用包**
+    // （已删的 `agent.package_file` 不再是退路）→ 503，而且必须 no-store。
+    sqlx::query("DELETE FROM agent_install_package")
+        .execute(env.store.pool())
+        .await
+        .expect("clear recorded package");
+    let current = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(current.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_no_store(&current);
+    let body = decode_text_response(current).await;
+    assert!(body.contains("not configured"), "{body}");
+
+    // by-id 的库读失败（直接撤掉历史表）→ 500，也必须 no-store。
+    sqlx::query("DROP TABLE agent_install_package_history")
+        .execute(env.store.pool())
+        .await
+        .expect("drop history table");
+    let by_id = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/pkg-0000000000000000",
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(by_id.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_no_store(&by_id);
+}
+
+#[tokio::test]
+async fn current_package_download_still_enforces_one_time_bootstrap_tokens() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "one-time", b"one-time-bytes").await;
+
+    // 取包端点同时接受客户端证书，没有放松 bootstrap token 的既有语义：
+    // 1) 首次可用。
+    let token = env.issue_token().await;
+    let first = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // 2) 被 enroll 消费后（一次性）不能再取包。
+    let enrolled = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&token),
+    )
+    .await;
+    assert_eq!(enrolled.status(), StatusCode::CREATED);
+    let replay = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&token),
+    )
+    .await;
+    assert_auth_rejected(replay, PACKAGE_INVALID_BOOTSTRAP_BODY).await;
+
+    // 3) 过期 token 同样被拒。
+    let expired = env.issue_token().await;
+    sqlx::query("UPDATE enrollment_tokens SET expires_at = ?1 WHERE token_hash = ?2")
+        .bind("2020-01-01T00:00:00+00:00")
+        .bind(token_hash(&expired))
+        .execute(env.store.pool())
+        .await
+        .expect("expire bootstrap token");
+    let after = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&expired),
+    )
+    .await;
+    assert_auth_rejected(after, PACKAGE_INVALID_BOOTSTRAP_BODY).await;
+}
+
+#[tokio::test]
+async fn install_package_history_url_is_admin_only_and_never_leaked_unauthenticated() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"url-secret-bytes",
+    );
+    let (_, digest) = set_install_package_source(&env, "url-secret", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+    let expected_url = format!(
+        "{}/api/v1/agent/packages/{package_id}",
+        env.config.public_base_url
+    );
+
+    // 管理面历史列表无凭据：401，且响应体里不得出现字段名或派生地址。
+    let unauthorized = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-packages",
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let body = String::from_utf8_lossy(&body_bytes(unauthorized).await).to_string();
+    assert!(!body.contains("agent_package_url"));
+    assert!(!body.contains(&expected_url));
+
+    // 安装包分发端点无凭据：同样 401，不泄露地址。
+    let pkg_unauth = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/agent/packages/{package_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(pkg_unauth.status(), StatusCode::UNAUTHORIZED);
+    let body = String::from_utf8_lossy(&body_bytes(pkg_unauth).await).to_string();
+    assert!(!body.contains("agent_package_url"));
+    assert!(!body.contains(&expected_url));
+
+    // 正例：带上 admin bearer 才出现该字段（防止上面的断言是假阴性）。
+    let authorized = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-packages",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(&body_bytes(authorized).await).to_string();
+    assert!(body.contains(&expected_url));
+}
+
+#[tokio::test]
+async fn install_package_history_absent_when_source_unreadable() {
+    let env = TestEnv::new().await;
+    let missing = write_source_package(&env, "gone-history", b"x");
+    std::fs::remove_file(&missing).expect("remove source");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": missing,
+                "package_sha256": "a".repeat(64),
+            }],
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a failed set must not leave a history row"
+    );
+}
+
+#[tokio::test]
+async fn install_package_history_empty_lists_as_empty_array() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-packages",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    // 空历史是一个成功的空列表，不是 404 / null。
+    assert_eq!(body, serde_json::json!({ "packages": [] }));
+}
+
+#[tokio::test]
+async fn install_package_set_records_setting_and_history_together() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.3.1-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd-0.3.1",
+    );
+    let (source, digest) = set_install_package_source(&env, "together", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+
+    // 成功录入：单行设置（当前生效来源）与历史行**都在**，且摘要同源。
+    let setting = env
+        .store
+        .get_agent_install_package("x86_64-unknown-linux-gnu")
+        .await
+        .unwrap()
+        .expect("setting");
+    assert_eq!(setting.package_url, source);
+    assert_eq!(
+        setting.package_sha256.as_deref(),
+        Some(format!("sha256:{digest}").as_str())
+    );
+
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].package_id, package_id);
+    assert_eq!(history[0].source, source);
+    assert_eq!(history[0].package_sha256, format!("sha256:{digest}"));
+    assert_eq!(history[0].version, "0.3.1");
+    assert_eq!(history[0].arch, "x86_64-unknown-linux-gnu");
+}
+
+#[tokio::test]
+async fn install_package_history_is_idempotent_for_the_same_package() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.4.0-aarch64-apple-darwin/wist-agentd",
+        b"agentd-0.4.0",
+    );
+    let (first_source, digest) = set_install_package_source(&env, "idem-first", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+
+    // 同一份字节从**另一个来源路径**再录一次：内容寻址 id 不变。
+    let (second_source, second_digest) = set_install_package_source(&env, "idem-copy", &pkg).await;
+    assert_eq!(
+        second_digest, digest,
+        "identical bytes must yield the same digest"
+    );
+    assert_eq!(package_id_for_sha256(&second_digest), package_id);
+    assert_ne!(second_source, first_source);
+
+    // 历史只有一行；留痕来源被覆盖为最近一次录入的地址。
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1, "same package must stay one history row");
+    assert_eq!(history[0].source, second_source);
+
+    // 按条副本只有一份，内容正确。
+    let cached = env.config.install_package_history_path(&package_id);
+    assert!(cached.is_file(), "per-package copy must exist");
+    assert_eq!(std::fs::read(&cached).expect("copy"), pkg);
+}
+
+#[tokio::test]
+async fn install_package_failed_set_keeps_previous_setting_and_history() {
+    let env = TestEnv::new().await;
+    let good = tar_gz_with_entry(
+        "wist-agentd-0.5.0-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd-0.5.0",
+    );
+    let (good_source, good_digest) = set_install_package_source(&env, "good-set", &good).await;
+
+    // 期望摘要不符：整次操作失败，既不留历史行也不覆盖已有单行设置。
+    let bad_source = write_source_package(&env, "bad-digest", b"agentd-0.6.0");
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": bad_source,
+                "package_sha256": "c".repeat(64),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let setting = env
+        .store
+        .get_agent_install_package("x86_64-unknown-linux-gnu")
+        .await
+        .unwrap()
+        .expect("setting");
+    assert_eq!(
+        setting.package_url, good_source,
+        "failed set must not overwrite"
+    );
+    assert_eq!(
+        setting.package_sha256.as_deref(),
+        Some(format!("sha256:{good_digest}").as_str())
+    );
+
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1, "failed set must not append history");
+    assert_eq!(history[0].source, good_source);
+}
+
+#[tokio::test]
+async fn install_package_history_orders_newest_first() {
+    let env = TestEnv::new().await;
+    // 直接落库两条（带受控 created_at），验证列表按 created_at DESC 且派生地址逐条成立。
+    let older = StoredAgentInstallPackage {
+        package_id: "pkg-00000000000000aa".to_string(),
+        source: "/packages/older.tar.gz".to_string(),
+        package_sha256: "sha256:older".to_string(),
+        version: "0.1.0".to_string(),
+        arch: "aarch64-apple-darwin".to_string(),
+        cached_path: "/state/older".to_string(),
+        created_by: "eng".to_string(),
+        created_at: "2026-01-01T00:00:00+00:00".to_string(),
+    };
+    let newer = StoredAgentInstallPackage {
+        package_id: "pkg-00000000000000bb".to_string(),
+        created_at: "2026-02-01T00:00:00+00:00".to_string(),
+        ..older.clone()
+    };
+    env.store
+        .upsert_agent_install_package_by_id(&older)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&newer)
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = decode_json_response(
+        get_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agent/install-packages",
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    let packages = body["packages"].as_array().expect("packages array");
+    assert_eq!(packages.len(), 2);
+    assert_eq!(packages[0]["package_id"], "pkg-00000000000000bb");
+    assert_eq!(packages[1]["package_id"], "pkg-00000000000000aa");
+    for (entry, id) in packages
+        .iter()
+        .zip(["pkg-00000000000000bb", "pkg-00000000000000aa"])
+    {
+        assert_eq!(
+            entry["agent_package_url"],
+            format!("{}/api/v1/agent/packages/{id}", env.config.public_base_url)
+        );
+    }
+}
+
+#[tokio::test]
+async fn agent_package_url_by_id_trims_trailing_slash_base() {
+    let env = TestEnv::new().await;
+    // 基址带/不带尾斜杠都拼出同一条地址（不出现 `//api/...`）。
+    assert_eq!(
+        env.config
+            .agent_package_url_by_id_at("https://gw.example.com/", "pkg-abc"),
+        "https://gw.example.com/api/v1/agent/packages/pkg-abc"
+    );
+    assert_eq!(
+        env.config
+            .agent_package_url_by_id_at("https://gw.example.com", "pkg-abc"),
+        "https://gw.example.com/api/v1/agent/packages/pkg-abc"
+    );
+}
+
+#[tokio::test]
+async fn package_download_by_id_requires_bootstrap_token_or_certificate() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd",
+    );
+    let (_, digest) = set_install_package_source(&env, "auth-byid", &pkg).await;
+    let uri = format!("/api/v1/agent/packages/{}", package_id_for_sha256(&digest));
+
+    // 无凭据（也没证书）→ 401。
+    assert_eq!(
+        get_agent_package(&env, &uri, None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // 带了但不合法的 bootstrap token → 401。
+    assert_eq!(
+        get_to_router(
+            &env.config,
+            &env.store_handle,
+            &uri,
+            Some("not-a-real-token"),
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // 客户端证书 → 200。
+    let agent_id = enroll_agent_credential(&env).await;
+    assert_eq!(
+        get_agent_package(&env, &uri, Some(&agent_id))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn package_download_by_id_returns_404_when_cached_copy_is_missing() {
+    let env = TestEnv::new().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"upgrade-bytes",
+    );
+    let (_, digest) = set_install_package_source(&env, "missing-copy", &pkg).await;
+    let package_id = package_id_for_sha256(&digest);
+    let uri = format!("/api/v1/agent/packages/{package_id}");
+    let credential = enroll_agent_credential(&env).await;
+
+    // 行在、副本在 → 200。
+    let ok = get_agent_package(&env, &uri, Some(&credential)).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(body_bytes(ok).await.to_vec(), pkg);
+
+    // 磁盘上的副本被清掉（行还在）：当前实现按「这个包不在了」处理 —— 404、非空体，不 panic。
+    std::fs::remove_file(env.config.install_package_history_path(&package_id))
+        .expect("remove cached copy");
+    let response = get_agent_package(&env, &uri, Some(&credential)).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = body_bytes(response).await;
+    assert!(
+        !body.is_empty(),
+        "must not return an empty body on a missing copy"
+    );
+}
+
+#[tokio::test]
+async fn package_download_by_id_rejects_path_traversal() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    // path 参数只用于**查库**（不是去拼文件路径）：穿越串查不到行 → 404，绝不读到任意文件。
+    for uri in [
+        "/api/v1/agent/packages/..%2F..%2Fetc%2Fpasswd",
+        "/api/v1/agent/packages/pkg-..%2F..%2Fetc%2Fpasswd",
+        "/api/v1/agent/packages/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+    ] {
+        let response = get_agent_package(&env, uri, Some(&credential)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "uri {uri}");
+    }
+}
+
+/// 历史行写入失败时：单行设置已存（请求 500），随后重试同一来源可幂等补齐历史。
+///
+/// 用一条临时 SQLite 触发器把「历史表的 INSERT」打失败来制造这个中间态 ——
+/// 这正是 `set_agent_install_package` 里「先 upsert 单行、再 upsert 历史」的顺序所暴露的分界。
+#[tokio::test]
+async fn install_package_set_heals_history_after_a_history_write_failure() {
+    let env = TestEnv::new().await;
+    sqlx::query(
+        "CREATE TRIGGER fail_history_insert BEFORE INSERT ON agent_install_package_history \
+         BEGIN SELECT RAISE(ABORT, 'injected history failure'); END",
+    )
+    .execute(env.store.pool())
+    .await
+    .expect("install failing trigger");
+
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.7.0-x86_64-unknown-linux-gnu/wist-agentd",
+        b"agentd-0.7.0",
+    );
+    let source = write_source_package(&env, "heal", &pkg);
+    let digest = bytes_sha256_hex(&pkg);
+
+    // 第一次：历史写失败 → 500，但单行设置已落库（与实现顺序一致）。
+    let failed = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": "x86_64-unknown-linux-gnu",
+                "package_url": source,
+                "package_sha256": format!("sha256:{digest}"),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let setting = env
+        .store
+        .get_agent_install_package("x86_64-unknown-linux-gnu")
+        .await
+        .unwrap()
+        .expect("setting stored despite failed history write");
+    assert_eq!(setting.package_url, source);
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "history write failed, so no history row yet"
+    );
+
+    // 去掉故障、重试同一来源：幂等补齐（设置不变，历史补上）。
+    sqlx::query("DROP TRIGGER fail_history_insert")
+        .execute(env.store.pool())
+        .await
+        .expect("drop trigger");
+    let retried = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": "x86_64-unknown-linux-gnu",
+                "package_url": source,
+                "package_sha256": format!("sha256:{digest}"),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::OK);
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].package_id, package_id_for_sha256(&digest));
+    assert_eq!(history[0].source, source);
+}
+
+#[tokio::test]
+async fn install_package_set_rejects_unreachable_url() {
+    let env = TestEnv::new().await;
+    // https URL 分支的失败：URL 不可请求（无 host）→ 502，且不留历史。
+    // （本机路径分支的失败已由 `install_package_set_rejects_unfetchable_source` 覆盖。）
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": TEST_PLATFORM,
+                "package_url": "https://",
+                "package_sha256": "a".repeat(64),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "an unreachable URL must not leave a history row"
+    );
+}
+
+/// 中心下发通道（环回）：与 admin 端点**同内核**，且**只**认环回请求。
+///
+/// 设计 `wist-design/doc/design/edge/agent-package-push-to-gateways.md`（发布 ②）。
+#[tokio::test]
+async fn agent_package_push_is_loopback_only_and_shares_the_install_package_core() {
+    use std::net::SocketAddr;
+
+    // 从**未录入任何包**的环境起（默认 `new()` 已给 `aarch64-apple-darwin` 录入一份，
+    // 会让后面的「非环回不得写」断言失去意义）。
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"pushed-agentd",
+    );
+    let source = write_source_package(&env, "pushed", &pkg);
+    let digest = bytes_sha256_hex(&pkg);
+    let body = serde_json::json!({
+        "artifacts": [{
+            "platform": "aarch64-apple-darwin",
+            "package_url": source,
+            "package_sha256": format!("sha256:{digest}"),
+        }],
+        "requested_by": "wist-gwlinkd",
+    });
+
+    // 非环回：403，且**什么都没写**（该端点只给同机的 gwlinkd）。
+    let remote = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([192, 0, 2, 1], 40_001))),
+        &body,
+    )
+    .await;
+    assert_eq!(remote.status(), StatusCode::FORBIDDEN);
+    assert!(
+        env.store
+            .get_agent_install_package("aarch64-apple-darwin")
+            .await
+            .unwrap()
+            .is_none(),
+        "a non-loopback request must not touch package management"
+    );
+
+    // 环回：与 admin 端点同内核 —— 每平台设置落库 + 内容寻址历史落地。
+    let loopback = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+        &body,
+    )
+    .await;
+    assert_eq!(loopback.status(), StatusCode::OK);
+    let setting = env
+        .store
+        .get_agent_install_package("aarch64-apple-darwin")
+        .await
+        .unwrap()
+        .expect("setting stored via the loopback push");
+    assert_eq!(setting.package_url, source);
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].package_id, package_id_for_sha256(&digest));
+    assert_eq!(history[0].arch, "aarch64-apple-darwin");
+}
+
+/// 环回护栏只认环回地址：**取不到连接信息**（fail-closed）与非环回都拒；IPv6 `::1` 放行。
+#[tokio::test]
+async fn agent_package_loopback_guard_accepts_only_loopback_addresses() {
+    use std::net::{Ipv6Addr, SocketAddr};
+
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"guard-bytes",
+    );
+    let source = write_source_package(&env, "guard", &pkg);
+    let body = serde_json::json!({
+        "artifacts": [{
+            "platform": "aarch64-apple-darwin",
+            "package_url": source,
+            "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+        }],
+    });
+
+    // 无连接信息：**fail-closed**（取不到 peer 就当非环回）。
+    let none = post_agent_package_push(&env.config, &env.store_handle, None, &body).await;
+    assert_eq!(none.status(), StatusCode::FORBIDDEN);
+    // 非环回：拒。
+    let remote = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([192, 0, 2, 1], 40_001))),
+        &body,
+    )
+    .await;
+    assert_eq!(remote.status(), StatusCode::FORBIDDEN);
+    assert!(
+        env.store
+            .get_agent_install_package("aarch64-apple-darwin")
+            .await
+            .unwrap()
+            .is_none(),
+        "rejected requests must not touch package management"
+    );
+
+    // IPv6 环回 `::1`：放行（与 IPv4 `127.0.0.1` 同口径）。
+    let v6 = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from((Ipv6Addr::LOCALHOST, 40_002))),
+        &body,
+    )
+    .await;
+    assert_eq!(v6.status(), StatusCode::OK);
+    assert!(
+        env.store
+            .get_agent_install_package("aarch64-apple-darwin")
+            .await
+            .unwrap()
+            .is_some(),
+        "IPv6 loopback is still loopback"
+    );
+}
+
+/// 与 admin 端点**同一份实现**：同一 body 经两条路得到同一份设置；
+/// 重复下发同一份内容**幂等**（内容寻址历史不翻倍）。
+#[tokio::test]
+async fn agent_package_push_shares_the_core_with_the_admin_endpoint() {
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"parity-bytes",
+    );
+    let source = write_source_package(&env, "parity", &pkg);
+    let body = serde_json::json!({
+        "artifacts": [{
+            "platform": "x86_64-unknown-linux-gnu",
+            "package_url": source,
+            "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+        }],
+    });
+
+    // 人工录入（admin bearer）。
+    let admin = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &body,
+    )
+    .await;
+    assert_eq!(admin.status(), StatusCode::OK);
+    let via_admin = env
+        .store
+        .get_agent_install_package("x86_64-unknown-linux-gnu")
+        .await
+        .unwrap()
+        .expect("setting stored via admin");
+
+    // 中心下发（环回）：同 body、同内核。
+    let push = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+        &body,
+    )
+    .await;
+    assert_eq!(push.status(), StatusCode::OK);
+    let via_push = env
+        .store
+        .get_agent_install_package("x86_64-unknown-linux-gnu")
+        .await
+        .unwrap()
+        .expect("setting stored via the loopback push");
+
+    assert_eq!(via_push.package_url, via_admin.package_url);
+    assert_eq!(via_push.package_sha256, via_admin.package_sha256);
+    assert_eq!(via_push.updated_by, via_admin.updated_by);
+    assert_eq!(
+        env.store.list_agent_install_packages().await.unwrap().len(),
+        1,
+        "the same content via both routes is one content-addressed history row"
+    );
+}
+
+/// 一次下发可覆盖多平台（agentd 常态），审计字段随包落库。
+#[tokio::test]
+async fn agent_package_push_covers_multiple_platforms_and_records_the_actor() {
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new_without_package().await;
+    let mac = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"multi-mac",
+    );
+    let linux = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"multi-linux",
+    );
+    let mac_src = write_source_package(&env, "multi-mac", &mac);
+    let linux_src = write_source_package(&env, "multi-linux", &linux);
+    let body = serde_json::json!({
+        "artifacts": [
+            {
+                "platform": "aarch64-apple-darwin",
+                "package_url": mac_src,
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(&mac)),
+            },
+            {
+                "platform": "x86_64-unknown-linux-gnu",
+                "package_url": linux_src,
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(&linux)),
+            },
+        ],
+        "requested_by": "wist-gwlinkd",
+    });
+
+    let response = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for platform in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+        let setting = env
+            .store
+            .get_agent_install_package(platform)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing setting for {platform}"));
+        assert_eq!(
+            setting.updated_by, "wist-gwlinkd",
+            "actor recorded per platform"
+        );
+    }
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 2, "one content-addressed row per package");
+    assert!(
+        history
+            .iter()
+            .all(|entry| entry.created_by == "wist-gwlinkd")
+    );
+}
+
+/// `origin` 是 **provenance**：网关把它记进历史的 `source`，但**取包仍取 `package_url`**（本机路径）——
+/// 设置里的「来源」是网关能取的那份，中心地址只作留痕（网关不持中心信任、不据此取包）。
+#[tokio::test]
+async fn agent_package_push_records_the_center_origin_as_provenance() {
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"provenance-bytes",
+    );
+    let source = write_source_package(&env, "provenance", &pkg);
+    let origin = "https://center.example/api/v1/releases/artifact/wist-agentd/0.1.9/wist-agentd-0.1.9-aarch64-apple-darwin.tar.gz";
+    let body = serde_json::json!({
+        "artifacts": [{
+            "platform": "aarch64-apple-darwin",
+            "package_url": source,
+            "origin": origin,
+            "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+        }],
+    });
+
+    let response = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 设置里的「来源」= 网关实际取的那份（本机路径）。
+    let setting = env
+        .store
+        .get_agent_install_package("aarch64-apple-darwin")
+        .await
+        .unwrap()
+        .expect("setting stored");
+    assert_eq!(setting.package_url, source, "设置来源 = 网关能取的本机路径");
+    // 历史的 `source` = 中心地址（provenance）。
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].source, origin, "历史记中心地址作 provenance");
+}
+
+/// `origin` 虽是留痕，也做**长度 / 控制字符**校验：坏 origin → 400，且**什么都没写**。
+#[tokio::test]
+async fn agent_package_push_rejects_a_malformed_origin() {
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new_without_package().await;
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"origin-guard",
+    );
+    let source = write_source_package(&env, "origin-guard", &pkg);
+    let sha = format!("sha256:{}", bytes_sha256_hex(&pkg));
+    let loopback = Some(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    // 超长 origin。
+    let too_long = format!("https://center.example/{}", "a".repeat(4096));
+    let response = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        loopback,
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": "aarch64-apple-darwin",
+                "package_url": source,
+                "origin": too_long,
+                "package_sha256": sha,
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 带控制字符的 origin。
+    let response = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        loopback,
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": "aarch64-apple-darwin",
+                "package_url": source,
+                "origin": "https://center.example/\u{7}bad",
+                "package_sha256": sha,
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected push must not leave history"
+    );
+}
+
+/// 多平台的 `origin` **各记各的**（逐平台 provenance，不串台）。
+#[tokio::test]
+async fn agent_package_push_records_per_platform_origins() {
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new_without_package().await;
+    let mac = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"prov-mac",
+    );
+    let linux = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"prov-linux",
+    );
+    let mac_src = write_source_package(&env, "prov-mac", &mac);
+    let linux_src = write_source_package(&env, "prov-linux", &linux);
+    let mac_origin = "https://center.example/api/v1/releases/artifact/wist-agentd/0.1.9/wist-agentd-0.1.9-aarch64-apple-darwin.tar.gz";
+    let linux_origin = "https://center.example/api/v1/releases/artifact/wist-agentd/0.1.9/wist-agentd-0.1.9-x86_64-unknown-linux-gnu.tar.gz";
+
+    let response = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        Some(SocketAddr::from(([127, 0, 0, 1], 40_000))),
+        &serde_json::json!({
+            "artifacts": [
+                {"platform": "aarch64-apple-darwin", "package_url": mac_src, "origin": mac_origin, "package_sha256": format!("sha256:{}", bytes_sha256_hex(&mac))},
+                {"platform": "x86_64-unknown-linux-gnu", "package_url": linux_src, "origin": linux_origin, "package_sha256": format!("sha256:{}", bytes_sha256_hex(&linux))},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 2);
+    let by_arch: std::collections::HashMap<&str, &str> = history
+        .iter()
+        .map(|entry| (entry.arch.as_str(), entry.source.as_str()))
+        .collect();
+    assert_eq!(
+        by_arch.get("aarch64-apple-darwin").copied(),
+        Some(mac_origin)
+    );
+    assert_eq!(
+        by_arch.get("x86_64-unknown-linux-gnu").copied(),
+        Some(linux_origin)
+    );
+}
+
+/// 坏输入在环回端点上也**不落任何东西**（与 admin 端点同一批校验，只是换了入口）。
+#[tokio::test]
+async fn agent_package_push_rejects_bad_input_without_writing() {
+    use std::net::SocketAddr;
+
+    async fn assert_nothing_written(env: &TestEnv) {
+        assert!(
+            env.store
+                .list_agent_install_packages()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rejected push must not leave history"
+        );
+        assert!(
+            env.store
+                .get_agent_install_package("aarch64-apple-darwin")
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected push must not touch the setting"
+        );
+    }
+
+    let env = TestEnv::new_without_package().await;
+    let loopback = Some(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    // 空 artifacts → 400。
+    let empty = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        loopback,
+        &serde_json::json!({ "artifacts": [] }),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    assert_nothing_written(&env).await;
+
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"reject-bytes",
+    );
+    let source = write_source_package(&env, "reject", &pkg);
+
+    // 摘要不符 → 400（与 admin 端点同一批校验）。
+    let mismatched = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        loopback,
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": "aarch64-apple-darwin",
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", "0".repeat(64)),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
+    assert_nothing_written(&env).await;
+
+    // 声明平台与包内 triple 不符 → 400。
+    let wrong_platform = post_agent_package_push(
+        &env.config,
+        &env.store_handle,
+        loopback,
+        &serde_json::json!({
+            "artifacts": [{
+                "platform": "x86_64-unknown-linux-gnu",
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", bytes_sha256_hex(&pkg)),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(wrong_platform.status(), StatusCode::BAD_REQUEST);
+    assert_nothing_written(&env).await;
+}
+
+/// 真 socket 端到端：把**真路由器**挂在 `127.0.0.1` 上（而不是 `MockConnectInfo` 假装环回），
+/// 用 HTTP 客户端按 gwlinkd `AgentPackageClient` 的**载荷形状** POST 环回端点。
+///
+/// 与 `oneshot + MockConnectInfo` 的差：环回护栏要在**真 TCP peer** 上成立（`OptionalConnectInfo`
+/// 取到真实 `ConnectInfo`），整条 HTTP 路径（头 / body 解析）也真跑一遍。
+#[tokio::test]
+async fn agent_package_push_works_over_a_real_loopback_socket() {
+    let env = TestEnv::new_without_package().await;
+    let (addr, server) = spawn_gateway_on_loopback(&env).await;
+
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"real-socket-bytes",
+    );
+    let source = write_source_package(&env, "real-socket", &pkg);
+    let digest = bytes_sha256_hex(&pkg);
+    let body = || {
+        serde_json::json!({
+            "artifacts": [{
+                "platform": "aarch64-apple-darwin",
+                "package_url": source,
+                "package_sha256": format!("sha256:{digest}"),
+            }],
+            "requested_by": "wist-gwlinkd",
+        })
+    };
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/gateway/agent-package");
+
+    // 首次：200，回执按平台列出（载荷形状 = gwlinkd `AgentPackageClient` 发出的那份）。
+    let response = client.post(&url).json(&body()).send().await.expect("send");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json");
+    let packages = payload["packages"].as_array().expect("packages");
+    assert_eq!(packages.len(), 1);
+    assert_eq!(packages[0]["platform"], "aarch64-apple-darwin");
+    assert_eq!(packages[0]["updated_by"], "wist-gwlinkd");
+
+    let setting = env
+        .store
+        .get_agent_install_package("aarch64-apple-darwin")
+        .await
+        .unwrap()
+        .expect("setting stored over a real loopback socket");
+    assert_eq!(setting.package_url, source);
+    assert_eq!(setting.updated_by, "wist-gwlinkd");
+
+    // 回执把**内容寻址摘要**报给 gwlinkd：它据此确认「网关落的就是中心发的那份内容」。
+    assert_eq!(packages[0]["package_sha256"], format!("sha256:{digest}"));
+    assert_eq!(packages[0]["package_url"], source);
+
+    // 「去中心镜像取包」这一腿也真跑了：中心发的字节落到网关的内容寻址副本，且摘要对得上。
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].package_id, package_id_for_sha256(&digest));
+    let cached = std::fs::read(&history[0].cached_path).unwrap_or_else(|err| {
+        panic!(
+            "gateway's local copy {} unreadable: {err}",
+            history[0].cached_path
+        )
+    });
+    assert_eq!(
+        bytes_sha256_hex(&cached),
+        digest,
+        "the bytes fetched into the gateway's local cache hash to the pushed digest"
+    );
+
+    // 幂等：再推同一份内容 → 仍一条内容寻址历史（副本不翻倍）。
+    let again = client.post(&url).json(&body()).send().await.expect("send");
+    assert_eq!(again.status(), StatusCode::OK);
+    assert_eq!(
+        env.store.list_agent_install_packages().await.unwrap().len(),
+        1
+    );
+
+    server.abort();
+}
+
+/// 真 socket 上的**拒绝路径**：摘要不符 → 400 且**什么都没写** ——
+/// 证明不只环回护栏，整条内核（校验 / 拉取 / 落库）在真 HTTP 上也跑通。
+#[tokio::test]
+async fn agent_package_push_rejects_a_bad_digest_over_a_real_socket() {
+    let env = TestEnv::new_without_package().await;
+    let (addr, server) = spawn_gateway_on_loopback(&env).await;
+
+    let pkg = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"real-socket-reject",
+    );
+    let source = write_source_package(&env, "real-socket-reject", &pkg);
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/gateway/agent-package"))
+        .json(&serde_json::json!({
+            "artifacts": [{
+                "platform": "aarch64-apple-darwin",
+                "package_url": source,
+                "package_sha256": format!("sha256:{}", "0".repeat(64)),
+            }],
+            "requested_by": "wist-gwlinkd",
+        }))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected push over a real socket must not leave history"
+    );
+    assert!(
+        env.store
+            .get_agent_install_package("aarch64-apple-darwin")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    server.abort();
+}
+
+/// 真 socket 上省略 `requested_by` → 内核回落默认操作者；一次推多平台 → 回执列出全部、
+/// 内容寻址历史两行。证明多平台分发与默认审计字段在真 HTTP 路径上同样成立。
+#[tokio::test]
+async fn agent_package_push_defaults_the_actor_and_lists_every_platform_over_a_real_socket() {
+    let env = TestEnv::new_without_package().await;
+    let (addr, server) = spawn_gateway_on_loopback(&env).await;
+
+    let mac = tar_gz_with_entry(
+        "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+        b"rs-default-mac",
+    );
+    let linux = tar_gz_with_entry(
+        "wist-agentd-0.1.9-x86_64-unknown-linux-gnu/wist-agentd",
+        b"rs-default-linux",
+    );
+    let mac_src = write_source_package(&env, "rs-default-mac", &mac);
+    let linux_src = write_source_package(&env, "rs-default-linux", &linux);
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/gateway/agent-package"))
+        .json(&serde_json::json!({
+            // `requested_by` 省略：内核回落到默认操作者。
+            "artifacts": [
+                {
+                    "platform": "aarch64-apple-darwin",
+                    "package_url": mac_src,
+                    "package_sha256": format!("sha256:{}", bytes_sha256_hex(&mac)),
+                },
+                {
+                    "platform": "x86_64-unknown-linux-gnu",
+                    "package_url": linux_src,
+                    "package_sha256": format!("sha256:{}", bytes_sha256_hex(&linux)),
+                },
+            ]
+        }))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json");
+    let packages = payload["packages"].as_array().expect("packages");
+    assert_eq!(packages.len(), 2, "回执列出每个平台：{payload}");
+    let mut platforms: Vec<&str> = packages
+        .iter()
+        .map(|entry| entry["platform"].as_str().expect("platform"))
+        .collect();
+    platforms.sort_unstable();
+    assert_eq!(
+        platforms,
+        vec!["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+    );
+    assert!(
+        packages
+            .iter()
+            .all(|entry| entry["updated_by"] == "platform-maintenance-engineer"),
+        "省略 requested_by 时默认操作者：{payload}"
+    );
+    assert_eq!(
+        env.store.list_agent_install_packages().await.unwrap().len(),
+        2,
+        "每个平台一条内容寻址历史"
+    );
+
+    server.abort();
+}
+
+/// 真 socket 上 body 不是合法 JSON → 客户端错误（请求体解析失败），且**什么都没写** ——
+/// 坏 body 绝不能触碰包管理。
+#[tokio::test]
+async fn agent_package_push_rejects_a_malformed_body_over_a_real_socket() {
+    let env = TestEnv::new_without_package().await;
+    let (addr, server) = spawn_gateway_on_loopback(&env).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/gateway/agent-package"))
+        .header("content-type", "application/json")
+        .body("{ this is not json")
+        .send()
+        .await
+        .expect("send");
+    assert!(
+        response.status().is_client_error(),
+        "malformed JSON must be a client error, got {}",
+        response.status()
+    );
+    assert!(
+        env.store
+            .list_agent_install_packages()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a malformed body must not leave history"
+    );
+    assert!(
+        env.store
+            .get_agent_install_package("aarch64-apple-darwin")
+            .await
+            .unwrap()
+            .is_none(),
+        "a malformed body must not touch the setting"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn install_package_history_records_non_tar_package_without_identity() {
+    let env = TestEnv::new().await;
+    // 裸二进制（非 gzip/tar）仍可录入与分发，只是历史里 version/arch 留空。
+    let raw = b"raw-binary-agentd-v0";
+    let (_, digest) = set_install_package_source(&env, "raw-package", raw).await;
+    let package_id = package_id_for_sha256(&digest);
+
+    let history = env.store.list_agent_install_packages().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].package_id, package_id);
+    assert_eq!(history[0].version, "", "non-tar package has no identity");
+    assert_eq!(history[0].arch, "");
+
+    // 而且能按 id 取回原字节（不因“没身份”而阻断升级）。
+    let credential = enroll_agent_credential(&env).await;
+    let response = get_agent_package(
+        &env,
+        &format!("/api/v1/agent/packages/{package_id}"),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.to_vec(), raw.to_vec());
+}
+
 fn enrollment_request(token: &str) -> EnrollmentRequest {
     EnrollmentRequest {
         api_version: "v1".to_string(),
         kind: "submit_enrollment_request".to_string(),
         token: token.to_string(),
-        credential_request: "none".to_string(),
+        credential_request: "csr".to_string(),
+        certificate_signing_request: certificate_signing_request(),
         host_profile: wist_contracts::enrollment::HostProfile {
             node_id: "node-a".to_string(),
             hostname: "host-a".to_string(),
@@ -1387,15 +8945,874 @@ fn enrollment_request(token: &str) -> EnrollmentRequest {
     }
 }
 
+const TEST_CONTENT_CATALOG: &str = r#"
+catalog_version = 1
+origin = "Gateway"
+published_at = "2026-09-22T00:00:00Z"
+
+[[units]]
+unit_id = "mac-metrics"
+family = "HostMetrics"
+capability = "collect_metrics"
+platform = "macos"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "none"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+
+[[units]]
+unit_id = "linux-metrics"
+family = "HostMetrics"
+capability = "collect_metrics"
+platform = "linux"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "root"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+"#;
+
+const TEST_CONTENT_PACKS: &str = r#"
+[[pack]]
+pack_id = "macos-base"
+platform = "macos"
+kind = "Baseline"
+families = ["HostMetrics"]
+unit_refs = ["mac-metrics"]
+catalog_version = 1
+status = "active"
+
+[[pack]]
+pack_id = "linux-base"
+platform = "linux"
+kind = "Baseline"
+families = ["HostMetrics"]
+unit_refs = ["linux-metrics"]
+catalog_version = 1
+status = "active"
+"#;
+
+const TEST_CONTENT_TEMPLATES: &str = r#"
+[[template]]
+template_id = "macos-daily"
+machine_class = "MacDaily"
+platform = "macos"
+pack_refs = ["macos-base"]
+catalog_version = 1
+template_version = 1
+status = "active"
+
+[[template]]
+template_id = "linux-compute"
+machine_class = "LinuxCompute"
+platform = "linux"
+pack_refs = ["linux-base"]
+catalog_version = 1
+template_version = 1
+status = "active"
+"#;
+
+/// 一次性调查：下发 → 命令进待下发集 → 报告从此后的目录读回。
+///
+/// 这条用例钉的是**接线**（路由 / 鉴权 / 形状），报告解析的细节在
+/// `api::investigations` 的单元测试里；两者合起来才是「页面能看到东西」。
+#[tokio::test]
+async fn admin_investigation_dispatch_and_report_directory_round_trip() {
+    let mut env = TestEnv::new().await;
+    // 管理面接口先查"这台机器在不在册"（未知 Agent 回 404），所以要真的入网一台。
+    let agent_id = enroll_agent_credential(&env).await;
+    assert_eq!(agent_id, "agent-node-a");
+    // G2：网关只给**自报认识这道题**的机器下发。先让这台机器报一次能力。
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    // G1 的下界默认**全关**（与采集面一致）：先显式开这张面，才谈得上下发。
+    let response = put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    env.config.data_plane_work_dir = Some(env._root.clone());
+    let report_dir = env._root.join("data").join("ivsrep");
+    std::fs::create_dir_all(&report_dir).expect("create report dir");
+    let body = serde_json::json!({
+        "command_id": "cmd_prev",
+        "topic": "disk",
+        "report_schema": "wist.investigation.disk/v1",
+        "observed_at": "2026-10-30T10:00:05Z",
+        "findings": [],
+        "summary": { "ok": 3, "warn": 1, "fail": 0, "overall": "warn" },
+        "verdict": "3 项正常 / 1 项警告 / 0 项失败"
+    })
+    .to_string();
+    let line = serde_json::json!({
+        "schema": "v1",
+        "agent": "agent-node-a",
+        "ts": "2026-10-30T10:00:05Z",
+        "seq": 7,
+        "body": body,
+    })
+    .to_string();
+    std::fs::write(report_dir.join("agent-ivsrep.jsonl"), format!("{line}\n"))
+        .expect("write report");
+
+    // 1) 下发：网关夹紧参数，命令进待下发集。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk", "top": 500 }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let dispatched: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(dispatched["command"]["kind"], "investigate");
+    assert!(dispatched["command"]["command_id"].is_string());
+    assert_eq!(dispatched["capabilities"]["surfaces"][0], "disk");
+    assert_eq!(dispatched["capabilities"]["privileged"], true);
+    // 下发响应也回带允许集：页面不必先 GET 一次才知道该禁哪个菜单项。
+    assert_eq!(dispatched["allowed_topics"][0], "disk");
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 8)
+        .await
+        .expect("pending commands");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, "investigate");
+    // G1：审计——谁点的这次调查。指纹不是原 token，但必须非空且稳定。
+    assert!(
+        pending[0].requested_by.starts_with("admin:"),
+        "requested_by={}",
+        pending[0].requested_by
+    );
+    let params: serde_json::Value = serde_json::from_str(&pending[0].params).expect("params json");
+    assert_eq!(params["topic"], "disk");
+    assert_eq!(params["top"], 50, "网关必须自己夹紧 top");
+
+    // 2) 列表：最近一次下发 + 报告目录里的报告。
+    let response = get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let list: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(list["report_dir"]["configured"], true);
+    assert_eq!(list["reports"][0]["command_id"], "cmd_prev");
+    assert_eq!(list["reports"][0]["overall"], "warn");
+    assert_eq!(list["latest_command"]["kind"], "investigate");
+    // 菜单可用性的两个输入 + 保留期：没配 `[investigations]` 时上界是全词表、保留 7 天；
+    // 这台机器被授权（且能跑）的只有 `disk`。
+    assert_eq!(list["allowed_topics"][0], "disk");
+    assert_eq!(list["grant"]["topics"][0], "disk");
+    assert_eq!(list["capabilities"]["surfaces"][0], "disk");
+    assert_eq!(list["retention_days"], 7);
+    // 额度：默认上限 12，本小时已发起 1 次（上面那次下发）—— 页面靠它解释 429。
+    assert_eq!(list["quota"]["limit_per_hour"], 12);
+    assert_eq!(list["quota"]["used_last_hour"], 1);
+    // G1：发起人要回显在视图里（审计发生在事前，但取证要事后可查）。
+    assert!(
+        list["latest_command"]["requested_by"]
+            .as_str()
+            .is_some_and(|by| by.starts_with("admin:"))
+    );
+
+    // 3) 单份报告：正文原样返回。
+    let response = get_admin(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/investigations/cmd_prev",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let detail: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(detail["report"]["topic"], "disk");
+
+    // 4) 未知 command / 未知题目都是"说清楚"，不是 500。
+    let response = get_admin(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/investigations/cmd_missing",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "memory" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `accepted` 阶段回报：**认领不等于完成**。
+///
+/// 走完整链路（agent 状态上报 → 落库 → 管理面视图），钉三件事：
+///   1. `accepted` 到达后命令**仍在**待下发集合里（agent 重启不丢命令）；
+///   2. 视图里 `claimed_at` 有值、`acknowledged_at` / `outcome` / `detail` 仍是 null
+///      —— 页面靠这一列把「等待认领」换成「调查中」；
+///   3. 终态到达后 `claimed_at` 保持第一次的值，不被覆盖。
+#[tokio::test]
+async fn an_investigation_accepted_stage_claims_the_command_without_finishing_it() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, "agent-node-a", &["disk"], true).await;
+    let response = put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    env.config.data_plane_work_dir = Some(env._root.clone());
+
+    let dispatched: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-node-a/investigations",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({ "topic": "disk" }),
+        )
+        .await,
+    )
+    .await;
+    let command_id = dispatched["command"]["command_id"]
+        .as_str()
+        .expect("command id")
+        .to_string();
+
+    let status_report = |acks: serde_json::Value| {
+        serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "0.18.4",
+            "command_acks": acks,
+        })
+    };
+    let read_list = || async {
+        decode_json_response::<serde_json::Value>(
+            get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+        )
+        .await
+    };
+
+    // 1) agent 取走（还在扫）：回 `accepted`。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_report(serde_json::json!([{
+            "command_id": command_id,
+            "outcome": "accepted",
+            "detail": "已取走，扫描中（最长 120s）",
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    // 阶段回报**不结束投递**：同一份回执里命令还会被带下去（agent 侧靠台账去重）。
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(
+        ack.commands.len(),
+        1,
+        "accepted 之后命令仍要留在待下发集合（agent 重启拿得到）"
+    );
+    assert_eq!(ack.commands[0].command_id, command_id);
+
+    let list = read_list().await;
+    let claimed_at = list["latest_command"]["claimed_at"]
+        .as_str()
+        .expect("claimed_at 要有值：页面据此把「等待认领」换成「调查中」")
+        .to_string();
+    assert!(
+        list["latest_command"]["acknowledged_at"].is_null(),
+        "accepted 不是终态：acknowledged_at 必须还是 null"
+    );
+    assert!(
+        list["latest_command"]["outcome"].is_null(),
+        "accepted 不能写进 outcome（它是阶段词，不是终态词）"
+    );
+    assert!(
+        list["latest_command"]["detail"].is_null(),
+        "detail 留给终态，阶段内容不能占位"
+    );
+
+    // 2) 命令重发带来的重复 `accepted`：认领时刻只认第一次。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_report(serde_json::json!([{
+            "command_id": command_id,
+            "outcome": "accepted",
+            "detail": "已取走，扫描中（最长 120s）",
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        read_list().await["latest_command"]["claimed_at"],
+        serde_json::Value::String(claimed_at.clone()),
+        "重复的阶段回报不能把认领时刻往后推"
+    );
+
+    // 3) 终态：收口，但认领时刻保持。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_report(serde_json::json!([{
+            "command_id": command_id,
+            "outcome": "succeeded",
+            "detail": "6 项正常 / 1 项警告",
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert!(ack.commands.is_empty(), "终态之后不再下发同一条命令");
+
+    let done = read_list().await;
+    assert_eq!(done["latest_command"]["outcome"], "succeeded");
+    assert!(done["latest_command"]["acknowledged_at"].is_string());
+    assert_eq!(
+        done["latest_command"]["claimed_at"],
+        serde_json::Value::String(claimed_at),
+        "终态不能覆盖认领时刻"
+    );
+}
+
+/// 造一份带调查能力的 `AgentStatusReport`（与 agentd 的实际上报同一形状）。
+async fn report_investigation_capabilities(
+    env: &TestEnv,
+    agent_id: &str,
+    surfaces: &[&str],
+    privileged: bool,
+) {
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(agent_id),
+        &AgentStatusReport {
+            agent_id: agent_id.to_string(),
+            instance_id: "node-a".to_string(),
+            version: "0.11.0".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            work_state_changes: None,
+            discovery_policy_version: None,
+            local_work: None,
+            uplink_state: None,
+            certificate_status: None,
+            machine_profile: None,
+            logs_capabilities: None,
+            investigation_capabilities: Some(
+                wist_contracts::capability_report::InvestigationCapabilities {
+                    surfaces: surfaces.iter().map(|surface| surface.to_string()).collect(),
+                    privileged,
+                },
+            ),
+            command_acks: Vec::new(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+/// 一条数据面报告记录（与 `business.d/agent_ivsrep.toml` 的 file sink 同形）。
+fn ivsrep_line(agent: &str, seq: u64, command_id: &str, observed_at: &str) -> String {
+    let body = serde_json::json!({
+        "command": "investigate",
+        "topic": "disk",
+        "report_schema": "wist.investigation.disk/v1",
+        "observed_at": observed_at,
+        "command_id": command_id,
+        "findings": [],
+        "summary": { "ok": 1, "warn": 0, "fail": 0, "overall": "ok" },
+        "verdict": "1 项正常"
+    })
+    .to_string();
+    serde_json::json!({
+        "schema": "v1",
+        "agent": agent,
+        "ts": observed_at,
+        "seq": seq,
+        "body": body,
+    })
+    .to_string()
+}
+
+/// 没挂数据面（`[data_plane] work_dir` 未配）：列表说清楚“没挂载”，按 id 读报告回 404。
+///
+/// 为什么值一条 e2e：现场最常见的错不是“报告解析不对”，而是**挂载/路径没对上** ——
+/// 代码路径不给 `configured=false`，页面就只会显示“暂无数据”，没人知道是没挂载。
+#[tokio::test]
+async fn admin_investigation_without_a_mounted_data_plane_says_so() {
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    // 默认没配 `data_plane_work_dir`。
+    assert!(env.config.data_plane_work_dir.is_none());
+
+    let response = get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let list: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(list["report_dir"]["configured"], false);
+    assert!(list["reports"].as_array().is_some_and(|r| r.is_empty()));
+
+    let response = get_admin(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/investigations/cmd_any",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_report_not_found");
+}
+
+/// 报告目录可配：绝对路径不依赖 `[data_plane] work_dir`（报告可以单独挂一个卷）。
+///
+/// 为什么要这条：报告是 **wparse 写、网关读**，两侧靠路径约定对齐。
+/// 约定被改（sink 的 `base` 换了位置 / 报告单独挂盘）时，网关必须能跟上，
+/// 不能只留一个写死的 `data/ivsrep`。
+#[tokio::test]
+async fn admin_investigation_reads_reports_from_a_configured_directory() {
+    let mut env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+
+    let report_dir = env._root.join("elsewhere").join("ivsrep");
+    std::fs::create_dir_all(&report_dir).expect("create report dir");
+    std::fs::write(
+        report_dir.join("agent-ivsrep.jsonl"),
+        format!(
+            "{}\n",
+            ivsrep_line("agent-node-a", 3, "cmd-abs", "2026-10-30T10:00:05Z")
+        ),
+    )
+    .expect("write report");
+    // 注意：`data_plane_work_dir` 仍是 `None` —— 绝对路径不需要它。
+    assert!(env.config.data_plane_work_dir.is_none());
+    env.config.investigation_report_dir = Some(report_dir.clone());
+
+    let list: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+    )
+    .await;
+    assert_eq!(list["report_dir"]["configured"], true, "{list}");
+    assert_eq!(
+        list["report_dir"]["path"],
+        report_dir.display().to_string(),
+        "页面要显示真实读的那份目录"
+    );
+    assert_eq!(list["reports"][0]["command_id"], "cmd-abs");
+}
+
+/// 按面授权（`[investigations] allowed_topics`）：网关关掉的面 → 403，且**不入队**。
+#[tokio::test]
+async fn admin_investigation_respects_the_gateway_allow_list() {
+    let mut env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    env.config.investigation_allowed_topics = Some(Vec::new());
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_not_allowed");
+    assert!(
+        env.store
+            .list_pending_agent_commands("agent-node-a", 8)
+            .await
+            .expect("pending")
+            .is_empty(),
+        "被策略拦下的调查不能进待下发集"
+    );
+
+    // 列表把「本网关允许什么」一并告诉页面（否则菜单不知道置灰哪几项）。
+    let list: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+    )
+    .await;
+    assert!(
+        list["allowed_topics"]
+            .as_array()
+            .is_some_and(|v| v.is_empty()),
+        "{list}"
+    );
+}
+
+/// 配额（`[investigations] max_per_agent_per_hour`）：连点第二次 → 429，且不入队。
+#[tokio::test]
+async fn admin_investigation_is_quota_limited_per_agent() {
+    let mut env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    // 授权默认全关：额度用例要先开这张面，否则会在授权闸先被 403 拦下。
+    put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    env.config.investigation_max_per_agent_per_hour = 1;
+
+    assert_eq!(
+        launch_disk_investigation(&env).await.status(),
+        StatusCode::OK
+    );
+    let refused = launch_disk_investigation(&env).await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    // 必须是**额度**码，而不是平台限流（`invalid_admin_bearer_token` / `retry later`）：
+    // 两者同为 429，页面要靠 `code` 决定是“等额度”还是“token 错了”。
+    let body: serde_json::Value = decode_json_response(refused).await;
+    assert_eq!(body["error"]["code"], "investigation_quota_exceeded");
+
+    // `0` = 不限。
+    env.config.investigation_max_per_agent_per_hour = 0;
+    assert_eq!(
+        launch_disk_investigation(&env).await.status(),
+        StatusCode::OK
+    );
+
+    // 列表回带额度现状：上限与「本小时已发起」（含被 429 拦下的那次之前的那一次）。
+    let list: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+    )
+    .await;
+    assert_eq!(list["quota"]["limit_per_hour"], 0);
+    assert_eq!(list["quota"]["used_last_hour"], 2, "{list}");
+}
+
+async fn launch_disk_investigation(env: &TestEnv) -> axum::response::Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk" }),
+    )
+    .await
+}
+
+async fn put_grant(env: &TestEnv, body: serde_json::Value) -> axum::response::Response {
+    put_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations/grant",
+        Some(TEST_ADMIN_API_TOKEN),
+        &body,
+    )
+    .await
+}
+
+/// G1 的第二层（按 agent 授权）：**默认全关**（与采集面一致），要开必须显式写、随时可收。
+///
+/// 为什么值一条 e2e：授权在库里只是一行，但在**下发行为**上是“发不发得出去” ——
+/// 把这层只做成页面逻辑的话，绕开页面直接调 API 就能把机器打开或锁死。
+#[tokio::test]
+async fn admin_investigation_is_deny_by_default_and_grants_can_be_revoked() {
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+
+    // ① 初始：没有本机行 = 一个面都没开（上界是全词表也不行），下发 403。
+    let list: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+    )
+    .await;
+    assert_eq!(list["grant"]["inherited"], false, "{list}");
+    assert!(
+        list["grant"]["topics"]
+            .as_array()
+            .is_some_and(|topics| topics.is_empty()),
+        "没授权过就是空集：{list}"
+    );
+    assert!(
+        list["effective_topics"]
+            .as_array()
+            .is_some_and(|topics| topics.is_empty()),
+        "没授权就没有可跑的面：{list}"
+    );
+    let refused = launch_disk_investigation(&env).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(refused).await;
+    assert_eq!(body["error"]["code"], "investigation_not_granted");
+    assert!(
+        env.store
+            .list_pending_agent_commands("agent-node-a", 8)
+            .await
+            .expect("pending")
+            .is_empty(),
+        "被授权闸拦下的调查不能进待下发集"
+    );
+
+    // ② 显式开一个面：立刻能下发，且能跑的面就是这一个。
+    let response = put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(saved["grant"]["topics"][0], "disk");
+    assert_eq!(saved["effective_topics"][0], "disk");
+    assert!(
+        saved["grant"]["updated_by"]
+            .as_str()
+            .is_some_and(|by| by.starts_with("admin:")),
+        "授权变更要留审计：{saved}"
+    );
+    assert_eq!(
+        launch_disk_investigation(&env).await.status(),
+        StatusCode::OK
+    );
+
+    // ③ 收权（`[]`）：即时生效，下发又变 403。
+    let pending_before = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 8)
+        .await
+        .expect("pending")
+        .len();
+    let response = put_grant(&env, serde_json::json!({ "topics": [] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let revoked: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        revoked["effective_topics"]
+            .as_array()
+            .is_some_and(|topics| topics.is_empty()),
+        "全关后没有可跑的面：{revoked}"
+    );
+    let refused = launch_disk_investigation(&env).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(refused).await;
+    assert_eq!(body["error"]["code"], "investigation_not_granted");
+    assert_eq!(
+        env.store
+            .list_pending_agent_commands("agent-node-a", 8)
+            .await
+            .expect("pending")
+            .len(),
+        pending_before,
+        "被授权闸拦下的调查不能进待下发集"
+    );
+
+    // ④ 删行 = 回到默认，也是全关 —— 不能再像旧构建那样“删行即全开”。
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations/grant",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reset: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(reset["grant"]["inherited"], false, "{reset}");
+    assert!(
+        reset["effective_topics"]
+            .as_array()
+            .is_some_and(|topics| topics.is_empty()),
+        "删行后仍是全关：{reset}"
+    );
+    assert_eq!(
+        launch_disk_investigation(&env).await.status(),
+        StatusCode::FORBIDDEN,
+        "默认全关：删行不等于放行"
+    );
+
+    // ⑤ 未知题目 400；越界（不在上界里）403 —— 下界只能收窄，不能绕过策略。
+    let response = put_grant(&env, serde_json::json!({ "topics": ["memory"] })).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_unknown_topic");
+}
+
+/// 下界不能超过上界：网关配成 `allowed_topics = []` 时，页面写 `["disk"]` 必须被拒。
+#[tokio::test]
+async fn admin_investigation_grant_cannot_exceed_the_gateway_allow_list() {
+    let mut env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    env.config.investigation_allowed_topics = Some(Vec::new());
+
+    let response = put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_not_allowed");
+    assert!(
+        env.store
+            .get_investigation_grant("agent-node-a")
+            .await
+            .expect("read grant")
+            .is_none(),
+        "被拒的授权不能落库"
+    );
+}
+
+/// 可见保留期（`[investigations] report_retention_days`）：超期报告列表不显示、按 id 也读不回。
+#[tokio::test]
+async fn admin_investigation_reports_expire_from_the_view() {
+    let mut env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, &agent_id, &["disk"], true).await;
+    env.config.data_plane_work_dir = Some(env._root.clone());
+    env.config.investigation_report_retention_days = 7;
+
+    let report_dir = env._root.join("data").join("ivsrep");
+    std::fs::create_dir_all(&report_dir).expect("create report dir");
+    let old = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    let fresh = chrono::Utc::now().to_rfc3339();
+    std::fs::write(
+        report_dir.join("agent-ivsrep.jsonl"),
+        format!(
+            "{}\n{}\n",
+            ivsrep_line("agent-node-a", 1, "cmd-old", &old),
+            ivsrep_line("agent-node-a", 2, "cmd-fresh", &fresh),
+        ),
+    )
+    .expect("write reports");
+
+    let list: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/investigations").await,
+    )
+    .await;
+    assert_eq!(list["retention_days"], 7);
+    let reports = list["reports"].as_array().expect("reports");
+    assert_eq!(reports.len(), 1, "超期的一条不该出现：{list}");
+    assert_eq!(reports[0]["command_id"], "cmd-fresh");
+
+    let response = get_admin(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/investigations/cmd-old",
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "过期后按 id 也读不回"
+    );
+    let response = get_admin(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/investigations/cmd-fresh",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// G2：能力闸拦在**入队前** —— 不会把命令发给一台注定做不了的机器。
+#[tokio::test]
+async fn admin_investigation_is_refused_when_the_agent_cannot_run_it() {
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+
+    // ① 从没报过能力（旧 agentd / 刚升级）：当作不可用，而不是“什么都会”。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_unsupported");
+    assert!(
+        env.store
+            .list_pending_agent_commands("agent-node-a", 8)
+            .await
+            .expect("pending")
+            .is_empty(),
+        "被拦下的调查不能进待下发集"
+    );
+
+    // ② 报了能力但不在列表里（这台机器实现了别的面）：同样拦。
+    report_investigation_capabilities(&env, &agent_id, &[], false).await;
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "investigation_unsupported");
+
+    // ③ 报对了：放行（授权默认全关：先显式开这张面），并回带能力（页面据此提示“非 root = 部分答案”）。
+    report_investigation_capabilities(&env, &agent_id, &["disk"], false).await;
+    put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/investigations",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["capabilities"]["privileged"], false);
+}
+
 struct TestEnv {
     config: AdminConfig,
-    store: AdminStore,
-    install_public_key_bytes: Vec<u8>,
+    store: SqliteStore,
+    store_handle: Arc<dyn Store>,
+    /// 就绪的本地安装包**制品**（测试夹具）。它不再是配置项 —— 运行时网关只认
+    /// 管理面录入的那份；这里只给「从本地文件构造来源」这类单测提供一个可读文件。
+    package_file: std::path::PathBuf,
     _root: std::path::PathBuf,
 }
 
 impl TestEnv {
-    fn new() -> Self {
+    async fn new() -> Self {
+        Self::new_with_policy_files(None, None, true).await
+    }
+
+    /// 不装载内容目录的用例用这个（`/api/v1/admin/content` 回 503）。
+    async fn new_without_content() -> Self {
+        Self::new_with_policy_files(None, None, false).await
+    }
+
+    /// **未录入任何安装包**的环境：用于「来源为空 / 没有可用包 → 503」这类用例
+    /// （默认的 `new()` 已录入一份本地制品，让安装链路开箱可用）。
+    async fn new_without_package() -> Self {
+        Self::new_with_policy_files_and_package(None, None, true, false).await
+    }
+
+    /// 需要用途推断的用例用这个：把规则表写进 temp 目录并挂到配置上。
+    /// `None` = 模拟「尚未配置规则表」 （事实照常入库，但不产出建议）。
+    async fn new_with_purpose_rules(purpose_rules_toml: Option<&str>) -> Self {
+        Self::new_with_policy_files(purpose_rules_toml, None, true).await
+    }
+
+    /// 需要发现方向策略表的用例用这个：把策略表写进 temp 目录并挂到配置上。
+    /// `None` = 模拟「尚未配置策略表」（poll 回 503，agentd 回落内建默认值）。
+    async fn new_with_discovery_policies(discovery_policies_toml: Option<&str>) -> Self {
+        Self::new_with_policy_files(None, discovery_policies_toml, true).await
+    }
+
+    async fn new_with_policy_files(
+        purpose_rules_toml: Option<&str>,
+        discovery_policies_toml: Option<&str>,
+        content: bool,
+    ) -> Self {
+        Self::new_with_policy_files_and_package(
+            purpose_rules_toml,
+            discovery_policies_toml,
+            content,
+            true,
+        )
+        .await
+    }
+
+    async fn new_with_policy_files_and_package(
+        purpose_rules_toml: Option<&str>,
+        discovery_policies_toml: Option<&str>,
+        content: bool,
+        record_package: bool,
+    ) -> Self {
         let root = std::env::temp_dir().join(format!("wist-gateway-test-{}", unique_suffix()));
         std::fs::create_dir_all(&root).expect("create root");
         let package_file = root.join("wist-agentd");
@@ -1403,56 +9820,131 @@ impl TestEnv {
         let tls_cert_file = root.join("admin-tls.crt.pem");
         std::fs::write(&tls_cert_file, TEST_TLS_CERT_PEM).expect("write tls cert");
         let store_file = root.join("state").join("admin-store.json");
-        let (install_signing_private_key_file, install_public_key_bytes) =
-            write_install_signing_key(&root);
-        let install_script_signing_public_key_pem =
-            load_install_script_public_key_pem(&install_signing_private_key_file)
-                .expect("derive install signing public key");
+        let db_path = root.join("state").join("wist-gateway.db");
+        let (content_catalog_file, content_packs_file, content_templates_file) = if content {
+            let content_dir = root.join("content");
+            std::fs::create_dir_all(&content_dir).expect("create content dir");
+            let catalog = content_dir.join("catalog.toml");
+            std::fs::write(&catalog, TEST_CONTENT_CATALOG).expect("write catalog");
+            let packs = content_dir.join("packs.toml");
+            std::fs::write(&packs, TEST_CONTENT_PACKS).expect("write packs");
+            let templates = content_dir.join("templates.toml");
+            std::fs::write(&templates, TEST_CONTENT_TEMPLATES).expect("write templates");
+            (Some(catalog), Some(packs), Some(templates))
+        } else {
+            (None, None, None)
+        };
         let config = AdminConfig {
             listen_addr: "127.0.0.1:3000".to_string(),
             public_base_url: "https://127.0.0.1:3000".to_string(),
             tls_cert_file,
             tls_key_file: root.join("admin-tls.key.pem"),
             admin_api_token_hash: sha256_hex(TEST_ADMIN_API_TOKEN),
-            agent_package_file: package_file,
+            self_face_allow: Vec::new(),
+            allowed_source_roots: crate::infra::config::default_allowed_source_roots(),
             bootstrap_token_ttl_seconds: 900,
             credential_ttl_seconds: 30 * 24 * 60 * 60,
-            store_file: store_file.clone(),
+            store_file,
+            database_url: None,
+            sqlite_path: db_path.clone(),
             trust_bundle: "internal-ca-stub".to_string(),
-            install_script_signing_private_key_file: install_signing_private_key_file,
-            install_script_signing_public_key_pem,
+            agent_ca_cert_file: Some(shared_test_agent_ca_paths().0),
+            agent_ca_key_file: Some(shared_test_agent_ca_paths().1),
+            client_cert_ttl_seconds: crate::infra::agent_ca::DEFAULT_CLIENT_CERT_TTL_SECONDS,
             tenant_id: "tenant-default".to_string(),
             environment_id: "env-default".to_string(),
             victoria_metrics_url: "http://127.0.0.1:18429".to_string(),
+            purpose_rules_file: purpose_rules_toml.map(|text| {
+                let path = root.join("purpose-rules.toml");
+                std::fs::write(&path, text).expect("write purpose rules");
+                path
+            }),
+            discovery_policies_file: discovery_policies_toml.map(|text| {
+                let path = root.join("aspect-policies.toml");
+                std::fs::write(&path, text).expect("write discovery policies");
+                path
+            }),
+            content_catalog_file,
+            content_packs_file,
+            content_templates_file,
+            // 内部接入端点默认关：测试走 `router()`，明文监听由 main.rs 单独起。
+            ingest_listen_addr: None,
+            data_plane_work_dir: None,
+            // 调查闸默认值（与线上一致）：上界全开、每小时 12 次、保留 7 天、报告目录跟数据面布局。
+            investigation_allowed_topics: None,
+            investigation_max_per_agent_per_hour:
+                crate::infra::config::DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR,
+            investigation_report_retention_days:
+                crate::infra::config::DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS,
+            investigation_report_dir: None,
+            // 知识库包默认不验签（要验签的用例自己把公钥填上）。
+            knowledge_source_dir: None,
+            knowledge_signing_public_key_file: None,
+            knowledge_signing_public_key: None,
+            log_max_bytes: crate::infra::LogRetention::default().max_bytes,
+            log_keep_files: crate::infra::LogRetention::default().keep_files,
+            log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
+            log: Default::default(),
         };
+        // A temp-file DB (not `:memory:`) because the router may use several
+        // pooled connections; `SqliteStore` is `Clone` and shares the same pool.
+        let store = SqliteStore::connect_path(&db_path)
+            .await
+            .expect("open store");
+        let store_handle: Arc<dyn Store> = Arc::new(store.clone());
+        // 安装包只有「管理面录入」一个来源（`agent.package_file` 已删）：默认给测试环境录一份本地
+        // 制品，等价于真实部署里先在「安装包」页录入 —— 否则签发安装代码/分发端点会直接 503。
+        if record_package {
+            let cached = config.install_package_cache_path(TEST_PLATFORM);
+            std::fs::create_dir_all(cached.parent().expect("cache dir")).expect("create cache dir");
+            std::fs::copy(&package_file, &cached).expect("seed package cache");
+            store_handle
+                .upsert_agent_install_package(&StoredAgentInstallPackageAddress {
+                    address_id: TEST_PLATFORM.to_string(),
+                    package_url: package_file.to_string_lossy().to_string(),
+                    package_sha256: None,
+                    updated_by: "test-ops".to_string(),
+                    updated_at: "2026-09-01T00:00:00+00:00".to_string(),
+                })
+                .await
+                .expect("record install package");
+        }
         Self {
             config,
-            store: AdminStore::new(store_file),
-            install_public_key_bytes,
+            store,
+            store_handle,
+            package_file,
             _root: root,
         }
     }
 
-    fn issue_token(&self) -> String {
-        let install_code =
-            issue_agent_install_code(&self.config, &self.store).expect("issue token");
+    async fn issue_token(&self) -> String {
+        let install_code = issue_agent_install_code(&self.config, &self.store_handle)
+            .await
+            .expect("issue token");
         install_code.bootstrap_enrollment_token
     }
 }
 
-fn test_state() -> ApiState {
-    let env = TestEnv::new();
+async fn test_state() -> ApiState {
+    let env = TestEnv::new().await;
+    let knowledge = LoadedKnowledge::from_config(&env.config);
     ApiState {
-        config: env.config,
-        store: env.store,
+        agent_ca: super::load_agent_ca(&env.config),
+        config: env.config.clone(),
+        store: Arc::clone(&env.store_handle),
         runtime: Arc::new(Mutex::new(AdminRuntimeState::default())),
         rate_limits: Arc::new(Mutex::new(super::rate_limit::RateLimitState::default())),
+        knowledge: Arc::new(RwLock::new(Arc::new(knowledge))),
+        link_request: Arc::new(Mutex::new(None)),
+        local_peers: LocalPeers::resolve(&env.config),
     }
 }
 
-fn issue_token_for_state(state: &ApiState) -> String {
-    let install_code =
-        issue_agent_install_code(&state.config, &state.store).expect("issue state token");
+async fn issue_token_for_state(state: &ApiState) -> String {
+    let install_code = issue_agent_install_code(&state.config, &state.store)
+        .await
+        .expect("issue state token");
     install_code.bootstrap_enrollment_token
 }
 
@@ -1460,8 +9952,224 @@ fn enrollment_request_json(token: &str) -> String {
     serde_json::to_string(&enrollment_request(token)).expect("serialize request")
 }
 
+/// 共享一份**测试用 agent CA**（证书 + 私钥），只在首次调用时生成。
+///
+/// mTLS 是 agent 唯一的凭据路径，注册/续期都必须有 CA 可签；每个 `TestEnv` 现造一份会白白
+/// 重复做密钥生成，所以就共享一份（文件落在系统临时目录，进程退出即随 `TestEnv` 一起被忽略）。
+fn shared_test_agent_ca_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    static PATHS: std::sync::OnceLock<(std::path::PathBuf, std::path::PathBuf)> =
+        std::sync::OnceLock::new();
+    PATHS
+        .get_or_init(|| {
+            let (_ca, cert_path, key_path) = test_agent_ca();
+            (cert_path, key_path)
+        })
+        .clone()
+}
+
+/// 采集内容只读视图：模板组成 + 各平台的面就绪度（“部分可用”的可见面）。
+#[tokio::test]
+async fn admin_content_view_lists_readiness_and_templates() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/content",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["catalog_version"], 1);
+    let templates = view["templates"].as_array().expect("templates array");
+    assert!(
+        templates
+            .iter()
+            .any(|template| template["template_id"] == "macos-daily")
+    );
+
+    let readiness = view["readiness"].as_array().expect("readiness array");
+    let macos = readiness
+        .iter()
+        .find(|entry| entry["platform"] == "macos")
+        .expect("macos readiness");
+    let host_metrics = macos["families"]
+        .as_array()
+        .expect("families array")
+        .iter()
+        .find(|family| family["family"] == "HostMetrics")
+        .expect("HostMetrics readiness");
+    assert_eq!(host_metrics["ready"], serde_json::Value::Bool(true));
+    assert_eq!(host_metrics["active_units"], 1);
+    // 两个轴都要出得来：只报一个会让「采到了但认不出是谁」看着像已就绪。
+    assert_eq!(host_metrics["parse_ready"], serde_json::Value::Bool(true));
+    assert_eq!(host_metrics["parse_ready_units"], 1);
+    assert_eq!(host_metrics["total_units"], 1);
+}
+
+#[tokio::test]
+async fn admin_content_view_requires_admin_bearer() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/content",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_content_view_reports_not_configured() {
+    // 端点存在、但这台网关没配内容目录 —— 与“没发布”区分开，回 503。
+    let env = TestEnv::new_without_content().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/content",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// 人工判定：写入后落到用途视图里（采集范围变更的前置）。
+#[tokio::test]
+async fn admin_classify_agent_stores_the_decision() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    assert_eq!(
+        post_facts(&env, &fact_report(&["/usr/bin/xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "MacDev", "note": "人看过" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["machine_class"], "MacDev");
+    assert_eq!(body["decided_by"], "admin");
+
+    let view = get_purpose_view(&env, "agent-node-a").await;
+    assert_eq!(view["classification"]["machine_class"], "MacDev");
+    assert_eq!(view["classification"]["note"], "人看过");
+}
+
+#[tokio::test]
+async fn admin_classify_agent_rejects_a_platform_mismatch() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    // 事实摘要是 macOS 的：Linux 类别必须被拒（分类必须与机器平台一致）。
+    post_facts(&env, &fact_report(&["xcodebuild"])).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "LinuxData" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_classify_agent_accepts_a_generic_linux_host() {
+    // 通用 Linux 服务器（`LinuxHost`）：平台对得上（linux 事实 + linux 类别）就应当被接受。
+    // 没有它，普通 Linux 机器在闭集里就没有可归档的类别，采集链就断在第一步。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let mut report = fact_report(&["dockerd", "nginx"]);
+    report.os = "linux".to_string();
+    report.content_digest = digest_of(&report);
+    post_facts(&env, &report).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "LinuxHost" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["machine_class"], "LinuxHost");
+    assert_eq!(body["decided_by"], "admin");
+}
+
+#[tokio::test]
+async fn admin_classify_agent_rejects_an_unobserved_agent() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    // 没有事实摘要 → 平台未知 → 拒（不是默认通过）。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "MacDaily" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_classify_agent_requires_admin_bearer() {
+    let env = TestEnv::new().await;
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        None,
+        &serde_json::json!({ "machine_class": "MacDev" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_purpose_coverage_counts_classified_and_unclassified() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    post_facts(&env, &fact_report(&["xcodebuild"])).await;
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "MacDev" }),
+    )
+    .await;
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/purpose-coverage",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["total_agents"], 1);
+    assert_eq!(view["classified_agents"], 1);
+    assert_eq!(view["unclassified_agents"], 0);
+    assert_eq!(view["by_class"][0]["machine_class"], "MacDev");
+    assert_eq!(view["by_class"][0]["agent_count"], 1);
+}
+
 async fn get_to_router(
     config: &AdminConfig,
+    store: &Arc<dyn Store>,
     uri: &str,
     admin_token: Option<&str>,
 ) -> axum::response::Response {
@@ -1469,14 +10177,83 @@ async fn get_to_router(
     if let Some(token) = admin_token {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
-    router(config.clone())
+    router(config.clone(), Arc::clone(store))
         .oneshot(builder.body(Body::empty()).expect("request"))
         .await
         .expect("route response")
 }
 
-async fn post_enrollment_to_router(config: &AdminConfig, body: String) -> axum::response::Response {
-    router(config.clone())
+/// agent 取包路由的 GET：第 4 个参数是 **agent_id**，注入「握手期验过的客户端证书身份」。
+///
+/// 与 [`get_to_router`]（管理面 admin token）分开，理由同 [`post_agent_json_to_router`]：
+/// agent 只有一条凭据路径 —— 客户端证书。
+async fn get_agent_package(
+    env: &TestEnv,
+    uri: &str,
+    agent_id: Option<&str>,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request");
+    if let Some(agent_id) = agent_id {
+        request.extensions_mut().insert(client_identity(agent_id));
+    }
+    router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(request)
+        .await
+        .expect("route response")
+}
+
+async fn delete_to_router(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    uri: &str,
+    admin_token: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method("DELETE").uri(uri);
+    if let Some(token) = admin_token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    router(config.clone(), Arc::clone(store))
+        .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("route response")
+}
+
+async fn put_json_to_router<T: serde::Serialize>(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    uri: &str,
+    admin_token: Option<&str>,
+    body: &T,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = admin_token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    router(config.clone(), Arc::clone(store))
+        .oneshot(
+            builder
+                .body(Body::from(
+                    serde_json::to_string(body).expect("serialize body"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+}
+
+async fn post_enrollment_to_router(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    body: String,
+) -> axum::response::Response {
+    router(config.clone(), Arc::clone(store))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -1501,6 +10278,7 @@ fn assert_no_store(response: &axum::response::Response) {
 
 async fn post_json_to_router<T: serde::Serialize>(
     config: &AdminConfig,
+    store: &Arc<dyn Store>,
     uri: &str,
     bearer_token: Option<&str>,
     body: &T,
@@ -1512,7 +10290,7 @@ async fn post_json_to_router<T: serde::Serialize>(
     if let Some(token) = bearer_token {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
-    router(config.clone())
+    router(config.clone(), Arc::clone(store))
         .oneshot(
             builder
                 .body(Body::from(
@@ -1520,6 +10298,83 @@ async fn post_json_to_router<T: serde::Serialize>(
                 ))
                 .expect("request"),
         )
+        .await
+        .expect("route response")
+}
+
+/// 中心下发端点的请求：`POST /api/v1/gateway/agent-package`。
+/// `addr = None` = **不注入**连接信息（模拟取不到 peer，应被环回护栏 fail-closed 拒绝）。
+async fn post_agent_package_push<T: serde::Serialize>(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    addr: Option<std::net::SocketAddr>,
+    body: &T,
+) -> axum::response::Response {
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/agent-package")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(body).expect("serialize body"),
+        ))
+        .expect("request");
+    if let Some(addr) = addr {
+        request.extensions_mut().insert(MockConnectInfo(addr));
+    }
+    router(config.clone(), Arc::clone(store))
+        .oneshot(request)
+        .await
+        .expect("route response")
+}
+
+/// 把**真路由器**挂到 `127.0.0.1` 上（真 `ConnectInfo`），返回其地址与后台服务句柄。
+///
+/// 环回护栏要在**真 TCP peer** 上成立 —— 这是 `MockConnectInfo` 假不出来的那一段。用完 `abort()`。
+async fn spawn_gateway_on_loopback(
+    env: &TestEnv,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let app = router(env.config.clone(), env.store_handle.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("loopback addr");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    (addr, handle)
+}
+
+/// agent 路由的请求：第 4 个参数是 **agent_id**，注入「握手期验过的客户端证书身份」。
+///
+/// 为什么和管理面那个助手分开：管理面走的是 **admin token**（bearer 头，人的凭据），而 agent
+/// **只有一条凭据路径 —— 客户端证书**（§5.2，2026-09-30 起删掉了 bearer 双轨）。两者靠 header
+/// 与否已经分不开了，所以在测试里就用两个助手区分，别让「同一个 helper 既能当人又能当机器」。
+async fn post_agent_json_to_router<T: serde::Serialize>(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    uri: &str,
+    agent_id: Option<&str>,
+    body: &T,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(body).expect("serialize body"),
+        ))
+        .expect("request");
+    if let Some(agent_id) = agent_id {
+        request.extensions_mut().insert(client_identity(agent_id));
+    }
+    router(config.clone(), Arc::clone(store))
+        .oneshot(request)
         .await
         .expect("route response")
 }
@@ -1541,26 +10396,6 @@ async fn body_bytes(response: axum::response::Response) -> axum::body::Bytes {
         .expect("body bytes")
 }
 
-fn write_install_signing_key(root: &std::path::Path) -> (std::path::PathBuf, Vec<u8>) {
-    let rng = ring_rand::SystemRandom::new();
-    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate install signing key");
-    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse signing key");
-    let path = root.join("install-signing-ed25519.pkcs8.pem");
-    std::fs::write(&path, private_key_pem(pkcs8.as_ref())).expect("write signing key");
-    (path, key_pair.public_key().as_ref().to_vec())
-}
-
-fn private_key_pem(der: &[u8]) -> String {
-    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der);
-    let mut output = String::from("-----BEGIN PRIVATE KEY-----\n");
-    for chunk in encoded.as_bytes().chunks(64) {
-        output.push_str(std::str::from_utf8(chunk).expect("base64 utf8"));
-        output.push('\n');
-    }
-    output.push_str("-----END PRIVATE KEY-----\n");
-    output
-}
-
 fn unique_suffix() -> u128 {
     static NEXT_SUFFIX: AtomicU64 = AtomicU64::new(1);
     let seq = NEXT_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
@@ -1569,4 +10404,6615 @@ fn unique_suffix() -> u128 {
         .expect("time")
         .as_nanos()
         + seq
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 工作授权（Control.Agent.Work）：授权 → 拉快照 → 确认 → 暂停/恢复/撤回
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 让 agent-node-a 成为一台「有事实、已判定 MacDaily」的机器（派活的两条前置），
+/// 返回它的通讯凭据（Agent 侧拉快照要用）。
+async fn a_classified_macos_agent(env: &TestEnv) -> String {
+    let credential = enroll_agent_credential(env).await;
+    assert_eq!(
+        post_facts(env, &fact_report(&["/usr/bin/xcodebuild"]))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": "MacDaily" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    credential
+}
+
+async fn grant_work(env: &TestEnv, body: serde_json::Value) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &body,
+    )
+    .await
+}
+
+async fn post_work_route(env: &TestEnv, path: &str) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        path,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "reason_code": "测试" }),
+    )
+    .await
+}
+
+/// 拒结类的断言用得上正文文本（理由写在那里，不在日志里）。
+async fn decode_text_response(response: Response) -> String {
+    String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8 body")
+}
+
+async fn get_agent_work(env: &TestEnv) -> serde_json::Value {
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+async fn get_agent_runtime_status(env: &TestEnv) -> serde_json::Value {
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/runtime-status",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+async fn poll_work(env: &TestEnv, credential: Option<&str>) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/work:poll",
+        credential,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": POLL_WORK_KIND,
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "last_seen_sequence": 0,
+            "wait_ms": 0,
+            "requested_at": "2026-09-23T00:00:00Z",
+        }),
+    )
+    .await
+}
+
+async fn poll_uplink(env: &TestEnv, credential: Option<&str>) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/uplink:poll",
+        credential,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": POLL_AGENT_UPLINK_KIND,
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "requested_at": "2026-09-26T00:00:00Z",
+        }),
+    )
+    .await
+}
+
+/// 带自定义 envelope 的 uplink poll（用于验 `api_version` / `kind` 被拒）。
+async fn poll_uplink_with(
+    env: &TestEnv,
+    credential: Option<&str>,
+    api_version: &str,
+    kind: &str,
+) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/uplink:poll",
+        credential,
+        &serde_json::json!({
+            "api_version": api_version,
+            "kind": kind,
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "requested_at": "2026-09-26T00:00:00Z",
+        }),
+    )
+    .await
+}
+
+/// envelope 字段与 `work:poll` 同一口径：`api_version` / `kind` 任一不对就是 400。
+#[tokio::test]
+async fn the_uplink_poll_rejects_a_wrong_envelope() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    for (api_version, kind) in [
+        ("v2", POLL_AGENT_UPLINK_KIND),
+        ("v1", "poll_something_else"),
+    ] {
+        let response = poll_uplink_with(&env, Some(&credential), api_version, kind).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "api_version={api_version} kind={kind}"
+        );
+    }
+}
+
+/// 「授权前不上送」的回归护栏：网关签发的初始配置**永远**是待命 ——
+/// 无论管理面有没有设上送地址、有没有打开部署级开关。启用只能来自运行期的
+/// `uplink:poll`（`（有生效工作 或 开关打开）且 有地址`）。
+/// 有人把模板改成 `enabled = true`，就会让新装 Agent 在授权前外发；这条测试要拦住它。
+#[tokio::test]
+async fn initial_config_never_enables_the_uplink() {
+    let env = TestEnv::new().await;
+    for switch in [false, true] {
+        let uplink = StoredAgentUplinkAddress {
+            setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
+            host: "10.0.1.9".to_string(),
+            port: 9100,
+            // 关键：连「开关已打开」也不得写进安装期配置 —— 安装脚本是死数据，
+            // 开关是运行期的（改了开关不需要重装）。
+            enabled: switch,
+            updated_by: "ops".to_string(),
+            updated_at: "2026-09-21T00:00:00+00:00".to_string(),
+        };
+        for with_target in [false, true] {
+            let text = agent_initial_config_toml(
+                &env.config,
+                "install-token-a",
+                with_target.then_some(&uplink),
+                &env.config.public_base_url,
+            );
+            // 只信解析结果，不做文本匹配：模板里 `[control_plane] enabled = true` 也会命中
+            // 子串/行匹配（`enabled` 这个键名不止一处），而解析后看的是**输出那一段**的真值。
+            let parsed: toml::Value = toml::from_str(&text).expect("valid agent config toml");
+            assert_eq!(
+                parsed["telemetry"]["logs"]["output"]["enabled"].as_bool(),
+                Some(false),
+                "网关签发的初始配置必须待命（switch={switch} with_target={with_target}）:\n{text}"
+            );
+        }
+    }
+}
+
+async fn ack_work(
+    env: &TestEnv,
+    credential: Option<&str>,
+    work_id: &str,
+    version: i64,
+) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/work:ack",
+        credential,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": ACK_WORK_KIND,
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "work_id": work_id,
+            "plan_version": version,
+            "acknowledged_at": "2026-09-23T00:00:00Z",
+        }),
+    )
+    .await
+}
+
+/// 没有用途判定就没法派活：判定决定取哪份模板，跳过它就是跳过采集范围的审定。
+#[tokio::test]
+async fn granting_work_without_a_classification_is_rejected() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message = decode_text_response(response).await;
+    assert!(message.contains("先归档用途判定"), "{message}");
+}
+
+/// 常驻工作留空的 spec 由网关**按事实从采集目录展开** —— 这就是「网关决定采什么」。
+#[tokio::test]
+async fn granting_standing_work_derives_the_spec_from_catalog_and_facts() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(receipt["work_kind"], "Standing");
+    assert_eq!(receipt["status"], "accepted");
+    assert_eq!(receipt["plan_version"], 1);
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["sequence"], 1);
+    // 断言落库/下发的是**物化过**的工作参数：agentd 拿着它就能直接采。
+    let spec = WorkSpec::parse(
+        view["standing"][0]["spec"]
+            .as_str()
+            .expect("spec is a string"),
+    )
+    .expect("spec 是可解析的工作参数");
+    assert_eq!(spec.units[0].unit_id, "mac-metrics");
+    assert_eq!(spec.units[0].capability, "collect_metrics");
+    assert_eq!(spec.units[0].sources[0].kind, "MetricInterval");
+    assert_eq!(view["standing"][0]["family"], "HostMetrics");
+    assert_eq!(view["standing"][0]["catalog_version"], 1);
+    assert_eq!(view["standing"][0]["status"], "active");
+    assert!(view["standing"][0]["ack"].is_null());
+
+    // 同一面再授一次 = 改这一份（同一个 work_id，版本 +1），不是多出一份。
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let again: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(again["work_id"], work_id.as_str());
+    assert_eq!(again["plan_version"], 2);
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["standing"].as_array().expect("standing").len(), 1);
+    assert_eq!(view["sequence"], 2);
+}
+
+#[tokio::test]
+async fn granting_a_family_that_is_not_ready_is_a_conflict() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    // 测试目录里只有 HostMetrics 的单元；LoginSession 这个面还没有采集就绪的单元
+    // （它的来源是导出器/导出式采集，不是 agentd 现在能执行的东西）。
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "LoginSession" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let message = decode_text_response(response).await;
+    assert!(message.contains("collect_not_ready"), "{message}");
+}
+
+#[tokio::test]
+async fn a_hand_written_spec_must_name_units_of_that_family() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({
+            "work_kind": "Standing", "family": "HostMetrics", "spec": "not-a-unit"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message = decode_text_response(response).await;
+    assert!(
+        message.contains("not in the collection catalog"),
+        "{message}"
+    );
+}
+
+/// 授权快照是「现在的期望」：幂等、可重复拉，且只有生效中的才下发。
+#[tokio::test]
+async fn agent_polls_the_work_grant_and_acks_the_plan_version() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+
+    let response = grant_work(
+        &env,
+        serde_json::json!({
+            "work_kind": "OneShot", "action": "upgrade", "spec": "0.1.4",
+            "deadline_at": "2026-09-24T00:00:00Z", "timeout_seconds": 600
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: serde_json::Value = decode_json_response(response).await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    // 拉快照：一次性工作在，状态是 dispatched（还没被确认）。
+    let grant: serde_json::Value =
+        decode_json_response(poll_work(&env, Some(&credential)).await).await;
+    assert_eq!(grant["one_shot"][0]["work_id"], work_id.as_str());
+    assert_eq!(grant["one_shot"][0]["status"], "dispatched");
+
+    // 确认：dispatched → accepted，并留下回执。
+    let acked: serde_json::Value =
+        decode_json_response(ack_work(&env, Some(&credential), &work_id, 1).await).await;
+    assert_eq!(acked["status"], "accepted");
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["one_shot"][0]["status"], "accepted");
+    assert_eq!(view["one_shot"][0]["ack"]["plan_version"], 1);
+}
+
+#[tokio::test]
+async fn acking_a_stale_plan_version_is_reported_in_band_and_not_recorded() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    let receipt: serde_json::Value = decode_json_response(response).await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    let acked: serde_json::Value =
+        decode_json_response(ack_work(&env, Some(&credential), &work_id, 99).await).await;
+    assert_eq!(acked["status"], "stale");
+
+    // 陈旧确认不写回执：否则「Agent 手上是哪一版」会被一个错的数盖掉。
+    let view = get_agent_work(&env).await;
+    assert!(view["standing"][0]["ack"].is_null());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 一次性工作的执行结果（Control.Agent.Work）：上报 → 推进 / 迟到 → 不覆盖
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 派一件一次性升级给已判定的 agent-node-a，返回 work_id。
+async fn grant_one_shot_upgrade(env: &TestEnv) -> String {
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            env,
+            serde_json::json!({
+                "work_kind": "OneShot", "action": "upgrade", "spec": "0.1.4",
+                "deadline_at": "2026-09-24T00:00:00Z", "timeout_seconds": 600
+            }),
+        )
+        .await,
+    )
+    .await;
+    receipt["work_id"].as_str().expect("work id").to_string()
+}
+
+/// 派一件带**指定**截止与预算的一次性升级（到期判定要看的是相对时间，不能写死）。
+async fn grant_one_shot_upgrade_until(
+    env: &TestEnv,
+    deadline_at: &str,
+    timeout_seconds: i64,
+) -> String {
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            env,
+            serde_json::json!({
+                "work_kind": "OneShot", "action": "upgrade", "spec": "0.1.4",
+                "deadline_at": deadline_at, "timeout_seconds": timeout_seconds
+            }),
+        )
+        .await,
+    )
+    .await;
+    receipt["work_id"].as_str().expect("work id").to_string()
+}
+
+async fn submit_work_result_as(
+    env: &TestEnv,
+    credential: Option<&str>,
+    agent_id: &str,
+    instance_id: &str,
+    work_id: &str,
+    status: &str,
+    detail: &str,
+) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/work:result",
+        credential,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": REPORT_WORK_RESULT_KIND,
+            "agent_id": agent_id,
+            "instance_id": instance_id,
+            "work_id": work_id,
+            "status": status,
+            "detail": detail,
+            "reported_at": "2026-09-23T00:05:00Z",
+        }),
+    )
+    .await
+}
+
+async fn submit_work_result(
+    env: &TestEnv,
+    credential: Option<&str>,
+    work_id: &str,
+    status: &str,
+    detail: &str,
+) -> Response {
+    submit_work_result_as(
+        env,
+        credential,
+        "agent-node-a",
+        "node-a",
+        work_id,
+        status,
+        detail,
+    )
+    .await
+}
+
+/// 结果上报回答「我做得怎么样了」：进度把工作从 dispatched 推到 running，页面上随工作一起可见。
+#[tokio::test]
+async fn an_agent_reports_the_result_of_a_one_shot_work() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    let accepted: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "running", "正在换件").await,
+    )
+    .await;
+    assert_eq!(accepted["status"], "accepted");
+
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["one_shot"][0]["status"], "running");
+    assert_eq!(view["one_shot"][0]["result"]["status"], "running");
+    assert_eq!(view["one_shot"][0]["result"]["detail"], "正在换件");
+}
+
+/// 终态让工作**了结**：离开「在办」清单，进历史留痕。
+#[tokio::test]
+async fn a_terminal_result_settles_the_work() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    let accepted: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "failed", "摘要不符").await,
+    )
+    .await;
+    assert_eq!(accepted["status"], "accepted");
+
+    let view = get_agent_work(&env).await;
+    assert!(view["one_shot"].as_array().expect("one_shot").is_empty());
+    assert_eq!(view["settled_one_shot"][0]["work_id"], work_id.as_str());
+    assert_eq!(view["settled_one_shot"][0]["status"], "failed");
+    // 了结之后**仍看得到原因**：失败说明正是这活做完才最需要看的东西。
+    assert_eq!(view["settled_one_shot"][0]["result"]["status"], "failed");
+    assert_eq!(view["settled_one_shot"][0]["result"]["detail"], "摘要不符");
+}
+
+/// 一件活只能有一个终态：迟到的结果回 `stale`、**不覆盖**状态，但结果记录照存
+/// —— 机器上确实发生过那次上报，抹掉它只会让事后无法解释。
+#[tokio::test]
+async fn a_late_result_is_stale_and_never_overwrites_the_terminal_state() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    let accepted: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "failed", "摘要不符").await,
+    )
+    .await;
+    assert_eq!(accepted["status"], "accepted");
+
+    let late: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "succeeded", "迟到的成功").await,
+    )
+    .await;
+    assert_eq!(late["status"], "stale");
+
+    let stored = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .expect("load work")
+        .expect("work exists");
+    assert_eq!(stored.work.status, "failed");
+
+    let result = env
+        .store_handle
+        .get_work_result(&work_id)
+        .await
+        .expect("load result")
+        .expect("result exists");
+    assert_eq!(result.status, "succeeded");
+    assert_eq!(result.detail, "迟到的成功");
+}
+
+/// agent 无权写回**控制面与期限**拥有的状态：那些要么是网关自己写的（dispatched），
+/// 要么归运维暂停/撤回或过了截止。
+#[tokio::test]
+async fn an_agent_cannot_report_a_status_the_control_plane_owns() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    for status in [
+        "dispatched",
+        "accepted",
+        "paused",
+        "canceled",
+        "expired",
+        "timed_out",
+        "rolled_back",
+    ] {
+        let response = submit_work_result(&env, Some(&credential), &work_id, status, "").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{status}");
+    }
+}
+
+/// 报一件**不属于自己**或**根本不存在**的活回 `unknown`：不报错，也不替它编一个状态。
+#[tokio::test]
+async fn a_result_for_an_unknown_or_someone_elses_work_is_unknown() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    // 不存在的活。
+    let unknown: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), "work-nope", "succeeded", "").await,
+    )
+    .await;
+    assert_eq!(unknown["status"], "unknown");
+
+    // 别人的活：换一台机器（agent-node-b）拿自己的凭据去报 agent-node-a 的活。
+    let other = enroll_agent_at_node(&env, "node-b").await;
+    let unknown: serde_json::Value = decode_json_response(
+        submit_work_result_as(
+            &env,
+            Some(&other),
+            "agent-node-b",
+            "node-b",
+            &work_id,
+            "succeeded",
+            "",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(unknown["status"], "unknown");
+
+    // 别人的上报没动这台机器的活：还是派下去那一刻的状态。
+    let stored = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .expect("load work")
+        .expect("work exists");
+    assert_eq!(stored.work.status, "dispatched");
+}
+
+#[tokio::test]
+async fn reporting_a_result_needs_an_agent_credential() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let work_id = grant_one_shot_upgrade(&env).await;
+
+    assert_eq!(
+        submit_work_result(&env, None, &work_id, "running", "")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        submit_work_result(&env, Some("forged"), &work_id, "running", "")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // 凭据是真的、但报的是**别人**报的身份：同样拒绝（身份与凭据必须对得上）。
+    assert_eq!(
+        submit_work_result_as(
+            &env,
+            Some(&credential),
+            "agent-node-b",
+            "node-b",
+            &work_id,
+            "running",
+            "",
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 一次性工作的到期判定（后台 tick）：截止 → expired，预算尽 → timed_out
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 过了绝对截止的活由**网关**收敛掉，不等 agent 来报 —— 掉线的 agent 恰恰是这活最可能
+/// 卡住的时候，那时没有 poll 可搭。
+#[tokio::test]
+async fn the_gateway_expires_a_one_shot_work_that_passed_its_deadline() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    // 截止设在 1 小时后、预算给足 24 小时：两条约束里只会碰``截止``那一条。
+    let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+    let work_id = grant_one_shot_upgrade_until(&env, &deadline.to_rfc3339(), 86_400).await;
+
+    // 还没到期：一件都不动。（扫描用显式传入的“现在”，测试不靠抢时间。）
+    assert_eq!(
+        expire_overdue_one_shot_works(
+            env.store_handle.as_ref(),
+            chrono::Utc::now().timestamp_millis()
+        )
+        .await
+        .expect("sweep"),
+        0
+    );
+
+    // 越过截止：记 expired，并离开未了结清单与下发的快照。
+    let after = (deadline + chrono::Duration::minutes(1)).timestamp_millis();
+    assert_eq!(
+        expire_overdue_one_shot_works(env.store_handle.as_ref(), after)
+            .await
+            .expect("sweep"),
+        1
+    );
+    let view = get_agent_work(&env).await;
+    assert!(view["one_shot"].as_array().expect("one_shot").is_empty());
+    assert_eq!(view["settled_one_shot"][0]["work_id"], work_id.as_str());
+    assert_eq!(view["settled_one_shot"][0]["status"], "expired");
+
+    let grant: serde_json::Value =
+        decode_json_response(poll_work(&env, Some(&credential)).await).await;
+    assert!(grant["one_shot"].as_array().expect("one_shot").is_empty());
+
+    // 到期是终态：再扫一遍不会重复推进。
+    assert_eq!(
+        expire_overdue_one_shot_works(env.store_handle.as_ref(), after)
+            .await
+            .expect("sweep"),
+        0
+    );
+}
+
+/// 截止还没到但执行预算尽了 → `timed_out`（两条约束各自独立，不以截止为唯一时钟）。
+#[tokio::test]
+async fn the_gateway_times_out_a_one_shot_work_that_blew_its_budget() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    // 截止给足 10 天，预算只有 600s：只有预算这条会先到。
+    let deadline = chrono::Utc::now() + chrono::Duration::days(10);
+    let work_id = grant_one_shot_upgrade_until(&env, &deadline.to_rfc3339(), 600).await;
+
+    let after = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp_millis();
+    assert_eq!(
+        expire_overdue_one_shot_works(env.store_handle.as_ref(), after)
+            .await
+            .expect("sweep"),
+        1
+    );
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["settled_one_shot"][0]["work_id"], work_id.as_str());
+    assert_eq!(view["settled_one_shot"][0]["status"], "timed_out");
+}
+
+#[tokio::test]
+async fn the_work_grant_needs_an_agent_credential() {
+    let env = TestEnv::new().await;
+    assert_eq!(
+        poll_work(&env, None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        poll_work(&env, Some("forged")).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 数据面上送启用（Control.Agent.Work）：现算 → 无工作 / 无地址即待命
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 直接经 store 设上送地址（比走管理面路由少一层，测试只关心授权计算结果）。
+///
+/// `enabled` 就是那个部署级开关；绝大多数用例需要的是「只按派工启用」，所以走这个偏门写法。
+async fn set_agent_uplink_address(env: &TestEnv, host: &str, port: u16, enabled: bool) {
+    env.store
+        .upsert_agent_uplink(&StoredAgentUplinkAddress {
+            setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
+            host: host.to_string(),
+            port,
+            enabled,
+            updated_by: "ops".to_string(),
+            updated_at: "2026-09-26T00:00:00+00:00".to_string(),
+        })
+        .await
+        .expect("store uplink address");
+}
+
+#[tokio::test]
+async fn the_uplink_grant_needs_an_agent_credential() {
+    let env = TestEnv::new().await;
+    assert_eq!(
+        poll_uplink(&env, None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        poll_uplink(&env, Some("forged")).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn the_uplink_poll_rejects_a_wrong_kind() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/uplink:poll",
+        Some(&credential),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "poll_something_else",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "requested_at": "2026-09-26T00:00:00Z",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "invalid_uplink_poll");
+}
+
+/// 没有生效工作就必须待命 —— 只要**开关也关着**：
+/// 地址只回答「能连到哪」，不回答「该不该连」。
+#[tokio::test]
+async fn uplink_poll_is_standby_without_any_work() {
+    let env = TestEnv::new().await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9000, false).await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!grant.enabled);
+    assert_eq!(grant.target(), None);
+}
+
+/// 部署级开关打开 → **没有派任何活也启用**（新装机不再需要人工派工才能开始上送）。
+///
+/// 这是 §4.1 的核心行为：开关回答「这套网关收不收数据」，与「这台干什么活」正交。
+#[tokio::test]
+async fn the_deployment_switch_opens_the_uplink_without_any_work() {
+    let env = TestEnv::new().await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, true).await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(grant.enabled, "开关打开时不必先派工");
+    assert_eq!(grant.target(), Some(("10.0.1.9", 9100)));
+}
+
+/// 开关**不能凭空造出去处**：取不到目标（对外基址里没有主机名）时照样待命。
+#[tokio::test]
+async fn the_deployment_switch_alone_cannot_open_the_uplink_without_a_target() {
+    let mut env = TestEnv::new().await;
+    env.config.public_base_url = "https://".to_string();
+    // 管理面也没设过 → 两条来源都取不出目标。
+    let credential = enroll_agent_credential(&env).await;
+
+    // 先把开关打开（用一份能存下的设置：开关与地址同在一行，所以得带个地址）。
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, true).await;
+    let with_address: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(with_address.enabled);
+
+    // 删掉那一行 → 只剩派生，而派生不出主机名 → 待命（不猜目标）。
+    sqlx::query("DELETE FROM agent_uplink")
+        .execute(env.store.pool())
+        .await
+        .expect("clear uplink setting");
+    let standby: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!standby.enabled, "没有目标可指时必须待命（开关也不例外）");
+    assert_eq!(standby.target(), None);
+}
+
+/// 开关是**并集**不是替代：关掉开关不影响「有工作即启用」这条原有路径。
+#[tokio::test]
+async fn turning_the_switch_off_still_leaves_worked_agents_enabled() {
+    let env = TestEnv::new().await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, false).await;
+    let credential = a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(grant.enabled, "开关关着时，派工这条路径必须原样生效");
+}
+
+/// 开关打开时的**粒度代价**，钉住它是刻意的：撤回工作不再能把这一台单独关掉。
+///
+/// 要单独停只有两条路：关掉部署级开关（会连带停掉其他「没有工作」的机器），或吊销这台 agent。
+/// 写下来是因为它会让人意外 —— 但反过来（让撤回压过开关）会使开关对**新装机**完全失效，
+/// 而「新装机不必先派工就能开始上送」正是这个开关存在的理由（设计 §4.1）。
+#[tokio::test]
+async fn with_the_switch_on_revoking_work_no_longer_stops_a_single_agent() {
+    let env = TestEnv::new().await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, true).await;
+    let credential = a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let view = get_agent_work(&env).await;
+    let work_id = view["standing"][0]["work_id"].as_str().expect("work id");
+    let revoked = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/revoke"),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(
+        grant.enabled,
+        "开关打开时，撤回工作不再单独关掉这一台（刻意的粒度取舍）"
+    );
+
+    // 而关掉开关就会回到待命 —— 这才是「停一台」的代价：粒度是部署级。
+    let off = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/uplink",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "host": "10.0.1.9", "port": 9100, "enabled": false }),
+    )
+    .await;
+    assert_eq!(off.status(), StatusCode::OK);
+    let standby: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!standby.enabled, "关掉开关后这台才回到待命");
+}
+
+/// 派活即启用 —— **不必先有人在管理面录入上送地址**：没设过时目标派生自部署配置
+/// （同一个域名 + 数据面端口），于是「装完 + 派活」就能开始上送。
+#[tokio::test]
+async fn uplink_poll_derives_the_target_from_the_deployment_config() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(grant.enabled);
+    assert_eq!(
+        grant.target(),
+        Some(("127.0.0.1", DEFAULT_AGENT_UPLINK_PORT))
+    );
+}
+
+async fn poll_discovery_snapshot(
+    env: &TestEnv,
+    credential: Option<&str>,
+    applied: Option<AppliedDiscoverySnapshot>,
+) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/discovery-snapshot:poll",
+        credential,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": POLL_DISCOVERY_SNAPSHOT_KIND,
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "requested_at": "2026-10-26T00:00:00Z",
+            "applied": applied,
+        }),
+    )
+    .await
+}
+
+async fn set_discovery_snapshot(env: &TestEnv, uri: &str, body: serde_json::Value) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &body,
+    )
+    .await
+}
+
+/// 网关**没有设置**时回 204：Agent 继续用本机 `[discovery]`。
+///
+/// 不能「按内置默认值下发」——那会把本机配置永久压掉，而本机配置是离线 / 旧网关 /
+/// 未入网时唯一的来源。
+#[tokio::test]
+async fn discovery_snapshot_poll_returns_no_content_when_the_gateway_has_no_setting() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+
+    let response = poll_discovery_snapshot(&env, Some(&credential), None).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+/// 优先级：单机覆盖 > 全局；清掉覆盖回落到全局。
+#[tokio::test]
+async fn discovery_snapshot_prefers_the_agent_override_then_falls_back_to_global() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+
+    let set = set_discovery_snapshot(
+        &env,
+        "/api/v1/admin/discovery/snapshot",
+        serde_json::json!({ "enabled": true, "interval_seconds": 3600 }),
+    )
+    .await;
+    assert_eq!(set.status(), StatusCode::OK);
+
+    let grant: DiscoverySnapshotGrant =
+        decode_json_response(poll_discovery_snapshot(&env, Some(&credential), None).await).await;
+    assert!(grant.enabled);
+    assert_eq!(grant.interval_seconds, 3600);
+    assert_eq!(grant.source, GRANT_SOURCE_GLOBAL);
+
+    let set = set_discovery_snapshot(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/discovery/snapshot",
+        serde_json::json!({ "enabled": true, "interval_seconds": 300 }),
+    )
+    .await;
+    assert_eq!(set.status(), StatusCode::OK);
+
+    let grant: DiscoverySnapshotGrant =
+        decode_json_response(poll_discovery_snapshot(&env, Some(&credential), None).await).await;
+    assert_eq!(grant.interval_seconds, 300);
+    assert_eq!(grant.source, GRANT_SOURCE_AGENT);
+
+    let cleared = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/discovery/snapshot",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+
+    let grant: DiscoverySnapshotGrant =
+        decode_json_response(poll_discovery_snapshot(&env, Some(&credential), None).await).await;
+    assert_eq!(grant.interval_seconds, 3600);
+    assert_eq!(grant.source, GRANT_SOURCE_GLOBAL);
+}
+
+/// 请求里搭车的 `applied` 会落库，管理面能看到「配置 vs 实际生效」分叉。
+#[tokio::test]
+async fn discovery_snapshot_applied_echo_is_visible_to_the_admin_view() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+
+    let applied = AppliedDiscoverySnapshot {
+        enabled: true,
+        interval_seconds: 300,
+        source: APPLIED_SOURCE_LOCAL_CONFIG.to_string(),
+    };
+    let response = poll_discovery_snapshot(&env, Some(&credential), Some(applied)).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let view = get_admin(&env, "/api/v1/admin/discovery/snapshot").await;
+    assert_eq!(view.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(view).await;
+    let agents = body["agents"].as_array().expect("agents");
+    let row = agents
+        .iter()
+        .find(|agent| agent["agent_id"] == "agent-node-a")
+        .expect("row for the polling agent");
+    assert_eq!(row["applied"]["interval_seconds"], 300);
+    assert_eq!(row["applied"]["source"], APPLIED_SOURCE_LOCAL_CONFIG);
+    assert!(
+        row["override_setting"].is_null(),
+        "没设过单机覆盖时必须回 null（页面据此显示「继承全局」）"
+    );
+}
+
+/// 周期低于下限一律 400：保存时不静默夹取 —— 否则页面显示成功，Agent 却收到另一个值。
+#[tokio::test]
+async fn discovery_snapshot_rejects_a_too_short_interval() {
+    let env = TestEnv::new().await;
+
+    for uri in [
+        "/api/v1/admin/discovery/snapshot",
+        "/api/v1/admin/agents/agent-node-a/discovery/snapshot",
+    ] {
+        let response = set_discovery_snapshot(
+            &env,
+            uri,
+            serde_json::json!({ "enabled": true, "interval_seconds": 30 }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    }
+}
+
+/// 派生不出目标（对外基址里取不出主机名）时**仍然不猜**：有工作也只能待命。
+#[tokio::test]
+async fn uplink_poll_with_work_but_no_target_stays_standby() {
+    let mut env = TestEnv::new().await;
+    env.config.public_base_url = "https://".to_string();
+    let credential = a_classified_macos_agent(&env).await;
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let grant: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!grant.enabled);
+    assert_eq!(grant.target(), None);
+}
+
+/// 授权层「暂停」≠ 撤回：暂停的工作仍在下发的快照里，所以上送授权**保持启用**。
+///
+/// 这是刻意的语义（暂停 = 暂不做这项采集，日志/指标停），不是 bug。钉住它，
+/// 免得有人顺手把 `effective_standing` 改成只认 `active` —— 那会把「暂停」变成「断连」。
+#[tokio::test]
+async fn a_paused_standing_work_still_authorizes_uplink() {
+    let env = TestEnv::new().await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9000, false).await;
+    let credential = a_classified_macos_agent(&env).await;
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            &env,
+            serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+        )
+        .await,
+    )
+    .await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    let enabled: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(enabled.enabled);
+
+    // 暂停之后仍启用。
+    let paused = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/pause"),
+    )
+    .await;
+    assert_eq!(paused.status(), StatusCode::OK);
+    let still_enabled: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(
+        still_enabled.enabled,
+        "暂停不是撤回：授权层暂停不该把上送也关掉"
+    );
+
+    // 撤回之后 → 回到待命。
+    let revoked = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/revoke"),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let standby: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!standby.enabled, "撤回后必须回到待命");
+}
+
+/// 派活即启用、撤回即待命：不需要管理面多一个动作，同一份拉取自动反映。
+#[tokio::test]
+async fn uplink_poll_enables_on_effective_work_and_target_then_returns_to_standby() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    set_agent_uplink_address(&env, "10.0.1.9", 9100, false).await;
+
+    // 还没派活：待命。
+    let standby: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!standby.enabled);
+    assert_eq!(standby.target(), None);
+
+    // 派常驻工作：同一份拉取立刻变 enabled，且目标与设置一致。
+    let response = grant_work(
+        &env,
+        serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let enabled: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(enabled.enabled);
+    assert_eq!(enabled.target(), Some(("10.0.1.9", 9100)));
+
+    // 撤回：自动变回待命。
+    let view = get_agent_work(&env).await;
+    let work_id = view["standing"][0]["work_id"].as_str().expect("work id");
+    let revoked = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/revoke"),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let standby_again: AgentUplinkGrant =
+        decode_json_response(poll_uplink(&env, Some(&credential)).await).await;
+    assert!(!standby_again.enabled);
+    assert_eq!(standby_again.target(), None);
+}
+
+#[tokio::test]
+async fn standing_work_pauses_resumes_and_leaves_the_grant_only_when_revoked() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            &env,
+            serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+        )
+        .await,
+    )
+    .await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    // 暂停：仍在下发的快照里（期望就是「暂不做」），但状态变了。
+    let paused = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/pause"),
+    )
+    .await;
+    assert_eq!(paused.status(), StatusCode::OK);
+    let grant: serde_json::Value =
+        decode_json_response(poll_work(&env, Some(&credential)).await).await;
+    assert_eq!(grant["standing"][0]["status"], "paused");
+
+    // 恢复不重新审定：版本不动。
+    let before = get_agent_work(&env).await;
+    let version_before = before["standing"][0]["plan_version"].clone();
+    let resumed = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/resume"),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let after = get_agent_work(&env).await;
+    assert_eq!(after["standing"][0]["status"], "active");
+    assert_eq!(after["standing"][0]["plan_version"], version_before);
+
+    // 撤回：不再下发，但留在 retired_standing 里供审计。
+    let revoked = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/revoke"),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let grant: serde_json::Value =
+        decode_json_response(poll_work(&env, Some(&credential)).await).await;
+    assert!(grant["standing"].as_array().expect("standing").is_empty());
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["retired_standing"][0]["status"], "revoked");
+}
+
+/// 不可中断的一次性工作**拒绝**暂停（而不是「尽力暂停」）。
+#[tokio::test]
+async fn an_uninterruptible_one_shot_work_refuses_to_pause() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            &env,
+            serde_json::json!({
+                "work_kind": "OneShot", "action": "upgrade", "spec": "0.1.4",
+                "deadline_at": "2026-09-24T00:00:00Z", "timeout_seconds": 600
+            }),
+        )
+        .await,
+    )
+    .await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    let response = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/pause"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let message = decode_text_response(response).await;
+    assert!(message.contains("not interruptible"), "{message}");
+
+    // 撤回未了结的一次性工作 = 取消（不是 revoked）：它本来就还没做完。
+    let canceled = post_work_route(
+        &env,
+        &format!("/api/v1/admin/agents/agent-node-a/work/{work_id}/revoke"),
+    )
+    .await;
+    assert_eq!(canceled.status(), StatusCode::OK);
+    let view = get_agent_work(&env).await;
+    assert_eq!(view["settled_one_shot"][0]["status"], "canceled");
+}
+
+#[tokio::test]
+async fn work_routes_need_the_admin_token_and_the_right_agent() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    let receipt: serde_json::Value = decode_json_response(
+        grant_work(
+            &env,
+            serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+        )
+        .await,
+    )
+    .await;
+    let work_id = receipt["work_id"].as_str().expect("work id").to_string();
+
+    // 无 token：401。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        None,
+        &serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 未知 agent：404。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-nope/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "HostMetrics" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // work_id 属于别的 agent：不能拿 A 的路径去改 B 的工作。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/agents/agent-other/work/{work_id}/revoke"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "reason_code": "x" }),
+    )
+    .await;
+    assert!(matches!(response.status(), StatusCode::NOT_FOUND));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 灰度发布计划（Control.Rollout）：创建 → 批准（物化第一阶段）→ 推进 → 完成 + 结果回填
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 建计划：只给**目标 + 阶段数**，阶段由服务端按阶梯切（客户端不再自己切）。
+async fn create_rollout_plan(
+    env: &TestEnv,
+    target_ids: &[&str],
+    phase_count: i64,
+) -> serde_json::Value {
+    create_rollout_plan_with_batch(env, target_ids, phase_count, 0).await
+}
+
+async fn create_rollout_plan_with_batch(
+    env: &TestEnv,
+    target_ids: &[&str],
+    phase_count: i64,
+    batch_size: i64,
+) -> serde_json::Value {
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "action": "upgrade",
+            "spec": "{\"target_version\":\"0.1.4\",\"package_url\":\"/tmp/pkg\",\"package_sha256\":\"sha256:abc\"}",
+            "target_ids": target_ids,
+            "phase_count": phase_count,
+            "deadline_at": "2026-10-01T00:00:00Z",
+            "timeout_seconds": 600,
+            "batch_size": batch_size,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    decode_json_response(response).await
+}
+
+/// 按**原始 spec** 建计划：给需要自定 spec 的用例用。
+async fn create_rollout_plan_with_spec(
+    env: &TestEnv,
+    target_ids: &[&str],
+    spec: &str,
+    batch_size: i64,
+) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "action": "upgrade",
+            "spec": spec,
+            "target_ids": target_ids,
+            "phase_count": 1,
+            "deadline_at": "2026-10-01T00:00:00Z",
+            "timeout_seconds": 600,
+            "batch_size": batch_size,
+        }),
+    )
+    .await
+}
+
+/// 按**版本**建计划（不选制品）：spec 只写 `target_version`，制品由网关按目标平台解析。
+async fn create_version_rollout_plan(
+    env: &TestEnv,
+    target_ids: &[&str],
+    version: &str,
+) -> Response {
+    create_rollout_plan_with_spec(
+        env,
+        target_ids,
+        &serde_json::json!({ "target_version": version }).to_string(),
+        0,
+    )
+    .await
+}
+
+/// 一条安装包录入历史（版本 + 平台）。摘要从 id 的 hex 后缀派生，让不同包的摘要不同 ——
+/// 测试要能分辨「实际派了哪一份」。
+fn agent_package_history(package_id: &str, version: &str, arch: &str) -> StoredAgentInstallPackage {
+    let hex = package_id.trim_start_matches("pkg-");
+    let digest = hex.repeat(64 / hex.len().max(1));
+    StoredAgentInstallPackage {
+        package_id: package_id.to_string(),
+        source: format!("/packages/agentd-{version}-{arch}.tar.gz"),
+        package_sha256: format!("sha256:{digest}"),
+        version: version.to_string(),
+        arch: arch.to_string(),
+        cached_path: format!("/state/agentd-{version}-{arch}"),
+        created_by: "eng".to_string(),
+        created_at: "2026-01-01T00:00:00+00:00".to_string(),
+    }
+}
+
+/// 读某个计划目标的**已解析**工作 spec。
+async fn resolved_work_spec(env: &TestEnv, plan_id: &str, agent_id: &str) -> serde_json::Value {
+    let work_id = crate::app::rollout::rollout_work_id(plan_id, agent_id);
+    let work = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .expect("load work")
+        .expect("work exists");
+    serde_json::from_str(&work.work.spec).expect("spec json")
+}
+
+async fn approve_plan(env: &TestEnv, plan_id: &str) -> serde_json::Value {
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/approve",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "plan_id": plan_id }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+async fn advance_plan(env: &TestEnv, plan_id: &str) -> serde_json::Value {
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/advance",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "plan_id": plan_id }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+async fn view_plan(env: &TestEnv, plan_id: &str) -> serde_json::Value {
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/rollout-plans/{plan_id}"),
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+#[tokio::test]
+async fn rollout_plan_routes_require_admin_bearer() {
+    let env = TestEnv::new().await;
+    let body = serde_json::json!({
+        "action": "upgrade", "spec": "x",
+        "target_ids": ["agent-node-a"], "phase_count": 1,
+        "deadline_at": "2026-10-01T00:00:00Z", "timeout_seconds": 600,
+    });
+    assert_eq!(
+        post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/rollout-plans",
+            None,
+            &body,
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/rollout-plans",
+            None,
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn creating_a_plan_validates_targets_and_returns_draft() {
+    let env = TestEnv::new().await;
+    enroll_fleet(&env).await;
+    // 2 个目标 / 2 阶段 → 阶梯切出 [1, 1]；闸门：首段 manual、其余 all_succeeded。
+    let plan = create_rollout_plan(&env, &["agent-node-a", "agent-node-b"], 2).await;
+    assert_eq!(plan["status"], "draft");
+    assert_eq!(plan["current_phase"], 0);
+    assert_eq!(plan["action"], "upgrade");
+    assert_eq!(plan["phases"].as_array().expect("phases").len(), 2);
+    assert_eq!(plan["phases"][0]["phase_index"], 1);
+    assert_eq!(plan["phases"][0]["status"], "pending");
+    assert_eq!(
+        plan["phases"][0]["advance_rule"], "manual",
+        "首段（金丝雀）人工确认"
+    );
+    assert_eq!(plan["phases"][1]["phase_index"], 2);
+    assert_eq!(plan["phases"][1]["advance_rule"], "all_succeeded");
+
+    // 目标为空 / 阶段数 < 1 / 阶段数大于目标数 都要响，不能当自由文本收下。
+    for (body, reason) in [
+        (
+            serde_json::json!({
+                "action": "upgrade", "spec": "x", "target_ids": [],
+                "phase_count": 1,
+                "deadline_at": "2026-10-01T00:00:00Z", "timeout_seconds": 600,
+            }),
+            "target_ids",
+        ),
+        (
+            serde_json::json!({
+                "action": "upgrade", "spec": "x", "target_ids": ["agent-node-a"],
+                "phase_count": 0,
+                "deadline_at": "2026-10-01T00:00:00Z", "timeout_seconds": 600,
+            }),
+            "phase_count",
+        ),
+        (
+            serde_json::json!({
+                "action": "upgrade", "spec": "x", "target_ids": ["agent-node-a"],
+                "phase_count": 3,
+                "deadline_at": "2026-10-01T00:00:00Z", "timeout_seconds": 600,
+            }),
+            "分不出",
+        ),
+    ] {
+        let response = post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/rollout-plans",
+            Some(TEST_ADMIN_API_TOKEN),
+            &body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn creating_a_plan_rejects_unknown_targets() {
+    let env = TestEnv::new().await;
+    // 只注册 node-a：agent-node-a 存在，agent-ghost 不存在。
+    enroll_agent_at_node(&env, "node-a").await;
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "action": "upgrade",
+            "spec": "x",
+            "target_ids": ["agent-node-a", "agent-ghost"],
+            "phase_count": 1,
+            "deadline_at": "2026-10-01T00:00:00Z",
+            "timeout_seconds": 600,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_bytes(response).await;
+    let text = String::from_utf8(body.to_vec()).expect("utf8");
+    // 报错要能直接指出是哪个 target 不存在（否则运维只能翻代码猜）。
+    assert!(text.contains("agent-ghost"), "{text}");
+}
+
+#[tokio::test]
+async fn approving_materializes_the_first_phase_and_the_plan_auto_finishes() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let plan = create_rollout_plan(&env, &["agent-node-a"], 1).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+
+    // 批准 → 进入第一阶段：物化出的 upgrade 工作应能被 agent 拉到。
+    let approved = approve_plan(&env, &plan_id).await;
+    assert_eq!(approved["status"], "rolling");
+    assert_eq!(approved["current_phase"], 1);
+    assert_eq!(approved["phases"][0]["status"], "rolling");
+    let grant: serde_json::Value =
+        decode_json_response(poll_work(&env, Some(&credential)).await).await;
+    let one_shot = grant["one_shot"].as_array().expect("one_shot");
+    assert_eq!(one_shot.len(), 1);
+    assert_eq!(one_shot[0]["action"], "upgrade");
+    assert_eq!(one_shot[0]["agent_id"], "agent-node-a");
+
+    // 闸门：本段还没了结 → 人工推进被拒（推进要求当前阶段全部了结）。
+    let blocked = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/advance",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "plan_id": plan_id }),
+    )
+    .await;
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+
+    // 了结本段（单阶段 = 末阶段）→ 不看闸门、自动收敛为 completed。
+    let work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["status"], "completed");
+    assert_eq!(detail["plan"]["phases"][0]["status"], "completed");
+}
+
+#[tokio::test]
+async fn advancing_materializes_the_next_phase() {
+    let env = TestEnv::new().await;
+    let credential = enroll_fleet(&env).await;
+    let plan = create_rollout_plan(&env, &["agent-node-a", "agent-node-b"], 2).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // 了结第一阶段（推进闸门要求本段全部了结）。
+    let work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+
+    let advanced = advance_plan(&env, &plan_id).await;
+    assert_eq!(advanced["status"], "rolling");
+    assert_eq!(advanced["current_phase"], 2);
+    assert_eq!(advanced["phases"][0]["status"], "completed");
+    assert_eq!(advanced["phases"][1]["status"], "rolling");
+
+    // 第二阶段的 target 也被物化成了工作（与第一阶段同一计划）。
+    let work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-b");
+    let work = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .expect("load work")
+        .expect("work exists");
+    assert_eq!(work.work.agent_id, "agent-node-b");
+    assert_eq!(work.work.issued_by, format!("rollout:{plan_id}"));
+}
+
+#[tokio::test]
+async fn version_based_upgrade_resolves_the_artifact_for_the_target_platform() {
+    let env = TestEnv::new().await;
+    // agent-node-a 报的是 macos / arm64 → 发布平台 aarch64-apple-darwin。
+    a_classified_macos_agent(&env).await;
+    let package = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    env.store
+        .upsert_agent_install_package_by_id(&package)
+        .await
+        .unwrap();
+
+    // 只选版本（不选制品）→ 建计划成功（该平台该版本有包）。
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    // 计划本身只记版本（制品不在计划里）。
+    assert_eq!(plan["spec"], "{\"target_version\":\"0.1.9\"}");
+
+    // 批准 → 物化：派给该 agent 的 spec 由网关按平台补好制品。
+    approve_plan(&env, &plan_id).await;
+    let work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    let work = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .expect("load work")
+        .expect("work exists");
+    let spec: serde_json::Value = serde_json::from_str(&work.work.spec).expect("spec json");
+    let expected_url = format!(
+        "{}/api/v1/agent/packages/{}",
+        env.config.public_base_url.trim_end_matches('/'),
+        package.package_id
+    );
+    assert_eq!(spec["package_url"], serde_json::json!(expected_url));
+    assert_eq!(
+        spec["package_sha256"],
+        serde_json::json!(package.package_sha256)
+    );
+    // 核对：不写 target_version —— agentd 要求它与包内自报版本逐字一致，而计划里存的是发布版本。
+    assert!(spec.get("target_version").is_none(), "{spec}");
+}
+
+#[tokio::test]
+async fn version_based_upgrade_rejects_a_version_without_a_package_for_the_target_platform() {
+    let env = TestEnv::new().await;
+    // agent-node-a 需要 aarch64-apple-darwin 的包（macos / arm64）。
+    a_classified_macos_agent(&env).await;
+    // 只录了**别的平台**的同版本包 → 建计划就必须拒（不把失败推迟到派活逐台暴露）。
+    let package =
+        agent_package_history("pkg-00000000000000bb", "0.1.9", "x86_64-unknown-linux-musl");
+    env.store
+        .upsert_agent_install_package_by_id(&package)
+        .await
+        .unwrap();
+
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    // 报错要能直接指出缺哪个版本、哪个平台（否则运维只能翻代码猜）。
+    assert!(text.contains("0.1.9"), "{text}");
+    assert!(text.contains("aarch64-apple-darwin"), "{text}");
+}
+
+#[tokio::test]
+async fn version_based_upgrade_resolves_each_target_platform_independently() {
+    let env = TestEnv::new().await;
+    // agent-node-a: macos/arm64；agent-node-b: linux/x86_64。
+    a_classified_macos_agent(&env).await;
+    enroll_agent_at_node(&env, "node-b").await;
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-b", "node-b", "linux", "x86_64", &["sshd"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let mac = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    let lin = agent_package_history("pkg-00000000000000bb", "0.1.9", "x86_64-unknown-linux-musl");
+    env.store
+        .upsert_agent_install_package_by_id(&mac)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&lin)
+        .await
+        .unwrap();
+
+    let response =
+        create_version_rollout_plan(&env, &["agent-node-a", "agent-node-b"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // 每台拿到的是**自己平台**那一份，不是「第一份」。
+    let mac_spec = resolved_work_spec(&env, &plan_id, "agent-node-a").await;
+    assert_eq!(
+        mac_spec["package_sha256"],
+        serde_json::json!(mac.package_sha256)
+    );
+    assert!(
+        mac_spec["package_url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/{}", mac.package_id)),
+        "{mac_spec}"
+    );
+
+    let lin_spec = resolved_work_spec(&env, &plan_id, "agent-node-b").await;
+    assert_eq!(
+        lin_spec["package_sha256"],
+        serde_json::json!(lin.package_sha256)
+    );
+    assert!(
+        lin_spec["package_url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/{}", lin.package_id)),
+        "{lin_spec}"
+    );
+}
+
+#[tokio::test]
+async fn version_based_upgrade_reports_every_uncovered_target_platform() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await; // macos 有包
+    enroll_agent_at_node(&env, "node-b").await; // linux 没包
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-b", "node-b", "linux", "x86_64", &["sshd"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let mac = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    env.store
+        .upsert_agent_install_package_by_id(&mac)
+        .await
+        .unwrap();
+
+    let response =
+        create_version_rollout_plan(&env, &["agent-node-a", "agent-node-b"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(text.contains("agent-node-b"), "{text}");
+    assert!(text.contains("x86_64-unknown-linux-musl"), "{text}");
+    // 有包的那台不该被误报。
+    assert!(!text.contains("agent-node-a"), "{text}");
+}
+
+#[tokio::test]
+async fn version_based_upgrade_rejects_a_target_without_a_reported_platform() {
+    let env = TestEnv::new().await;
+    // 只注册、不上报事实 → 平台未知。
+    enroll_agent_credential(&env).await;
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(text.contains("has not reported a platform"), "{text}");
+}
+
+#[tokio::test]
+async fn version_based_upgrade_rejects_an_agent_platform_without_agentd_artifacts() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    // macOS-Intel：真实的 os/arch 组合，但 agentd **没有**该平台制品。
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-a", "node-a", "macos", "x86_64", &["xcodebuild"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(
+        text.contains("not a known agentd release platform"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn version_based_upgrade_ships_the_newest_package_for_a_duplicated_version() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    // 同一 (version, arch) 两份、created_at 不同：派活应取**最新录入**的那份。
+    let older = StoredAgentInstallPackage {
+        created_at: "2026-01-01T00:00:00+00:00".to_string(),
+        ..agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin")
+    };
+    let newer = StoredAgentInstallPackage {
+        created_at: "2026-02-01T00:00:00+00:00".to_string(),
+        ..agent_package_history("pkg-00000000000000bb", "0.1.9", "aarch64-apple-darwin")
+    };
+    assert_ne!(newer.package_sha256, older.package_sha256);
+    env.store
+        .upsert_agent_install_package_by_id(&older)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&newer)
+        .await
+        .unwrap();
+
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let spec = resolved_work_spec(&env, &plan_id, "agent-node-a").await;
+    assert_eq!(
+        spec["package_sha256"],
+        serde_json::json!(newer.package_sha256)
+    );
+}
+
+#[tokio::test]
+async fn version_based_upgrade_forwards_allow_downgrade() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    let package = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    env.store
+        .upsert_agent_install_package_by_id(&package)
+        .await
+        .unwrap();
+
+    let raw = serde_json::json!({ "target_version": "0.1.9", "allow_downgrade": true }).to_string();
+    let response = create_rollout_plan_with_spec(&env, &["agent-node-a"], &raw, 0).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let resolved = resolved_work_spec(&env, &plan_id, "agent-node-a").await;
+    // 计划里带的 allow_downgrade 要透到派活的 spec（重新拼 spec 也不能吞掉它）。
+    assert_eq!(resolved["allow_downgrade"], serde_json::json!(true));
+    assert!(resolved.get("target_version").is_none(), "{resolved}");
+}
+
+#[tokio::test]
+async fn create_rejects_a_version_spec_with_an_empty_target_version() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    // 空版本 + 无制品：坏 spec，不能当「显式制品」把空壳透传给 agentd。
+    let response =
+        create_rollout_plan_with_spec(&env, &["agent-node-a"], r#"{"target_version":"   "}"#, 0)
+            .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(text.contains("target_version"), "{text}");
+
+    // `null` 版本（键在但取不出可用值）同样拒。
+    let null_response =
+        create_rollout_plan_with_spec(&env, &["agent-node-a"], r#"{"target_version":null}"#, 0)
+            .await;
+    assert_eq!(null_response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn explicit_artifact_plan_passes_through_verbatim_without_a_platform_lookup() {
+    let env = TestEnv::new().await;
+    // 注册但**不上报事实**：显式制品不需要平台，建计划与派活都不该因此失败。
+    enroll_agent_credential(&env).await;
+    let raw = r#"{"package_url":"/srv/wist/agentd.tar.gz","package_sha256":"sha256:abc"}"#;
+    let response = create_rollout_plan_with_spec(&env, &["agent-node-a"], raw, 0).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    let work = env
+        .store_handle
+        .get_one_shot_work(&work_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(work.work.spec.as_str(), raw, "显式制品的 spec 应原样透传");
+}
+
+#[tokio::test]
+async fn version_based_upgrade_resolves_the_artifact_on_the_refill_path() {
+    let env = TestEnv::new().await;
+    let credential_a = a_classified_macos_agent(&env).await;
+    let credential_b = enroll_agent_at_node(&env, "node-b").await;
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-b", "node-b", "linux", "x86_64", &["sshd"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let mac = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    let lin = agent_package_history("pkg-00000000000000bb", "0.1.9", "x86_64-unknown-linux-musl");
+    env.store
+        .upsert_agent_install_package_by_id(&mac)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&lin)
+        .await
+        .unwrap();
+
+    let raw = serde_json::json!({ "target_version": "0.1.9" }).to_string();
+    let response =
+        create_rollout_plan_with_spec(&env, &["agent-node-a", "agent-node-b"], &raw, 1).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // batch_size=1：只物化了 1 台。找出它是谁，了结它 → 触发 refill。
+    let detail = view_plan(&env, &plan_id).await;
+    let entries = detail["entries"].as_array().expect("entries");
+    let dispatched = entries
+        .iter()
+        .find(|entry| entry["status"] == "dispatched")
+        .expect("one dispatched");
+    let first = dispatched["target_id"].as_str().unwrap().to_string();
+    let second = if first == "agent-node-a" {
+        "agent-node-b"
+    } else {
+        "agent-node-a"
+    };
+    let credential = if first == "agent-node-a" {
+        credential_a.clone()
+    } else {
+        credential_b.clone()
+    };
+    let work_id = dispatched["work_id"].as_str().unwrap().to_string();
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+
+    // refill 后第二台也被物化，且 spec 已按**它的**平台解析好。
+    let resolved = resolved_work_spec(&env, &plan_id, second).await;
+    let expected = if second == "agent-node-a" { &mac } else { &lin };
+    assert_eq!(
+        resolved["package_sha256"],
+        serde_json::json!(expected.package_sha256)
+    );
+}
+
+#[tokio::test]
+async fn dispatch_refuses_an_upgrade_spec_that_is_missing_package_url() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    // 直接落一份「既无 version 也无 package_url」的 upgrade 计划（绕过建计划校验，模拟历史/
+    // 版本错配留下的坏 spec）——agentd 对缺 `package_url` 只会以 spec_invalid 拒绝，网关应先在
+    // 自己这侧挡住，而不是把空壳发出去。
+    let plan = crate::infra::StoredRolloutPlan {
+        plan_id: "plan-bad-spec".to_string(),
+        action: "upgrade".to_string(),
+        spec: r#"{"foo":1}"#.to_string(),
+        deadline_at: "2026-10-01T00:00:00Z".to_string(),
+        timeout_seconds: 600,
+        phases: vec![crate::infra::StoredRolloutPhase {
+            phase_index: 1,
+            target_ids: vec!["agent-node-a".to_string()],
+            advance_rule: "manual".to_string(),
+            status: "pending".to_string(),
+        }],
+        batch_size: 0,
+        current_phase: 0,
+        status: "draft".to_string(),
+        created_by: "admin".to_string(),
+        created_at: "2026-10-01T00:00:00+00:00".to_string(),
+        approved_by: None,
+        approved_at: None,
+    };
+    env.store.save_rollout_plan(&plan).await.unwrap();
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/approve",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "plan_id": "plan-bad-spec" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let text = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(text.contains("package_url"), "{text}");
+
+    // 没有物化任何工作：拦住的是「半截 spec 出站」，不是别的。
+    assert!(
+        env.store_handle
+            .get_one_shot_work(&crate::app::rollout::rollout_work_id(
+                "plan-bad-spec",
+                "agent-node-a"
+            ))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+async fn retry_plan(env: &TestEnv, body: serde_json::Value) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/retry",
+        Some(TEST_ADMIN_API_TOKEN),
+        &body,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn retry_requeues_a_failed_target_with_a_new_work_id() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let package = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    env.store
+        .upsert_agent_install_package_by_id(&package)
+        .await
+        .unwrap();
+
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // 让该目标失败。
+    let original_work_id = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    submit_work_result(&env, Some(&credential), &original_work_id, "failed", "boom").await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["entries"][0]["status"], "failed", "{detail}");
+
+    // 重试：计划重开为 rolling，条目回 dispatched。
+    let retried: serde_json::Value =
+        decode_json_response(retry_plan(&env, serde_json::json!({ "plan_id": plan_id })).await)
+            .await;
+    assert_eq!(retried["status"], "rolling", "{retried}");
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["entries"][0]["status"], "dispatched", "{detail}");
+    let new_work_id = detail["entries"][0]["work_id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    // 换了**新** work_id（否则 agentd 不会重跑）。
+    assert_ne!(new_work_id, original_work_id, "{detail}");
+
+    // 新工作的 spec 仍按平台解析好（package_url 指向该包的网关分发地址）。
+    let work = env
+        .store_handle
+        .get_one_shot_work(&new_work_id)
+        .await
+        .unwrap()
+        .expect("retry work exists");
+    let spec: serde_json::Value = serde_json::from_str(&work.work.spec).expect("spec json");
+    assert!(
+        spec["package_url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/{}", package.package_id)),
+        "{spec}"
+    );
+}
+
+#[tokio::test]
+async fn retry_can_target_a_single_failed_subset() {
+    let env = TestEnv::new().await;
+    let credential_a = a_classified_macos_agent(&env).await;
+    let credential_b = enroll_agent_at_node(&env, "node-b").await;
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-b", "node-b", "linux", "x86_64", &["sshd"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let mac = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    let lin = agent_package_history("pkg-00000000000000bb", "0.1.9", "x86_64-unknown-linux-musl");
+    env.store
+        .upsert_agent_install_package_by_id(&mac)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&lin)
+        .await
+        .unwrap();
+
+    let response =
+        create_version_rollout_plan(&env, &["agent-node-a", "agent-node-b"], "0.1.9").await;
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // 两台都失败。
+    let wa = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    let wb = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-b");
+    submit_work_result(&env, Some(&credential_a), &wa, "failed", "a-boom").await;
+    // 注意：结果要**以该 agent 自己的身份**上报（`submit_work_result` 固定用 agent-node-a）。
+    submit_work_result_as(
+        &env,
+        Some(&credential_b),
+        "agent-node-b",
+        "node-b",
+        &wb,
+        "failed",
+        "b-boom",
+    )
+    .await;
+
+    // 只重试 agent-node-a。
+    retry_plan(
+        &env,
+        serde_json::json!({ "plan_id": plan_id, "target_ids": ["agent-node-a"] }),
+    )
+    .await;
+
+    let detail = view_plan(&env, &plan_id).await;
+    let entries = detail["entries"].as_array().expect("entries");
+    let find = |target: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["target_id"] == target)
+            .expect("entry")
+    };
+    assert_eq!(find("agent-node-a")["status"], "dispatched", "{detail}");
+    assert_ne!(
+        find("agent-node-a")["work_id"].as_str().unwrap(),
+        wa,
+        "{detail}"
+    );
+    // 没被点到的目标保持 failed。
+    assert_eq!(find("agent-node-b")["status"], "failed", "{detail}");
+}
+
+#[tokio::test]
+async fn retrying_a_failed_target_rolls_the_plan_back_to_its_phase() {
+    let env = TestEnv::new().await;
+    let credential_a = a_classified_macos_agent(&env).await; // agent-node-a：macos/arm64
+    let _b = enroll_agent_at_node(&env, "node-b").await;
+    assert_eq!(
+        post_facts(
+            &env,
+            &fact_report_for("agent-node-b", "node-b", "linux", "x86_64", &["sshd"])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let mac = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    let lin = agent_package_history("pkg-00000000000000bb", "0.1.9", "x86_64-unknown-linux-musl");
+    env.store
+        .upsert_agent_install_package_by_id(&mac)
+        .await
+        .unwrap();
+    env.store
+        .upsert_agent_install_package_by_id(&lin)
+        .await
+        .unwrap();
+
+    // 两阶段：phase1 = 金丝雀（agent-node-a），phase2 = 余下（agent-node-b）。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "action": "upgrade",
+            "spec": "{\"target_version\":\"0.1.9\"}",
+            "target_ids": ["agent-node-a", "agent-node-b"],
+            "phase_count": 2,
+            "deadline_at": "2026-10-01T00:00:00Z",
+            "timeout_seconds": 600,
+            "batch_size": 0,
+        }),
+    )
+    .await;
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    assert_eq!(plan["phases"][0]["target_ids"][0], "agent-node-a", "{plan}");
+
+    approve_plan(&env, &plan_id).await;
+    // 金丝雀失败，但仍人工推进（闸门允许带失败推进）—— 计划来到第二阶段。
+    let wa = crate::app::rollout::rollout_work_id(&plan_id, "agent-node-a");
+    submit_work_result(&env, Some(&credential_a), &wa, "failed", "canary-boom").await;
+    let advanced = advance_plan(&env, &plan_id).await;
+    assert_eq!(advanced["current_phase"], 2, "{advanced}");
+    assert_eq!(advanced["phases"][0]["status"], "completed", "{advanced}");
+
+    // 重试第一阶段那个失败目标 → 计划与阶段都**重开**，current_phase 指回它所在的第 1 段。
+    let retried: serde_json::Value =
+        decode_json_response(retry_plan(&env, serde_json::json!({ "plan_id": plan_id })).await)
+            .await;
+    assert_eq!(retried["status"], "rolling", "{retried}");
+    assert_eq!(retried["current_phase"], 1, "{retried}");
+    assert_eq!(retried["phases"][0]["status"], "rolling", "{retried}");
+
+    // 重开的条目换了新 work_id、回 dispatched；未涉及的第二阶段条目不动。
+    let detail = view_plan(&env, &plan_id).await;
+    let find = |target: &str| {
+        detail["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .find(|entry| entry["target_id"] == target)
+            .expect("entry")
+    };
+    assert_eq!(find("agent-node-a")["status"], "dispatched", "{detail}");
+    assert_ne!(
+        find("agent-node-a")["work_id"].as_str().unwrap(),
+        wa,
+        "{detail}"
+    );
+    assert_eq!(find("agent-node-b")["status"], "dispatched", "{detail}");
+}
+
+#[tokio::test]
+async fn retry_refuses_a_draft_plan_and_a_plan_without_failures() {
+    let env = TestEnv::new().await;
+    a_classified_macos_agent(&env).await;
+    let package = agent_package_history("pkg-00000000000000aa", "0.1.9", "aarch64-apple-darwin");
+    env.store
+        .upsert_agent_install_package_by_id(&package)
+        .await
+        .unwrap();
+    let response = create_version_rollout_plan(&env, &["agent-node-a"], "0.1.9").await;
+    let plan: serde_json::Value = decode_json_response(response).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+
+    // 草稿态：还没派过活 → 409。
+    let draft = retry_plan(&env, serde_json::json!({ "plan_id": plan_id })).await;
+    assert_eq!(draft.status(), StatusCode::CONFLICT);
+
+    // 批准后没有任何失败项 → 400。
+    approve_plan(&env, &plan_id).await;
+    let none = retry_plan(&env, serde_json::json!({ "plan_id": plan_id })).await;
+    assert_eq!(none.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_work_result_fills_the_rollout_entry() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let plan = create_rollout_plan(&env, &["agent-node-a"], 1).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let detail = view_plan(&env, &plan_id).await;
+    let work_id = detail["entries"][0]["work_id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    assert_eq!(detail["entries"][0]["status"], "dispatched");
+
+    // 结果回填：成功 → 条目 succeeded。
+    let accepted: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await,
+    )
+    .await;
+    assert_eq!(accepted["status"], "accepted");
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["entries"][0]["status"], "succeeded");
+
+    // 迟到的失败是 stale：不覆盖已落成的终态（与工作自身的终态语义一致）。
+    let stale: serde_json::Value = decode_json_response(
+        submit_work_result(&env, Some(&credential), &work_id, "failed", "迟到的失败").await,
+    )
+    .await;
+    assert_eq!(stale["status"], "stale");
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["entries"][0]["status"], "succeeded");
+}
+
+#[tokio::test]
+async fn a_failed_work_result_fills_the_entry_with_the_detail() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    let plan = create_rollout_plan(&env, &["agent-node-a"], 1).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+    let detail = view_plan(&env, &plan_id).await;
+    let work_id = detail["entries"][0]["work_id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+
+    submit_work_result(&env, Some(&credential), &work_id, "failed", "摘要不符").await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["entries"][0]["status"], "failed");
+    assert_eq!(detail["entries"][0]["detail"], "摘要不符");
+    // 末阶段含失败：计划收尾落 `failed`（**不抹成 completed**）。
+    assert_eq!(detail["plan"]["status"], "failed", "{detail}");
+    assert_eq!(detail["plan"]["phases"][0]["status"], "completed");
+}
+
+#[tokio::test]
+async fn a_settled_last_phase_finishes_the_plan_without_a_manual_advance() {
+    let env = TestEnv::new().await;
+    let credential = a_classified_macos_agent(&env).await;
+    // 单阶段 + manual：末阶段不需要人工闸门 —— 全部了结就应收敛为 completed，
+    // 而不是让计划永远停在 rolling 等人去点那个什么都不启动的「推进」。
+    let plan = create_rollout_plan(&env, &["agent-node-a"], 1).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["status"], "rolling");
+    let work_id = detail["entries"][0]["work_id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["status"], "completed", "{detail}");
+    assert_eq!(
+        detail["plan"]["phases"][0]["status"], "completed",
+        "{detail}"
+    );
+
+    // 已收敛之后再点推进会被拒（不是 rolling）—— 证明它是自己收尾的，不是靠人点。
+    let advance = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/rollout-plans/advance",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "plan_id": plan_id }),
+    )
+    .await;
+    assert_ne!(advance.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_settled_last_phase_is_reconciled_when_the_plan_is_read() {
+    // 模拟「结果回填时网关没接上」留下的 rolling：条目已终态，但计划没收敛。
+    let env = TestEnv::new().await;
+    let _credential = a_classified_macos_agent(&env).await;
+    let plan = create_rollout_plan(&env, &["agent-node-a"], 1).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // 直接把条目改成终态（绕过结果回填，模拟那条没触发收敛的路径）。
+    let mut entries = env
+        .store
+        .list_rollout_plan_entries(&plan_id)
+        .await
+        .expect("entries");
+    assert_eq!(entries.len(), 1);
+    entries[0].status = "succeeded".to_string();
+    entries[0].detail = String::new();
+    env.store
+        .upsert_rollout_plan_entry(&entries[0])
+        .await
+        .expect("upsert entry");
+
+    let stored = env
+        .store
+        .get_rollout_plan(&plan_id)
+        .await
+        .expect("load plan")
+        .expect("plan");
+    assert_eq!(stored.status, "rolling", "这一步计划确实还挂着");
+
+    // 读详情顺手对账 → 收敛为 completed（幂等）。
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["status"], "completed", "{detail}");
+    assert_eq!(
+        detail["plan"]["phases"][0]["status"], "completed",
+        "{detail}"
+    );
+}
+
+fn entry_work_id(detail: &serde_json::Value, target: &str) -> String {
+    detail["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["target_id"] == target)
+        .and_then(|entry| entry["work_id"].as_str())
+        .expect("work id")
+        .to_string()
+}
+
+fn entry_status(detail: &serde_json::Value, target: &str) -> String {
+    detail["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["target_id"] == target)
+        .and_then(|entry| entry["status"].as_str())
+        .expect("entry status")
+        .to_string()
+}
+
+/// 注册 node-a（拿凭据）+ node-b + node-c，让计划里的 target 都真实存在。
+/// 返回 agent-node-a 的凭据（提交结果要用）。
+async fn enroll_fleet(env: &TestEnv) -> String {
+    let credential = enroll_agent_at_node(env, "node-a").await;
+    enroll_agent_at_node(env, "node-b").await;
+    enroll_agent_at_node(env, "node-c").await;
+    credential
+}
+
+#[tokio::test]
+async fn a_phase_with_all_succeeded_advances_automatically() {
+    // 固定闸门策略：首段（金丝雀）恒 manual，其后恒 all_succeeded。
+    // 所以「自动推进」要过掉金丝雀才看得到（先人工 advance 进第 2 段）。
+    let env = TestEnv::new().await;
+    let credential_a = enroll_agent_at_node(&env, "node-a").await;
+    let credential_b = enroll_agent_at_node(&env, "node-b").await;
+    enroll_agent_at_node(&env, "node-c").await;
+    let plan =
+        create_rollout_plan(&env, &["agent-node-a", "agent-node-b", "agent-node-c"], 3).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // 第 1 段（manual）：a 成功也不自动推进，要人工确认。
+    let detail = view_plan(&env, &plan_id).await;
+    let work_id = entry_work_id(&detail, "agent-node-a");
+    submit_work_result(&env, Some(&credential_a), &work_id, "succeeded", "").await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["current_phase"], 1, "金丝雀段要人工确认");
+
+    // 人工进第 2 段（all_succeeded）。
+    advance_plan(&env, &plan_id).await;
+    let detail = view_plan(&env, &plan_id).await;
+    let work_id = entry_work_id(&detail, "agent-node-b");
+    submit_work_result_as(
+        &env,
+        Some(&credential_b),
+        "agent-node-b",
+        "node-b",
+        &work_id,
+        "succeeded",
+        "",
+    )
+    .await;
+
+    // 第 2 段全部成功 → 自动推进到第 3 段。
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["status"], "rolling");
+    assert_eq!(detail["plan"]["current_phase"], 3);
+    assert_eq!(detail["plan"]["phases"][1]["status"], "completed");
+    assert_eq!(detail["plan"]["phases"][2]["status"], "rolling");
+    assert_eq!(entry_status(&detail, "agent-node-c"), "dispatched");
+}
+
+#[tokio::test]
+async fn a_manual_phase_never_auto_advances() {
+    let env = TestEnv::new().await;
+    let credential = enroll_fleet(&env).await;
+    let plan = create_rollout_plan(&env, &["agent-node-a", "agent-node-b"], 2).await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    let detail = view_plan(&env, &plan_id).await;
+    let work_id = entry_work_id(&detail, "agent-node-a");
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+
+    // manual：即便阶段 1 全部成功，也不自动推进，要人工 advance 确认。
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["current_phase"], 1);
+    assert_eq!(detail["plan"]["phases"][0]["status"], "rolling");
+
+    advance_plan(&env, &plan_id).await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(detail["plan"]["current_phase"], 2);
+}
+
+#[tokio::test]
+async fn batch_size_throttles_materialization_and_refills_on_terminal_results() {
+    let env = TestEnv::new().await;
+    let credential = enroll_fleet(&env).await;
+    // 单阶段 + batch_size=2：阶段由服务端切（3 目标 / 1 阶段 = 一段装 3 台）。
+    let plan = create_rollout_plan_with_batch(
+        &env,
+        &["agent-node-a", "agent-node-b", "agent-node-c"],
+        1,
+        2,
+    )
+    .await;
+    let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+    approve_plan(&env, &plan_id).await;
+
+    // batch_size=2：只物化前 2 台，第 3 台 pending。
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(entry_status(&detail, "agent-node-a"), "dispatched");
+    assert_eq!(entry_status(&detail, "agent-node-b"), "dispatched");
+    assert_eq!(entry_status(&detail, "agent-node-c"), "pending");
+
+    // 一台成功（释放一个在飞槽位）→ 补物化第 3 台。
+    let work_id = entry_work_id(&detail, "agent-node-a");
+    submit_work_result(&env, Some(&credential), &work_id, "succeeded", "").await;
+    let detail = view_plan(&env, &plan_id).await;
+    assert_eq!(entry_status(&detail, "agent-node-c"), "dispatched");
+    assert!(entry_work_id(&detail, "agent-node-c").starts_with("work-"));
+}
+
+// ── mTLS 客户端证书鉴权（docs/design/agent-identity-mtls.md §5.2 / §5.3 / §5.4）──
+
+/// 造一个「已由 agent CA 验链通过」的客户端身份，等价于 TLS 握手后注入的请求扩展。
+fn client_identity(agent_id: &str) -> VerifiedAgentIdentity {
+    VerifiedAgentIdentity {
+        agent_id: agent_id.to_string(),
+        tenant_id: "tenant-default".to_string(),
+        environment_id: "env-default".to_string(),
+        fingerprint_sha256: "ab".repeat(32),
+        not_before: "2026-09-01T00:00:00+00:00".to_string(),
+        not_after: "2026-10-08T00:00:00+00:00".to_string(),
+    }
+}
+
+/// 发一次 agent 请求，并可选地把证书身份塞进请求扩展（模拟握手注入）。
+async fn post_agent_with_client_identity(
+    env: &TestEnv,
+    uri: &str,
+    bearer_token: Option<&str>,
+    identity: Option<VerifiedAgentIdentity>,
+    body: &serde_json::Value,
+) -> Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = bearer_token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let mut request = builder
+        .body(Body::from(
+            serde_json::to_string(body).expect("serialize body"),
+        ))
+        .expect("request");
+    if let Some(identity) = identity {
+        request.extensions_mut().insert(identity);
+    }
+    super::router_with_state(super::build_state(
+        env.config.clone(),
+        Arc::clone(&env.store_handle),
+    ))
+    .oneshot(request)
+    .await
+    .expect("route response")
+}
+
+async fn response_text(response: Response) -> String {
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn status_body(agent_id: &str, instance_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "agent_id": agent_id,
+        "instance_id": instance_id,
+        "version": "v0.2.0",
+    })
+}
+
+/// 核心验收：库丢了（没有该 agent 记录），但 agent 持有效证书 → 首触重建登记，零人工。
+#[tokio::test]
+async fn mtls_certificate_rebuilds_unknown_agent_on_first_touch() {
+    let env = TestEnv::new().await;
+    assert!(
+        env.store
+            .get_agent("agent-rebuilt")
+            .await
+            .expect("read")
+            .is_none()
+    );
+
+    let response = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None, // 库丢了，旧 bearer 凭据也没了 —— 只有证书
+        Some(client_identity("agent-rebuilt")),
+        &status_body("agent-rebuilt", "rebuilt-host"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let rebuilt = env
+        .store
+        .get_agent("agent-rebuilt")
+        .await
+        .expect("read")
+        .expect("agent must be rebuilt from the certificate");
+    assert_eq!(rebuilt.tenant_id, "tenant-default");
+    assert_eq!(rebuilt.environment_id, "env-default");
+    assert_eq!(rebuilt.credential_status, StoredCredentialStatus::Active);
+}
+
+/// §5.3 只保证**第一次**心跳能自愈 —— 除非「证书 + 陈旧 bearer」也按证书放行。
+///
+/// 重建出来的那行**不可能**知道这台机器的 bearer token（重建只读证书），而双轨期的 agent
+/// （§7）照旧会把 token 一起带上。若 bearer 先判，第二次心跳就是「行在、token 对不上」→
+/// 401 `credential_mismatch`（对 agentd 是**终态**：停重试、只能人工重注册）。
+/// 现象就是「自愈一次就死」。2026-09-30 实撞，所以这条测试锁死：证书已验证且未吊销时，
+/// 陈旧的 bearer 不该把请求判死。
+#[tokio::test]
+async fn a_certificate_authenticated_agent_survives_a_stale_bearer_token() {
+    let env = TestEnv::new().await;
+
+    // ① 库是空的：只有证书 → 凭证书首触重建（§5.3）。
+    let first = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None, // 库丢了，旧 bearer 凭据也没了 —— 只有证书
+        Some(client_identity("agent-rehydrated")),
+        &status_body("agent-rehydrated", "host-a"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    // ② 同一个 agent 的**下一次**心跳：它照旧带上自己那份 bearer（重建后库里并没这条 token）。
+    let second = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        Some("wic_stale_bearer_from_before_the_rebuild"),
+        Some(client_identity("agent-rehydrated")),
+        &status_body("agent-rehydrated", "host-a"),
+    )
+    .await;
+    let second_status = second.status();
+    let second_body = response_text(second).await;
+    assert_eq!(
+        second_status,
+        StatusCode::ACCEPTED,
+        "证书已验、未吊销时，陈旧的 bearer 不该把请求判死（正文：{second_body}）"
+    );
+}
+
+/// 证书身份与请求体不一致必须被拒：不能拿 A 的证书代表 B。
+#[tokio::test]
+async fn mtls_certificate_identity_mismatch_is_rejected() {
+    let env = TestEnv::new().await;
+    let response = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        Some(client_identity("agent-other")),
+        &status_body("agent-victim", "victim-host"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = response_text(response).await;
+    assert!(body.contains("certificate_mismatch"), "{body}");
+    assert!(
+        env.store
+            .get_agent("agent-victim")
+            .await
+            .expect("read")
+            .is_none()
+    );
+}
+
+/// 既没凭据也没证书：拒绝，并给出可辨识的 code。
+///
+/// `TestEnv` 配了 agent CA（mTLS 开启）⇒ 该带而没带 → `certificate_required`；
+/// 没配 CA 的网关则回 `missing_credential`（两者都可自愈/可重装，都不是终态）。
+#[tokio::test]
+async fn agent_request_without_credential_or_certificate_is_rejected() {
+    let env = TestEnv::new().await;
+    let response = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        None,
+        &status_body("agent-nobody", "nobody-host"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = response_text(response).await;
+    assert!(body.contains("certificate_required"), "{body}");
+}
+
+/// 凭据路径只有一条 —— **客户端证书**：有证书（哪怕不带 Authorization 头）就放行；
+/// 只有 bearer token、没有证书一律拒绝（双轨已删）。
+#[tokio::test]
+async fn certificate_is_the_only_credential_path() {
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+
+    // 有证书、**不带任何 Authorization 头** → 放行（证明 bearer 已彻底删除）。
+    let accepted = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&agent_id),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    // 只有 bearer token、没有证书 → 拒绝（token 不再有任何效力）。
+    let rejected = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        Some("wic_some_old_bearer"),
+        None,
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// **核心回归**：库丢 / 换网关后，agent 凭证书**自愈重建** → **续期也必须能成**。
+///
+/// 重建登记的 `current_instance_id` 是 NULL（首触时实例本就未知），而网关续期时取的是库里
+/// 的 instance_id（投影退化为 `''`）。若续期按「实例必须相等」硬卡，自愈后的第一次续期会
+/// 白撞 401 —— 而身份明明已由证书验明。
+#[tokio::test]
+async fn a_rebuilt_agent_can_renew_its_certificate() {
+    let env = TestEnv::new().await;
+    let agent_id = "agent-rebuilt";
+
+    // ① 空库 + 只有证书 → 首触重建（§5.3）。
+    let first = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(agent_id),
+        &status_body(agent_id, "host-a"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    assert!(
+        env.store.get_agent(agent_id).await.expect("read").is_some(),
+        "凭证书首触应重建登记"
+    );
+
+    // ② 续期：带 CSR，必须换回一张新证书（而不是 401）。
+    let renewed = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/credentials:renew",
+        Some(agent_id),
+        &CredentialRenewal::new(
+            agent_id.to_string(),
+            "host-a".to_string(),
+            "csr".to_string(),
+            certificate_signing_request(),
+            "2026-07-29T00:00:00Z".to_string(),
+        ),
+    )
+    .await;
+    let status = renewed.status();
+    let body = response_text(renewed).await;
+    assert_eq!(status, StatusCode::OK, "自愈后的续期不该被拒：{body}");
+    assert!(body.contains("BEGIN CERTIFICATE"), "{body}");
+}
+
+/// 续期**必须**带 CSR：空 CSR 直接 400（mTLS 是唯一凭据路径，不签 token）。
+#[tokio::test]
+async fn renewal_without_a_csr_is_rejected() {
+    let env = TestEnv::new().await;
+    let agent_id = enroll_agent_credential(&env).await;
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/credentials:renew",
+        Some(&agent_id),
+        &CredentialRenewal::new(
+            "agent-node-a".to_string(),
+            "node-a".to_string(),
+            "csr".to_string(),
+            String::new(),
+            "2026-07-29T00:00:00Z".to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// 证书只证明「CA 签过它」，不证明「它现在还是本网关的成员」：没登记过的 agent 不能取包。
+///
+/// 取包路径与状态上报不同，**不重建**登记 —— 比照「被删掉的登记不该还能拉包」。
+#[tokio::test]
+async fn package_download_rejects_a_certificate_for_an_unknown_agent() {
+    let env = TestEnv::new().await;
+    set_install_package_source(&env, "unknown-agent", b"unknown-agent-bytes").await;
+
+    let rejected = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some("agent-ghost"),
+    )
+    .await;
+    assert_auth_rejected(rejected, "invalid agent client certificate").await;
+
+    // 登记一台后放行（证明拒绝来自「未知」，不是端点坏了）。
+    let agent_id = enroll_agent_credential(&env).await;
+    let ok = get_agent_package(
+        &env,
+        "/api/v1/agent/packages/current?platform=aarch64-apple-darwin",
+        Some(&agent_id),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+}
+
+// ── 注册时拿 CSR 换客户端证书（docs/design/agent-identity-mtls.md §5.1）──
+
+/// 临时 agent CA：返回 `(CA, 证书文件, 私钥文件)`。
+///
+/// 文件用于给 `AdminConfig` 指路 —— `build_state` 是从配置**装载** CA 的，不是从内存对象。
+fn test_agent_ca() -> (
+    crate::infra::AgentCa,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "Wist Test Agent CA");
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    let key = KeyPair::generate().expect("ca key");
+    let certificate = params.self_signed(&key).expect("ca cert");
+    let cert_path = write_temp_pem("agent-ca.crt.pem", &certificate.pem());
+    let key_path = write_temp_pem("agent-ca.key.pem", &key.serialize_pem());
+    let ca =
+        crate::infra::AgentCa::from_pem(&certificate.pem(), &key.serialize_pem()).expect("load ca");
+    (ca, cert_path, key_path)
+}
+
+fn write_temp_pem(suffix: &str, body: &str) -> std::path::PathBuf {
+    static NEXT_SUFFIX: AtomicU64 = AtomicU64::new(1);
+    let path = std::env::temp_dir().join(format!(
+        "wist-gateway-test-{}-{}-{suffix}",
+        std::process::id(),
+        NEXT_SUFFIX.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, body).expect("write temp pem");
+    path
+}
+
+fn certificate_signing_request() -> String {
+    let key = rcgen::KeyPair::generate().expect("client key");
+    rcgen::CertificateParams::default()
+        .serialize_request(&key)
+        .expect("csr")
+        .pem()
+        .expect("csr pem")
+}
+
+/// `TestEnv` 里配置的那份测试 agent CA（`load_agent_ca` 从配置装载）。
+///
+/// mTLS 是 agent 唯一凭据路径，所以注册 / 续期都需要真 CA 可签；测试直接用它。
+fn env_agent_ca(env: &TestEnv) -> std::sync::Arc<crate::infra::AgentCa> {
+    super::load_agent_ca(&env.config).expect("test agent CA is configured")
+}
+
+/// 核心：带 CSR + 配了 agent CA → 回包里带客户端证书，且证书身份就是刚注册的 agent。
+#[tokio::test]
+async fn enrollment_with_a_csr_issues_a_client_certificate() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let (ca, _, _) = test_agent_ca();
+    let request = enrollment_request(&token);
+
+    let result =
+        agent_enrollment_result(&env.config, &env.store_handle, Some(&ca), request, "v0.1.0").await;
+    assert_eq!(result.status, EnrollmentStatus::Accepted);
+
+    let bundle = result.credential_bundle.clone().expect("credential bundle");
+    let certificate_pem = bundle.certificate;
+
+    // 证书里的身份 = 刚注册的 agent，且能被 agent CA 验链接受。
+    let (_, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes()).expect("pem");
+    let identity =
+        crate::infra::agent_identity_from_certificate_der(&pem.contents).expect("identity");
+    assert_eq!(
+        identity.agent_id,
+        result.agent_id.clone().expect("agent id")
+    );
+    assert_eq!(identity.environment_id, "env-default");
+}
+
+/// 开了 agent CA 但 CSR 是坏的：**拒绍**，不静默降级。
+#[tokio::test]
+async fn enrollment_with_a_broken_csr_is_rejected_not_downgraded() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    let (ca, _, _) = test_agent_ca();
+    let mut request = enrollment_request(&token);
+    request.certificate_signing_request = "not a csr".to_string();
+
+    let result =
+        agent_enrollment_result(&env.config, &env.store_handle, Some(&ca), request, "v0.1.0").await;
+    assert_eq!(result.status, EnrollmentStatus::Rejected);
+    assert!(
+        result
+            .reason_code
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invalid_certificate_signing_request"),
+        "{:?}",
+        result.reason_code
+    );
+}
+
+/// 没配 agent CA = 这台网关没开 mTLS：注册**直接拒**（没有 bearer 可以回落）。
+#[tokio::test]
+async fn enrollment_without_an_agent_ca_is_rejected() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+
+    let result = agent_enrollment_result(
+        &env.config,
+        &env.store_handle,
+        None,
+        enrollment_request(&token),
+        "v0.1.0",
+    )
+    .await;
+    assert_eq!(result.status, EnrollmentStatus::Rejected);
+    assert_eq!(
+        result.reason_code.as_deref(),
+        Some("agent_certificate_authority_not_configured")
+    );
+    assert!(result.credential_bundle.is_none());
+}
+
+/// 续期也能换发新证书：agent 重新交 CSR，网关用 agent CA 签一张新的（§4.2）。
+#[tokio::test]
+async fn credential_renewal_with_a_csr_issues_a_new_client_certificate() {
+    let mut env = TestEnv::new().await;
+    let (_ca, ca_cert_path, ca_key_path) = test_agent_ca();
+    env.config.agent_ca_cert_file = Some(ca_cert_path);
+    env.config.agent_ca_key_file = Some(ca_key_path);
+
+    let credential = enroll_agent_credential(&env).await;
+    let body = serde_json::json!({
+        "api_version": "v1",
+        "kind": "renew_agent_credential",
+        "agent_id": "agent-node-a",
+        "instance_id": "node-a",
+        "credential_request": "csr",
+        "certificate_signing_request": certificate_signing_request(),
+        "requested_at": "2026-09-28T00:00:00Z",
+    });
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/credentials:renew",
+        Some(&credential),
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let renewed: CredentialRenewed = decode_json_response(response).await;
+    let bundle = renewed.credential_bundle;
+    let certificate_pem = bundle.certificate;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes()).expect("pem");
+    let identity =
+        crate::infra::agent_identity_from_certificate_der(&pem.contents).expect("identity");
+    assert_eq!(identity.agent_id, "agent-node-a");
+}
+
+/// 客户端证书状态：agent 报上来 → 入库 → 管理面运行态里看得到（§5.5），连最近一次续签判定一起。
+#[tokio::test]
+async fn agent_certificate_status_is_stored_and_exposed_to_admins() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.2.0",
+            "certificate_status": {
+                "not_after": "2026-11-04T00:00:00+00:00",
+                "remaining_seconds": 1_234_567,
+                "state": "renew_due",
+                "last_renewal": {
+                    "outcome": "renewed",
+                    "checked_at": "2026-10-08T00:00:00+00:00",
+                    "detail": "credential renewed",
+                    "not_after": "2026-11-04T00:00:00+00:00",
+                },
+            },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let runtime = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/runtime-status",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(runtime.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(runtime).await;
+    assert_eq!(body["certificate_status"]["state"], "renew_due");
+    assert_eq!(body["certificate_status"]["remaining_seconds"], 1_234_567);
+    assert_eq!(
+        body["certificate_status"]["not_after"],
+        "2026-11-04T00:00:00+00:00"
+    );
+    // 续签上报（§5.5）：原样透出，网关不重算。
+    assert_eq!(
+        body["certificate_status"]["last_renewal"]["outcome"],
+        "renewed"
+    );
+    assert_eq!(
+        body["certificate_status"]["last_renewal"]["checked_at"],
+        "2026-10-08T00:00:00+00:00"
+    );
+
+    // 旧版本 agentd（不带 last_renewal）：**保留**上一次的续签记录，必填子字段照常覆盖。
+    let legacy = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.2.0",
+            "certificate_status": {
+                "not_after": "2026-11-04T00:00:00+00:00",
+                "remaining_seconds": 1_200_000,
+                "state": "valid",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(legacy.status(), StatusCode::ACCEPTED);
+    let runtime = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/runtime-status",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(runtime).await;
+    assert_eq!(body["certificate_status"]["state"], "valid");
+    assert_eq!(
+        body["certificate_status"]["last_renewal"]["outcome"],
+        "renewed"
+    );
+}
+
+// ── 拒绝名单 / 吊销（docs/design/agent-identity-mtls.md §5.6）──
+
+async fn revoke_agent_via_admin(env: &TestEnv, agent_id: &str, reason: &str) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/agents/{agent_id}/revocation"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "reason_code": reason }),
+    )
+    .await
+}
+
+/// 吊销后 **bearer 路径**立即被拒，且 code 明确为 `certificate_revoked`（agentd 据此停重试）。
+#[tokio::test]
+async fn a_revoked_agent_is_rejected_on_the_bearer_path() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let ok = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::ACCEPTED);
+
+    let revoked = revoke_agent_via_admin(&env, "agent-node-a", "compromised").await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+
+    let blocked = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(blocked.status(), StatusCode::UNAUTHORIZED);
+    let body = response_text(blocked).await;
+    assert!(body.contains("certificate_revoked"), "{body}");
+}
+
+/// 吊销也拦 **证书路径**：同一张此前可用的证书，之后一律 401（续签也过不来）。
+#[tokio::test]
+async fn a_revoked_agent_is_rejected_on_the_certificate_path() {
+    let env = TestEnv::new().await;
+    let first = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        Some(client_identity("agent-revoked")),
+        &status_body("agent-revoked", "host"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-revoked", "stolen key")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let blocked = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        Some(client_identity("agent-revoked")),
+        &status_body("agent-revoked", "host"),
+    )
+    .await;
+    assert_eq!(blocked.status(), StatusCode::UNAUTHORIZED);
+    assert!(response_text(blocked).await.contains("certificate_revoked"));
+}
+
+/// 列表能看到「谁在名单里」；解除后恢复访问（且再解除返回 404）。
+#[tokio::test]
+async fn lifting_a_revocation_restores_access_and_the_list_shows_entries() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "bye")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let list = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent-revocations",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(list).await;
+    assert_eq!(body["revocations"][0]["agent_id"], "agent-node-a");
+    assert_eq!(body["revocations"][0]["reason_code"], "bye");
+
+    let lifted = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/revocation",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(lifted.status(), StatusCode::OK);
+
+    let ok = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::ACCEPTED);
+
+    // 已经不在名单里：再解除一次是 404，不把空操作当成功。
+    let again = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/revocation",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::NOT_FOUND);
+}
+
+/// 运行态里能看出「被吊销」——与「离线」区分开（离线会自己回来，被吊销不会）。
+#[tokio::test]
+async fn runtime_status_exposes_the_revocation_flag() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    let before = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/runtime-status",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(before).await;
+    assert_eq!(body["revoked"], false);
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "retired")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let after = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/runtime-status",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(after).await;
+    assert_eq!(body["revoked"], true);
+}
+
+/// 吊销一台不存在的 agent：404（不静默建一条无主条目）。
+#[tokio::test]
+async fn revoking_an_unknown_agent_is_rejected() {
+    let env = TestEnv::new().await;
+    let response = revoke_agent_via_admin(&env, "agent-ghost", "n/a").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// **续签也过不来**：这是「拒绝名单」相对「停止续签」的核心补口 —— 续签的凭据就是旧证书本身，
+/// 若不在这条路径上拦，持钥者能自己续命。走的就是 `authenticate_agent`，与上报同一条闸门。
+#[tokio::test]
+async fn a_revoked_agent_cannot_renew_its_credential() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "stolen key or retired")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let renew = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/credentials:renew",
+        Some(&credential),
+        &CredentialRenewal::new(
+            "agent-node-a".to_string(),
+            "node-a".to_string(),
+            "csr".to_string(),
+            certificate_signing_request(),
+            "2026-07-29T00:00:00Z".to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(renew.status(), StatusCode::UNAUTHORIZED);
+    assert!(response_text(renew).await.contains("certificate_revoked"));
+}
+
+/// 过了 GC 水位就不再拦（即便行还没被清）：那时被吊销的证书早已过期，agent 只能带 token 重装。
+/// 用注入 `retain_until` 在过去的条目来验证，不必真的等 30 天。
+#[tokio::test]
+async fn a_revocation_past_its_retention_no_longer_blocks() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    env.store
+        .revoke_agent(&StoredAgentRevocation {
+            entry_id: "denylist-agent-node-a".to_string(),
+            agent_id: "agent-node-a".to_string(),
+            reason_code: "retired long ago".to_string(),
+            denied_by: "admin".to_string(),
+            denied_at: "2026-01-01T00:00:00+00:00".to_string(),
+            // 已过水位（“很久以前吊销的那张证书”早已过期）。
+            retain_until: "2026-02-01T00:00:00+00:00".to_string(),
+        })
+        .await
+        .expect("inject a stale revocation");
+
+    let ok = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::ACCEPTED);
+}
+
+/// 重复吊销同一台：列表里仍是一条（`agent_id` 一条），不是两条。
+#[tokio::test]
+async fn revoking_twice_keeps_one_entry() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    for reason in ["first", "again"] {
+        assert_eq!(
+            revoke_agent_via_admin(&env, "agent-node-a", reason)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    let list = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent-revocations",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(list).await;
+    let entries = body["revocations"].as_array().expect("array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["reason_code"], "again");
+}
+
+/// 拒绝名单视图是管理面接口：没有 admin 凭据一律 401。
+#[tokio::test]
+async fn listing_revocations_requires_admin_credentials() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent-revocations",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 不带**任何**凭据的请求不该探出「某 agent 已被吊销」：名单判定在凭据验明之后，
+/// 所以这里拿到的是与其它未鉴权请求同口径的 401，而不是 `certificate_revoked`。
+#[tokio::test]
+async fn an_unauthenticated_probe_cannot_reveal_revocation() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "x")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // 既没 bearer 也没证书。
+    let probe = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        None,
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(probe.status(), StatusCode::UNAUTHORIZED);
+    let body = response_text(probe).await;
+    assert!(
+        !body.contains("certificate_revoked"),
+        "must not leak revocation to an unauthenticated probe: {body}"
+    );
+
+    // 凭据没验明（错的 bearer）同样不泄露。
+    let wrong = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some("wic_not_the_real_token"),
+        &status_body("agent-node-a", "node-a"),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    assert!(!response_text(wrong).await.contains("certificate_revoked"));
+}
+
+/// 被吊销 + 库丢了 + 手持有效证书：**不能**走首触重建把自己登记回来。
+///
+/// 这是「名单判定放在重建之前」的保护（见 `certificate_authenticate`）：若顺序反了，
+/// 被吊销的 agent 一接触网关就把自己重新登记回来，拒绝名单形同虚设。
+#[tokio::test]
+async fn a_revoked_agent_is_not_rebuilt_from_its_certificate() {
+    let env = TestEnv::new().await;
+    // 库里有吊销条目，但没有这台 agent 的注册记录（模拟「库丢了」）。
+    env.store
+        .revoke_agent(&StoredAgentRevocation {
+            entry_id: "denylist-agent-rebuilt".to_string(),
+            agent_id: "agent-rebuilt".to_string(),
+            reason_code: "compromised".to_string(),
+            denied_by: "admin".to_string(),
+            denied_at: "2026-09-01T00:00:00+00:00".to_string(),
+            retain_until: "2027-01-01T00:00:00+00:00".to_string(),
+        })
+        .await
+        .expect("inject revocation");
+
+    let response = post_agent_with_client_identity(
+        &env,
+        "/api/v1/agent/status",
+        None,
+        Some(client_identity("agent-rebuilt")),
+        &status_body("agent-rebuilt", "rebuilt-host"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        response_text(response)
+            .await
+            .contains("certificate_revoked")
+    );
+    assert!(
+        env.store
+            .get_agent("agent-rebuilt")
+            .await
+            .expect("read")
+            .is_none(),
+        "a revoked agent must not be rebuilt from its certificate"
+    );
+}
+
+/// 被吊销的 agent 的数据面记录也不进库（§5.6）：控制面切断之外，数据面同样是「它还能联系网关」的途径。
+#[tokio::test]
+async fn ingest_endpoint_rejects_a_revoked_agent() {
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+    let record = data_plane_record("agent-node-a", &fact_report(&["/usr/bin/xcodebuild"]));
+
+    // 吊销前正常收下。
+    let ok = post_to_ingest_router(&env, &record).await;
+    assert_eq!(ok.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        revoke_agent_via_admin(&env, "agent-node-a", "cut off")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let rejected = post_to_ingest_router(&env, &record).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(rejected).await;
+    assert!(
+        body["failures"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is revoked"),
+        "{body}"
+    );
+}
+
+// ── 知识库：从管理面登记的生效包装载 + 运行时整体换版（设计 §6 / §8）──────────────
+
+/// 在环境的状态目录里造一个包目录，并写入五份**真实**策展数据。
+fn stage_knowledge_package(env: &TestEnv, package_id: &str) -> std::path::PathBuf {
+    stage_knowledge_dir(&env.config.knowledge_package_dir(package_id))
+}
+
+/// 把五份**真实**数据铺到任意目录 —— 包目录与 `[knowledge] source_dir`（启动期知识源）共用这一手。
+/// 用真数据而不是内联夹具：这里要验的正是“策展数据能被装载器吃下”。
+fn stage_knowledge_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).expect("create knowledge dir");
+    for name in crate::app::knowledge::PACKAGE_FILES {
+        std::fs::copy(crate::test_support::knowledge_file(name), dir.join(name))
+            .unwrap_or_else(|err| panic!("copy {name}: {err}"));
+    }
+    dir.to_path_buf()
+}
+
+fn knowledge_package_row(package_id: &str, dir: &std::path::Path) -> StoredKnowledgePackage {
+    StoredKnowledgePackage {
+        package_id: package_id.to_string(),
+        source: dir.display().to_string(),
+        package_sha256: format!("sha256:{package_id}"),
+        version: "0.1.0".to_string(),
+        catalog_version: Some(crate::test_support::real_catalog_version()),
+        template_version: Some(1),
+        policy_version: Some(1),
+        purpose_version: Some(crate::test_support::real_purpose_version()),
+        parser_abi: 1,
+        signed_by: String::new(),
+        cached_path: dir.display().to_string(),
+        created_by: "admin".to_string(),
+        created_at: "2026-09-30T00:00:00Z".to_string(),
+    }
+}
+
+async fn record_and_activate_knowledge(env: &TestEnv, package_id: &str) {
+    let dir = stage_knowledge_package(env, package_id);
+    env.store_handle
+        .upsert_knowledge_package(&knowledge_package_row(package_id, &dir))
+        .await
+        .expect("record knowledge package");
+    env.store_handle
+        .activate_knowledge(&KnowledgeActivation {
+            package_id,
+            reason: "activate",
+            requested_by: "admin",
+            created_at: "2026-09-30T00:00:00Z",
+        })
+        .await
+        .expect("activate knowledge");
+}
+
+/// 生效包优先于配置里的 `*_file`：管理面切过的网关，不再看卡器里写了什么。
+#[tokio::test]
+async fn knowledge_loads_from_the_active_package_in_the_store() {
+    // `TestEnv::new()` 的配置里本来就有内容（夹具那版是 `catalog_version = 1`），用来证明**优先级**。
+    let env = TestEnv::new().await;
+    record_and_activate_knowledge(&env, "kbp-test").await;
+
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("load from store");
+    assert_eq!(
+        loaded.source,
+        KnowledgeSource::Package {
+            package_id: "kbp-test".to_string()
+        }
+    );
+    assert_eq!(loaded.generation, 1);
+    assert_eq!(
+        loaded.content.as_deref().map(|set| set.catalog_version),
+        Some(crate::test_support::real_catalog_version())
+    );
+    assert_eq!(
+        loaded
+            .purpose_rules
+            .as_deref()
+            .map(|table| i64::from(table.purpose_version)),
+        Some(crate::test_support::real_purpose_version())
+    );
+    assert!(loaded.discovery_policies.is_some());
+}
+
+/// **生效包优先于启动期知识源**：管理面切过的包，不能被出厂初始包顶掉。
+#[tokio::test]
+async fn an_active_package_wins_over_the_startup_source_dir() {
+    let mut env = TestEnv::new().await;
+    env.config.knowledge_source_dir = Some(stage_knowledge_dir(&env._root.join("initial")));
+    record_and_activate_knowledge(&env, "kbp-test").await;
+
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("resolve");
+    assert_eq!(
+        loaded.source,
+        KnowledgeSource::Package {
+            package_id: "kbp-test".to_string()
+        }
+    );
+}
+
+/// 启动期知识源（出厂初始包）：管理面还没激活过任何包时，用它而不是空载/配置态。
+#[tokio::test]
+async fn knowledge_uses_the_startup_source_dir_before_any_package_is_activated() {
+    let mut env = TestEnv::new().await;
+    let dir = stage_knowledge_dir(&env._root.join("initial"));
+    env.config.knowledge_source_dir = Some(dir.clone());
+
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("resolve");
+    assert_eq!(
+        loaded.source,
+        KnowledgeSource::Dir {
+            path: dir.display().to_string()
+        }
+    );
+    assert_eq!(loaded.generation, 0);
+    assert!(loaded.content.is_some());
+    assert!(loaded.purpose_rules.is_some());
+    assert!(loaded.discovery_policies.is_some());
+}
+
+/// 从未录入过 = 空载：回落配置文件（今天的部署就是这样跑起来的）。
+#[tokio::test]
+async fn knowledge_falls_back_to_config_files_before_anything_is_activated() {
+    let env = TestEnv::new().await;
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("load from config");
+    assert_eq!(loaded.source, KnowledgeSource::ConfigFiles);
+    assert_eq!(loaded.generation, 0);
+    assert!(loaded.content.is_some());
+}
+
+/// **悬空的生效包不再拒启**（曾经是“生效包损坏 = 拒绝启动”）：
+/// 搬了库没搬盘时会撞上，拒启等于把处置入口（管理面）一起关掉 —— 回落并告警就行。
+#[tokio::test]
+async fn a_dangling_active_package_no_longer_refuses_startup() {
+    let env = TestEnv::new().await;
+    activate_missing_package(&env, "kbp-broken").await;
+
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("a missing package copy must not refuse startup");
+    // 没有启动期知识源 → 落到配置文件那份（`TestEnv` 配了内容）。
+    assert_eq!(loaded.source, KnowledgeSource::ConfigFiles);
+    assert!(loaded.content.is_some());
+}
+
+/// 悬空的生效包 + 有启动期知识源 → 用后者（“搬库没搬盘”现场的实际回归）。
+#[tokio::test]
+async fn a_dangling_active_package_falls_back_to_the_startup_source_dir() {
+    let mut env = TestEnv::new().await;
+    let dir = stage_knowledge_dir(&env._root.join("initial"));
+    env.config.knowledge_source_dir = Some(dir.clone());
+    activate_missing_package(&env, "kbp-broken").await;
+
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("resolve");
+    assert_eq!(
+        loaded.source,
+        KnowledgeSource::Dir {
+            path: dir.display().to_string()
+        }
+    );
+}
+
+/// 启动期知识源配错/没铺 → 告警回落，不当启动失败。
+#[tokio::test]
+async fn a_broken_startup_source_dir_falls_back_without_refusing() {
+    let mut env = TestEnv::new().await;
+    env.config.knowledge_source_dir = Some(env._root.join("no-such-knowledge"));
+
+    let loaded = LoadedKnowledge::resolve(&env.config, &env.store_handle)
+        .await
+        .expect("a broken source_dir must not refuse startup");
+    assert_eq!(loaded.source, KnowledgeSource::ConfigFiles);
+}
+
+/// 登记并激活一个**目录不存在**的包（模拟“搬库没搬盘”）。
+async fn activate_missing_package(env: &TestEnv, package_id: &str) {
+    env.store_handle
+        .upsert_knowledge_package(&knowledge_package_row(
+            package_id,
+            &env.config.knowledge_package_dir(package_id),
+        ))
+        .await
+        .expect("record broken package");
+    env.store_handle
+        .activate_knowledge(&KnowledgeActivation {
+            package_id,
+            reason: "activate",
+            requested_by: "admin",
+            created_at: "2026-09-30T00:00:00Z",
+        })
+        .await
+        .expect("activate broken package");
+}
+
+/// 换版**不需要重启**：换掉的是 `ApiState` 里那一份 `Arc`，同一个 router 立刻跟着变。
+#[tokio::test]
+async fn admin_content_view_follows_a_knowledge_swap_without_a_restart() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+
+    // 起始：`TestEnv` 配置里的那份内容（`TEST_CONTENT_CATALOG`，catalog_version = 1）。
+    let view = get_view(&state, "/api/v1/admin/content").await;
+    assert_eq!(view["catalog_version"], 1);
+
+    // 不重启、不换 router：只把装载着的内容整体换成"空载"。
+    state.replace_knowledge(Arc::new(LoadedKnowledge::none()));
+
+    let response = get_from_state(&state, "/api/v1/admin/content").await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+async fn get_from_state(state: &ApiState, uri: &str) -> axum::response::Response {
+    super::router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+}
+
+async fn get_view(state: &ApiState, uri: &str) -> serde_json::Value {
+    decode_json_response(get_from_state(state, uri).await).await
+}
+
+async fn post_to_state(state: &ApiState, uri: &str, body: &serde_json::Value) -> Response {
+    super::router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::from(
+                    serde_json::to_string(body).expect("serialize body"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+}
+
+// ── 知识库管理面：录入 → 激活 → 换版（设计 §7）────────────────────────────
+
+#[tokio::test]
+async fn knowledge_record_rejects_a_package_that_requires_a_newer_gateway() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let root = crate::test_support::unique_temp_dir("wist-knowledge-incompatible");
+    let tarball = crate::test_support::knowledge_package_tarball_with_compat(
+        &root,
+        false,
+        Some(r#"{"requires":{"wist-gateway":">=99.0.0"}}"#),
+    );
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages",
+        &serde_json::json!({
+            "source": tarball.to_string_lossy(),
+            "sha256": crate::infra::bytes_sha256_hex(
+                &std::fs::read(&tarball).expect("read tarball")
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "package_incompatible");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("请先升级"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn knowledge_record_reports_a_compatible_package() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let root = crate::test_support::unique_temp_dir("wist-knowledge-compatible");
+    let tarball = crate::test_support::knowledge_package_tarball_with_compat(
+        &root,
+        false,
+        Some(r#"{"requires":{"wist-gateway":">=0.0.1"}}"#),
+    );
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages",
+        &serde_json::json!({
+            "source": tarball.to_string_lossy(),
+            "sha256": crate::infra::bytes_sha256_hex(
+                &std::fs::read(&tarball).expect("read tarball")
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["compatibility"]["status"], "ok");
+}
+
+#[tokio::test]
+async fn knowledge_activation_rechecks_compatibility() {
+    let env = TestEnv::new().await;
+    let package_id = "kbp-incompatible";
+    let dir = stage_knowledge_package(&env, package_id);
+    std::fs::write(
+        dir.join("compat.json"),
+        r#"{"requires":{"wist-gateway":">=99.0.0"}}"#,
+    )
+    .expect("write compat");
+    env.store_handle
+        .upsert_knowledge_package(&knowledge_package_row(package_id, &dir))
+        .await
+        .expect("record knowledge package");
+
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let response = post_to_state(
+        &state,
+        &format!("/api/v1/admin/knowledge/packages/{package_id}/activate"),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "knowledge_package_incompatible");
+}
+
+/// 整条链走一遍：录入不生效 → 激活当场换版（同一个 router，**不重启**）→ 回滚留痕。
+///
+/// 这是"没有设置入口"那个问题的闭环回归：包从哪来（tar.gz）、怎么录、怎么切、切完谁能看见。
+#[tokio::test]
+async fn knowledge_endpoints_record_then_activate_without_a_restart() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let root = crate::test_support::unique_temp_dir("wist-knowledge-api");
+    let tarball = crate::test_support::knowledge_package_tarball(&root, false);
+
+    // ① 录入：**不生效**（录入 ≠ 生效，设计 I2）
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages",
+        &serde_json::json!({
+            "source": tarball.to_string_lossy(),
+            // 摘要必填：交真实 tarball 的 sha256。
+            "sha256": crate::infra::bytes_sha256_hex(
+                &std::fs::read(&tarball).expect("read tarball")
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let recorded: serde_json::Value = decode_json_response(response).await;
+    let package_id = recorded["package_id"]
+        .as_str()
+        .expect("package_id")
+        .to_string();
+    assert!(package_id.starts_with("kbp-"), "{package_id}");
+    assert_eq!(recorded["active"], false);
+    assert_eq!(recorded["available"], true);
+    assert_eq!(
+        recorded["catalog_version"],
+        serde_json::json!(crate::test_support::real_catalog_version())
+    );
+
+    // 内容照旧：还是测试夹具那一版（catalog_version = 1）。
+    let view = get_view(&state, "/api/v1/admin/content").await;
+    assert_eq!(view["catalog_version"], 1);
+
+    // ② 激活 → 内容**当场**变，同一个 state 不重启。
+    let activate_uri = format!("/api/v1/admin/knowledge/packages/{package_id}/activate");
+    let response = post_to_state(
+        &state,
+        &activate_uri,
+        &serde_json::json!({ "requested_by": "tester" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view = get_view(&state, "/api/v1/admin/content").await;
+    assert_eq!(
+        view["catalog_version"],
+        serde_json::json!(crate::test_support::real_catalog_version())
+    );
+
+    // ③ 生效视图：来源是包、世代 1、留痕一条（首次激活 `from_package` 为空）。
+    let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
+    assert_eq!(knowledge["source"], "package");
+    assert_eq!(knowledge["generation"], 1);
+    assert_eq!(knowledge["package_id"], package_id);
+    assert_eq!(
+        knowledge["purpose_version"],
+        crate::test_support::real_purpose_version()
+    );
+    assert_eq!(knowledge["policy_version"], 1);
+    assert!(knowledge["hint"].is_null(), "有内容时不该再提示空载");
+    assert_eq!(knowledge["activations"][0]["reason"], "activate");
+    assert!(knowledge["activations"][0]["from_package"].is_null());
+
+    // ④ 回滚（这里指回同一版）：世代继续前进，**不是**回到 1 —— 否则“哪一代算的”会重复。
+    let response = post_to_state(
+        &state,
+        &activate_uri,
+        &serde_json::json!({ "reason": "rollback", "requested_by": "tester" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
+    assert_eq!(knowledge["generation"], 2);
+    assert_eq!(knowledge["activations"][0]["reason"], "rollback");
+    assert_eq!(knowledge["activations"][0]["from_package"], package_id);
+
+    // ⑤ “谁还锁在旧版目录”可读（换版不追改在跑的工作）。
+    let locks = get_view(&state, "/api/v1/admin/knowledge/locks").await;
+    assert_eq!(
+        locks["active_catalog_version"],
+        serde_json::json!(crate::test_support::real_catalog_version())
+    );
+    assert!(locks["locks"].is_array());
+}
+
+/// `activate: true` 的一次性路径：录入与切换一趟做完（页面上的「立即激活」）。
+///
+/// 回归的是这条路径曾经 **100% 失败**：`record_package` 交出的 `LoadedKnowledge.source` 还是默认的
+/// `None`，而 `activate_loaded` 只认 `KnowledgeSource::Package`，于是它回 HTTP 500
+/// `{"code":"package_store_failed","message":"内部错误：切的是未登记的包"}`。
+/// 两条激活路径（本接口 / 单独的 `/activate`）的输入必须同形，所以这里把两种情形都钉住：
+/// 全新录入，以及重复录入同一份（幂等 upsert）后的一次性激活。
+#[tokio::test]
+async fn knowledge_record_can_activate_in_one_shot() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let root = crate::test_support::unique_temp_dir("wist-knowledge-one-shot");
+    let tarball = crate::test_support::knowledge_package_tarball(&root, false);
+    let body = serde_json::json!({
+        "source": tarball.to_string_lossy(),
+        "sha256": crate::infra::bytes_sha256_hex(&std::fs::read(&tarball).expect("read tarball")),
+        "activate": true,
+        "requested_by": "tester",
+    });
+
+    // ① 录完即生效：同一个请求里既登记又切换。
+    let response = post_to_state(&state, "/api/v1/admin/knowledge/packages", &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let recorded: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(recorded["active"], true, "一次性路径应当录完就生效");
+    let package_id = recorded["package_id"]
+        .as_str()
+        .expect("package_id")
+        .to_string();
+
+    // 内容当场就是包里的那一版（不重启），且留痕是 activate。
+    let content = get_view(&state, "/api/v1/admin/content").await;
+    assert_eq!(
+        content["catalog_version"],
+        serde_json::json!(crate::test_support::real_catalog_version())
+    );
+    let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
+    assert_eq!(knowledge["source"], "package");
+    assert_eq!(knowledge["generation"], 1);
+    assert_eq!(knowledge["package_id"], package_id);
+    assert_eq!(knowledge["activations"][0]["reason"], "activate");
+
+    // ② 同一份再录一次（幂等 upsert）也仍然能一次性激活 —— 这半边盖的是
+    //    「记录已存在，但交出去的 `loaded` 仍要带上 `Package` 标签」。
+    let response = post_to_state(&state, "/api/v1/admin/knowledge/packages", &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let knowledge = get_view(&state, "/api/v1/admin/knowledge").await;
+    assert_eq!(knowledge["generation"], 2);
+    assert_eq!(knowledge["activations"][0]["from_package"], package_id);
+}
+
+/// 空载：`configured: false` + 一句"怎么办"（I5：空载要看得见，不能是 503 哑谜）。
+#[tokio::test]
+async fn knowledge_view_reports_the_unconfigured_state_with_a_hint() {
+    let env = TestEnv::new_without_content().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let view = get_view(&state, "/api/v1/admin/knowledge").await;
+    assert_eq!(view["configured"], false);
+    assert_eq!(view["source"], "none");
+    assert_eq!(view["generation"], 0);
+    let hint = view["hint"].as_str().expect("空载必须给出怎么办");
+    assert!(hint.contains("录入一个包"), "{hint}");
+}
+
+/// 错误要能被机器分支：正文带 `code`，状态码按"谁能修"分。
+#[tokio::test]
+async fn knowledge_endpoints_report_actionable_error_codes() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages",
+        &serde_json::json!({ "source": "relative/path.tar.gz", "sha256": "a".repeat(64) }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "package_source_invalid");
+
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages/kbp-nope/activate",
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "package_not_found");
+
+    let response = get_from_state(&state, "/api/v1/admin/knowledge/packages/kbp-nope").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// 只抬**整表版本**、分册 id 一字不改 —— 这正是"改了内容却忘了改分册 id"那条路。
+/// 断言落库的建议真的重算了（而不是靠时间戳之类的旁证）。
+#[tokio::test]
+async fn agent_purpose_route_recomputes_when_only_the_purpose_version_changes() {
+    let env = TestEnv::new_with_purpose_rules(Some(TEST_PURPOSE_RULES)).await;
+    enroll_agent_credential(&env).await;
+    post_facts(&env, &fact_report(&["xcodebuild"])).await;
+    assert_eq!(
+        get_purpose_view(&env, "agent-node-a").await["suggestion"]["rule_set_id"],
+        "macos-v1"
+    );
+    let recorded = env
+        .store_handle
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("read suggestion")
+        .expect("suggestion");
+    assert_eq!(recorded.purpose_version, Some(1));
+
+    // 内容改了、版本抬了、分册 id 没动：旧行必须被判成过期并重算。
+    let v2 = TEST_PURPOSE_RULES.replace("purpose_version = 1", "purpose_version = 2");
+    assert_ne!(v2, TEST_PURPOSE_RULES, "夹具里应当有 purpose_version");
+    let with_v2 = config_with_purpose_rules(&env, &v2);
+    let response = get_to_router(
+        &with_v2,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/purpose",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["suggestion"]["rule_set_id"], "macos-v1");
+
+    let recomputed = env
+        .store_handle
+        .get_purpose_suggestion("agent-node-a")
+        .await
+        .expect("read suggestion")
+        .expect("suggestion");
+    assert_eq!(
+        recomputed.purpose_version,
+        Some(2),
+        "版本抬了就必须重算并把新版本记下来"
+    );
+}
+
+/// 接入请求通道：admin 提交 → gwlinkd 环回拉取 → 回报结果 → 终态；环回限定。
+#[tokio::test]
+async fn gateway_link_request_flow_round_trips() {
+    use std::net::SocketAddr;
+
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let env = TestEnv::new().await;
+    // 接入待办只挂进程内存：留一份 `ApiState` 句柄直接读它。
+    let state = super::build_state(env.config.clone(), env.store_handle.clone());
+    let app = super::router_with_state(state.clone());
+    let loopback = || MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    // 1. admin 提交（含地址 + 券 + CA）。
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/gateway/link-request")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "gateway_id": "gw-1",
+                        "center_endpoint": "https://center.example",
+                        "link_token": "link_abc",
+                        "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\n",
+                        "requested_by": "admin",
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["has_request"], true);
+    assert_eq!(view["status"], "Pending");
+    // admin 视图**不得**回传券与 CA。
+    assert!(view.get("link_token").is_none());
+    assert!(view.get("trust_bundle_pem").is_none());
+
+    // 2. gwlinkd 环回拉取：拿到券与 CA，Pending → Connecting。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["has_request"], true);
+    assert_eq!(body["link_token"], "link_abc");
+    assert_eq!(body["status"], "Connecting");
+
+    // 3. 非环回拒绝。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request
+        .extensions_mut()
+        .insert(MockConnectInfo(SocketAddr::from(([192, 0, 2, 1], 40_001))));
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // 4. 回报 Connected → 清掉明文券。
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/link-result")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "gateway_id": "gw-1", "status": "Connected", "detail": "" })
+                .to_string(),
+        ))
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 5. 终态：环回不再派发待办，页面看到 Connected。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["has_request"], false);
+
+    let stored = state.link_request.lock().unwrap().clone().expect("request");
+    assert_eq!(stored.status, "Connected");
+    assert!(stored.link_token.is_empty(), "消费后必须清掉明文券");
+
+    // admin 视图走**同一张 app**（同一份内存态）——接入待办不落库，另起 router 会读不到。
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/gateway/link-request")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["status"], "Connected");
+}
+
+/// CA 信任锚仅对 **https** 中心必需：http 明文可省；https 无 CA 则 400（不得静默回落）。
+#[tokio::test]
+async fn link_request_ca_is_required_only_for_https_centers() {
+    let env = TestEnv::new().await;
+    let app = router(env.config.clone(), env.store_handle.clone());
+
+    async fn post(app: axum::Router, body: serde_json::Value) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/gateway/link-request")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+        .status()
+    }
+
+    // http 明文中心 + 无 CA → 接受。
+    let http = post(
+        app.clone(),
+        serde_json::json!({
+            "gateway_id": "gw-http",
+            "center_endpoint": "http://center.local:3100",
+            "link_token": "link_http",
+            "trust_bundle_pem": "",
+        }),
+    )
+    .await;
+    assert_eq!(http, StatusCode::OK, "http 明文中心无需 CA");
+
+    // https 中心 + 无 CA → 拒绝（不允许静默回落到系统根）。
+    let https = post(
+        app.clone(),
+        serde_json::json!({
+            "gateway_id": "gw-https",
+            "center_endpoint": "https://center.example",
+            "link_token": "link_https",
+            "trust_bundle_pem": "",
+        }),
+    )
+    .await;
+    assert_eq!(https, StatusCode::BAD_REQUEST, "https 中心必须带 CA");
+}
+
+/// 终态 `Failed` 不再派发（避免 gwlinkd 用同一张已消费的券反复重试）。
+#[tokio::test]
+async fn gateway_link_request_failed_is_not_reserved() {
+    use std::net::SocketAddr;
+
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let env = TestEnv::new().await;
+    // 直接种一条 Pending 待办到进程内存（绕过 admin 面，聚焦状态机）。
+    let state = super::build_state(env.config.clone(), env.store_handle.clone());
+    *state.link_request.lock().unwrap() = Some(super::link_request::LinkRequest {
+        gateway_id: "gw-1".to_string(),
+        center_endpoint: "https://center.example".to_string(),
+        link_token: "link_abc".to_string(),
+        trust_bundle_pem: "CA".to_string(),
+        status: "Pending".to_string(),
+        result_detail: String::new(),
+        requested_by: "admin".to_string(),
+        requested_at: "t".to_string(),
+        updated_at: "t".to_string(),
+    });
+
+    let app = super::router_with_state(state.clone());
+    let loopback = || MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    // gwlinkd 拉一次 → Connecting。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let body: serde_json::Value =
+        decode_json_response(app.clone().oneshot(request).await.expect("route response")).await;
+    assert_eq!(body["has_request"], true);
+
+    // 回报 Failed → 变终态。
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/link-result")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "gateway_id": "gw-1", "status": "Failed", "detail": "bad token" })
+                .to_string(),
+        ))
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 再拉：不再派发。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let body: serde_json::Value =
+        decode_json_response(app.clone().oneshot(request).await.expect("route response")).await;
+    assert_eq!(body["has_request"], false, "Failed 不应再被派发");
+}
+
+/// 重提覆盖（单例）：admin 再次提交 → 状态回到 Pending、券被替换；未知 result status → 400。
+#[tokio::test]
+async fn gateway_link_request_admin_overwrite_and_bad_result_status() {
+    use std::net::SocketAddr;
+
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), env.store_handle.clone());
+    let app = super::router_with_state(state.clone());
+    let loopback = || MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    async fn post_admin(app: axum::Router, body: serde_json::Value) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/gateway/link-request")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+        .status()
+    }
+
+    let first = post_admin(
+        app.clone(),
+        serde_json::json!({
+            "gateway_id": "gw-1",
+            "center_endpoint": "https://center.example",
+            "link_token": "link_first",
+            "trust_bundle_pem": "CA",
+        }),
+    )
+    .await;
+    assert_eq!(first, StatusCode::OK);
+
+    // gwlinkd 拉一次 → Connecting（证明再提交前确实有非 Pending 的旧待办）。
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/gateway/link-request")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let _ = app.clone().oneshot(request).await.expect("route response");
+
+    // 重提（新券）→ 覆盖，状态回 Pending。
+    let second = post_admin(
+        app.clone(),
+        serde_json::json!({
+            "gateway_id": "gw-1",
+            "center_endpoint": "https://center.example",
+            "link_token": "link_second",
+            "trust_bundle_pem": "CA",
+        }),
+    )
+    .await;
+    assert_eq!(second, StatusCode::OK);
+    {
+        let guard = state.link_request.lock().unwrap();
+        let stored = guard.as_ref().expect("request");
+        assert_eq!(stored.link_token, "link_second", "重提应替换券");
+        assert_eq!(stored.status, "Pending", "重提应回到 Pending");
+    }
+
+    // 未知 result status → 400。
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/link-result")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "gateway_id": "gw-1", "status": "Bogus" }).to_string(),
+        ))
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// gwlinkd 状态通道：环回心跳 → 网关存储 → admin 视图（含 `age_seconds` / `stale`）；环回限定。
+#[tokio::test]
+async fn gateway_linkd_status_heartbeat_round_trips() {
+    use std::net::SocketAddr;
+
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let env = TestEnv::new().await;
+    let app = router(env.config.clone(), env.store_handle.clone());
+    let loopback = || MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000)));
+
+    // 1. 从未上报 → has_status=false（页面显示「未检测到 gwlinkd」）：空态也是全字段契约。
+    let view: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/gateway/linkd-status").await).await;
+    assert_eq!(view["has_status"], false);
+    assert_eq!(view["stale"], false, "从未有过 ≠ 失联");
+    assert_eq!(view["age_seconds"], 0);
+
+    // 2. gwlinkd 环回心跳（无密钥载荷）。
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/linkd-status")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "gateway_id": "GX01",
+                "instance_id": "GX01/inst-1",
+                "version": "0.4.0",
+                "gops_version": "2.4.0",
+                "gx_version": "0.17.0",
+                "center_endpoint": "https://center.example",
+                "state": "Linked",
+                "credential_expires_at": "2026-12-01T00:00:00Z",
+                "last_center_report_at": "2026-10-05T00:00:00Z",
+                "reported_at": "2026-10-05T00:00:00Z",
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    request.extensions_mut().insert(loopback());
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(accepted["gateway_id"], "GX01");
+    assert!(
+        accepted["received_at"].is_string(),
+        "受理回执要给网关收讫时刻"
+    );
+
+    // 3. admin 读回：新鲜 → stale=false（失联判定走**网关时钟**的 received_at）。
+    let view: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/gateway/linkd-status").await).await;
+    assert_eq!(view["has_status"], true);
+    assert_eq!(view["state"], "Linked");
+    assert_eq!(view["gateway_id"], "GX01");
+    assert_eq!(view["gops_version"], "2.4.0");
+    assert_eq!(view["gx_version"], "0.17.0");
+    assert_eq!(view["center_endpoint"], "https://center.example");
+    assert_eq!(view["stale"], false, "刚心跳不算失联");
+    let age = view["age_seconds"].as_i64().expect("i64");
+    assert!((0..=5).contains(&age), "刚写进去，age 应在 [0,5]：{age}");
+
+    // 3b. 心跳轨迹（页面「最近 1 小时稳不稳」）：刚那一拍应出现在窗口内。
+    let history: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/gateway/linkd-status/history").await)
+            .await;
+    assert_eq!(history["window_seconds"], 3600, "缺省窗口 = 1h：{history}");
+    let samples = history["samples"].as_array().expect("samples");
+    assert_eq!(samples.len(), 1, "刚报了一拍，轨迹应有一条：{history}");
+    assert_eq!(samples[0]["state"], "Linked");
+    assert!(samples[0]["at"].is_i64(), "时刻是 unix 秒：{history}");
+
+    // 3c. 窗口可调且被夹到 [60, 保留窗口]。
+    let tiny: serde_json::Value = decode_json_response(
+        get_admin(
+            &env,
+            "/api/v1/admin/gateway/linkd-status/history?window_seconds=1",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(tiny["window_seconds"], 60, "过小的窗口应夹到 60s：{tiny}");
+
+    // 4. 非环回拒绝（与 link-request / self-state 同口径）。
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/gateway/linkd-status")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "gateway_id": "GX01" }).to_string(),
+        ))
+        .expect("request");
+    request
+        .extensions_mut()
+        .insert(MockConnectInfo(SocketAddr::from(([192, 0, 2, 1], 40_001))));
+    let response = app.clone().oneshot(request).await.expect("route response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // 5. admin 面要 bearer：没带 token → 401（状态不可匿名读）。
+    let unauthorized = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/gateway/linkd-status",
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    // 6. **错误**的 bearer 同样 401（不是只认「有没有带」）。
+    let wrong = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/gateway/linkd-status",
+        Some("adm_wrong_token"),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    // 7. 轨迹口同样要 bearer（没带 → 401）。
+    let unauthorized_history = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/gateway/linkd-status/history",
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized_history.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 网关**自身**状态读口（页面）：admin bearer → 200 且全键契约；无 token → 401；
+/// 环回自述面（`/api/v1/gateway/self-state`）非环回仍 403（不被 admin 读口放宽）。
+#[tokio::test]
+async fn admin_reads_gateway_self_state_but_loopback_face_stays_private() {
+    let env = TestEnv::new().await;
+
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/gateway/self-state?gateway_id=gw-1").await,
+    )
+    .await;
+    for key in [
+        "gateway_id",
+        "version",
+        "collected_at",
+        "store_healthy",
+        "agent_count",
+        "last_error",
+    ] {
+        assert!(view.get(key).is_some(), "缺 {key}: {view}");
+    }
+    assert_eq!(view["gateway_id"], "gw-1", "原样回显调用方给的 id");
+    assert_eq!(view["store_healthy"], true, "空库应可查（健康）");
+
+    // 无 token → 401。
+    let unauthorized = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/gateway/self-state",
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    // 环回面：不带环回连接信息的请求仍被拒（admin 读口不影响它的私密性）。
+    let response = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/gateway/self-state?gateway_id=gw-1")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// 网关自述状态**轨迹**读口：采样落表后能读回（值原样，量不出的是 `null`）；窗口被夹；无 token → 401。
+#[tokio::test]
+async fn admin_reads_gateway_self_state_history() {
+    let env = TestEnv::new().await;
+    let now = chrono::Utc::now().timestamp();
+    env.store_handle
+        .append_gateway_self_state_sample(
+            &crate::infra::StoredGatewaySelfStateSample {
+                at_seconds: now,
+                cpu_percent: Some(1.5),
+                memory_bytes: Some(64 * 1024 * 1024),
+                load_1m: Some(0.42),
+                online_agents: 3,
+                disk_usage_percent: None,
+            },
+            // 写入时裁旧：保留窗口（2h），刚采的这条不会把自己裁掉。
+            now - 7200,
+        )
+        .await
+        .expect("append sample");
+
+    let view: serde_json::Value =
+        decode_json_response(get_admin(&env, "/api/v1/admin/gateway/self-state/history").await)
+            .await;
+    assert_eq!(view["window_seconds"], 3600, "缺省窗口 = 1h：{view}");
+    let samples = view["samples"].as_array().expect("samples");
+    assert_eq!(samples.len(), 1, "刚采的一拍应读回：{view}");
+    assert_eq!(samples[0]["cpu_percent"], 1.5);
+    assert_eq!(samples[0]["online_agents"], 3);
+    assert!(
+        samples[0]["disk_usage_percent"].is_null(),
+        "量不出应是 null（不是缺键、也不是 0）：{view}"
+    );
+    assert!(samples[0]["at"].is_i64(), "时刻是 unix 秒：{view}");
+
+    // 窗口可调且被夹到 [60s, 2h]。
+    let tiny: serde_json::Value = decode_json_response(
+        get_admin(
+            &env,
+            "/api/v1/admin/gateway/self-state/history?window_seconds=1",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(tiny["window_seconds"], 60, "过小的窗口应夹到 60s：{tiny}");
+
+    // admin 面要 bearer（状态轨迹不可匿名读）。
+    let unauthorized = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/gateway/self-state/history",
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 网关版本端点（公开）：命中 200 + `{version}`，且**不带任何凭据**也能拿到 —— 页面左下角
+/// 在未登录时也要显示后端版本（见 api/version.rs）。
+#[tokio::test]
+async fn version_route_is_public_and_reports_a_non_empty_version() {
+    let env = TestEnv::new_without_package().await;
+    let response = get_to_router(&env.config, &env.store_handle, "/api/v1/version", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let version = body["version"].as_str().unwrap_or("");
+    assert!(
+        !version.is_empty(),
+        "缺省 `version` 必须非空（页面据此显示后端版本）：{body}"
+    );
+    // 全栈版本可选：stack 没挂 `version.txt` 时不返回；一旦返回就必须是非空字符串。
+    match body.get("stack_version") {
+        None => {}
+        Some(value) => assert!(
+            value.as_str().is_some_and(|value| !value.trim().is_empty()),
+            "`stack_version` 要么不出现，要么是非空字符串：{body}"
+        ),
+    }
+}
+
+/// 容器部署的准入（`[server] self_face_allow`）：列出的那个对端按「本机」放行，
+/// 同网段的**别的**地址与外部地址仍 403 —— 这条钉住「放宽只放宿主、不外扩」。
+#[tokio::test]
+async fn gateway_loopback_face_allows_the_configured_peer_and_rejects_the_rest() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new().await;
+    let mut config = env.config.clone();
+    // 就是容器里「宿主那一跳」的样子：对端 = 网络网关（这里显式列入放行）。
+    config.self_face_allow = vec![crate::infra::IpNet::parse("172.28.0.1").expect("ip")];
+    let store = env.store_handle.clone();
+
+    let request = |addr: SocketAddr| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/gateway/self-state?gateway_id=gw-1")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(MockConnectInfo(addr));
+        request
+    };
+
+    let allowed = router(config.clone(), Arc::clone(&store))
+        .oneshot(request(SocketAddr::from(([172, 28, 0, 1], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(allowed.status(), StatusCode::OK, "列出的本机对端必须放行");
+
+    // 同网段的**别的**地址（别的容器）不是本机 —— 放行的是那一个地址，不是整网段。
+    let sibling = router(config.clone(), Arc::clone(&store))
+        .oneshot(request(SocketAddr::from(([172, 28, 0, 9], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(sibling.status(), StatusCode::FORBIDDEN);
+
+    let external = router(config, store)
+        .oneshot(request(SocketAddr::from(([203, 0, 113, 9], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(external.status(), StatusCode::FORBIDDEN);
+}
+
+/// 不外扩：环回面（这里以自述面为代表）对外部地址与**取不到 peer** 都 fail-closed。
+#[tokio::test]
+async fn gateway_loopback_face_rejects_non_local_and_unknown_peers() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new().await;
+
+    let request = |addr: Option<SocketAddr>| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/gateway/self-state?gateway_id=gw-1")
+            .body(Body::empty())
+            .expect("request");
+        if let Some(addr) = addr {
+            request.extensions_mut().insert(MockConnectInfo(addr));
+        }
+        request
+    };
+
+    let remote = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(request(Some(SocketAddr::from(([192, 0, 2, 7], 40_000)))))
+        .await
+        .expect("response");
+    assert_eq!(remote.status(), StatusCode::FORBIDDEN, "非本机不得读自述面");
+
+    // 取不到 peer（没注入连接信息）→ 也拒绝，不因「没连接信息」就放行。
+    let unknown = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(request(None))
+        .await
+        .expect("response");
+    assert_eq!(unknown.status(), StatusCode::FORBIDDEN);
+}
+
+/// 容器部署的**自动**准入（B 方案的主体）：对端 = 容器默认网关（= 宿主那一跳）时环回面也放行，
+/// 而同网段的**别的**容器仍拒。这里用显式装配的 `ApiState` 把「探到的网关按名单收」钉住。
+#[tokio::test]
+async fn gateway_loopback_face_accepts_the_container_gateway_peer() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    let env = TestEnv::new().await;
+    let mut state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    // 模拟「容器里探到默认网关 172.17.0.1」：`resolve` 在容器里就是这么填的。
+    state.local_peers = LocalPeers::new(Some("172.17.0.1".parse().expect("ip")), Vec::new());
+    let app = super::router_with_state(state);
+
+    let request = |addr: SocketAddr| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/gateway/self-state?gateway_id=gw-1")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(MockConnectInfo(addr));
+        request
+    };
+
+    let host = app
+        .clone()
+        .oneshot(request(SocketAddr::from(([172, 17, 0, 1], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(
+        host.status(),
+        StatusCode::OK,
+        "容器默认网关 = 宿主，必须放行"
+    );
+
+    // 同网段的**别的**地址（别的容器）不是本机。
+    let sibling = app
+        .oneshot(request(SocketAddr::from(([172, 17, 0, 2], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(sibling.status(), StatusCode::FORBIDDEN);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 采集预检（collection preflight）：网关发起 → 机器自己探 → 网关给结论
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 预检用例的内容目录：容器面在 Linux 上的**两个互斥单元**（k8s 节点 / 纯 Docker）。
+///
+/// 与真实知识库同形（`wist-knowledge/catalog.toml` 里那两条），但不依赖跨仓数据：
+/// 这里要钉的是**求值链与视图**，不是策展内容本身。
+const PREFLIGHT_CATALOG: &str = r#"
+catalog_version = 3
+origin = "Gateway"
+published_at = "2026-10-01T00:00:00Z"
+
+[[units]]
+unit_id = "mac-metrics"
+family = "HostMetrics"
+capability = "collect_metrics"
+platform = "macos"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "none"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+
+[[units]]
+unit_id = "linux-container-stdout"
+family = "ContainerWorkload"
+capability = "collect_logs"
+platform = "linux"
+match = "path_exists:/var/log/containers"
+rule_ref = ""
+requires_privilege = "root"
+status = "active"
+
+[[units.sources]]
+kind = "FileGlob"
+target = "/var/log/containers/*.log"
+
+[[units]]
+unit_id = "linux-docker-container-stdout"
+family = "ContainerWorkload"
+capability = "collect_logs"
+platform = "linux"
+match = "path_exists:/var/lib/docker/containers;not_path_exists:/var/log/containers"
+rule_ref = ""
+requires_privilege = "root"
+status = "active"
+
+[[units.sources]]
+kind = "FileGlob"
+target = "/var/lib/docker/containers/*/*-json.log*"
+"#;
+
+const PREFLIGHT_PACKS: &str = r#"
+[[pack]]
+pack_id = "macos-base"
+platform = "macos"
+kind = "Baseline"
+families = ["HostMetrics"]
+unit_refs = ["mac-metrics"]
+catalog_version = 3
+status = "active"
+
+[[pack]]
+pack_id = "linux-containers"
+platform = "linux"
+kind = "Baseline"
+families = ["ContainerWorkload"]
+unit_refs = ["linux-container-stdout", "linux-docker-container-stdout"]
+catalog_version = 3
+status = "active"
+"#;
+
+const PREFLIGHT_TEMPLATES: &str = r#"
+[[template]]
+template_id = "linux-host"
+machine_class = "LinuxHost"
+platform = "linux"
+pack_refs = ["linux-containers"]
+catalog_version = 3
+template_version = 1
+status = "active"
+"#;
+
+const DOCKER_ROOT: &str = "/var/lib/docker/containers";
+const K8S_LOG_DIR: &str = "/var/log/containers";
+
+impl TestEnv {
+    /// 容器面的内容目录（预检用例专用）。
+    async fn new_with_container_content() -> Self {
+        let mut env = Self::new().await;
+        let dir = env._root.join("content");
+        std::fs::create_dir_all(&dir).expect("create content dir");
+        let catalog = dir.join("catalog.toml");
+        std::fs::write(&catalog, PREFLIGHT_CATALOG).expect("write catalog");
+        let packs = dir.join("packs.toml");
+        std::fs::write(&packs, PREFLIGHT_PACKS).expect("write packs");
+        let templates = dir.join("templates.toml");
+        std::fs::write(&templates, PREFLIGHT_TEMPLATES).expect("write templates");
+        env.config.content_catalog_file = Some(catalog);
+        env.config.content_packs_file = Some(packs);
+        env.config.content_templates_file = Some(templates);
+        env
+    }
+}
+
+/// 一台 Linux 机器：注册 + 上报 linux 事实 + 人工判定（分类必须与事实平台一致）。
+async fn linux_agent_classified(env: &TestEnv, machine_class: &str) {
+    enroll_agent_credential(env).await;
+    assert_eq!(
+        post_facts(
+            env,
+            &fact_report_for("agent-node-a", "node-a", "linux", "x86_64", &[])
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/classification",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "machine_class": machine_class }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// 模拟 agentd 回传的路径实测（网关落库的那一条）。
+async fn seed_path_probe(
+    env: &TestEnv,
+    observed_at: &str,
+    probed: &[&str],
+    present: &[&str],
+) -> crate::infra::StoredAgentPathProbe {
+    let probe = crate::infra::StoredAgentPathProbe {
+        agent_id: "agent-node-a".to_string(),
+        observed_at: observed_at.to_string(),
+        probed_paths: probed.iter().map(|value| value.to_string()).collect(),
+        present_paths: present.iter().map(|value| value.to_string()).collect(),
+        unreadable_paths: Vec::new(),
+        received_at: observed_at.to_string(),
+    };
+    env.store
+        .upsert_agent_path_probe(&probe)
+        .await
+        .expect("store path probe");
+    probe
+}
+
+async fn get_preflight(env: &TestEnv, agent_id: &str) -> serde_json::Value {
+    let response = get_admin(
+        env,
+        &format!("/api/v1/admin/agents/{agent_id}/collection-preflight"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+async fn run_preflight(env: &TestEnv, agent_id: &str) -> serde_json::Value {
+    // 无 body 的 POST（「让机器再探一次」不需要参数）。
+    let response = router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/admin/agents/{agent_id}/collection-preflight"
+                ))
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+async fn post_preflight_report(
+    env: &TestEnv,
+    identity: Option<&str>,
+    body: &serde_json::Value,
+) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/collection-preflight",
+        identity,
+        body,
+    )
+    .await
+}
+
+fn family_state(view: &serde_json::Value) -> &str {
+    view["families"][0]["state"].as_str().expect("family state")
+}
+
+fn unit_result<'a>(view: &'a serde_json::Value, unit_id: &str) -> &'a serde_json::Value {
+    view["families"][0]["units"]
+        .as_array()
+        .expect("units")
+        .iter()
+        .find(|unit| unit["unit_id"] == unit_id)
+        .unwrap_or_else(|| panic!("missing unit {unit_id}: {view}"))
+}
+
+#[tokio::test]
+async fn collection_preflight_selects_the_docker_unit_when_only_the_docker_root_exists() {
+    // 现场那两台机器就是这个形状：docker/containerd 在跑、没有 k8s。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    seed_path_probe(
+        &env,
+        "2026-10-26T00:00:00Z",
+        &[K8S_LOG_DIR, DOCKER_ROOT],
+        &[DOCKER_ROOT],
+    )
+    .await;
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["verdict"], "grantable", "{view}");
+    assert_eq!(view["machine_class"], "LinuxHost");
+    assert_eq!(view["platform"], "linux");
+    assert!(view["undetermined_reason"].is_null(), "{view}");
+    assert!(
+        view["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("都可授权")
+    );
+    // 结论来自**本机实测**，不是那份可能过期的摘要。
+    assert_eq!(view["probe"]["source"], "probe");
+    assert_eq!(view["probe"]["pending"], false);
+    assert_eq!(
+        view["probe"]["probed_paths"],
+        serde_json::json!([K8S_LOG_DIR, DOCKER_ROOT])
+    );
+    assert!(view["probe"]["not_probed_paths"].is_null(), "{view}");
+
+    assert_eq!(family_state(&view), "grantable");
+    assert!(view["families"][0]["reason"].is_null());
+    assert_eq!(
+        view["families"][0]["selected_units"],
+        serde_json::json!(["linux-docker-container-stdout"])
+    );
+
+    // 证据：每个单元都给出结论与实测值，而不是只报一个「没命中」。
+    let k8s = unit_result(&view, "linux-container-stdout");
+    assert_eq!(k8s["result"], "match_unsatisfied");
+    assert_eq!(k8s["paths"][0]["path"], K8S_LOG_DIR);
+    assert_eq!(k8s["paths"][0]["state"], "absent");
+
+    let docker = unit_result(&view, "linux-docker-container-stdout");
+    assert_eq!(docker["result"], "selected");
+    assert_eq!(docker["paths"][0]["path"], DOCKER_ROOT);
+    assert_eq!(docker["paths"][0]["state"], "present");
+}
+
+#[tokio::test]
+async fn collection_preflight_reports_absent_when_both_directories_were_probed_and_missing() {
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    seed_path_probe(
+        &env,
+        "2026-10-26T00:00:00Z",
+        &[K8S_LOG_DIR, DOCKER_ROOT],
+        &[],
+    )
+    .await;
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["verdict"], "blocked", "{view}");
+    assert_eq!(family_state(&view), "absent");
+    // 一句话里说清「哪条路径没有」——这是现场唯一要拿去核对的事实。
+    assert!(
+        view["families"][0]["reason"]
+            .as_str()
+            .expect("reason")
+            .contains(K8S_LOG_DIR),
+        "{view}"
+    );
+    assert_eq!(
+        unit_result(&view, "linux-docker-container-stdout")["result"],
+        "match_unsatisfied"
+    );
+}
+
+#[tokio::test]
+async fn collection_preflight_reports_unprobed_when_nothing_was_probed() {
+    // 「不知道」必须与「确认没有」分开：前者要再探一次，后者要换机器/换面。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["verdict"], "blocked", "{view}");
+    assert_eq!(view["probe"]["source"], "reported");
+    assert_eq!(family_state(&view), "unprobed");
+    assert!(
+        view["families"][0]["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("还没探过"),
+        "{view}"
+    );
+    // 目录要探的路径一条都没探到 —— 这就是「该再探一次」的判据。
+    assert_eq!(
+        view["probe"]["not_probed_paths"],
+        serde_json::json!([DOCKER_ROOT, K8S_LOG_DIR])
+    );
+    assert_eq!(
+        unit_result(&view, "linux-container-stdout")["paths"][0]["state"],
+        "unprobed"
+    );
+}
+
+#[tokio::test]
+async fn collection_preflight_reports_unreadable_apart_from_unprobed() {
+    // 探不了（权限）与没探过是两件事：前者该去要权限，后者再点一次就行。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    env.store
+        .upsert_agent_path_probe(&crate::infra::StoredAgentPathProbe {
+            agent_id: "agent-node-a".to_string(),
+            observed_at: "2026-10-26T00:00:00Z".to_string(),
+            probed_paths: vec![K8S_LOG_DIR.to_string()],
+            present_paths: vec![],
+            unreadable_paths: vec![crate::infra::UnreadablePath {
+                path: DOCKER_ROOT.to_string(),
+                error: "permission denied".to_string(),
+            }],
+            received_at: "2026-10-26T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("store path probe");
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(family_state(&view), "unreadable", "{view}");
+    let reason = view["families"][0]["reason"].as_str().expect("reason");
+    assert!(reason.contains("探不了"), "{reason}");
+    assert!(reason.contains("permission denied"), "{reason}");
+    assert_eq!(
+        unit_result(&view, "linux-docker-container-stdout")["result"],
+        "unreadable"
+    );
+    // 探不了的路径不算「没探到」——否则永远在重试同一个不可能成功的探测。
+    assert!(view["probe"]["not_probed_paths"].is_null(), "{view}");
+}
+
+#[tokio::test]
+async fn collection_preflight_falls_back_to_the_reported_summary_before_a_probe() {
+    // 没预检过也能答（用事实证明里的路径），只是会标 `source = reported` 且可能过期。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let mut report = fact_report_for("agent-node-a", "node-a", "linux", "x86_64", &[]);
+    report.probed_paths = vec![K8S_LOG_DIR.to_string(), DOCKER_ROOT.to_string()];
+    report.present_paths = vec![DOCKER_ROOT.to_string()];
+    report.content_digest = digest_of(&report);
+    assert_eq!(
+        post_facts(&env, &report).await.status(),
+        StatusCode::ACCEPTED
+    );
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["verdict"], "grantable", "{view}");
+    assert_eq!(view["probe"]["source"], "reported");
+    // 2026-09-22 上报、今天才看 —— 必须标过期，否则人会以为「刚探过」。
+    assert_eq!(view["probe"]["stale"], true);
+}
+
+#[tokio::test]
+async fn collection_preflight_flags_paths_the_catalog_added_after_the_probe() {
+    // 目录换版新增了路径，实测结果还是旧的：如实标进 `not_probed_paths`，不假装探过。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    seed_path_probe(&env, "2026-10-26T00:00:00Z", &[DOCKER_ROOT], &[DOCKER_ROOT]).await;
+
+    let view = get_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(
+        view["probe"]["not_probed_paths"],
+        serde_json::json!([K8S_LOG_DIR])
+    );
+    // 没探到的那条路径上，单元只能是「不知道」。
+    assert_eq!(
+        unit_result(&view, "linux-container-stdout")["result"],
+        "fact_not_collected"
+    );
+}
+
+#[tokio::test]
+async fn collection_preflight_undetermined_reasons_are_machine_readable() {
+    // 答不了的时候，页面要能分别给出「去判定 / 等上报 / 找管理员」三种完全不同的 CTA。
+    let no_content = TestEnv::new_without_content().await;
+    enroll_agent_credential(&no_content).await;
+    let view = get_preflight(&no_content, "agent-node-a").await;
+    assert_eq!(view["verdict"], "undetermined");
+    assert_eq!(view["undetermined_reason"], "no_content");
+
+    let unclassified = TestEnv::new_with_container_content().await;
+    enroll_agent_credential(&unclassified).await;
+    let view = get_preflight(&unclassified, "agent-node-a").await;
+    assert_eq!(view["verdict"], "undetermined");
+    assert_eq!(view["undetermined_reason"], "unclassified");
+
+    let no_facts = TestEnv::new_with_container_content().await;
+    enroll_agent_credential(&no_facts).await;
+    no_facts
+        .store_handle
+        .upsert_agent_classification(&crate::infra::StoredAgentClassification {
+            agent_id: "agent-node-a".to_string(),
+            machine_class: "LinuxHost".to_string(),
+            suggestion_id: None,
+            note: None,
+            decided_by: "test".to_string(),
+            decided_at: "2026-09-22T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("store classification");
+    let view = get_preflight(&no_facts, "agent-node-a").await;
+    assert_eq!(view["verdict"], "undetermined");
+    assert_eq!(view["undetermined_reason"], "no_facts");
+    // 没事实也照样给探测白名单：点一下就能探，不用登录。
+    assert_eq!(
+        view["probe"]["not_probed_paths"],
+        serde_json::Value::Null,
+        "source = none 时不谈「没探到」"
+    );
+}
+
+#[tokio::test]
+async fn collection_preflight_requires_admin_bearer() {
+    let env = TestEnv::new_with_container_content().await;
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/collection-preflight",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn collection_preflight_reports_unknown_agents_as_not_found() {
+    // 打错 agent_id 不该得到一个看起来正常的「未分类」结论。
+    let env = TestEnv::new_with_container_content().await;
+
+    let response = get_admin(&env, "/api/v1/admin/agents/agent-typo/collection-preflight").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "agent_not_found");
+}
+
+#[tokio::test]
+async fn running_a_preflight_enqueues_a_probe_command_with_the_catalog_paths() {
+    // 「点一下」的全部效果：一条待认领命令 + `probe.pending = true`。
+    // 不需要任何人登录 —— agentd 会在下一个状态上报里认领。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let view = run_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["probe"]["pending"], true, "{view}");
+    assert!(
+        view["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("已下发本机探测"),
+        "{view}"
+    );
+
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert_eq!(pending.len(), 1);
+    // 复用 `refresh_facts`：老 agentd 不认识 params 时会退化成整轮重采，仍然能用。
+    assert_eq!(
+        pending[0].kind,
+        wist_api::status::command_kind::REFRESH_FACTS
+    );
+    let params: serde_json::Value = serde_json::from_str(&pending[0].params).expect("params json");
+    assert_eq!(params["scope"], "paths");
+    assert_eq!(
+        params["paths"],
+        serde_json::json!([DOCKER_ROOT, K8S_LOG_DIR])
+    );
+}
+
+#[tokio::test]
+async fn repeated_preflight_requests_supersede_the_pending_one() {
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    run_preflight(&env, "agent-node-a").await;
+    run_preflight(&env, "agent-node-a").await;
+
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert_eq!(pending.len(), 1, "重复点击只保留最后一次");
+}
+
+#[tokio::test]
+async fn a_preflight_report_turns_into_a_conclusion_without_any_login() {
+    // 端到端（去掉网络）：入队 → agent 回传实测 → 页面读到结论。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    assert_eq!(
+        get_preflight(&env, "agent-node-a").await["probe"]["source"],
+        "reported"
+    );
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "observed_at": "2026-10-26T00:00:00Z",
+            "probed_paths": [K8S_LOG_DIR, DOCKER_ROOT],
+            "present_paths": [DOCKER_ROOT],
+            "unreadable_paths": []
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reported: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(reported["verdict"], "grantable", "{reported}");
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["verdict"], "grantable", "{view}");
+    assert_eq!(view["probe"]["source"], "probe");
+    assert_eq!(
+        view["families"][0]["selected_units"],
+        serde_json::json!(["linux-docker-container-stdout"])
+    );
+}
+
+#[tokio::test]
+async fn a_preflight_report_keeps_the_reported_packages() {
+    // 探针只覆盖**路径**维度：`installed:` 类条件必须继续用事实证明里的软件清单，
+    // 否则一次预检就把它们全变成「无法判定」。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "probed_paths": [K8S_LOG_DIR, DOCKER_ROOT],
+            "present_paths": [K8S_LOG_DIR],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+
+    // 选中 k8s 单元；docker 单元被否条件排除 —— 说明只有路径维度被替换。
+    assert_eq!(view["verdict"], "grantable", "{view}");
+    assert_eq!(
+        view["families"][0]["selected_units"],
+        serde_json::json!(["linux-container-stdout"])
+    );
+}
+
+#[tokio::test]
+async fn a_preflight_report_rejects_inconsistent_results() {
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "probed_paths": [K8S_LOG_DIR],
+            "present_paths": [DOCKER_ROOT]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "invalid_preflight_request");
+}
+
+#[tokio::test]
+async fn a_preflight_report_requires_a_certificate_identity() {
+    let env = TestEnv::new_with_container_content().await;
+
+    let response = post_preflight_report(
+        &env,
+        None,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_preflight_report_rejects_a_wrong_kind() {
+    let env = TestEnv::new_with_container_content().await;
+    enroll_agent_credential(&env).await;
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "status_report",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "invalid_preflight_request");
+}
+
+#[tokio::test]
+async fn a_rejected_grant_auto_enqueues_a_probe() {
+    // 现场唯一的入口就是「点了授权、被拒」。这一步顺手把探测命令发下去，
+    // 人下一次重试（≥3s）就拿到实测 —— 不用自己去点预检，更不用登录客户机。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "ContainerWorkload" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert!(
+        pending[0].params.contains("\"scope\":\"paths\""),
+        "{pending:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_grant_does_not_reprobe_when_the_evidence_is_complete() {
+    // 证据已经完整（两条路径都探过、都不在）→ 重探不会改变结论，白跑一趟。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    seed_path_probe(
+        &env,
+        "2026-10-26T00:00:00Z",
+        &[K8S_LOG_DIR, DOCKER_ROOT],
+        &[],
+    )
+    .await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "ContainerWorkload" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert!(pending.is_empty(), "{pending:?}");
+}
+
+#[tokio::test]
+async fn a_grant_uses_the_same_facts_as_the_preflight() {
+    // 预检的全部意义是「先告诉你能不能授」。两边不同源就会出现
+    // 「预检说可以、授权却拒绝」—— 那比没有预检更让人失去信任。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    seed_path_probe(
+        &env,
+        "2026-10-26T00:00:00Z",
+        &[K8S_LOG_DIR, DOCKER_ROOT],
+        &[DOCKER_ROOT],
+    )
+    .await;
+
+    assert_eq!(
+        get_preflight(&env, "agent-node-a").await["verdict"],
+        "grantable"
+    );
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "ContainerWorkload" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // 选中的是 docker 单元 —— 与预检的 `selected_units` 一致。
+    let works = env
+        .store
+        .list_standing_work("agent-node-a")
+        .await
+        .expect("list standing work");
+    assert_eq!(works.len(), 1, "{works:?}");
+    assert!(
+        works[0].spec.contains("linux-docker-container-stdout"),
+        "{}",
+        works[0].spec
+    );
+}
+
+#[tokio::test]
+async fn a_reported_probe_clears_pending_before_the_command_ack_arrives() {
+    // agentd 是「先回传实测、回执跟在下一拍状态上报里（≤3s）」。不区分的话，
+    // 页面会明明已经拿到结论、却还显示「探测中」。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let queued = run_preflight(&env, "agent-node-a").await;
+    assert_eq!(queued["probe"]["pending"], true, "{queued}");
+    assert!(queued["probe"]["pending_since"].is_string(), "{queued}");
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "probed_paths": [K8S_LOG_DIR, DOCKER_ROOT],
+            "present_paths": [DOCKER_ROOT],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 命令还没被 ack（测试里没有状态上报通道），但结果已经回来了。
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["probe"]["pending"], false, "{view}");
+    assert!(view["probe"]["pending_since"].is_null(), "{view}");
+    assert_eq!(view["verdict"], "grantable", "{view}");
+}
+
+#[tokio::test]
+async fn an_out_of_order_probe_does_not_overwrite_a_newer_one() {
+    // 重试 / 双发 / 连点两次都可能让结果乱序到达。谁是“更新”的只有观测时刻能回答。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let newer = serde_json::json!({
+        "api_version": "v1",
+        "kind": "collection_preflight",
+        "agent_id": "agent-node-a",
+        "instance_id": "node-a",
+        "observed_at": "2026-10-26T12:00:00Z",
+        "probed_paths": [K8S_LOG_DIR, DOCKER_ROOT],
+        "present_paths": [DOCKER_ROOT],
+    });
+    assert_eq!(
+        post_preflight_report(&env, Some("agent-node-a"), &newer)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let older = serde_json::json!({
+        "api_version": "v1",
+        "kind": "collection_preflight",
+        "agent_id": "agent-node-a",
+        "instance_id": "node-a",
+        "observed_at": "2026-10-26T11:00:00Z",
+        "probed_paths": [K8S_LOG_DIR, DOCKER_ROOT],
+        "present_paths": [K8S_LOG_DIR],
+    });
+    let response = post_preflight_report(&env, Some("agent-node-a"), &older).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(
+        view["probe"]["observed_at"], "2026-10-26T12:00:00+00:00",
+        "旧的实测不能盖掉新的：{view}"
+    );
+    assert_eq!(
+        view["families"][0]["selected_units"],
+        serde_json::json!(["linux-docker-container-stdout"]),
+        "{view}"
+    );
+}
+
+#[tokio::test]
+async fn a_probe_report_without_observed_at_uses_the_gateway_clock() {
+    // 空时间戳不能变成一个“1970 年探过”的假事实。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "probed_paths": [K8S_LOG_DIR],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["probe"]["stale"], false, "{view}");
+}
+
+#[tokio::test]
+async fn a_preflight_on_a_host_with_no_path_conditions_enqueues_nothing() {
+    // 目录里这个平台没有任何 `path_exists` 条件 → 探了也不会改变任何结论。
+    // 下发一条命令只会让页面显示「探测中」然后什么也不发生 —— 那是最差的反馈。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let view = run_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["probe"]["pending"], false, "{view}");
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert!(pending.is_empty(), "{pending:?}");
+}
+
+#[tokio::test]
+async fn running_a_preflight_for_an_unclassified_agent_enqueues_nothing() {
+    // 没判定就没有「当前面」可谈：探完也还是 `unclassified`，不该发命令。
+    let env = TestEnv::new_with_container_content().await;
+    enroll_agent_credential(&env).await;
+
+    let view = run_preflight(&env, "agent-node-a").await;
+
+    assert_eq!(view["verdict"], "undetermined", "{view}");
+    assert_eq!(view["undetermined_reason"], "unclassified", "{view}");
+    assert_eq!(view["probe"]["pending"], false, "{view}");
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert!(pending.is_empty(), "{pending:?}");
+}
+
+#[tokio::test]
+async fn running_a_preflight_for_an_unknown_agent_is_404() {
+    let env = TestEnv::new_with_container_content().await;
+
+    let response = router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/agents/agent-typo/collection-preflight")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_preflight_report_with_too_many_paths_is_rejected() {
+    // 上限是防畸形/恶意客户端撑大存储，不是业务约束（目录里通常只有十几个）。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let paths: Vec<String> = (0..600).map(|index| format!("/probe/{index}")).collect();
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "probed_paths": paths,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_preflight_report_from_a_different_agent_is_rejected() {
+    // 证书身份是权威：不接受「证书说是 A、请求体说是 B」。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_preflight_report(
+        &env,
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "collection_preflight",
+            "agent_id": "agent-other",
+            "instance_id": "node-a",
+            "probed_paths": [K8S_LOG_DIR],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_pending_full_refresh_is_not_replaced_by_a_path_probe() {
+    // 用户点了「重采事实」（整轮）后授权被拒：自动预检不能把它顶掉 ——
+    // 整轮重采会连路径一起刷新，而路径探测拿不到进程/端口。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/fact-refresh",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let view = run_preflight(&env, "agent-node-a").await;
+    // 仍然显示「有命令在路上」：确实在采，只是采的不是只有路径。
+    assert_eq!(view["probe"]["pending"], true, "{view}");
+
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert_eq!(pending.len(), 1, "整轮重采不能被顶成两条：{pending:?}");
+    assert_eq!(pending[0].params, "", "留在队列里的应该是那条整轮重采");
+}
+
+// ── L1：日志源人工覆盖（仅 API） ─────────────────────────────────────────────
+
+/// 管理面请求（任意方法）：GET 无 body，PUT/DELETE 按需带 JSON。
+async fn send_admin(
+    env: &TestEnv,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> Response {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"));
+    let request = match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request"),
+        None => {
+            builder = builder.header("content-type", "application/json");
+            builder.body(Body::empty()).expect("request")
+        }
+    };
+    router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(request)
+        .await
+        .expect("route response")
+}
+
+#[tokio::test]
+async fn a_log_source_override_is_stored_listed_and_deleted() {
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let uri = "/api/v1/admin/agents/agent-node-a/log-sources";
+
+    // 多实例：两条覆盖各自落在自己的实例上。
+    for (source_ref, dir) in [
+        ("port:5432", "/data/pg1/log"),
+        ("port:5433", "/data/pg2/log"),
+    ] {
+        let response = send_admin(
+            &env,
+            "PUT",
+            &format!("{uri}/postgresql"),
+            Some(serde_json::json!({ "source_ref": source_ref, "dir": dir })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = send_admin(&env, "GET", uri, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    let sources = view["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 2, "{view}");
+    assert!(
+        sources
+            .iter()
+            .all(|source| source["origin"] == "override" && source["evidence"] == "human"),
+        "{view}"
+    );
+    // roots 一并返回：人填之前就能看到允许的范围。
+    assert!(view["allowed_source_roots"].as_array().is_some(), "{view}");
+
+    // 删一个实例：另一条不受影响。
+    let response = send_admin(&env, "DELETE", &format!("{uri}/postgresql/port:5432"), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send_admin(&env, "GET", uri, None).await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["sources"].as_array().map(Vec::len), Some(1), "{view}");
+    assert_eq!(view["sources"][0]["source_ref"], "port:5433");
+
+    // 删服务级：全清。
+    let response = send_admin(&env, "DELETE", &format!("{uri}/postgresql"), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send_admin(&env, "GET", uri, None).await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["sources"].as_array().map(Vec::len), Some(0), "{view}");
+}
+
+#[tokio::test]
+async fn a_log_source_override_outside_roots_is_rejected() {
+    // 人是好意也不行：roots 是**策略**，要放开就改网关配置（策略级变更 + 留痕）。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let response = send_admin(
+        &env,
+        "PUT",
+        "/api/v1/admin/agents/agent-node-a/log-sources/postgresql",
+        Some(serde_json::json!({ "source_ref": "port:5432", "dir": "/etc/pg/log" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "log_source_invalid", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("allowed_source_roots")),
+        "{body}"
+    );
+
+    let response = send_admin(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/log-sources",
+        None,
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["sources"].as_array().map(Vec::len), Some(0), "{view}");
+}
+
+#[tokio::test]
+async fn a_log_source_override_rejects_bad_service_or_source_ref() {
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let uri = "/api/v1/admin/agents/agent-node-a/log-sources";
+
+    let response = send_admin(
+        &env,
+        "PUT",
+        &format!("{uri}/postgres"),
+        Some(serde_json::json!({ "source_ref": "port:5432", "dir": "/data/pg/log" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = send_admin(
+        &env,
+        "PUT",
+        &format!("{uri}/postgresql"),
+        Some(serde_json::json!({ "source_ref": "5432", "dir": "/data/pg/log" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 相对路径 / 含 `..`：同样 400（不是“尽力修”）。
+    for dir in ["data/pg/log", "/data/../etc/pg"] {
+        let response = send_admin(
+            &env,
+            "PUT",
+            &format!("{uri}/postgresql"),
+            Some(serde_json::json!({ "source_ref": "port:5432", "dir": dir })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "dir={dir}");
+    }
+}
+
+/// agentd 上报日志源候选（agent 面入口）。
+async fn post_log_source_report(
+    env: &TestEnv,
+    identity: Option<&str>,
+    body: &serde_json::Value,
+) -> Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/log-sources",
+        identity,
+        body,
+    )
+    .await
+}
+
+fn log_source_report(sources: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "api_version": "v1",
+        "kind": "log_sources",
+        "agent_id": "agent-node-a",
+        "instance_id": "node-a",
+        "observed_at": "2026-10-26T02:00:00Z",
+        "sources": sources,
+    })
+}
+
+#[tokio::test]
+async fn an_agent_log_source_report_replaces_auto_rows_but_keeps_overrides() {
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let admin_uri = "/api/v1/admin/agents/agent-node-a/log-sources";
+
+    // 人工覆盖：它是人的显式意图，agent 上报不能把它抹掉。
+    let response = send_admin(
+        &env,
+        "PUT",
+        &format!("{admin_uri}/postgresql"),
+        Some(serde_json::json!({ "source_ref": "port:5432", "dir": "/opt/pg/log" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 一条合法 + 一条不成立（相对路径）。不成立那条逐条丢弃，不拖垮整份报告。
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([
+            {
+                "service": "postgresql",
+                "source_ref": "port:5432",
+                "dir": "/data/pg/log",
+                "evidence": "cmdline_datadir",
+                "detail": "-D /data/pg",
+                "confidence": 90
+            },
+            {
+                "service": "mysql",
+                "source_ref": "port:3306",
+                "dir": "data/mysql",
+                "evidence": "cmdline_datadir"
+            }
+        ])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 1, "{ack}");
+    assert_eq!(ack["rejected"], 1, "{ack}");
+
+    let response = send_admin(&env, "GET", admin_uri, None).await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    let sources = view["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 2, "{view}");
+    // 覆盖在前（它赢），解析值在后 —— 两者并存，删覆盖即回落。
+    assert_eq!(sources[0]["origin"], "override");
+    assert_eq!(sources[0]["dir"], "/opt/pg/log");
+    assert_eq!(sources[1]["origin"], "agent");
+    assert_eq!(sources[1]["dir"], "/data/pg/log");
+
+    // 下一轮**什么都没解析到**：agent 行清空，覆盖仍在（覆盖不是「最后一轮解析结果」）。
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send_admin(&env, "GET", admin_uri, None).await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    let sources = view["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 1, "只该剩覆盖：{view}");
+    assert_eq!(sources[0]["origin"], "override");
+}
+
+#[tokio::test]
+async fn an_agent_cannot_claim_a_human_override() {
+    // `human` 是人工覆盖的标记：agent 自称它等于把「人指定」冒充成「机器解析」。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([{
+            "service": "postgresql",
+            "source_ref": "port:5432",
+            "dir": "/data/pg/log",
+            "evidence": "human"
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 0, "{ack}");
+    assert_eq!(ack["rejected"], 1, "{ack}");
+}
+
+#[tokio::test]
+async fn a_stale_log_source_report_is_ignored() {
+    // 替换语义下，一份乱序到达的旧报告会把新候选清成旧的 —— 只比 agent 自己的 observed_at。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let fresh = serde_json::json!([{
+        "service": "postgresql",
+        "source_ref": "port:5432",
+        "dir": "/data/pg/new-log",
+        "evidence": "cmdline_datadir"
+    }]);
+    let response =
+        post_log_source_report(&env, Some("agent-node-a"), &log_source_report(fresh)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut stale = log_source_report(serde_json::json!([{
+        "service": "postgresql",
+        "source_ref": "port:5432",
+        "dir": "/data/pg/old-log",
+        "evidence": "cmdline_datadir"
+    }]));
+    stale["observed_at"] = serde_json::json!("2026-10-26T01:00:00Z");
+    let response = post_log_source_report(&env, Some("agent-node-a"), &stale).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 0, "旧报告不该生效：{ack}");
+    assert_eq!(ack["rejected"], 0, "它不是坏数据，只是过期：{ack}");
+
+    let response = send_admin(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/log-sources",
+        None,
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["sources"][0]["dir"], "/data/pg/new-log", "{view}");
+}
+
+#[tokio::test]
+async fn a_log_source_report_with_too_many_entries_is_rejected() {
+    // 超量说明 agent 侧上限失灵：宁可让它重来，也别悄悄截断。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let entries: Vec<serde_json::Value> = (0..65)
+        .map(|index| {
+            serde_json::json!({
+                "service": "postgresql",
+                "source_ref": format!("pid:{}", index + 1),
+                "dir": format!("/data/pg{index}/log"),
+                "evidence": "cmdline_datadir"
+            })
+        })
+        .collect();
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::Value::Array(entries)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn an_unknown_evidence_is_rejected_per_entry() {
+    // 证据词表是「为什么认为是它」的唯一记法：拼错一个就该被点名，而不是当成功存下去。
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([
+            {
+                "service": "postgresql",
+                "source_ref": "port:5432",
+                "dir": "/data/pg/log",
+                "evidence": "cmdline"          // 词表里是 cmdline_datadir
+            },
+            {
+                "service": "postgresql",
+                "source_ref": "port:5433",
+                "dir": "/data/pg2/log",
+                "evidence": "env_datadir"
+            }
+        ])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 1, "{ack}");
+    assert_eq!(ack["rejected"], 1, "{ack}");
+
+    let response = send_admin(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/log-sources",
+        None,
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    let sources = view["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 1, "{view}");
+    assert_eq!(sources[0]["source_ref"], "port:5433");
+}
+
+#[tokio::test]
+async fn reporting_the_same_set_twice_is_idempotent() {
+    let env = TestEnv::new().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let report = log_source_report(serde_json::json!([{
+        "service": "postgresql",
+        "source_ref": "port:5432",
+        "dir": "/data/pg/log",
+        "evidence": "cmdline_datadir"
+    }]));
+    for _ in 0..2 {
+        let response = post_log_source_report(&env, Some("agent-node-a"), &report).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let ack: serde_json::Value = decode_json_response(response).await;
+        assert_eq!(ack["accepted"], 1, "{ack}");
+    }
+    let response = send_admin(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/log-sources",
+        None,
+    )
+    .await;
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["sources"].as_array().map(Vec::len), Some(1), "{view}");
+}
+
+// ── L2a：agentd 解析出的目录要真的进到 spec 里 ──────────────────────────────
+
+const PREFLIGHT_DB_CATALOG: &str = r#"
+catalog_version = 4
+
+[[units]]
+unit_id = "mac-metrics"
+family = "HostMetrics"
+capability = "collect_metrics"
+platform = "macos"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "none"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+
+[[units]]
+unit_id = "linux-db"
+family = "DatabaseService"
+capability = "collect_logs"
+platform = "linux"
+match = "any:port:5432|path_exists:/var/log/postgresql"
+rule_ref = ""
+requires_privilege = "root"
+status = "active"
+
+# 标准目录：解析不到时的兜底
+[[units.sources]]
+kind = "FileGlob"
+target = "/var/log/postgresql/*.csv"
+multiline = "postgres_csv"
+
+# 非标准目录：由 agentd 解析 / 人工覆盖得出
+[[units.sources]]
+kind = "FileGlob"
+from_dir = "log_source:postgresql"
+pattern = "*.csv"
+multiline = "postgres_csv"
+"#;
+
+const PREFLIGHT_DB_PACKS: &str = r#"
+[[pack]]
+pack_id = "macos-base"
+platform = "macos"
+kind = "Baseline"
+families = ["HostMetrics"]
+unit_refs = ["mac-metrics"]
+catalog_version = 4
+status = "active"
+
+[[pack]]
+pack_id = "linux-db"
+platform = "linux"
+kind = "Baseline"
+families = ["DatabaseService"]
+unit_refs = ["linux-db"]
+catalog_version = 4
+status = "active"
+"#;
+
+const PREFLIGHT_DB_TEMPLATES: &str = r#"
+[[template]]
+template_id = "macos-daily"
+machine_class = "MacDaily"
+platform = "macos"
+pack_refs = ["macos-base"]
+catalog_version = 4
+template_version = 1
+status = "active"
+
+[[template]]
+template_id = "linux-data"
+machine_class = "LinuxData"
+platform = "linux"
+pack_refs = ["linux-db"]
+catalog_version = 4
+template_version = 1
+status = "active"
+"#;
+
+impl TestEnv {
+    /// 数据库面的内容目录（`from_dir` 用例专用）。
+    async fn new_with_db_content() -> Self {
+        let mut env = Self::new().await;
+        let dir = env._root.join("content");
+        std::fs::create_dir_all(&dir).expect("create content dir");
+        let catalog = dir.join("catalog.toml");
+        std::fs::write(&catalog, PREFLIGHT_DB_CATALOG).expect("write catalog");
+        let packs = dir.join("packs.toml");
+        std::fs::write(&packs, PREFLIGHT_DB_PACKS).expect("write packs");
+        let templates = dir.join("templates.toml");
+        std::fs::write(&templates, PREFLIGHT_DB_TEMPLATES).expect("write templates");
+        env.config.content_catalog_file = Some(catalog);
+        env.config.content_packs_file = Some(packs);
+        env.config.content_templates_file = Some(templates);
+        env
+    }
+}
+
+#[tokio::test]
+async fn an_agent_resolved_log_dir_reaches_the_work_spec() {
+    // 端到端（去掉网络）：agent 上报 → 预检可授权 → 授权 → spec 里就是那个目录。
+    let env = TestEnv::new_with_db_content().await;
+    linux_agent_classified(&env, "LinuxData").await;
+    // 端口在听：`port:` 条件才判得出来（空 listen_ports = 没采，不是没开）。
+    let mut summary = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("load facts")
+        .expect("facts");
+    summary.listen_ports = vec!["tcp:5432".to_string()];
+    env.store
+        .upsert_agent_fact_summary(&summary)
+        .await
+        .expect("store facts");
+
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([{
+            "service": "postgresql",
+            "source_ref": "port:5432",
+            "dir": "/data/pg/log",
+            "evidence": "cmdline_datadir",
+            "detail": "-D /data/pg",
+            "confidence": 90
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["verdict"], "grantable", "{view}");
+    assert_eq!(view["families"][0]["state"], "grantable", "{view}");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "work_kind": "Standing",
+            "family": "DatabaseService",
+            "spec": ""
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let work = env
+        .store
+        .list_standing_work("agent-node-a")
+        .await
+        .expect("list standing work")
+        .into_iter()
+        .find(|work| work.family == "DatabaseService")
+        .expect("DatabaseService granted");
+    assert!(
+        work.spec.contains("/data/pg/log/*.csv"),
+        "解析出来的目录必须进 spec：{}",
+        work.spec
+    );
+}
+
+#[tokio::test]
+async fn without_a_resolved_log_dir_the_family_is_source_unresolved() {
+    // 现场原型：PG 在 5432 上监听，但 /var/log/postgresql 不存在、也没人配覆盖。
+    // 页面必须说「服务在、找不到日志」，而不是「这台机器没有数据库」。
+    let env = TestEnv::new_with_db_content().await;
+    linux_agent_classified(&env, "LinuxData").await;
+    let mut summary = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("load facts")
+        .expect("facts");
+    summary.listen_ports = vec!["tcp:5432".to_string()];
+    summary.probed_paths = vec!["/var/log/postgresql".to_string()];
+    summary.present_paths = Vec::new();
+    env.store
+        .upsert_agent_fact_summary(&summary)
+        .await
+        .expect("store facts");
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["verdict"], "blocked", "{view}");
+    assert_eq!(view["families"][0]["state"], "source_unresolved", "{view}");
+    assert_eq!(
+        view["families"][0]["units"][0]["result"], "source_not_resolved",
+        "{view}"
+    );
+    // 点名是哪个服务没找到 —— 否则人得从第一个服务开始猜。
+    assert_eq!(
+        view["families"][0]["units"][0]["unresolved_sources"][0], "postgresql",
+        "{view}"
+    );
+    let reason = view["families"][0]["reason"]
+        .as_str()
+        .expect("reason for non-grantable family");
+    assert!(reason.contains("postgresql"), "{reason}");
+
+    // 授权同样是 409，且文案里带得上原因（不会「预检说不行、授权说不清」）。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "work_kind": "Standing",
+            "family": "DatabaseService",
+            "spec": ""
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("source_not_resolved")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_family_reports_how_many_instances_it_saw_and_located() {
+    // 分母：agent 报 1 个已定位 + 1 个「看得见但没找到目录」→ 「2 个实例，其中 1 个未定位」。
+    let env = TestEnv::new_with_db_content().await;
+    linux_agent_classified(&env, "LinuxData").await;
+    let mut summary = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("load facts")
+        .expect("facts");
+    summary.listen_ports = vec!["tcp:5432".to_string(), "tcp:5433".to_string()];
+    env.store
+        .upsert_agent_fact_summary(&summary)
+        .await
+        .expect("store facts");
+
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([
+            {
+                "service": "postgresql",
+                "source_ref": "port:5432",
+                "dir": "/data/pg/log",
+                "evidence": "cmdline_datadir"
+            },
+            {
+                "service": "postgresql",
+                "source_ref": "port:5433",
+                "dir": "",
+                "evidence": "unresolved",
+                "detail": "-D /data/pg2"
+            }
+        ])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 2, "占位行也要入库（分母靠它）：{ack}");
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["families"][0]["state"], "grantable", "{view}");
+    assert_eq!(
+        view["families"][0]["instances"],
+        serde_json::json!({ "resolved": 1, "total": 2 }),
+        "{view}"
+    );
+    // 能授权、但没授全 —— 必须说出来，否则人以为两个实例都在采。
+    assert!(
+        view["families"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("1 个未定位")),
+        "{view}"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_directory_outside_roots_is_stored_but_never_collected() {
+    // 容器里的 PG 常把数据目录放在 named volume（`/var/lib/docker/volumes/...`）：
+    // 目录**找到了**，只是不在默认 roots 里。要能告诉人「放宽 roots」，而不是把它丢掉。
+    let env = TestEnv::new_with_db_content().await;
+    linux_agent_classified(&env, "LinuxData").await;
+    let mut summary = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("load facts")
+        .expect("facts");
+    summary.listen_ports = vec!["tcp:5432".to_string()];
+    summary.probed_paths = vec!["/var/log/postgresql".to_string()];
+    summary.present_paths = Vec::new();
+    env.store
+        .upsert_agent_fact_summary(&summary)
+        .await
+        .expect("store facts");
+
+    let response = post_log_source_report(
+        &env,
+        Some("agent-node-a"),
+        &log_source_report(serde_json::json!([{
+            "service": "postgresql",
+            "source_ref": "port:5432",
+            "dir": "/var/lib/docker/volumes/pgdata/_data/log",
+            "evidence": "cmdline_datadir",
+            "detail": "-D /var/lib/postgresql/data（container a55a）"
+        }])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(ack["accepted"], 1, "越界不是坏数据，要存下来：{ack}");
+
+    let view = get_preflight(&env, "agent-node-a").await;
+    assert_eq!(view["families"][0]["state"], "source_unresolved", "{view}");
+    assert_eq!(
+        view["families"][0]["instances"],
+        serde_json::json!({ "resolved": 0, "total": 1 }),
+        "分母含越界那个实例：{view}"
+    );
+    let reason = view["families"][0]["reason"]
+        .as_str()
+        .expect("reason for source_unresolved");
+    assert!(
+        reason.contains("allowed_source_roots"),
+        "要说清是 roots 的问题，不是没装库 / logging_collector：{reason}"
+    );
+    // 越界目录**绝不能**进 spec：授权必须 409（roots 过滤在求值时做）。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "DatabaseService", "spec": "" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+/// 环回「Agent 明细」面（gwlinkd 拉取后转报中心）：真环回 socket 上按机队列出，缺 `gateway_id` → 400。
+///
+/// 形状是**上报契约** `wist_control::AgentRuntimeStatus`（snake_case）—— gwlinkd 原样转报中心
+/// `POST /api/v1/gateway/agents/status`，任一侧改名即导致中心 Agent 页静默变空。
+#[tokio::test]
+async fn gateway_agents_lists_the_fleet_over_a_loopback_socket() {
+    let env = env_with_enrolled_agent().await;
+    let (addr, server) = spawn_gateway_on_loopback(&env).await;
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/gateway/agents?gateway_id=gw-1"
+        ))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["gateway_id"], "gw-1", "调用方自报的 id 原样回显");
+    let agents = body["agents"].as_array().expect("agents array");
+    assert_eq!(agents.len(), 1, "enrolled agent must be listed: {body}");
+    assert_eq!(agents[0]["agent_id"], "agent-node-a");
+    // 上报契约字段一个不能少（`status` 现算：注册过但没上报过 → 也是合法取值，不写死 online）。
+    for key in [
+        "agent_id",
+        "instance_id",
+        "version",
+        "status",
+        "health",
+        "last_seen_at",
+        "memory_bytes",
+        "cpu_percent",
+        "admin_latency_ms",
+        "node_id",
+        "hostname",
+        "ip_addresses",
+    ] {
+        assert!(agents[0].get(key).is_some(), "missing key {key}: {body}");
+    }
+    assert!(
+        matches!(
+            agents[0]["status"].as_str(),
+            Some("online") | Some("offline")
+        ),
+        "status 必须是 online/offline：{body}"
+    );
+
+    // 缺 gateway_id → 400（与自述面同口径：调用方必须自报 id）。
+    let missing = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/gateway/agents"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    server.abort();
+}
+
+/// 非环回 / 取不到 peer 一律拒绝（fail-closed）—— 与自述面 / agent-package 同一护栏。
+#[tokio::test]
+async fn gateway_agents_is_loopback_only() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    let env = env_with_enrolled_agent().await;
+
+    let request = |addr: Option<SocketAddr>| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/gateway/agents?gateway_id=gw-1")
+            .body(Body::empty())
+            .expect("request");
+        if let Some(addr) = addr {
+            request.extensions_mut().insert(MockConnectInfo(addr));
+        }
+        request
+    };
+
+    let remote = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(request(Some(SocketAddr::from(([192, 0, 2, 7], 40_000)))))
+        .await
+        .expect("response");
+    assert_eq!(remote.status(), StatusCode::FORBIDDEN, "非环回不得读到机队");
+
+    // 取不到 peer（没注入连接信息）→ 也拒绝，不因「没连接信息」就放行。
+    let unknown = router(env.config.clone(), env.store_handle.clone())
+        .oneshot(request(None))
+        .await
+        .expect("response");
+    assert_eq!(unknown.status(), StatusCode::FORBIDDEN);
+}
+
+/// 容器部署的准入（`[server] self_face_allow`）：列出的那个对端按「本机」放行，
+/// 同网段的**别的**地址与外部地址仍 403 —— 这条钉住「放宽只放宿主、不外扩」。
+#[tokio::test]
+async fn gateway_agents_allows_the_configured_peer_and_rejects_the_rest() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    let env = env_with_enrolled_agent().await;
+    let mut config = env.config.clone();
+    // 就是容器里「宿主那一跳」的样子：对端 = 网络网关（这里显式列入放行）。
+    config.self_face_allow = vec![crate::infra::IpNet::parse("172.28.0.1").expect("ip")];
+    let store = env.store_handle.clone();
+
+    let request = |addr: SocketAddr| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/gateway/agents?gateway_id=gw-1")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(MockConnectInfo(addr));
+        request
+    };
+
+    let allowed = router(config.clone(), Arc::clone(&store))
+        .oneshot(request(SocketAddr::from(([172, 28, 0, 1], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(allowed.status(), StatusCode::OK, "列出的本机对端必须放行");
+
+    // 同网段的**别的**地址（别的容器）不是本机 —— 放行的是那一个地址，不是整网段。
+    let sibling = router(config.clone(), Arc::clone(&store))
+        .oneshot(request(SocketAddr::from(([172, 28, 0, 9], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(sibling.status(), StatusCode::FORBIDDEN);
+
+    let external = router(config, store)
+        .oneshot(request(SocketAddr::from(([203, 0, 113, 9], 40_000))))
+        .await
+        .expect("response");
+    assert_eq!(external.status(), StatusCode::FORBIDDEN);
 }

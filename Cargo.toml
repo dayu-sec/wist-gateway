@@ -2,35 +2,99 @@
 
 [package]
 name = "wist-gateway"
-version = "0.1.1" #@gxl:set(version)
+version = "0.36.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
 jumo-derive = "0.1"
 axum = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 toml = "1.1"
 base64 = "0.23"
+# 单实例锁：`flock(LOCK_EX | LOCK_NB)`（见 infra/single_instance.rs）。
+# 只用它一个系统调用，而且 libc 早就在依赖图里（tokio / ring 一路带进来的）。
+libc = "0.2"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "http1", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = "1"
 rustls-webpki = "0.103"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-wist-contracts = { version = "0.1"}
-wist-control = { version = "0.1" }
-wist-error = { version = "0.1" }
-
-#wist-contracts = { version = "0.1.1", path = "../wist-contracts" }
-#wist-control = { version = "0.1.1", path = "../wist-control" }
-#wist-error = { version = "0.1.1", path = "../wist-error" }
-orion-error = { version = "0.8", features = ["derive", "serde_json"] }
+wist-contracts = "0.9.9"
+# 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可临时切 path。
+wist-api = "0.9.5"
+wist-control = { version = "0.19" }
+#wist-control = { version = "0.14", path = "../wist-control" }
+wist-error = { version = "0.2" }
+#wist-error = { version = "0.2", path = "../wist-error" }
+# 分层配置（主配置 + 接口层声明 `${VAR}` + 同目录 `.env`），与 center / gwlinkd 共用。
+wist-config = { version = "0.1" }
+#wist-config = { version = "0.1", path = "../wist-config" }
+# 跨进程错误投影 wire 类型（`ProtocolError` / `Severity`），见 `api/error.rs`。
+wist-shared = { version = "0.2" }
+#wist-shared = { version = "0.2", path = "../wist-shared" }
+# 管理面鉴权原语（Bearer token / sha256 / 常数时间比较 / 失败限流桶）。
+# 已发布到 crates.io（CI 发版）。本地联调可临时切 path：
+#wist-auth = { path = "../wist-auth" }
+wist-auth = "0.1.1"
+orion-error = { version = "0.9", features = ["derive", "serde_json"] }
+# 配置里的 `${SEC_...}` 变量解析：orion-sec 读 `./.galaxy/sec_value.yml` / `~/.galaxy/sec_value.yml`，
+# orion-variate 提供 `EnvDict` / `EnvEvaluable` / `EnvChecker`（含 `${VAR:default}` 与未解析校验）。
+orion-sec = "0.7"
+orion-variate = "0.14"
+# 运行日志：`log` 门面（写）+ 共享 crate `wist-log`（收：env_logger / 格式 / 轮转，`[log]` 段）。
+log = "0.4"
+# 本地联调切 path。
+wist-log = { version = "0.1" }
+#wist-log = { version = "0.1", path = "../wist-log" }
 ring = "0.17"
+# agent 客户端证书（mTLS）签发/解析：见 docs/design/agent-identity-mtls.md §4。
+# rcgen 负责「CSR → 客户端证书」的签发（签发时忽略 CSR 主体，主体由网关填）；
+# x509-parser 负责从对端证书里读 URI SAN（rustls-webpki 的 EndEntityCert 只验链、取不到主体）。
+# 两者共用同一个 x509-parser 版本，避免依赖重复。
+rcgen = { version = "0.13", features = ["x509-parser"] }
+x509-parser = "0.16"
+# 证书有效期用 rcgen 的 `OffsetDateTime`（rcgen 不重导出 time）。
+time = { version = "0.3", features = ["std"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+# 安装包内核（来源读取 / 摘要校验 / 身份解析 / 命名）+ 升级兼容声明检查 —— 与中心共用一份。
+wist-release = "0.6"
+# 本地联调：按 rust-gx 约定切下面这行用 path 指向本地 `wist-release`；发版时切回上面的 registry。
+#wist-release = { version = "0.6", path = "../wist-release" }
+# 解 gzip/tar：知识库制品入库时解开校验（`app/knowledge.rs::unpack_into`）。
+# flate2 默认走纯 Rust 后端（miniz_oxide），不引入 C 依赖。
+flate2 = "1"
+tar = "0.4"
+
+# 网关**进程自身**资源（CPU / 内存 / 运行时长）：自述面与上报中心用。
+# 版本与 wist-agentd 对齐（同一 sysinfo，避免依赖图里出现两份）。
+sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
+
+# 持久化：SQLite（默认，内嵌）+ 同一 Store trait 下可选的 Postgres 实现。
+# - sqlite-bundled：从源码编译 libsqlite3，构建期需要 C 编译器（release 流水线按架构原生构建，满足）。
+#   这里不用 `sqlite` 聚合开关，是为了避免顺带启用 sqlite-load-extension。
+# - macros + migrate：sqlx::migrate! 嵌入式迁移（两者缺一不可）。
+# - chrono / json：TIMESTAMP 与 JSON 列的类型映射。
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite-bundled",
+    "macros",
+    "migrate",
+    "chrono",
+    "json",
+] }
+# 异步 trait：Store 需要 Arc<dyn Store> 持有，原生 async fn in trait 不可 dyn。
+async-trait = "0.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+# 本地联调：与 `wist-contracts` / `wist-api` 同期改动时启用（`[patch]` 让 api/control/shared 也解析到本地版本，
+# 否则会同时存在两份 contracts、类型互不认识）。**发布态不要留**：
+# [patch.crates-io]
+# wist-contracts = { path = "../wist-contracts" }
+# wist-api = { path = "../wist-api" }

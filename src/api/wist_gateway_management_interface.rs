@@ -1,17 +1,8 @@
-// @jumo generated
-// @jumo hash=5cd0b68d5b14ca27
-
 use wist_control::AdminShowAgentRuntimeStatus;
 
-#[derive(::jumo_derive::Jumo)]
-#[jumo(
-    kind = "interface",
-    domain = "Control",
-    module = "Control.GatewayApp.UserFacingInterface"
-)]
-pub struct WarpGateWayManagementInterface;
+pub struct WarpGatewayManagementInterface;
 
-impl WarpGateWayManagementInterface {
+impl WarpGatewayManagementInterface {
     pub fn route() -> (&'static str, &'static str) {
         ("GET", "/api/v1/admin/agents/{agent_id}/runtime-status")
     }

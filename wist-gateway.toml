@@ -1,5 +1,8 @@
 [server]
 listen_addr = "127.0.0.1:3000"
+# 对外基址：新装 Agent 的控制面 endpoint（安装命令 / 安装包也从它派生）。
+# 同时是**数据面上送目标的域名来源**：管理面没设过「数据面上送地址」时，目标 =
+# 本基址的主机名 + 数据面端口 9000（见 docs/design 里的上送授权设计）。
 public_base_url = "https://127.0.0.1:3000"
 tls_cert_file = "state/admin-tls.crt.pem"
 tls_key_file = "state/admin-tls.key.pem"
@@ -7,11 +10,72 @@ admin_api_token = "${WARP_INSIGHT_ADMIN_TOKEN}"
 victoria_metrics_url = "http://127.0.0.1:18429"
 
 [agent]
-package_file = "../../../wist-agentd/target/debug/wist-agentd"
-bootstrap_token_ttl_seconds = 900
+bootstrap_ttl_seconds = 900
 credential_ttl_seconds = 2592000
 store_file = "state/wist-gateway-store.json"
-trust_bundle = "internal-ca-stub"
-install_script_signing_private_key_file = "state/install-script-signing-ed25519.pkcs8.pem"
+trust_bundle_file = "state/admin-tls.crt.pem"
 tenant_id = "tenant-default"
 environment_id = "env-default"
+
+# agent 客户端证书（mTLS）签发 CA：与「服务端叶证书的 CA」**分开**的一把 CA
+# （见 docs/design/agent-identity-mtls.md §4.1）。两者同给同缺；都给才开 mTLS 签发。
+# ca_cert_file = "state/agent-ca.crt.pem"
+# ca_key_file = "state/agent-ca.key.pem"
+# 签发的客户端证书有效期（秒）；缺省 37 天 = 保底 30 天 + 提前 7 天续期（§4.2）。
+# client_cert_ttl_seconds = 3196800
+
+[ingest]
+# 数据面（wparse）内部接入端点：明文 HTTP，默认只绑环回；容器里要绑网卡（0.0.0.0）才连得上。
+listen_addr = "127.0.0.1:3001"
+
+# ── 可选：本网关进程自己的运行日志（缺省 info / text / stderr；RUST_LOG 环境变量优先）──
+# 与下面 [logs] 的「被采集 agent 日志落盘保留」是两回事：这里是**网关自己**的运行日志。
+# [log]
+# level  = "info"                       # 或 "wist_gateway=debug,hyper=warn"
+# format = "json"                       # 缺省 text；只有要 JSON 行才需写
+# file   = "/var/log/wist-gateway.log"  # 给了就写文件（相对配置目录解析；自动建父目录）；缺省 stderr
+# max_bytes       = 67108864            # 单文件上限（字节），写满轮转成 file.1/file.2/…（缺省 64 MiB）
+# keep_files      = 4                   # 保留的历史分卷个数（0 = 不留历史；缺省 4）
+# max_age_seconds = 604800              # 历史分卷保留时长（秒）；0 = 不按时间清（缺省 7 天）
+# 注意：轮转由网关进程自己做；**不要再给这个文件挂 logrotate**，两套轮转会互相打架。
+
+# ── 可选：采集日志落盘的保留 / 轮转（不配就用默认：64 MiB / 4 卷 / 7 天）──
+# 日志是无界观测流：不设上界文件会一直长（曾经单文件 52 GB）。写满就轮转成
+# agent-logs.ndjson.1/.2/…，再按数量与时长清理；磁盘占用约 max_bytes × (keep + 1)。
+# [logs]
+# max_bytes = 67108864         # 单文件上限（字节），下限 8 MiB
+# keep_files = 4               # 保留的历史分卷个数（0 = 不留历史）
+# max_age_seconds = 604800     # 历史分卷保留时长（秒）；0 = 不按时间清
+
+# ── 可选：一次性调查（`investigate`）的**网关侧授权与额度** ──
+# 调查是**另一道授权轴**，不参与采集面的「就绪度 / 上送开关」：采集能力坏掉时，诊断能力必须仍在。
+# 三件事都在网关做（agentd 只保证「能跑、有界」）：上界能查哪几个面、一台机器一小时能查几次、
+# 报告在管理面能看多久。不写这一段 = 上界全开 / 每小时 12 次 / 保留 7 天。
+# 但**上界全开 ≠ 机器能查**：每台机器还要在「授权 → 调查授权」里显式开面
+# （按机器授权默认全关，与采集面一致；没有授权行时下发回 403 `investigation_not_granted`）。
+# 被关掉的面在管理面会置灰（`POST` 回 403 `investigation_not_allowed`），不需要去下线 agent。
+# [investigations]
+# allowed_topics = ["disk"]     # 省略 = 全部已知面；空表 `[]` = 一个都不许
+# max_per_agent_per_hour = 12   # 0 = 不限（内网/开发环境）
+# report_retention_days = 7     # 0 = 不限；只影响**可见性**，网关从不删数据面写的报告文件
+# report_dir = "data/ivsrep"    # 相对 [data_plane] work_dir；也可写绝对路径（报告单独挂卷）
+#                               # 缺省 data/ivsrep，与数据面 business.d/agent_ivsrep.toml 的 base 对齐
+
+# ── 可选段（默认都不装载；要启用就把文件放进配置目录并取消注释）──
+# 源头是知识库仓 wist-knowledge/*.toml；改了内容要同步 bump 相应版本号。
+#
+# [purpose]   rules_file    = "content/purpose-rules.toml"    # 用途推断规则表
+# [discovery] policies_file = "content/aspect-policies.toml"  # 发现方向策略表
+# [content]   catalog_file / packs_file / templates_file      # 内容目录三件套（要么都给、要么都不给）
+#
+# [store]     database_url  = ""                              # 持久化 DSN；留空 = 用 store_file 同级的 SQLite
+
+# ── 知识库内容包的来源与验签 ──
+# 内容**不再只能靠上面那几个文件路径**：管理面可以录入一个包（wist-knowledge 的 Release 制品
+# 或离线投放的 tar.gz），并在**不重启**的前提下切生效版（设计：docs/design/
+# knowledge-content-management.md）。上面那三个 `*_file` 是过渡期路子，管理面入口落地后退役。
+#
+# 验签是**可选**的：不给公钥 = 只记 sha256；给了就**必须**验过签名才允许录入（一把钥匙，
+# 私钥在发布 CI、公钥在网关配置里）。
+# [knowledge]
+# signing_public_key_file = "state/knowledge-signing.pub.pem"

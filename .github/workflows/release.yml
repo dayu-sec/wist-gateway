@@ -20,7 +20,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
@@ -37,7 +37,9 @@ jobs:
         run: |
           mkdir -p artifacts
           cp "target/${{ matrix.target }}/release/wist-gateway" artifacts/wist-gateway
-          tar -czf "wist-gateway-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C artifacts wist-gateway
+          # 升级兼容声明随包走（缺了只是“兼容性未知”，有它才能在安装/派发前拦住不兼容组合）。
+          cp compat.json artifacts/compat.json
+          tar -czf "wist-gateway-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C artifacts wist-gateway compat.json
 
       - uses: actions/upload-artifact@v7
         with:
@@ -79,14 +81,41 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 国内镜像源（腾讯云 TCR）：国内服务器拉 ghcr.io 很慢，客户端改用 TCR 地址。
+      # 凭据在 TCR 控制台生成（访问凭证），存 GitHub Secrets：TCR_USERNAME / TCR_PASSWORD。
+      - name: Login to TCR
+        uses: docker/login-action@v3
+        with:
+          registry: dy-sec.tencentcloudcr.com
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          # 预发布 tag（v0.1.3-alpha / -beta / -rc …）只推该 tag，**不覆盖 :latest**：
+          # 否则 :latest 会指向预发布产物，而 wist-gateway-stack 是按 :latest 拉镜像的。
+          # 注意 on.push.tags 的 `v*.*.*` 也会匹配 `v0.1.3-alpha`，不能指望触发条件区分。
+          # 两个源（ghcr / TCR）同进退。
+          ghcr="ghcr.io/${{ github.repository }}"
+          tcr="dy-sec.tencentcloudcr.com/cloud/wist-gateway"
+          tags="$(printf '%s\n%s' "$ghcr:${{ github.ref_name }}" "$tcr:${{ github.ref_name }}")"
+          case "${{ github.ref_name }}" in
+            *-*)
+              ;;
+            *)
+              tags="$(printf '%s\n%s' "$tags" "$ghcr:latest")"
+              tags="$(printf '%s\n%s' "$tags" "$tcr:latest")"
+              ;;
+          esac
+          printf 'tags<<__EOF__\n%s\n__EOF__\n' "$tags" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: docker
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:latest
+          tags: ${{ steps.meta.outputs.tags }}
           platforms: linux/amd64,linux/arm64
 
   # 3. 发布 tarball 到 GitHub Release
@@ -111,3 +140,102 @@ jobs:
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
           files: artifacts/*.tar.gz
+
+  # 可选：把本仓制品推到腾讯云 COS（对象存储），供中心 / CDN / 客户端按稳定 URL 拉取。
+  # 未配置 Variables（COS_BUCKET 为空）时整段自动跳过，不会让发布失败；
+  # 一旦设置 COS_BUCKET 即视为启用，此时密钥缺失会直接报错（便于发现漏配）。
+  # 注意：`secrets` 上下文不能出现在 step 级 if 里，故启用判定放在 job 级（只看 vars）。
+  #   Variables：COS_BUCKET（含 -APPID）、COS_REGION（如 ap-guangzhou）、可选 COS_PREFIX（默认取仓库名）
+  #   Secrets：  COS_SECRET_ID、COS_SECRET_KEY（临时密钥再加 COS_SESSION_TOKEN）
+  # 对象键：<COS_PREFIX>/<tag>/<文件名> 与 <COS_PREFIX>/latest/<文件名>
+  # 每个对象带自定义元数据 x-cos-meta-artifact-sha256=<hex>（COS 只存 MD5 ETag，sha256 得自带）。
+  upload-cos:
+    name: Upload artifacts to Tencent COS
+    needs: [release]
+    runs-on: ubuntu-24.04
+    if: ${{ vars.COS_BUCKET != '' }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: pkg
+          merge-multiple: true
+
+      - name: Install coscli
+        run: |
+          set -eu
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/coscli" \
+            https://github.com/tencentyun/coscli/releases/download/v1.0.9/coscli-v1.0.9-linux-amd64
+          chmod +x "$HOME/.local/bin/coscli"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/coscli" --version
+
+      - name: Upload to COS
+        env:
+          COS_BUCKET: ${{ vars.COS_BUCKET }}
+          COS_REGION: ${{ vars.COS_REGION }}
+          COS_PREFIX: ${{ vars.COS_PREFIX }}
+          COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
+          COS_SECRET_KEY: ${{ secrets.COS_SECRET_KEY }}
+          COS_SESSION_TOKEN: ${{ secrets.COS_SESSION_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          # 去掉密钥里的空白字符：粘贴常带入尾随换行/空格，会让签名报 SecretKey is invalid。
+          secret_id="$(printf '%s' "${COS_SECRET_ID}" | tr -d '[:space:]')"
+          secret_key="$(printf '%s' "${COS_SECRET_KEY}" | tr -d '[:space:]')"
+          session_token="$(printf '%s' "${COS_SESSION_TOKEN}" | tr -d '[:space:]')"
+          # 明文写入 AK/SK，因此必须显式关掉 coscli 的密钥加密（disableencryption）。
+          cat > "$HOME/.cos.yaml" <<EOF
+          cos:
+            base:
+              protocol: https
+              disableencryption: "true"
+              secretid: "${secret_id}"
+              secretkey: "${secret_key}"
+              sessiontoken: "${session_token}"
+            buckets:
+              - name: "${COS_BUCKET}"
+                alias: "${COS_BUCKET}"
+                region: "${COS_REGION}"
+                endpoint: "cos.${COS_REGION}.myqcloud.com"
+          EOF
+          prefix="${COS_PREFIX:-${GITHUB_REPOSITORY##*/}}"
+          prefix="${prefix%/}"
+          cfg="$HOME/.cos.yaml"
+          out="$PWD/coscli_output"
+          rm -rf "${out}"
+          # coscli 只打印汇总，失败明细落在 coscli_output/<时间>/ 下；失败时打印并输出为 annotation。
+          dump_err() {
+            echo "::error::$1"
+            if [ -d "${out}" ]; then
+              find "${out}" -type f -exec sh -c 'echo "--- $1"; cat "$1"' _ {} \;
+              detail="$(find "${out}" -type f -exec cat {} \; | tr '\n' ' ' | sed -e 's/%/%25/g' | cut -c1-1500)"
+              echo "::error title=coscli 明细::$1 —— ${detail}"
+            fi
+            exit 1
+          }
+          shopt -s nullglob
+          files=(pkg/*)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::pkg/ 下没有制品可上传"; exit 1; }
+          for f in "${files[@]}"; do
+            [ -f "${f}" ] || continue
+            name="$(basename "${f}")"
+            # COS 对象只存 MD5（ETag），GitHub 侧资产 digest（sha256）过不来。把 sha256 作为
+            # **对象自定义元数据**写进对象本身（x-cos-meta-artifact-sha256 —— 与设计里的
+            # artifact_sha256 字段同名）—— 随对象走，录 COS 地址时可用 `coscli stat`（HEAD）
+            # 读回填 expected_sha256（`ls` 不返回自定义元数据）。--meta 形如 key:value（多个用 # 分隔）。
+            # 本 step 只有 `set -eu`（无 pipefail），管道失败会被 cut 吃掉；空摘要等于又「丢」了，
+            # 故显式兜一道。
+            sha="$(sha256sum "${f}" | cut -d' ' -f1)"
+            [ -n "${sha}" ] || { echo "::error::无法计算 ${name} 的 sha256" >&2; exit 1; }
+            meta="x-cos-meta-artifact-sha256:${sha}"
+            coscli cp "${f}" "cos://${COS_BUCKET}/${prefix}/${TAG}/${name}" -c "${cfg}" --meta "${meta}" \
+              || dump_err "上传 ${name} 失败（${TAG}）"
+            coscli cp "${f}" "cos://${COS_BUCKET}/${prefix}/latest/${name}" -c "${cfg}" --meta "${meta}" \
+              || dump_err "上传 ${name} 失败（latest）"
+            echo "已上传 ${name}  sha256=${sha}"
+          done
+          echo "COS 上传完成。"
+          coscli ls "cos://${COS_BUCKET}/${prefix}/" -c "${cfg}" \
+            || echo "::warning::COS 列表失败（可能缺 cos:GetBucket 权限）；上传本身已成功。"

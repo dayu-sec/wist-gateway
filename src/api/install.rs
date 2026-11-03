@@ -1,41 +1,37 @@
-use std::sync::Mutex;
-use std::time::SystemTime;
+use super::codes;
+use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 
 use crate::infra::{
-    AdminConfig, AdminStore, StoredEnrollmentToken, StoredEnrollmentTokenStatus, bytes_sha256_hex,
-    new_secret_token, sha256_hex, sign_install_script,
+    AdminConfig, BootstrapTokenCheck, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
+    Store, StoreResult, StoredAgentUplinkAddress, StoredEnrollmentToken,
+    StoredEnrollmentTokenStatus, VerifiedAgentIdentity, bytes_sha256_hex, new_secret_token,
+    sha256_hex,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use ring::digest::{SHA256, digest};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use webpki::EndEntityCert;
-use wist_control::AdminAgentInstallCodeReturned;
-use wist_control::types::{AgentBootstrapBundle, AgentInstallCode, DateTime};
+use wist_control::types::{AgentBootstrapBundle, AgentInstallCode, AgentPlatformPackage, DateTime};
 
 use super::ApiState;
+use super::error::ApiError;
+use super::install_package::{
+    AgentPackageSource, PLATFORM_LINUX_ARM, PLATFORM_LINUX_X86, PLATFORM_MACOS_ARM,
+    effective_package_path, resolve_agent_package, resolve_agent_platform_packages,
+};
 use super::{admin_auth::require_admin_bearer, rate_limit};
 
 const INSTALL_SCRIPT_TEMPLATE: &str = include_str!("install.sh");
-const ENROLLMENT_TOKEN_RESERVATION_TTL_SECONDS: i64 = 60;
+pub(crate) const ENROLLMENT_TOKEN_RESERVATION_TTL_SECONDS: i64 = 60;
 const BOOTSTRAP_AUTH_SCOPE: &str = "bootstrap";
 const NO_STORE: &str = "no-store";
-
-/// Cache the agent package sha256 keyed by the package file's mtime/size so the
-/// unauthenticated install endpoints do not read the whole package per request.
-struct PackageHashCacheEntry {
-    modified: SystemTime,
-    len: u64,
-    hash: String,
-}
-
-static PACKAGE_HASH_CACHE: Mutex<Option<PackageHashCacheEntry>> = Mutex::new(None);
 
 pub async fn get_agent_install_code(
     State(state): State<ApiState>,
@@ -46,90 +42,73 @@ pub async fn get_agent_install_code(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    match issue_agent_install_code(&state.config, &state.store) {
+    match issue_agent_install_code(&state.config, &state.store).await {
         Ok(install_code) => {
-            eprintln!(
+            log::info!(
                 "audit install_code_issued tenant={} environment={} bundle={}",
                 state.config.tenant_id,
                 state.config.environment_id,
                 install_code.bootstrap_bundle.bundle_id,
             );
-            (
-                [(header::CACHE_CONTROL, NO_STORE)],
-                Json(AdminAgentInstallCodeReturned { install_code }),
-            )
-                .into_response()
+            ([(header::CACHE_CONTROL, NO_STORE)], Json(install_code)).into_response()
         }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to issue install code: {err}"),
+        Err(err) => ApiError::internal(
+            codes::INSTALL_CODE_ISSUE_FAILED,
+            "failed to issue install code",
+            err,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
 pub async fn get_agent_install_script(
     State(state): State<ApiState>,
-    Path(arch): Path<String>,
+    Path(platform): Path<String>,
 ) -> Response {
-    let Ok(arch) = supported_agent_arch(&arch) else {
-        return unknown_arch_response();
+    let Ok(platform) = supported_agent_platform(&platform) else {
+        return unknown_platform_response();
     };
-    match install_script(&state.config, arch) {
-        Ok(script) => (
+    let base = effective_advertise_base(&state.config, &state.store).await;
+    match crate::error::logged_op(
+        module_path!(),
+        "resolve agent package",
+        &[("platform", platform.to_string())],
+        resolve_agent_package(&state.config, &state.store, &base, platform).await,
+    ) {
+        // 失败已由 logged_op 记（含链路）；这里只投影，不重复记。
+        Err(_) => ApiError::handled(
+            StatusCode::SERVICE_UNAVAILABLE,
+            codes::INSTALL_PACKAGE_UNAVAILABLE,
+            format!("agent package for platform {platform} is not available"),
+        )
+        .with_no_store()
+        .into_response(),
+        Ok(package) => (
             [
                 (header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8"),
                 (header::CACHE_CONTROL, NO_STORE),
             ],
-            script,
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to render install script: {err}"),
+            install_script(&state.config, platform, &package, &base),
         )
             .into_response(),
     }
 }
 
-pub async fn get_agent_install_script_signature(
-    State(state): State<ApiState>,
-    Path(arch): Path<String>,
-) -> Response {
-    let Ok(arch) = supported_agent_arch(&arch) else {
-        return unknown_arch_response();
-    };
-    match install_script_signature(&state.config, arch) {
-        Ok(signature) => (
-            [
-                (header::CONTENT_TYPE, "application/octet-stream"),
-                (header::CACHE_CONTROL, NO_STORE),
-            ],
-            signature,
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to sign install script: {err}"),
-        )
-            .into_response(),
-    }
-}
-
-fn supported_agent_arch(arch: &str) -> Result<&'static str, ()> {
-    match arch {
-        "x86" => Ok("x86"),
-        "arm" => Ok("arm"),
+/// 安装脚本路径里的**平台**（target-triple）：只认 agentd 发布的三个平台。
+/// 其余一律 404（安装面是固定的：macOS-ARM + Linux x86_64/ARM64）；
+/// 具体某个平台是否有包，另由 `resolve_agent_package` 判定（无则 503）。
+fn supported_agent_platform(platform: &str) -> Result<&'static str, ()> {
+    match platform.trim() {
+        p if p == PLATFORM_LINUX_X86 => Ok(PLATFORM_LINUX_X86),
+        p if p == PLATFORM_LINUX_ARM => Ok(PLATFORM_LINUX_ARM),
+        p if p == PLATFORM_MACOS_ARM => Ok(PLATFORM_MACOS_ARM),
         _ => Err(()),
     }
 }
 
-fn unknown_arch_response() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        [(header::CACHE_CONTROL, NO_STORE)],
-        "unknown agent architecture",
-    )
+fn unknown_platform_response() -> Response {
+    ApiError::not_found(codes::UNKNOWN_PLATFORM, "unknown agent platform")
+        .with_no_store()
         .into_response()
 }
 
@@ -145,48 +124,95 @@ pub async fn get_agent_initial_config_with_token(
     }
     let Some(token) = bootstrap_bearer_token(&headers) else {
         rate_limit::record_auth_failure(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
-        return unauthorized_no_store("agent initial config requires a bootstrap bearer token");
+        return unauthorized_no_store(
+            codes::BOOTSTRAP_TOKEN_REQUIRED,
+            "agent initial config requires a bootstrap bearer token",
+        );
     };
 
-    match validate_bootstrap_token_for_config(&state.config, &state.store, token) {
+    match validate_bootstrap_token_for_config(&state.config, &state.store, token).await {
         Ok(()) => {
             rate_limit::clear_auth_failures(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
+            // 控制面 endpoint 取「网关对外地址」（未设置回落配置值）：agent 拿到的
+            // 必须是它对目标主机可见的地址，否则装完连不上。
+            let base = effective_advertise_base(&state.config, &state.store).await;
+            // 上送目标：管理面设置 → 部署配置派生（与上面同一个域名 + 数据面端口）。
+            // 读设置失败不阻断安装：按「没设过」处理，用派生值兜底并留下告警。
+            let uplink = match effective_agent_uplink(&state.config, &state.store).await {
+                Ok(value) => value,
+                Err(err) => {
+                    log::warn!("warning: failed to read agent uplink address: {err}");
+                    derived_agent_uplink(&state.config, &state.store).await
+                }
+            };
             (
                 [
                     (header::CONTENT_TYPE, "application/toml; charset=utf-8"),
                     (header::CACHE_CONTROL, NO_STORE),
                 ],
-                agent_initial_config_toml(&state.config, token),
+                agent_initial_config_toml(&state.config, token, uplink.as_ref(), &base),
             )
                 .into_response()
         }
         Err(reason) => {
             rate_limit::record_auth_failure(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
-            unauthorized_no_store(reason)
+            // 对外只回一句不可区分的口径：不暴露「token 存在但过期/已消费」这类可枚举细节
+            // （与安装包分发端点、enroll 路径的对外口径一致）。具体原因只进服务端审计日志，
+            // 保留运维可诊断性。
+            log::warn!("audit bootstrap_token_rejected endpoint=initial-config reason={reason}");
+            unauthorized_no_store(
+                codes::BOOTSTRAP_TOKEN_INVALID,
+                "invalid bootstrap bearer token",
+            )
         }
     }
 }
 
+/// 安装包当前分发端点上的目标平台（`?platform=<target-triple>`）。
+#[derive(serde::Deserialize)]
+pub struct AgentPackageQuery {
+    #[serde(default)]
+    pub platform: Option<String>,
+}
+
 pub async fn download_agent_package(
     State(state): State<ApiState>,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
     headers: HeaderMap,
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Query(params): Query<AgentPackageQuery>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
-    if let Some(response) = rate_limit::check_rate_limit(&state, &client_key, BOOTSTRAP_AUTH_SCOPE)
+    if let Err(response) = authorize_package_download(
+        &state,
+        client_identity.as_ref().map(|identity| &identity.0),
+        &headers,
+        &client_key,
+    )
+    .await
     {
         return response;
     }
-    let Some(token) = bootstrap_bearer_token(&headers) else {
-        rate_limit::record_auth_failure(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
-        return unauthorized_no_store("agent package download requires a bootstrap bearer token");
+    let Some(platform) = params
+        .platform
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return ApiError::bad_request(codes::MISSING_PLATFORM, "missing platform query parameter")
+            .with_no_store()
+            .into_response();
     };
-    if let Err(reason) = validate_bootstrap_token_for_config(&state.config, &state.store, token) {
-        rate_limit::record_auth_failure(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
-        return unauthorized_no_store(reason);
-    }
-    rate_limit::clear_auth_failures(&state, &client_key, BOOTSTRAP_AUTH_SCOPE);
-    match std::fs::read(&state.config.agent_package_file) {
+    let Some(package_path) = effective_package_path(&state.config, &state.store, platform).await
+    else {
+        return ApiError::unavailable(
+            codes::AGENT_PACKAGE_NOT_CONFIGURED,
+            "agent package for this platform is not configured on this gateway",
+        )
+        .with_no_store()
+        .into_response();
+    };
+    match std::fs::read(&package_path) {
         Ok(bytes) => (
             [
                 (header::CONTENT_TYPE, "application/octet-stream"),
@@ -199,108 +225,391 @@ pub async fn download_agent_package(
             bytes,
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+        Err(err) => ApiError::internal(
+            codes::AGENT_PACKAGE_READ_FAILED,
             "failed to read agent package",
+            err,
         )
-            .into_response(),
+        .with_no_store()
+        .into_response(),
     }
 }
 
-fn unauthorized_no_store(message: impl Into<String>) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::CACHE_CONTROL, NO_STORE)],
-        message.into(),
+/// 按内容寻址 id 取某个录入过的安装包（升级路径）。
+///
+/// 与 `/current` 不同：这里取的是历史里**这个包自己**的那份副本，而不是单例缓存。
+/// 鉴权与 `/current` 一致（bootstrap token 或 agent 凭据二者其一）。
+pub async fn download_agent_package_by_id(
+    State(state): State<ApiState>,
+    Path(package_id): Path<String>,
+    client_identity: Option<Extension<VerifiedAgentIdentity>>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = authorize_package_download(
+        &state,
+        client_identity.as_ref().map(|identity| &identity.0),
+        &headers,
+        &client_key,
     )
+    .await
+    {
+        return response;
+    }
+    let entry = match state
+        .store
+        .get_agent_install_package_by_id(&package_id)
+        .await
+    {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return ApiError::not_found(codes::AGENT_PACKAGE_NOT_FOUND, "unknown agent package")
+                .with_no_store()
+                .into_response();
+        }
+        Err(err) => {
+            return ApiError::internal(
+                codes::AGENT_PACKAGE_HISTORY_LOAD_FAILED,
+                "failed to load agent package history",
+                err,
+            )
+            .with_no_store()
+            .into_response();
+        }
+    };
+    match std::fs::read(&entry.cached_path) {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CACHE_CONTROL, NO_STORE),
+            ],
+            bytes,
+        )
+            .into_response(),
+        // 行在但副本丢了（磁盘被清/被移）：按不存在处理，别把 500 当作“网关挂了”。
+        Err(_) => ApiError::not_found(
+            codes::AGENT_PACKAGE_COPY_MISSING,
+            "agent package copy is missing",
+        )
+        .with_no_store()
+        .into_response(),
+    }
+}
+
+/// 安装包分发端点的鉴权：接受 **bootstrap（注册）token 或 agent 客户端证书** 二者其一。
+///
+/// 为什么要两个入口：新装场景手上是注册 token（agent 还没证书）；而升级场景的机器没有
+/// enrollment token，靠 mTLS 出示自己的客户端证书（升级器 `/current` 或按 id 取包）。
+/// 两者都是「可信的舰队成员」，且包本身不是秘密（install.sh 会内嵌下载地址与摘要）。
+///
+/// **bearer 凭据路径已随双轨一起删除**（§7 收口）：机器一方的身份只有客户端证书这一条。
+///
+/// 限流沿用现有 `BOOTSTRAP_AUTH_SCOPE`：这是同一个端点上的**一次**鉴权决策，
+/// 桶按客户端 IP 分；沿用旧 scope 能保持 `/current` 现有行为不变（不新立 scope）。
+#[allow(clippy::result_large_err)]
+async fn authorize_package_download(
+    state: &ApiState,
+    client_identity: Option<&VerifiedAgentIdentity>,
+    headers: &HeaderMap,
+    client_key: &str,
+) -> Result<(), Response> {
+    if let Some(response) = rate_limit::check_rate_limit(state, client_key, BOOTSTRAP_AUTH_SCOPE) {
+        return Err(response);
+    }
+    // 先按 mTLS 客户端证书（升级路径），再按引导 token（新装路径）。
+    if client_identity.is_some() {
+        return match super::agent_ops::authorize_agent_certificate(state, client_identity).await {
+            Ok(()) => {
+                rate_limit::clear_auth_failures(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+                Ok(())
+            }
+            Err(reason) => {
+                rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+                log::warn!(
+                    "audit package_download_rejected reason=invalid_certificate detail={reason}"
+                );
+                Err(unauthorized_no_store(
+                    codes::AGENT_CERTIFICATE_INVALID,
+                    "invalid agent client certificate",
+                ))
+            }
+        };
+    }
+    let Some(token) = bootstrap_bearer_token(headers) else {
+        rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+        // 对外仍是一句不可区分的口径；具体原因只进服务端审计日志（**不记 token 本身**）。
+        log::warn!("audit package_download_rejected reason=missing_credential");
+        return Err(unauthorized_no_store(
+            codes::CREDENTIAL_REQUIRED,
+            "agent package download requires a bootstrap token or a client certificate",
+        ));
+    };
+    match validate_bootstrap_token_for_config(&state.config, &state.store, token).await {
+        Ok(()) => {
+            rate_limit::clear_auth_failures(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+            Ok(())
+        }
+        Err(reason) => {
+            rate_limit::record_auth_failure(state, client_key, BOOTSTRAP_AUTH_SCOPE);
+            log::warn!(
+                "audit package_download_rejected reason=invalid_bootstrap_token detail={reason}"
+            );
+            Err(unauthorized_no_store(
+                codes::BOOTSTRAP_TOKEN_INVALID,
+                "invalid bootstrap token",
+            ))
+        }
+    }
+}
+
+fn unauthorized_no_store(code: &str, message: impl Into<String>) -> Response {
+    ApiError::unauthorized(code, message)
+        .with_no_store()
         .into_response()
 }
 
-pub fn issue_agent_install_code(
+pub async fn issue_agent_install_code(
     config: &AdminConfig,
-    store: &AdminStore,
+    store: &Arc<dyn Store>,
 ) -> Result<AgentInstallCode, String> {
     let token = new_enrollment_token()?;
     let token_hash = token_hash(&token);
     let issued_at = chrono::Utc::now();
     let expires_at = issued_at + chrono::Duration::seconds(config.bootstrap_token_ttl_seconds);
     let stored = StoredEnrollmentToken {
-        token_hash: token_hash.clone(),
+        token_id: format!("install-{}", short_token_id(&token)),
+        token_hash,
         tenant_id: config.tenant_id.clone(),
         environment_id: config.environment_id.clone(),
+        issued_by: "admin-api".to_string(),
+        allowed_node_selector: None,
         max_uses: 1,
         used_count: 0,
         issued_at: issued_at.to_rfc3339(),
         expires_at: expires_at.to_rfc3339(),
         reserved_at: None,
+        revoked_at: None,
         status: StoredEnrollmentTokenStatus::Active,
     };
     store
-        .update(|snapshot| {
-            snapshot.enrollment_tokens.insert(token_hash, stored);
-        })
+        .insert_enrollment_token(&stored)
+        .await
         .map_err(|err| err.to_string())?;
-    agent_install_code(config, &token, expires_at)
+    // 分发地址恒为网关自身端点；管理面设置的是来源地址，制品已缓存到网关本地。
+    // 基址取「网关对外地址」：安装命令、脚本与安装包的分发地址、以及 Agent 的控制面
+    // endpoint 全部由它派生，必须同源。
+    let base = effective_advertise_base(config, store).await;
+    let packages = resolve_agent_platform_packages(config, store, &base).await?;
+    if packages.is_empty() {
+        return Err(
+            "没有可用的 agent 安装包：管理面未录入任何平台（或副本已不在）—— 到「安装包」页按平台录入"
+                .to_string(),
+        );
+    }
+    agent_install_code(config, &token, expires_at, &packages, &base)
+}
+
+/// 生效的对外基址：管理面设置过就用它（去掉尾斜杠），否则回落 `server.public_base_url`。
+///
+/// 读设置失败不阻断安装链路，只回落并留下告警 —— 与 [`effective_package_path`] 同一个
+/// 取舍：安装端点不该因为管理面的一次读失败而整体不可用。
+pub async fn effective_advertise_base(config: &AdminConfig, store: &Arc<dyn Store>) -> String {
+    match store.get_agent_advertise_url().await {
+        Ok(Some(setting)) => setting.url.trim_end_matches('/').to_string(),
+        Ok(None) => config.public_base_url.clone(),
+        Err(err) => {
+            log::warn!("warning: failed to read gateway advertise url: {err}");
+            config.public_base_url.clone()
+        }
+    }
+}
+
+/// 生效的数据面上送目标：**管理面设置 → 部署配置派生 → 都没有**。
+///
+/// 「一台机器、一个域名」的部署不该再录一遍地址：录进来的域名（[`effective_advertise_base`]）
+/// 就是唯一来源 —— 派生规则是「与 Agent 拿到的控制面地址**同域**，端口取数据面约定的入口端口
+/// [`DEFAULT_AGENT_UPLINK_PORT`]」。要指到别处（另一台机器的数据面、非约定端口）才需要管理面录入。
+///
+/// 派生的那条 `updated_at` 留空，管理面据此把「来自部署配置」与「管理面设置过」区分开
+/// （见 `admin_ops::uplink_response`）。
+pub async fn effective_agent_uplink(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+) -> StoreResult<Option<StoredAgentUplinkAddress>> {
+    Ok(match store.get_agent_uplink().await? {
+        Some(setting) => Some(setting),
+        None => derived_agent_uplink(config, store).await,
+    })
+}
+
+/// 部署配置派生的上送目标（管理面没设过时的回落）。
+///
+/// `None` = 连基址里都取不出主机名 —— 这时才是真的「没有上送目标」，调用方按未设置处理。
+///
+/// `enabled` 恒为 `false`：派生只说明「能连到哪」（同一域名 + 数据面端口），不说明「该不该连」。
+/// 把 `true` 当成默认就等于「升级即开始上送」，与「默认零行为变化」相冲。
+pub async fn derived_agent_uplink(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+) -> Option<StoredAgentUplinkAddress> {
+    let base = effective_advertise_base(config, store).await;
+    uplink_host_from_base_url(&base).map(|host| StoredAgentUplinkAddress {
+        setting_id: DEFAULT_AGENT_UPLINK_SETTING_ID.to_string(),
+        host,
+        port: DEFAULT_AGENT_UPLINK_PORT,
+        enabled: false,
+        updated_by: String::new(),
+        updated_at: String::new(),
+    })
+}
+
+/// 从基址取「裸主机名」：`https://gw.example.com:8443/x` → `gw.example.com`。
+///
+/// 端口一律丢掉：上送端口是**数据面**端口，与基址里那个（网关自己的监听端口）无关。
+///
+/// **只接受裸主机名 / IPv4 字面量**（白名单），其余一律判为派生不出：
+///   * IPv6 字面量（`[::1]`）拼不出 agentd 要的 `host:port`；
+///   * 带 userinfo（`https://user@gw`）、带空白或其它符号的写法：宁可判「无目标」也不猜 ——
+///     派生错了会让整队 agent 去连一个不存在的地址（**比没有目标更糟**）。
+fn uplink_host_from_base_url(base: &str) -> Option<String> {
+    // scheme 按大小写不敏感地切（固定小写是在上游校验里保证的，这里不靠它做正确性）。
+    let after_scheme = base.find("://").map_or(base, |index| &base[index + 3..]);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let host = authority.split(':').next().unwrap_or_default();
+    let is_bare_host = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    is_bare_host.then(|| host.to_string())
 }
 
 pub fn agent_install_code(
     config: &AdminConfig,
     token: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
+    packages: &[(String, AgentPackageSource)],
+    base: &str,
 ) -> Result<AgentInstallCode, String> {
-    let package_sha256 = agent_package_sha256(config)?;
-    let x86_install_script_url = config.install_script_url("x86");
-    let arm_install_script_url = config.install_script_url("arm");
-    let macos_install_code = macos_install_command(config)?;
+    let macos_install_code = macos_install_command(config, base)?;
+    // 每平台一份：安装脚本地址（平台限定）+ 网关托管包地址/摘要。
+    let platforms: Vec<AgentPlatformPackage> = packages
+        .iter()
+        .map(|(platform, source)| AgentPlatformPackage {
+            platform: platform.clone(),
+            install_script_url: config.install_script_url_at(base, platform),
+            agent_package_url: source.url.clone(),
+            agent_package_sha256: source.sha256.clone(),
+        })
+        .collect();
     Ok(AgentInstallCode {
-        x86_linux_install_code: install_command(config, &x86_install_script_url),
+        x86_linux_install_code: linux_install_command(config, packages, base, PLATFORM_LINUX_X86),
         bootstrap_enrollment_token: token.to_string(),
-        arm_linux_install_code: install_command(config, &arm_install_script_url),
+        arm_linux_install_code: linux_install_command(config, packages, base, PLATFORM_LINUX_ARM),
         macos_install_code,
         bootstrap_bundle: AgentBootstrapBundle {
             bundle_id: format!("agent-bootstrap-{}", short_token_id(token)),
-            install_script_url: x86_install_script_url,
-            agent_package_url: config.agent_package_url(),
-            agent_package_sha256: package_sha256,
-            control_endpoint: config.public_base_url.clone(),
+            control_endpoint: base.to_string(),
             trust_bundle: config.trust_bundle.clone(),
             tenant_id: config.tenant_id.clone(),
             environment_id: config.environment_id.clone(),
             expires_at: DateTime::from_rfc3339(&expires_at.to_rfc3339())
                 .unwrap_or_else(DateTime::now),
+            platforms,
         },
     })
 }
 
-pub fn install_script(config: &AdminConfig, arch: &str) -> Result<String, String> {
-    let package_sha256 = agent_package_sha256(config)?;
-    Ok(INSTALL_SCRIPT_TEMPLATE
-        .replace("{{ARCH}}", arch)
-        .replace("{{AGENT_PACKAGE_URL}}", &config.agent_package_url())
+/// 渲染 install.sh，并把生效的安装包地址与校验摘要写进模板。
+///
+/// 调用方给的 [`AgentPackageSource`] 必须与**引导命令算摘要时用的那份**一致（同 platform + 同包来源）：
+/// 两侧各渲一次，换一份来源摘要就对不上、校验白装。
+pub fn install_script(
+    config: &AdminConfig,
+    platform: &str,
+    package: &AgentPackageSource,
+    base: &str,
+) -> String {
+    INSTALL_SCRIPT_TEMPLATE
+        .replace("{{ARCH}}", platform)
+        .replace("{{AGENT_PACKAGE_URL}}", &package.url)
         .replace(
             "{{AGENT_INITIAL_CONFIG_URL}}",
-            &config.agent_initial_config_url(),
+            &config.agent_initial_config_url_at(base),
         )
-        .replace("{{AGENT_PACKAGE_SHA256}}", &package_sha256)
-        .replace("{{TRUST_BUNDLE}}", &config.trust_bundle))
+        .replace("{{AGENT_PACKAGE_SHA256}}", &package.sha256)
+        .replace("{{TRUST_BUNDLE}}", &config.trust_bundle)
 }
 
-fn install_command(config: &AdminConfig, script_url: &str) -> String {
-    let signature_url = install_script_signature_url(script_url);
-    // The two downloads use -k (skip cert verification) because the admin runs
-    // a self-signed CA that a fresh host cannot yet trust. This is safe: the
-    // script's integrity/authenticity is verified by the embedded public key
-    // below (openssl pkeyutl -verify), so TLS is just transport here.
+/// Linux 引导命令：下载安装脚本，**按内嵌的 sha256 校验通过后才执行**。
+///
+/// 下载带 `-k`（跳过证书校验）：管理面用的是自签 CA，全新主机还不信任它。这安全的前提是
+/// **完整性由命令里内嵌的摘要保证** —— 摘要是运维从已认证的管理面**带外**粘贴过来的，
+/// TLS 在这里只当传输层用。macOS 走另一条路（`curl --pinnedpubkey`，见
+/// [`macos_install_command`]）。
+///
+/// 老写法（Ed25519 + `openssl pkeyutl -verify -rawin`）已弃用：它要求目标机有
+/// **OpenSSL ≥ 3.0**，把兼容底线抬到 EL9+ / Ubuntu 22.04+，与 `install.sh`、agentd 自己的
+/// 口径（systemd + curl 的老发行版）不一致。取摘要工具的写法与 `install.sh` 一致
+/// （`sha256sum` 优先、`shasum` 兜底）—— 两者都只在底线内。
+fn install_command(script_url: &str, script_sha256: &str) -> String {
     format!(
-        r#"set -eu; D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT INT TERM; echo "working dir: $D"
+        r#"set -eu; D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT INT TERM
 curl -fsSLk "{script_url}" -o "$D/s"
-curl -fsSLk "{signature_url}" -o "$D/sig"
-cat >"$D/key.pem" <<'EOF'
-{public_key_pem}EOF
-openssl pkeyutl -verify -pubin -inkey "$D/key.pem" -rawin -in "$D/s" -sigfile "$D/sig" && sh "$D/s""#,
-        script_url = script_url,
-        signature_url = signature_url,
-        public_key_pem = config.install_script_signing_public_key_pem,
+echo "==> 校验安装脚本摘要"
+if command -v sha256sum >/dev/null 2>&1; then actual="$(sha256sum "$D/s" | awk '{{print $1}}')"
+elif command -v shasum >/dev/null 2>&1; then actual="$(shasum -a 256 "$D/s" | awk '{{print $1}}')"
+else echo "缺少 sha256sum / shasum：无法校验安装脚本（底线要求二者有其一），已中止" >&2; exit 1; fi
+if [ "$actual" != "{script_sha256}" ]; then echo "安装脚本摘要不匹配：已中止，未执行任何脚本" >&2; exit 1; fi
+sh "$D/s""#,
+    )
+}
+
+/// 某一 linux 平台的引导命令。
+///
+/// 摘要**必须**取自与脚本端点**同一次渲染**（同 `platform` + 同包来源）：端点下发的就是
+/// [`install_script`] 用同一个包渲染出来的字节，换一份来源摘要就对不上、校验白装。
+fn linux_install_command(
+    config: &AdminConfig,
+    packages: &[(String, AgentPackageSource)],
+    base: &str,
+    platform: &str,
+) -> String {
+    let Some(package) = package_for_platform(packages, platform) else {
+        return package_unavailable_command(platform);
+    };
+    let script = install_script(config, platform, package, base);
+    install_command(
+        &config.install_script_url_at(base, platform),
+        &bytes_sha256_hex(script.as_bytes()),
+    )
+}
+
+fn package_for_platform<'a>(
+    packages: &'a [(String, AgentPackageSource)],
+    platform: &str,
+) -> Option<&'a AgentPackageSource> {
+    packages
+        .iter()
+        .find(|(candidate, _)| candidate == platform)
+        .map(|(_, source)| source)
+}
+
+/// 该平台**没有可用安装包**时下发的命令：什么都不做，只说明去哪补包。
+///
+/// 为什么不照旧下发「一条能下载、但注定失败」的命令：摘要只能由网关**从将要下发的那份脚本**
+/// 算出来（包不在就算不出脚本），所以这种情况给不出一条**能校验**的命令；
+/// 而「跳过校验直接执行」与「跑到一半撞 503」两个都不行。
+fn package_unavailable_command(platform: &str) -> String {
+    format!(
+        r#"set -eu
+printf '%s\n' "网关当前没有 {platform} 的 agent 安装包，这条命令不会做任何改动。" >&2
+printf '%s\n' "到网关「安装包」页为该平台录入安装包，再回本页重新复制命令。" >&2
+exit 1"#
     )
 }
 
@@ -324,44 +633,79 @@ fn server_tls_spki_pin(config: &AdminConfig) -> Result<String, String> {
 
 /// macOS install command: the built-in curl authenticates the TLS channel by
 /// pinning the gateway's serving certificate, so the target host needs no
-/// external OpenSSL 3 / Ed25519 CLI support. The host architecture is picked
-/// at runtime (arm64 -> arm, everything else -> x86).
-fn macos_install_command(config: &AdminConfig) -> Result<String, String> {
+/// external OpenSSL 3 / Ed25519 CLI support. 只发布 macOS-ARM（`aarch64-apple-darwin`），
+/// 脚本按**平台**寻址（`/api/v1/agent/install/<triple>/install.sh`）。
+fn macos_install_command(config: &AdminConfig, base: &str) -> Result<String, String> {
     let pin = server_tls_spki_pin(config)?;
-    let install_base = format!(
-        "{}/api/v1/agent/install",
-        config.public_base_url.trim_end_matches('/')
-    );
+    let script_url = config.install_script_url_at(base, PLATFORM_MACOS_ARM);
     Ok(format!(
-        r#"set -eu; D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT INT TERM; echo "working dir: $D"
+        r#"set -eu; D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT INT TERM
 if [ "$(uname -s)" != "Darwin" ]; then echo "this install command is for macOS only" >&2; exit 2; fi
-case "$(uname -m)" in arm64) ARCH=arm ;; *) ARCH=x86 ;; esac
-curl -fsSLk --pinnedpubkey "sha256//{pin}" "{install_base}/$ARCH/install.sh" -o "$D/s"
+curl -fsSLk --pinnedpubkey "sha256//{pin}" "{script_url}" -o "$D/s"
 sh "$D/s""#,
         pin = pin,
-        install_base = install_base,
+        script_url = script_url,
     ))
 }
 
-fn install_script_signature_url(script_url: &str) -> String {
-    format!("{script_url}.sig")
-}
-
-pub(crate) fn install_script_signature(
+pub fn agent_initial_config_toml(
     config: &AdminConfig,
-    arch: &str,
-) -> Result<Vec<u8>, String> {
-    let script = install_script(config, arch)?;
-    sign_install_script(
-        &config.install_script_signing_private_key_file,
-        script.as_bytes(),
-    )
-}
-
-pub fn agent_initial_config_toml(config: &AdminConfig, enrollment_token: &str) -> String {
+    enrollment_token: &str,
+    uplink: Option<&StoredAgentUplinkAddress>,
+    base: &str,
+) -> String {
     // Give each install a unique instance_name derived from its bootstrap token so
     // cloned machines (shared machine-id) still derive distinct agent identities.
     let instance_name = format!("host-{}", short_token_id(enrollment_token));
+    // 默认**待命**：Agent 不采集日志、也不上送（指标同样不上送）。
+    //
+    // 待命由 `[telemetry.logs.output] enabled = false` 表达 —— 它与 `kind` **正交**：
+    // `kind` 回答「写到哪」（file / tcp），`enabled` 回答「要不要写」。待命是开关状态，
+    // 不该由「写到哪」来表达：
+    //   * 有上送地址 → 记下真实目标（`kind = "tcp"`），但 `enabled = false` 先关掉；
+    //   * 没有上送地址 → 没有目标可指，用 `kind = "file"` 表示，避免记一个会连错的
+    //     tcp 默认值（旧默认是 127.0.0.1:9000）。
+    //
+    // 控制面派活后会在 `uplink:poll` 上下发 `enabled = true` + 目标，Agent 自动开始上送，
+    // **无需人工改这份配置**、也无需重装。这也是相对旧实现（用 `kind = "file"` 表达待命）
+    // 的修复：旧写法让事实帧走 file 分支返回 Err，默认配置持续打印 `fact summary uplink failed`；
+    // `enabled = false` 时事实帧根本不会被上送，噪声自然消失。
+    let telemetry = match uplink {
+        Some(setting) => format!(
+            r#"# 待命：不采集日志、也不上送（指标同样不上送）。
+# 待命由 enabled = false 表达，与 kind 正交：目标记成 tcp，但开关先关掉。
+# 控制面派活后会在 uplink:poll 上下发 enabled = true + 目标，Agent 自动开始上送 ——
+# 不需要人工改这份配置。
+[telemetry.logs]
+in_memory_buffer_bytes = 1048576
+spool_dir = "state/spool/logs"
+
+[telemetry.logs.output]
+enabled = false
+kind = "tcp"
+
+[telemetry.logs.output.tcp]
+addr = "{addr}"
+port = {port}
+framing = "line"
+"#,
+            addr = toml_escape(&setting.host),
+            port = setting.port,
+        ),
+        None => r#"# 待命：不采集日志、也不上送（指标同样不上送）。
+# 待命由 enabled = false 表达，与 kind 正交。
+# 管理面还没设置「数据面上送地址」，所以这里连上送目标都没有，用 kind = "file" 表示
+# 「没有目标」（不记一个会连错的 tcp 默认值）。派活后控制面会在 uplink:poll 上下发目标。
+[telemetry.logs]
+in_memory_buffer_bytes = 1048576
+spool_dir = "state/spool/logs"
+
+[telemetry.logs.output]
+enabled = false
+kind = "file"
+"#
+        .to_string(),
+    };
     format!(
         r#"schema_version = "v1"
 
@@ -373,27 +717,16 @@ instance_name = "{instance_name}"
 enabled = true
 endpoint = "{endpoint}"
 enrollment_token = "{enrollment_token}"
-credential_request = "bearer"
+credential_request = "csr"
 tls_mode = "{tls_mode}"
 trust_bundle = "{trust_bundle}"
 auth_mode = "enrollment_token"
 
-[paths]
-root_dir = ".."
-run_dir = "run"
-state_dir = "state"
-log_dir = "log"
-
-[telemetry.logs]
-in_memory_buffer_bytes = 1048576
-spool_dir = "state/spool/logs"
-
-[telemetry.logs.output]
-kind = "file"
-
-[telemetry.logs.output.file]
-path = "log/wist-records.ndjson"
-
+# 路径布局由 agentd 按**配置目录**推导，此处不声明 [paths]：
+#   /etc/wist-agentd（系统级安装）→ 数据 /var/lib/wist-agentd、日志 /var/log/wist-agentd
+#   其它位置（用户级安装）→ 数据与日志留在配置目录下
+# 一旦在此声明（即使值等于默认），agentd 就不再填默认值，系统级安装会退回配置目录下。
+{telemetry}
 [discovery]
 host_enabled = true
 network_enabled = true
@@ -403,77 +736,37 @@ container_enabled = false
 "#,
         environment_id = toml_escape(&config.environment_id),
         instance_name = toml_escape(&instance_name),
-        endpoint = toml_escape(&config.public_base_url),
+        endpoint = toml_escape(base),
         enrollment_token = toml_escape(enrollment_token),
-        tls_mode = toml_escape(tls_mode_for_endpoint(&config.public_base_url)),
+        tls_mode = toml_escape(tls_mode_for_endpoint(base)),
         trust_bundle = toml_escape(&config.trust_bundle),
+        telemetry = telemetry,
     )
 }
 
-pub fn validate_bootstrap_token_for_config(
+pub async fn validate_bootstrap_token_for_config(
     config: &AdminConfig,
-    store: &AdminStore,
+    store: &Arc<dyn Store>,
     token: &str,
 ) -> Result<(), String> {
     let token_hash = token_hash(token);
-    // Use `update` (always persists) rather than `update_result` (rolls back on
-    // Err) so status transitions — marking an expired token, recovering an
-    // expired reservation — are actually written to the store.
-    store
-        .update(|snapshot| -> Result<(), String> {
-            let Some(stored) = snapshot.enrollment_tokens.get_mut(&token_hash) else {
-                return Err("unknown enrollment token".to_string());
-            };
-            if stored.tenant_id != config.tenant_id
-                || stored.environment_id != config.environment_id
-            {
-                return Err("enrollment token environment mismatch".to_string());
-            }
-            if stored.token_hash != token_hash {
-                return Err("enrollment token hash mismatch".to_string());
-            }
-            let expires_at = chrono::DateTime::parse_from_rfc3339(&stored.expires_at)
-                .map_err(|_| "enrollment token has invalid expiration".to_string())?
-                .with_timezone(&chrono::Utc);
-            let now = chrono::Utc::now();
-            if now >= expires_at {
-                stored.status = StoredEnrollmentTokenStatus::Expired;
-                return Err("enrollment token is expired".to_string());
-            }
-            recover_expired_reservation(stored, &now);
-            if stored.status != StoredEnrollmentTokenStatus::Active {
-                return Err("enrollment token is not active".to_string());
-            }
-            if stored.used_count >= stored.max_uses {
-                return Err("enrollment token is exhausted".to_string());
-            }
-            Ok(())
+    // The store persists its own state transitions (marking an expired token,
+    // recovering a stale reservation) even when it rejects, so here we only map
+    // the semantic rejection back to the existing outward error strings.
+    let rejection = store
+        .validate_bootstrap_token(&BootstrapTokenCheck {
+            token_hash: &token_hash,
+            tenant_id: &config.tenant_id,
+            environment_id: &config.environment_id,
+            reservation_ttl_seconds: ENROLLMENT_TOKEN_RESERVATION_TTL_SECONDS,
         })
+        .await
         .map_err(|err| err.to_string())?
-}
-
-pub fn agent_package_sha256(config: &AdminConfig) -> Result<String, String> {
-    let path = &config.agent_package_file;
-    let metadata = std::fs::metadata(path).map_err(|err| err.to_string())?;
-    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let len = metadata.len();
-    let mut cache = PACKAGE_HASH_CACHE
-        .lock()
-        .map_err(|_| "package hash cache poisoned".to_string())?;
-    if let Some(entry) = cache.as_ref()
-        && entry.modified == modified
-        && entry.len == len
-    {
-        return Ok(entry.hash.clone());
+        .err();
+    match rejection {
+        Some(rejection) => Err(rejection.to_string()),
+        None => Ok(()),
     }
-    let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
-    let hash = bytes_sha256_hex(&bytes);
-    *cache = Some(PackageHashCacheEntry {
-        modified,
-        len,
-        hash: hash.clone(),
-    });
-    Ok(hash)
 }
 
 fn tls_mode_for_endpoint(endpoint: &str) -> &'static str {
@@ -522,30 +815,4 @@ fn bootstrap_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
         .map(str::trim)
         .filter(|value| !value.is_empty())
-}
-
-pub fn recover_expired_reservation(
-    token: &mut StoredEnrollmentToken,
-    now: &chrono::DateTime<chrono::Utc>,
-) {
-    if token.status != StoredEnrollmentTokenStatus::Reserved {
-        return;
-    }
-    let reserved_at = token
-        .reserved_at
-        .as_deref()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&chrono::Utc));
-    let Some(reserved_at) = reserved_at else {
-        token.used_count = token.used_count.saturating_sub(1);
-        token.reserved_at = None;
-        token.status = StoredEnrollmentTokenStatus::Active;
-        return;
-    };
-    if *now - reserved_at < chrono::Duration::seconds(ENROLLMENT_TOKEN_RESERVATION_TTL_SECONDS) {
-        return;
-    }
-    token.used_count = token.used_count.saturating_sub(1);
-    token.reserved_at = None;
-    token.status = StoredEnrollmentTokenStatus::Active;
 }

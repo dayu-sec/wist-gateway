@@ -4,17 +4,68 @@ use std::{
 };
 
 use orion_error::conversion::ToStructError;
+use orion_sec::sec::NoSecConv;
+use orion_sec::{SecFileFmt, load_sec_dict, load_secfile_by};
+use orion_variate::vars::{EnvChecker, EnvDict, EnvEvaluable, ValueType};
 use serde::Deserialize;
 
-use super::{load_install_script_public_key_pem, sha256_hex};
+use super::{IpNet, sha256_hex};
 use wist_error::ConfigReason;
 
 const DEFAULT_CONFIG_PATH: &str = "wist-gateway.toml";
+/// `[ingest]` 段缺省时的内部接入端点：只绑环回，避免明文监听被动暴露到网卡上。
+const DEFAULT_INGEST_LISTEN_ADDR: &str = "127.0.0.1:3001";
 const CONFIG_ENV: &str = "WIST_GATEWAY_CONFIG";
+/// 可选的**接口层**配置（默认文件名 `wist-gateway-pub.toml`）：现场选择（对外地址 / 身份引用 /
+/// 归属）单独一份，与主配置**分文件**。
+///
+/// 为什么要分：主配置是**交付物**（模板渲染、升级该被覆盖），接口层是**现场选择**（升级必须保留）。
+/// 混在一个文件里时，`preserve` / `ignore` / `backup` 只能互相让步。
+/// 显式设了 `PUB_CONFIG_ENV` 就用它（相对路径按主配置目录解析）；未设则取主配置同目录的同名文件（**存在才用**）。
+const PUB_CONFIG_ENV: &str = "WIST_GATEWAY_PUB_CONFIG";
+const PUB_CONFIG_FILE_NAME: &str = "wist-gateway-pub.toml";
+/// 现场态**值**的约定文件名：与现场态声明同目录（docker-compose 的 `.env` 口径）。
+const PUB_ENV_FILE_NAME: &str = ".env";
+/// 指向现场态 `.env` 的环境变量（docker-compose 的 `--env-file` 对应物）：
+/// 显式设了就用它（相对路径按现场态声明目录解析）；未设 = 声明旁边的 `.env`。
+const PUB_ENV_FILE_ENV: &str = "WIST_GATEWAY_ENV_FILE";
+
+/// 本组件的「分层配置」约定 —— 交给共享 crate `wist-config` 干活
+/// （主配置 + 现场态声明 `${VAR}` 插值 + 同目录 `.env` 合并），与 center / gwlinkd 同一套口径。
+const LAYER: wist_config::LayerSpec = wist_config::LayerSpec {
+    overlay_file: PUB_CONFIG_FILE_NAME,
+    overlay_env: PUB_CONFIG_ENV,
+    values_file: PUB_ENV_FILE_NAME,
+    values_env: PUB_ENV_FILE_ENV,
+};
+
+/// 显式指定密钥文件（**绝对路径**）；未设则用 orion 默认
+/// `./.galaxy/sec_value.yml` → `~/.galaxy/sec_value.yml`。
+const SEC_FILE_ENV: &str = "WIST_GATEWAY_SEC_FILE";
+/// 显式设置即覆盖文件值；显式置空 = 回到默认 SQLite 文件存储。
+const ENV_DATABASE_URL: &str = "WIST_GATEWAY_DATABASE_URL";
 // Lower bound on the admin token length; the actual strength gate is the
 // entropy check in require_non_weak_admin_token (>= 8 alphanumeric chars).
 const MIN_ADMIN_API_TOKEN_BYTES: usize = 8;
 const MAX_BOOTSTRAP_TOKEN_TTL_SECONDS: i64 = 60 * 60;
+/// 采集日志单文件上限的下限。
+///
+/// 必须**大于单次 append 的字节数**（内部接入端点 body 上限 4 MiB）：否则一批就能把文件顶到上限
+/// 之上，下一批会把它当成「遗留超大文件」丢掉 —— 丢数据。取回看窗口（8 MiB）作为下限，
+/// 比窗口还小的文件，按窗口回看本身也没意义。
+const MIN_AGENT_LOG_BYTES: u64 = crate::infra::TAIL_WINDOW_BYTES;
+
+/// 一次性调查的默认额度：每台 agent 每小时 12 次（= 5 分钟一次，远高于人工排障的频率）。
+///
+/// 为什么需要额度：调查会在客户机上扫盘，而管理面一个“重试”就能把一台机器扫一整天；
+/// 12 次/小时足够连点排障，又能把脚本误触挡在门外。`0` = 不限。
+pub(crate) const DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR: u32 = 12;
+
+/// 报告的默认保留天数（`0` = 不限）。
+///
+/// 报告含客户机的路径/文件名（`sensitivity = paths`），默认不该在网关上永远留着；
+/// 7 天够一次事故回看。**只过滤不删文件**（报告由数据面写，网关是只读方）。
+pub(crate) const DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS: u32 = 7;
 /// Well-known weak values that must never be used as the admin API token.
 const WEAK_ADMIN_API_TOKENS: &[&str] = &[
     "admin",
@@ -33,16 +84,99 @@ pub struct AdminConfig {
     pub tls_cert_file: PathBuf,
     pub tls_key_file: PathBuf,
     pub admin_api_token_hash: String,
-    pub agent_package_file: PathBuf,
+    /// 环回面（`self-state` / `link-request` / `linkd-status` / `agent-package`）
+    /// 除环回外**额外**放行的对端（`[server] self_face_allow`；IP 或 CIDR）。
+    ///
+    /// 容器部署时**通常不用填**：网关启动时会自动认**容器默认路由的下一跳**（= 宿主在容器网络
+    /// 上的地址）为本机（见 [`crate::infra::LocalPeers`]）。这里填是给非标准网络（自建网桥 /
+    /// 宿主源 IP 被 SNAT 成别处）兑底。
+    ///
+    /// **`/0` 一律拒启**（那等于把这些**无鉴权**面公开给所有地址）—— 手滑写 `0.0.0.0/0` 是最容易
+    /// 犯的错，宁可起不来也不静默放行。
+    pub self_face_allow: Vec<IpNet>,
     pub bootstrap_token_ttl_seconds: i64,
     pub credential_ttl_seconds: i64,
+    /// 旧版单文件 JSON 存储路径：现在只作为「首次启动一次性导入」的来源。
     pub store_file: PathBuf,
+    /// SQLite DSN（显式配置时），留空则由 [`AdminConfig::sqlite_path`] 决定。
+    pub database_url: Option<String>,
+    /// 默认 SQLite 数据库文件（DSN 未配置时使用）。
+    pub sqlite_path: PathBuf,
     pub trust_bundle: String,
-    pub install_script_signing_private_key_file: PathBuf,
-    pub install_script_signing_public_key_pem: String,
+    /// agent 客户端证书签发 CA（证书 + 私钥，PEM）。这是与「服务端叶证书的 CA」**分开**的
+    /// 一把 CA（见 `docs/design/agent-identity-mtls.md` §4.1）。两者**要么都给、要么都不给**：
+    /// 都缺 = 关闭 mTLS 签发（双轨期，bearer 路径照常）。
+    pub agent_ca_cert_file: Option<PathBuf>,
+    pub agent_ca_key_file: Option<PathBuf>,
+    /// 签发的 agent 客户端证书有效期（秒）。缺省 37 天 = 保底 30 天 + 提前 7 天续期（§4.2）。
+    pub client_cert_ttl_seconds: i64,
     pub tenant_id: String,
     pub environment_id: String,
     pub victoria_metrics_url: String,
+    /// 用途推断规则表（策展数据）。未配置时：事实照常入库，但不产出建议。
+    pub purpose_rules_file: Option<PathBuf>,
+    /// 发现方向策略表（策展数据）。未配置时：不下发该端点，Agent 回落到自己的内建默认值。
+    pub discovery_policies_file: Option<PathBuf>,
+    /// 采集内容三件套（catalog / packs / templates，策展数据）。
+    /// 三者**要么都给、要么都不给** —— 内容集内部互相引用，缺一不可。
+    pub content_catalog_file: Option<PathBuf>,
+    pub content_packs_file: Option<PathBuf>,
+    pub content_templates_file: Option<PathBuf>,
+    /// 数据面订阅端的内部接入端点（明文 HTTP，只应绑环回）。
+    /// `None` = 关闭订阅（见 [`RawIngestConfig`]）。
+    pub ingest_listen_addr: Option<String>,
+    /// 数据面工作根（宿主 `data-plane-run/work`，容器内只读挂载）：
+    /// 管理面「配置与规则」从这里读 conf / topology / connectors / models。
+    /// `None` = 没挂载（该页面回 503）。
+    pub data_plane_work_dir: Option<PathBuf>,
+    /// 允许触发的一次性调查面（`None` = 全部已知面；空表 = 一个都不许）。
+    ///
+    /// 这是**上界**：每台机器实际开哪几面由 `investigation_grant` 决定，**默认全关**
+    /// （与采集面一致）—— `None` 不等于“所有机器都能查”。
+    ///
+    /// 为什么网关侧要再拦一道：agentd 只保证「能跑」，**谁允许在这台机器上读什么**是控制面的事
+    /// （见 `doc/design/center/investigation-surfaces.md` §3 G1）。在还没有按调用者身份分权之前，
+    /// 这一节就是最小的「按面授权」：关掉一个面是**整个网关**的开关，不必去下线 agent。
+    pub investigation_allowed_topics: Option<Vec<String>>,
+    /// 每台 agent 每小时最多几次调查（`0` = 不限）。默认 [`DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR`]。
+    ///
+    /// 为什么需要：调查会在客户机上扫盘，而管理面一个“重试”按钮就能把一台机器扫一整天。
+    /// 计数看的是**尝试**（含已被覆盖/未确认的），已确认的不回退名额。
+    pub investigation_max_per_agent_per_hour: u32,
+    /// 报告保留天数（`0` = 不限）。超过的**不再出现在列表/详情**（不删文件）。
+    ///
+    /// 为什么只过滤不删：报告目录是数据面（wparse）写的，网关只是读者；
+    /// 一个只读视图不该替写者删数据。真要清盘，按运维的保留策略清。
+    pub investigation_report_retention_days: u32,
+    /// 调查报告目录（`[investigations] report_dir`）。
+    ///
+    /// 相对路径 = 相对 `[data_plane] work_dir`；绝对路径 = 直接就是那个目录（不要求挂 work_dir）。
+    /// 缺省 `None` → `data/ivsrep`（与数据面 `business.d/agent_ivsrep.toml` 的 `base` 对齐）。
+    /// 改这个值 = 数据面 sink 的 `base` 也改了，或报告单独挂了一个卷；两侧必须一起改。
+    pub investigation_report_dir: Option<PathBuf>,
+    /// 日志源（`from_dir` / 人工覆盖）允许落地的目录 roots。
+    ///
+    /// **这是网关策略，对所有人一致**：agent 上报什么、人显式指定什么，都要过这一关。
+    /// 人工覆盖**不能**借它越权（要采 roots 外的东西 = 改这里，那是策略级变更）。
+    /// 缺省 `["/var/log", "/data", "/srv", "/opt"]`。
+    pub allowed_source_roots: Vec<String>,
+    /// 启动期知识源：一个**已解开的包目录**（五份数据；`manifest.json` 不参与装载），
+    /// 即 `[knowledge] source_dir`。
+    /// 只在管理面**没有可用生效包**时启用 —— 出厂初始包放这里；它自己不可用也只告警回落，
+    /// 绝不把网关挡在启动之外（见 [`crate::app::knowledge::LoadedKnowledge::resolve`]）。
+    pub knowledge_source_dir: Option<PathBuf>,
+    /// 知识库内容包的签名公钥文件（Ed25519 SPKI PEM）。`None` = 不验签（只记 sha256）。
+    pub knowledge_signing_public_key_file: Option<PathBuf>,
+    /// 上面那个文件解析出的**裸公钥**（32 字节）。验签用它，省得每次重解 PEM。
+    pub knowledge_signing_public_key: Option<Vec<u8>>,
+    /// 采集日志落盘的**单文件上限**（字节）：写满就轮转（见 [`crate::infra::LogRetention`]）。
+    pub log_max_bytes: u64,
+    /// 采集日志保留的历史分卷个数（`<file>.1` … `<file>.N`）。
+    pub log_keep_files: usize,
+    /// 采集日志历史分卷的保留时长（秒）；`0` = 不按时间清。
+    pub log_max_age_seconds: i64,
+    /// `[log]` 段：本进程运行日志（级别 / 格式 / 落点 / 轮转）。与 `[logs]`（被采集 agent 日志）不同。
+    pub log: wist_log::LogSection,
 }
 
 pub use wist_error::ConfigError;
@@ -59,10 +193,218 @@ fn config_parse(message: impl Into<String>) -> ConfigError {
     ConfigReason::Parse.to_err().with_detail(message)
 }
 
+// 接口层（`wist-gateway-pub.toml`）的**路径解析**与**无重复叶子合并**不再在本文件手写：
+// 统一由共享 crate `wist-config` 提供（`overlay_path` / `merge_disjoint` / `load_layered_toml`），
+// 与 center / gwlinkd 同一套口径（见上面的 `LAYER`）。
+
 #[derive(Debug, Deserialize)]
 struct RawAdminConfig {
     server: RawServerConfig,
     agent: RawAgentConfig,
+    #[serde(default)]
+    store: RawStoreConfig,
+    #[serde(default)]
+    purpose: RawPurposeConfig,
+    #[serde(default)]
+    discovery: RawDiscoveryConfig,
+    #[serde(default)]
+    content: RawContentConfig,
+    /// `[collection]` 段：日志源允许落地的目录 roots（跑时也会被 `from_dir` / 覆盖用到）。
+    #[serde(default)]
+    collection: RawCollectionConfig,
+    #[serde(default)]
+    ingest: RawIngestConfig,
+    /// `[data_plane]` 段：数据面工作根的只读浏览器（管理面页面用）。
+    #[serde(default)]
+    data_plane: RawDataPlaneConfig,
+    /// `[investigations]` 段：一次性调查的**网关侧**授权与配额。
+    #[serde(default)]
+    investigations: RawInvestigationConfig,
+    #[serde(default)]
+    knowledge: RawKnowledgeConfig,
+    #[serde(default)]
+    logs: RawLogsConfig,
+    /// `[log]` 段：**本网关进程自己**的运行日志（与上面 `[logs]` 的“被采集 agent 日志落盘保留”不同）。
+    #[serde(default)]
+    log: RawLogConfig,
+}
+
+/// `[knowledge]` 段：知识库内容包的**信任配置**（设计 §9）。
+///
+/// 缺省 = 不验签：录入只记 sha256（M1 行为）。
+/// 给了公钥就**必须**验过签名才允许录入 —— 与安装脚本那把密钥同一简单度：
+/// 一把钥匙，不做多密钥共存，轮换就是换文件 + 重启。
+#[derive(Debug, Default, Deserialize)]
+struct RawKnowledgeConfig {
+    /// 签名公钥（Ed25519，SPKI PEM，相对配置目录）。只验签，不需要私钥 ——
+    /// 私钥在发布侧（wist-knowledge 的 CI），网关永远拿不到也不应该拿到。
+    #[serde(default)]
+    signing_public_key_file: Option<String>,
+    /// 启动期知识源：一个**已解开的包目录**（五份数据齐全）。
+    ///
+    /// 语义是「出厂初始包」：管理面还没激活过任何包（或激活的那个已不可用）时用它，
+    /// 一旦管理面切了可用包就由包接管（见 `LoadedKnowledge::resolve` 的优先级）。
+    /// **故意不做存在性校验**：配了却读不到只告警回落，不能反过来把网关挡在启动之外。
+    #[serde(default)]
+    source_dir: Option<String>,
+}
+
+/// `[ingest]` 段：数据面（warp-parse）**订阅端**的内部接入端点。
+///
+/// 为什么不复用 `server.listen_addr`：那张监听是 HTTPS（自签证书），而数据面的 sink
+/// 连接器**没有 TLS 参数**，打不进来。按设计这就是「数据面 → 网关的**内部信任边界**」
+/// （见 doc/design/center/agent-work-delivery-plan.md §4），所以是**明文 HTTP 且只绑环回**。
+///
+/// 缺省（无此段）→ **默认开启**，否则数据面上报落地无处可去；
+/// 显式置空（`listen_addr = ""`）→ 关闭，即网关不订阅数据面。
+#[derive(Debug, Default, Deserialize)]
+struct RawIngestConfig {
+    #[serde(default)]
+    listen_addr: Option<String>,
+}
+
+/// `[data_plane]` 段：数据面工作根（只读浏览）。
+///
+/// 缺省 = 不挂载，管理面「配置与规则」回 503；容器部署时由 compose 把宿主
+/// `data-plane-run/work` 只读挂到 `/data-plane`，模板里写死 `work_dir = "/data-plane"`。
+#[derive(Debug, Default, Deserialize)]
+struct RawDataPlaneConfig {
+    /// 数据面工作根（`conf/`、`topology/`、`connectors/`、`models/` 的父目录）。
+    /// **故意不做存在性校验**：没挂载只让这一个页面不可用，不能把网关挡在启动之外。
+    #[serde(default)]
+    work_dir: Option<String>,
+}
+
+/// `[investigations]` 段：一次性调查的网关侧闸（按面授权 / 配额 / 保留期）。
+///
+/// 缺省全用默认值（上界全开、每小时 12 次、保留 7 天）——**旧配置不需要改**。
+///
+/// 注意“上界全开”不是“调查默认可用”：每台机器还要在「授权 → 调查授权」里显式开面，
+/// 没有授权行 = 一个面都不开。
+#[derive(Debug, Default, Deserialize)]
+struct RawInvestigationConfig {
+    /// 允许触发的工作面；`None` = 全部已知面，空表 = 一个都不许。
+    #[serde(default)]
+    allowed_topics: Option<Vec<String>>,
+    /// 每台 agent 每小时次数；`0` = 不限。
+    #[serde(default)]
+    max_per_agent_per_hour: Option<u32>,
+    /// 报告保留天数；`0` = 不限。
+    #[serde(default)]
+    report_retention_days: Option<u32>,
+    /// 报告目录：相对 `[data_plane] work_dir`，也接受绝对路径；缺省 `data/ivsrep`。
+    #[serde(default)]
+    report_dir: Option<String>,
+}
+
+/// `[purpose]` 段。缺省时不装载规则表：摘要照常入库，但不产出建议。
+#[derive(Debug, Default, Deserialize)]
+struct RawPurposeConfig {
+    /// 源头是知识库仓 `wist-knowledge/purpose-rules.toml`，由部署侧提供给网关。
+    /// 为什么不做内嵌默认副本：那会有两份真相，改规则时必然漂移。
+    #[serde(default)]
+    rules_file: Option<String>,
+}
+
+/// `[discovery]` 段。缺省时不装载策略表：不提供下发端点，Agent 用自己的内建默认值。
+#[derive(Debug, Default, Deserialize)]
+struct RawDiscoveryConfig {
+    /// 源头是知识库仓 `wist-knowledge/aspect-policies.toml`，由部署侧提供给网关。
+    /// 为什么不做内嵌默认副本：那会有两份真相，改策略时必然漂移。
+    #[serde(default)]
+    policies_file: Option<String>,
+}
+
+/// `[content]` 段。缺省时不装载内容目录（不影响事实 / 用途 / 清单）。
+/// 三份文件互相引用，**要么都给、要么都不给**（校验在 `validate` 里）。
+#[derive(Debug, Default, Deserialize)]
+struct RawContentConfig {
+    /// 源头是知识库仓 `wist-knowledge/catalog.toml`。
+    #[serde(default)]
+    catalog_file: Option<String>,
+    /// `wist-knowledge/packs.toml`。
+    #[serde(default)]
+    packs_file: Option<String>,
+    /// `wist-knowledge/templates.toml`。
+    #[serde(default)]
+    templates_file: Option<String>,
+}
+
+/// `[collection]` 段：采集来源的**策略边界**。
+///
+/// 为什么不做「每个 agent 一套」：roots 是**安全边界**，随机器变化就会变成「谁配的谁说了算」，
+/// 审计时无法回答「这台机器允许读哪里」。要放宽就地改这一处（策略级变更 + 留痕）。
+#[derive(Debug, Default, Deserialize)]
+struct RawCollectionConfig {
+    /// 允许的日志源目录（绝对路径）。空 = 只允许目录字面值，禁止任何解析 / 覆盖目录。
+    #[serde(default)]
+    allowed_source_roots: Option<Vec<String>>,
+}
+
+/// 缺省 roots：与设计稿 §5.4 一致。
+///
+/// 不收 `/`（那等于放开整个盘），也不收相对路径：roots 是**边界**，写得越宽越难审计。
+pub fn default_allowed_source_roots() -> Vec<String> {
+    ["/var/log", "/data", "/srv", "/opt"]
+        .iter()
+        .map(|root| (*root).to_string())
+        .collect()
+}
+
+/// `[store]` 段。缺省（旧配置无此段）时回退到本地 SQLite 文件。
+#[derive(Debug, Default, Deserialize)]
+struct RawStoreConfig {
+    /// 持久化 DSN，目前支持 `sqlite:` 前缀（如 `sqlite:state/wist-gateway.db`）。
+    /// 留空 → 使用 `agent.store_file` 同目录下的 `wist-gateway.db`。
+    #[serde(default)]
+    database_url: Option<String>,
+}
+
+/// `[logs]` 段：采集日志落盘的保留 / 轮转。缺省时用下面的默认值（不设上界就会无限长）。
+#[derive(Debug, Deserialize)]
+struct RawLogsConfig {
+    /// 单文件上限（字节）：写满就轮转。默认 64 MiB。
+    #[serde(default = "default_log_max_bytes")]
+    max_bytes: u64,
+    /// 保留的历史分卷个数。默认 4。
+    #[serde(default = "default_log_keep_files")]
+    keep_files: usize,
+    /// 历史分卷保留时长（秒）；`0` = 不按时间清。默认 7 天。
+    #[serde(default = "default_log_max_age_seconds")]
+    max_age_seconds: i64,
+}
+
+impl Default for RawLogsConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_log_max_bytes(),
+            keep_files: default_log_keep_files(),
+            max_age_seconds: default_log_max_age_seconds(),
+        }
+    }
+}
+
+/// `[log]` 段：本网关进程自己的运行日志（级别 / 格式 / 落点）。
+#[derive(Debug, Default, Deserialize)]
+struct RawLogConfig {
+    /// 过滤器指令（`info`，或 `wist_gateway=debug,hyper=warn`）。缺省 `info`。
+    #[serde(default)]
+    level: Option<String>,
+    /// 输出格式（`text` | `json`）。缺省 `text`。
+    #[serde(default)]
+    format: wist_log::LogFormat,
+    /// 写文件（追加；相对 config 目录解析；自动建父目录；写满轮转）。缺省写 stderr。
+    #[serde(default)]
+    file: Option<String>,
+    /// 单文件上限（字节）；缺省 64 MiB。
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    /// 保留的历史分卷个数；缺省 4。
+    #[serde(default)]
+    keep_files: Option<usize>,
+    /// 历史分卷保留时长（秒）；缺省 7 天。旧名 `max_age_seconds` 仍接受。
+    #[serde(default, alias = "max_age_seconds")]
+    max_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,19 +416,30 @@ struct RawServerConfig {
     admin_api_token: String,
     #[serde(default = "default_victoria_metrics_url")]
     victoria_metrics_url: String,
+    /// 环回面额外放行的对端（IP / CIDR）；缺省空（容器里靠自动认默认网关）。
+    #[serde(default)]
+    self_face_allow: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawAgentConfig {
-    package_file: String,
-    #[serde(default = "default_bootstrap_token_ttl_seconds")]
-    bootstrap_token_ttl_seconds: i64,
+    #[serde(default = "default_bootstrap_ttl_seconds")]
+    bootstrap_ttl_seconds: i64,
     #[serde(default = "default_credential_ttl_seconds")]
     credential_ttl_seconds: i64,
     #[serde(default = "default_store_file")]
     store_file: String,
-    trust_bundle: String,
-    install_script_signing_private_key_file: String,
+    /// 外部信任锚文件（相对 config 目录的 PEM）。信任锚**只走文件**：证书不内联进本配置，
+    /// 便于轮换（换证书只换文件），也免去把多行 PEM 塞进 TOML。
+    trust_bundle_file: String,
+    /// agent 客户端证书签发 CA（相对 config 目录的 PEM）。两者同给同缺，见 [`AdminConfig`]。
+    /// 段名已含 `agent`，键名不再重复该前缀（配置里写作 `[agent] ca_cert_file`）。
+    #[serde(default)]
+    ca_cert_file: Option<String>,
+    #[serde(default)]
+    ca_key_file: Option<String>,
+    #[serde(default = "default_client_cert_ttl_seconds")]
+    client_cert_ttl_seconds: i64,
     tenant_id: String,
     environment_id: String,
 }
@@ -112,13 +465,11 @@ impl AdminConfig {
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let config_path = absolutize_config_path(path.as_ref())?;
-        let raw_content = fs::read_to_string(&config_path).map_err(|err| {
-            config_io(format!(
-                "failed to read config {}: {err}",
-                config_path.display()
-            ))
-        })?;
-        let raw: RawAdminConfig = toml::from_str(&raw_content).map_err(|err| {
+        // 主配置 + 可选的现场态**声明**（`wist-gateway-pub.toml`，其中 `${VAR}` 由「进程环境 > 同目录
+        // `.env`」插值）+ **无重复叶子**合并 —— 全部交给共享 crate `wist-config`（与 center / gwlinkd
+        // 同一套口径）。声明不存在时只读主配置，行为与之前一致。
+        let doc: toml::Value = wist_config::load_layered_toml(&config_path, &LAYER)?;
+        let raw: RawAdminConfig = doc.try_into().map_err(|err| {
             config_parse(format!(
                 "failed to parse config {}: {err}",
                 config_path.display()
@@ -136,16 +487,49 @@ impl AdminConfig {
     }
 
     fn from_raw(raw: RawAdminConfig, config_dir: &Path) -> Result<Self, ConfigError> {
-        let package_file = expand_env(&raw.agent.package_file)?;
-        let tls_cert_file = expand_env(&raw.server.tls_cert_file)?;
-        let tls_key_file = expand_env(&raw.server.tls_key_file)?;
-        let admin_api_token = expand_env(&raw.server.admin_api_token)?;
-        let install_script_signing_private_key_file = absolutize_path(
-            config_dir,
-            Path::new(&expand_env(
-                &raw.agent.install_script_signing_private_key_file,
-            )?),
-        );
+        let env = secret_dict()?;
+        let tls_cert_file = expand(&env, &raw.server.tls_cert_file)?;
+        let tls_key_file = expand(&env, &raw.server.tls_key_file)?;
+        let admin_api_token = expand(&env, &raw.server.admin_api_token)?;
+        // 知识库内容包的验签公钥：只读**公钥**（私钥在发布侧，网关不持有）。
+        // 格式错就地拒绝启动 —— 它是信任锚，含糊地接受比验不了更糟。
+        let knowledge_signing_public_key_file = normalize_optional(
+            raw.knowledge
+                .signing_public_key_file
+                .as_deref()
+                .map(|value| expand(&env, value))
+                .transpose()?,
+        )
+        .map(|value| absolutize_path(config_dir, Path::new(&value)));
+        let knowledge_signing_public_key = match knowledge_signing_public_key_file.as_deref() {
+            Some(path) => {
+                let pem = fs::read_to_string(path).map_err(|err| {
+                    config_validation(format!(
+                        "failed to read knowledge signing public key {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                Some(
+                    crate::infra::parse_ed25519_public_key_pem(&pem).map_err(|err| {
+                        config_validation(format!(
+                            "invalid knowledge signing public key {}: {err}",
+                            path.display()
+                        ))
+                    })?,
+                )
+            }
+            None => None,
+        };
+        // 启动期知识源（出厂初始包）：归一化 + 相对配置目录化；**不做存在性校验** ——
+        // 它是「尽量可用」的回落来源，配了却读不到只告警（见 `LoadedKnowledge::resolve`）。
+        let knowledge_source_dir = normalize_optional(
+            raw.knowledge
+                .source_dir
+                .as_deref()
+                .map(|value| expand(&env, value))
+                .transpose()?,
+        )
+        .map(|value| absolutize_path(config_dir, Path::new(&value)));
         require_non_empty("server.admin_api_token", &admin_api_token)?;
         require_min_secret_length(
             "server.admin_api_token",
@@ -153,29 +537,192 @@ impl AdminConfig {
             MIN_ADMIN_API_TOKEN_BYTES,
         )?;
         require_non_weak_admin_token(&admin_api_token)?;
+        let trust_bundle = read_trust_bundle_file(config_dir, &raw.agent.trust_bundle_file, &env)?;
         Ok(Self {
-            listen_addr: expand_env(&raw.server.listen_addr)?,
-            public_base_url: trim_trailing_slash(expand_env(&raw.server.public_base_url)?),
+            listen_addr: expand(&env, &raw.server.listen_addr)?,
+            public_base_url: trim_trailing_slash(expand(&env, &raw.server.public_base_url)?),
             tls_cert_file: absolutize_path(config_dir, Path::new(&tls_cert_file)),
             tls_key_file: absolutize_path(config_dir, Path::new(&tls_key_file)),
             admin_api_token_hash: sha256_hex(&admin_api_token),
-            agent_package_file: absolutize_path(config_dir, Path::new(&package_file)),
-            bootstrap_token_ttl_seconds: raw.agent.bootstrap_token_ttl_seconds,
+            // 环回面额外放行的对端：在这里就解析成网段（形态不对 → 启动即拒，不拖到第一个请求）。
+            self_face_allow: raw
+                .server
+                .self_face_allow
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    let value = expand(&env, value)?;
+                    let net = IpNet::parse(&value).map_err(|err| {
+                        config_validation(format!("server.self_face_allow: {err}"))
+                    })?;
+                    // `/0` = 「谁都放」：这几个面无鉴权，写它等于公开 —— 拒启（fail-closed）。
+                    if net.is_unbounded() {
+                        return Err(config_validation(format!(
+                            "server.self_face_allow: 不允许 /0（会把这些无鉴权面暴露给所有地址）：{value}"
+                        )));
+                    }
+                    Ok(net)
+                })
+                .collect::<Result<Vec<IpNet>, ConfigError>>()?,
+            bootstrap_token_ttl_seconds: raw.agent.bootstrap_ttl_seconds,
             credential_ttl_seconds: raw.agent.credential_ttl_seconds,
-            store_file: absolutize_path(config_dir, Path::new(&expand_env(&raw.agent.store_file)?)),
-            trust_bundle: expand_env(&raw.agent.trust_bundle)?,
-            install_script_signing_private_key_file: install_script_signing_private_key_file
-                .clone(),
-            install_script_signing_public_key_pem: load_install_script_public_key_pem(
-                &install_script_signing_private_key_file,
-            )
-            .map_err(config_validation)?,
-            tenant_id: expand_env(&raw.agent.tenant_id)?,
-            environment_id: expand_env(&raw.agent.environment_id)?,
-            victoria_metrics_url: trim_trailing_slash(expand_env(
+            store_file: absolutize_path(
+                config_dir,
+                Path::new(&expand(&env, &raw.agent.store_file)?),
+            ),
+            database_url: resolved_database_url(&raw.store, &env)?,
+            sqlite_path: default_sqlite_path(config_dir, &raw.agent.store_file, &env)?,
+            trust_bundle,
+            agent_ca_cert_file: resolve_optional_agent_ca_path(
+                config_dir,
+                raw.agent.ca_cert_file.as_deref(),
+                &env,
+            )?,
+            agent_ca_key_file: resolve_optional_agent_ca_path(
+                config_dir,
+                raw.agent.ca_key_file.as_deref(),
+                &env,
+            )?,
+            client_cert_ttl_seconds: raw.agent.client_cert_ttl_seconds,
+            tenant_id: expand(&env, &raw.agent.tenant_id)?,
+            environment_id: expand(&env, &raw.agent.environment_id)?,
+            victoria_metrics_url: trim_trailing_slash(expand(
+                &env,
                 &raw.server.victoria_metrics_url,
             )?),
+            purpose_rules_file: normalize_optional(
+                raw.purpose
+                    .rules_file
+                    .as_deref()
+                    .map(|value| expand(&env, value))
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            discovery_policies_file: normalize_optional(
+                raw.discovery
+                    .policies_file
+                    .as_deref()
+                    .map(|value| expand(&env, value))
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            content_catalog_file: normalize_optional(
+                raw.content
+                    .catalog_file
+                    .as_deref()
+                    .map(|value| expand(&env, value))
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            content_packs_file: normalize_optional(
+                raw.content
+                    .packs_file
+                    .as_deref()
+                    .map(|value| expand(&env, value))
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            content_templates_file: normalize_optional(
+                raw.content
+                    .templates_file
+                    .as_deref()
+                    .map(|value| expand(&env, value))
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            ingest_listen_addr: match raw.ingest.listen_addr.as_deref() {
+                // 缺省（无 `[ingest]` 段）= 开，默认只绑环回；显式置空 = 关。
+                None => Some(DEFAULT_INGEST_LISTEN_ADDR.to_string()),
+                Some(value) => normalize_optional(Some(expand(&env, value)?)),
+            },
+            data_plane_work_dir: normalize_optional(
+                raw.data_plane
+                    .work_dir
+                    .as_deref()
+                    .map(|value| expand(&env, value))
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
+            investigation_allowed_topics: raw.investigations.allowed_topics.map(|topics| {
+                topics
+                    .into_iter()
+                    .map(|topic| topic.trim().to_string())
+                    .filter(|topic| !topic.is_empty())
+                    .collect::<Vec<_>>()
+            }),
+            investigation_max_per_agent_per_hour: raw
+                .investigations
+                .max_per_agent_per_hour
+                .unwrap_or(DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR),
+            investigation_report_retention_days: raw
+                .investigations
+                .report_retention_days
+                .unwrap_or(DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS),
+            // 只做 `$VAR` 展开与去空白：**不** absolutize —— 相对路径的基准是
+            // `[data_plane] work_dir`，不是配置文件所在目录。
+            investigation_report_dir: normalize_optional(
+                raw.investigations
+                    .report_dir
+                    .as_deref()
+                    .map(|value| expand(&env, value))
+                    .transpose()?,
+            )
+            .map(PathBuf::from),
+            allowed_source_roots: {
+                let raw_roots = match raw.collection.allowed_source_roots {
+                    None => default_allowed_source_roots(),
+                    Some(roots) => roots
+                        .iter()
+                        .map(|root| expand(&env, root))
+                        .collect::<Result<Vec<_>, _>>()?,
+                };
+                // 装载期就归一 + 拒绝危险值：roots 是**安全边界**，
+                // 留一个 `/` 或相对路径到运行期才发现，等于这段时间内边界是假的。
+                crate::app::log_source::normalize_roots(&raw_roots).map_err(|err| {
+                    config_validation(format!("collection.allowed_source_roots: {err}"))
+                })?
+            },
+            knowledge_source_dir,
+            knowledge_signing_public_key_file,
+            knowledge_signing_public_key,
+            log_max_bytes: raw.logs.max_bytes,
+            log_keep_files: raw.logs.keep_files,
+            log_max_age_seconds: raw.logs.max_age_seconds,
+            log: wist_log::LogSection {
+                level: normalize_optional(
+                    raw.log
+                        .level
+                        .as_deref()
+                        .map(|value| expand(&env, value))
+                        .transpose()?,
+                ),
+                format: raw.log.format,
+                file: normalize_optional(
+                    raw.log
+                        .file
+                        .as_deref()
+                        .map(|value| expand(&env, value))
+                        .transpose()?,
+                )
+                .map(|value| absolutize_path(config_dir, Path::new(&value))),
+                max_bytes: raw.log.max_bytes,
+                keep_files: raw.log.keep_files,
+                max_seconds: raw.log.max_seconds,
+            },
         })
+    }
+
+    /// agent CA 的（证书文件, 私钥文件）。两者都配了才返回 `Some` —— 也就是这台网关启用了
+    /// agent 客户端证书签发/验证（mTLS）。见 `docs/design/agent-identity-mtls.md` §4.1。
+    pub fn agent_ca_files(&self) -> Option<(&Path, &Path)> {
+        match (
+            self.agent_ca_cert_file.as_deref(),
+            self.agent_ca_key_file.as_deref(),
+        ) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            _ => None,
+        }
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -183,54 +730,256 @@ impl AdminConfig {
         require_https_url("server.public_base_url", &self.public_base_url)?;
         require_existing_file("server.tls_cert_file", &self.tls_cert_file)?;
         require_existing_file("server.tls_key_file", &self.tls_key_file)?;
-        require_existing_file("agent.package_file", &self.agent_package_file)?;
         require_positive_seconds(
-            "agent.bootstrap_token_ttl_seconds",
+            "agent.bootstrap_ttl_seconds",
             self.bootstrap_token_ttl_seconds,
         )?;
         require_seconds_at_most(
-            "agent.bootstrap_token_ttl_seconds",
+            "agent.bootstrap_ttl_seconds",
             self.bootstrap_token_ttl_seconds,
             MAX_BOOTSTRAP_TOKEN_TTL_SECONDS,
         )?;
         require_positive_seconds("agent.credential_ttl_seconds", self.credential_ttl_seconds)?;
+        require_positive_seconds(
+            "agent.client_cert_ttl_seconds",
+            self.client_cert_ttl_seconds,
+        )?;
+        require_agent_ca_together(
+            self.agent_ca_cert_file.as_deref(),
+            self.agent_ca_key_file.as_deref(),
+        )?;
+        // 启动时就把 CA 读一遍：文件坏了/不是 PEM，现在就报出来，而不是等第一次签发或握手才炸。
+        if let Some((cert_file, key_file)) = self.agent_ca_files() {
+            crate::infra::agent_ca::AgentCa::load(cert_file, key_file)
+                .map_err(config_validation)?;
+        }
         require_non_empty("agent.trust_bundle", &self.trust_bundle)?;
-        require_existing_file(
-            "agent.install_script_signing_private_key_file",
-            &self.install_script_signing_private_key_file,
-        )?;
-        require_non_empty(
-            "agent.install_script_signing_public_key_pem",
-            &self.install_script_signing_public_key_pem,
-        )?;
         require_non_empty("agent.tenant_id", &self.tenant_id)?;
         require_non_empty("agent.environment_id", &self.environment_id)?;
         require_non_empty("server.victoria_metrics_url", &self.victoria_metrics_url)?;
+        require_min_bytes("logs.max_bytes", self.log_max_bytes, MIN_AGENT_LOG_BYTES)?;
+        if let Some(rules_file) = self.purpose_rules_file.as_deref() {
+            require_existing_file("purpose.rules_file", rules_file)?;
+            // 用**真实的装载器**做结构化校验（不只是 TOML 语法）：规则表写错必须在启动时
+            // 就被拒，而不是静默降级成「不推断」。
+            //
+            // 取舍：这是 infra 调 app（同 crate 内允许，非硬循环）。要彻底消掉这层反向引用，
+            // 得把 PurposeRule* 的类型与装载器从 `app/purpose.rs` 挪到 `infra/`，
+            // 只把 `infer` 留在 app —— 当下换来的是 fail-fast，值得。
+            crate::app::purpose::load_rule_table(rules_file).map_err(|err| {
+                config_validation(format!(
+                    "purpose.rules_file {}: {err}",
+                    rules_file.display()
+                ))
+            })?;
+        }
+        if let Some(policies_file) = self.discovery_policies_file.as_deref() {
+            require_existing_file("discovery.policies_file", policies_file)?;
+            // 同 purpose：用**真实的装载器**做结构化校验，策略表写错必须在启动时被拒，
+            // 而不是静默降级成「不下发」（那会让 agentd 悄悄回落内建默认值）。
+            crate::app::discovery_policy::load_policy_table(policies_file).map_err(|err| {
+                config_validation(format!(
+                    "discovery.policies_file {}: {err}",
+                    policies_file.display()
+                ))
+            })?;
+        }
+        // 内容三件套：要么都给、要么都不给；给了就逐一存在 + 用**真实装载器**校验
+        // （模板引用写错必须在启动时被拒，而不是等到展开时才发现）。
+        let content_provided = [
+            self.content_catalog_file.is_some(),
+            self.content_packs_file.is_some(),
+            self.content_templates_file.is_some(),
+        ]
+        .iter()
+        .filter(|present| **present)
+        .count();
+        if content_provided != 0 && content_provided != 3 {
+            return Err(config_validation(
+                "content.*: catalog_file / packs_file / templates_file 必须同时提供（缺一不可）",
+            ));
+        }
+        if let (Some(catalog), Some(packs), Some(templates)) = (
+            self.content_catalog_file.as_deref(),
+            self.content_packs_file.as_deref(),
+            self.content_templates_file.as_deref(),
+        ) {
+            require_existing_file("content.catalog_file", catalog)?;
+            require_existing_file("content.packs_file", packs)?;
+            require_existing_file("content.templates_file", templates)?;
+            crate::app::content::load_content(catalog, packs, templates)
+                .map_err(|err| config_validation(format!("content: {err}")))?;
+        }
+        // roots 是**安全边界**：装载期已经归一过一次，这里再守一道（`AdminConfig` 也
+        // 会被测试/嵌入方直接构造）。`/` 与相对路径一律拒启 —— 前者等于放开整个盘，
+        // 后者会把「相对什么」留给运行期 cwd 决定。
+        for root in &self.allowed_source_roots {
+            let normalized = crate::app::log_source::normalize_dir(root).map_err(|err| {
+                config_validation(format!("collection.allowed_source_roots: {err}"))
+            })?;
+            if normalized != *root {
+                return Err(config_validation(format!(
+                    "collection.allowed_source_roots: {root:?} 未归一（应为 {normalized:?}）"
+                )));
+            }
+        }
+        if let Some(database_url) = self.database_url.as_deref()
+            && !database_url.starts_with("sqlite:")
+        {
+            return Err(config_validation(format!(
+                "unsupported store.database_url scheme (this build implements SQLite only): {database_url}"
+            )));
+        }
+        if let Some(ingest_addr) = self.ingest_listen_addr.as_deref() {
+            // 这个监听器是**明文 HTTP**：地址写错必须在启动时被拒，而不是等到第一个
+            // 数据面帧打进来才发现。也不允许与 TLS 监听撞端口（两者语义完全不同）。
+            if ingest_addr.parse::<std::net::SocketAddr>().is_err() {
+                return Err(config_validation(format!(
+                    "ingest.listen_addr must be host:port, got {ingest_addr}"
+                )));
+            }
+            if ingest_addr == self.listen_addr {
+                return Err(config_validation(format!(
+                    "ingest.listen_addr must differ from server.listen_addr ({ingest_addr}): \
+                     the ingest endpoint is plain HTTP and must not share the TLS listener"
+                )));
+            }
+        }
         Ok(())
     }
 
-    pub fn install_script_url(&self, arch: &str) -> String {
+    /// 安装脚本分发地址（基址取配置里的 `server.public_base_url`）。
+    ///
+    /// **运行期分发不要用这个**：基址应取「网关对外地址」（管理面设置，未设置时回落
+    /// 配置值），见 [`Self::install_script_url_at`]。
+    pub fn install_script_url(&self, platform: &str) -> String {
+        self.install_script_url_at(&self.public_base_url, platform)
+    }
+
+    /// 同 [`Self::install_script_url`]，但基址由调用方给出（网关对外地址）。
+    ///
+    /// 脚本按**平台（target-triple）**寻址：`/api/v1/agent/install/{platform}/install.sh`。
+    /// 每个平台的脚本内嵌对应平台的托管包与摘要（agentd 是平台专用制品）。
+    pub fn install_script_url_at(&self, base: &str, platform: &str) -> String {
         format!(
-            "{}/api/v1/agent/install/{arch}/install.sh",
-            self.public_base_url
+            "{}/api/v1/agent/install/{platform}/install.sh",
+            trim_base_url(base)
         )
     }
 
-    pub fn agent_package_url(&self) -> String {
-        format!("{}/api/v1/agent/packages/current", self.public_base_url)
+    /// 安装包分发地址（基址取配置里的 `server.public_base_url`）；运行期见
+    /// [`Self::agent_package_url_at`]。
+    pub fn agent_package_url(&self, platform: &str) -> String {
+        self.agent_package_url_at(&self.public_base_url, platform)
     }
 
+    /// 同 [`Self::agent_package_url`]，但基址由调用方给出。
+    ///
+    /// `?platform=` 标注目标平台：同一网关上不同平台的 agent 各取到自己那份包。
+    pub fn agent_package_url_at(&self, base: &str, platform: &str) -> String {
+        format!(
+            "{}/api/v1/agent/packages/current?platform={platform}",
+            trim_base_url(base)
+        )
+    }
+
+    /// 某个内容寻址 id 的安装包下载地址（基址由调用方给出，通常取
+    /// `effective_advertise_base`）。
+    ///
+    /// 与 [`Self::agent_package_url_at`] 同一口径，只是路径尾部是 `package_id` 而非
+    /// `current`；由网关派生，避免前端自己拼。
+    pub fn agent_package_url_by_id_at(&self, base: &str, package_id: &str) -> String {
+        format!("{}/api/v1/agent/packages/{package_id}", trim_base_url(base))
+    }
+
+    /// Agent 初始配置地址（基址取配置里的 `server.public_base_url`）；运行期见
+    /// [`Self::agent_initial_config_url_at`]。
     pub fn agent_initial_config_url(&self) -> String {
-        format!("{}/api/v1/agent/initial-config", self.public_base_url)
+        self.agent_initial_config_url_at(&self.public_base_url)
+    }
+
+    /// 同 [`Self::agent_initial_config_url`]，但基址由调用方给出。
+    pub fn agent_initial_config_url_at(&self, base: &str) -> String {
+        format!("{}/api/v1/agent/initial-config", trim_base_url(base))
+    }
+
+    /// 管理面设置的安装包**本地缓存**路径（**按平台**一份）。
+    ///
+    /// 设置来源地址时网关会把制品拉到这里，之后该平台的安装都从这份缓存分发；
+    /// 放在 SQLite 库同目录（`state/`）下，便于随 `state/` 一起备份或清理。
+    pub fn install_package_cache_path(&self, platform: &str) -> PathBuf {
+        let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
+        state_dir
+            .join("install-package")
+            .join("current")
+            .join(platform)
+    }
+
+    /// 内容寻址的安装包**按条副本**路径：每个录入过的包单独存一份（升级要按条目取包）。
+    ///
+    /// 与单例 [`Self::install_package_cache_path`] 是两回事：那个 `agent-package` 是
+    /// 「当前生效来源」的单文件缓存（安装仍用它），这里 `history/<package_id>` 是历史里
+    /// 每个包各自的副本。调用方写入前会确保 parent 目录存在（见 `install_package::write_cache_to`）。
+    pub fn install_package_history_path(&self, package_id: &str) -> PathBuf {
+        let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
+        state_dir
+            .join("install-package")
+            .join("history")
+            .join(package_id)
+    }
+
+    /// 知识库内容包副本的**根目录**：`<state>/knowledge/`。
+    ///
+    /// 与安装包缓存同一约定：放在 SQLite 库同目录（`state/`）下，随 `state/` 一起备份或清理。
+    /// 目录下每个包一份（`<package_id>/`）；与安装包不同的是，这里是**目录**（解开的五份
+    /// 数据加 `manifest.json`），而且**每版都要留着**：在跑的常驻工作锁在它展开时那一版
+    /// 目录上（见 `docs/design/knowledge-content-management.md` §4）。
+    pub fn knowledge_dir(&self) -> PathBuf {
+        let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
+        state_dir.join("knowledge")
+    }
+
+    /// 某一个知识库内容包的目录。
+    pub fn knowledge_package_dir(&self, package_id: &str) -> PathBuf {
+        self.knowledge_dir().join(package_id)
+    }
+
+    /// 采集日志（数据面转发的 `LOGRAW:` 记录）的本地落盘文件。
+    ///
+    /// 与安装包缓存同一约定：放在 SQLite 库同目录（`state/`）下，随 `state/` 一起备份或清理。
+    /// 为什么先落文件而不是入库：日志是无界的观测流，索引键尚未定档 —— 先落 NDJSON
+    /// （可以 `tail`、可以 `grep`）；**保留 / 轮转**已由 [`Self::agent_log_retention`] 给定
+    /// （写满即轮转，历史按数量与时长清理）。
+    pub fn agent_log_file(&self) -> PathBuf {
+        let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
+        state_dir.join("logs").join("agent-logs.ndjson")
+    }
+
+    /// 运行日志的 `[log]` 段（供 [`wist_log::init`] 用）。
+    pub fn log_section(&self) -> wist_log::LogSection {
+        self.log.clone()
+    }
+
+    /// 采集日志落盘的保留 / 轮转策略（由 `[logs]` 段决定，缺省见 [`crate::infra::LogRetention`]）。
+    pub fn agent_log_retention(&self) -> crate::infra::LogRetention {
+        crate::infra::LogRetention {
+            max_bytes: self.log_max_bytes,
+            keep_files: self.log_keep_files,
+            max_age_seconds: self.log_max_age_seconds,
+        }
     }
 }
 
-fn default_bootstrap_token_ttl_seconds() -> i64 {
+fn default_bootstrap_ttl_seconds() -> i64 {
     900
 }
 
 fn default_credential_ttl_seconds() -> i64 {
     30 * 24 * 60 * 60
+}
+
+fn default_client_cert_ttl_seconds() -> i64 {
+    crate::infra::agent_ca::DEFAULT_CLIENT_CERT_TTL_SECONDS
 }
 
 fn default_victoria_metrics_url() -> String {
@@ -239,6 +988,55 @@ fn default_victoria_metrics_url() -> String {
 
 fn default_store_file() -> String {
     "state/wist-gateway-store.json".to_string()
+}
+
+fn default_log_max_bytes() -> u64 {
+    crate::infra::LogRetention::default().max_bytes
+}
+
+fn default_log_keep_files() -> usize {
+    crate::infra::LogRetention::default().keep_files
+}
+
+fn default_log_max_age_seconds() -> i64 {
+    crate::infra::LogRetention::default().max_age_seconds
+}
+
+/// 未配置 `database_url` 时的默认 SQLite 库：与旧存储文件同目录。
+fn default_sqlite_path(
+    config_dir: &Path,
+    store_file: &str,
+    env: &EnvDict,
+) -> Result<PathBuf, ConfigError> {
+    let store_file = absolutize_path(config_dir, Path::new(&expand(env, store_file)?));
+    let file_name = store_file
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("wist-gateway-store.json")
+        .replace(".json", ".db");
+    Ok(store_file.with_file_name(file_name))
+}
+
+/// `database_url` 的解析：文件值 → 环境变量覆盖（显式置空等于「回到默认 SQLite 文件」）。
+fn resolved_database_url(
+    raw: &RawStoreConfig,
+    env: &EnvDict,
+) -> Result<Option<String>, ConfigError> {
+    let file_value = match raw.database_url.as_deref() {
+        Some(value) => Some(expand(env, value)?),
+        None => None,
+    };
+    let value = match env::var(ENV_DATABASE_URL) {
+        Ok(value) => Some(value),
+        Err(_) => file_value,
+    };
+    Ok(normalize_optional(value))
+}
+
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn absolutize_config_path(path: &Path) -> Result<PathBuf, ConfigError> {
@@ -257,32 +1055,109 @@ fn absolutize_path(base_dir: &Path, path: &Path) -> PathBuf {
     base_dir.join(path)
 }
 
-fn expand_env(value: &str) -> Result<String, ConfigError> {
-    let mut output = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(start) = rest.find("${") {
-        output.push_str(&rest[..start]);
-        let after_start = &rest[start + 2..];
-        let Some(end) = after_start.find('}') else {
-            return Err(config_validation(format!(
-                "invalid environment placeholder in {value:?}"
-            )));
-        };
-        let key = &after_start[..end];
-        if key.is_empty() {
-            return Err(config_validation("empty environment placeholder"));
-        }
-        let replacement = env::var(key)
-            .map_err(|_| config_validation(format!("missing environment variable {key}")))?;
-        output.push_str(&replacement);
-        rest = &after_start[end + 1..];
+/// 构建 `${VAR}` 展开用的变量表：**进程环境变量优先**，其下是密钥文件里的 `SEC_*`
+/// （`WIST_GATEWAY_SEC_FILE` 指定，或 orion 默认 `.galaxy/sec_value.yml`）。变量表里查不到时
+/// [`expand`] 再回落到系统环境变量（orion 内建）。
+fn secret_dict() -> Result<EnvDict, ConfigError> {
+    let mut dict = match env::var_os(SEC_FILE_ENV).filter(|path| !path.is_empty()) {
+        Some(path) => load_sec_file(Path::new(&path))?,
+        None => load_sec_dict()
+            .map_err(|err| config_validation(format!("failed to load secrets: {err}")))?,
+    };
+    // 环境变量后写入 = 优先（`EnvDict` 查表优先于系统 env，故把 env 盖进去实现 env-first）。
+    for (key, value) in env::vars() {
+        dict.insert(key, ValueType::from(value.as_str()));
     }
-    output.push_str(rest);
-    Ok(output)
+    Ok(dict)
+}
+
+/// 从指定文件载入密钥表（`WIST_GATEWAY_SEC_FILE`，YAML；键自动规范成 `SEC_<UPPER>`）。
+/// **显式指定的文件必须存在** —— 缺了就报清楚，别让下游只报「`SEC_xxx` 未解析」。
+fn load_sec_file(path: &Path) -> Result<EnvDict, ConfigError> {
+    if !path.exists() {
+        return Err(config_validation(format!(
+            "secrets file not found: {}（WIST_GATEWAY_SEC_FILE）",
+            path.display()
+        )));
+    }
+    let space = load_secfile_by(path.to_path_buf(), SecFileFmt::Yaml).map_err(|err| {
+        config_validation(format!("failed to load secrets {}: {err}", path.display()))
+    })?;
+    let mut dict = EnvDict::new();
+    for (key, value) in space.no_sec() {
+        dict.insert(key, value);
+    }
+    Ok(dict)
+}
+
+/// 展开 `${VAR}` / `${VAR:default}`：先查 [`secret_dict`] 的变量表（env 优先），再回落系统环境变量。
+/// **展开后仍含占位符 → 报错**（fail-closed）—— 绝不把未解析的 `${SEC_...}` 当字面值用。
+fn expand(env: &EnvDict, value: &str) -> Result<String, ConfigError> {
+    let expanded: String = value.to_string().env_eval(env);
+    if expanded.needs_env_eval() {
+        return Err(config_validation(format!(
+            "unresolved environment variable(s) in {value:?}: {}",
+            expanded.list_env_vars().join(", ")
+        )));
+    }
+    Ok(expanded)
 }
 
 fn trim_trailing_slash(value: String) -> String {
     value.trim_end_matches('/').to_string()
+}
+
+/// 读 agent 的信任锚文件（相对 config 目录的 PEM）。
+fn read_trust_bundle_file(
+    config_dir: &Path,
+    file: &str,
+    env: &EnvDict,
+) -> Result<String, ConfigError> {
+    let resolved = absolutize_path(config_dir, Path::new(&expand(env, file)?));
+    fs::read_to_string(&resolved).map_err(|err| {
+        config_io(format!(
+            "failed to read agent.trust_bundle_file {}: {err}",
+            resolved.display()
+        ))
+    })
+}
+
+/// 拼路径前把基址的尾斜杠裁掉：管理面设置的对外地址允许带 `/` 收尾。
+fn trim_base_url(base: &str) -> &str {
+    base.trim_end_matches('/')
+}
+
+/// 解析可选的 agent CA 路径（相对 config 目录）。
+fn resolve_optional_agent_ca_path(
+    config_dir: &Path,
+    value: Option<&str>,
+    env: &EnvDict,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let value = match value {
+        Some(value) => normalize_optional(Some(expand(env, value)?)),
+        None => None,
+    };
+    Ok(value.map(|value| absolutize_path(config_dir, Path::new(&value))))
+}
+
+/// agent CA 的证书与私钥必须**同给同缺**：只有一半是配置错误，宁可起不来也不静默降级。
+fn require_agent_ca_together(
+    cert_file: Option<&Path>,
+    key_file: Option<&Path>,
+) -> Result<(), ConfigError> {
+    match (cert_file, key_file) {
+        (None, None) => Ok(()),
+        (Some(cert), Some(key)) => {
+            require_existing_file("agent.ca_cert_file", cert)?;
+            require_existing_file("agent.ca_key_file", key)
+        }
+        (Some(_), None) => Err(config_validation(
+            "agent.ca_cert_file is set but agent.ca_key_file is missing",
+        )),
+        (None, Some(_)) => Err(config_validation(
+            "agent.ca_key_file is set but agent.ca_cert_file is missing",
+        )),
+    }
 }
 
 fn require_non_empty(field: &str, value: &str) -> Result<(), ConfigError> {
@@ -310,7 +1185,10 @@ fn require_https_url(field: &str, value: &str) -> Result<(), ConfigError> {
 /// The value is embedded verbatim into install scripts that run under `sh` on
 /// target hosts (inside double-quoted URLs). Reject characters that would break
 /// out of that context or that are never valid in a control-plane base URL.
-fn contains_shell_metacharacters(value: &str) -> bool {
+///
+/// `pub(crate)`：管理面设置「网关对外地址」时要按同一口径校验（它同样会被拼进
+/// 安装命令），两处绝不能各写一份。
+pub(crate) fn contains_shell_metacharacters(value: &str) -> bool {
     value.chars().any(|ch| {
         matches!(
             ch,
@@ -348,6 +1226,15 @@ fn require_seconds_at_most(field: &str, value: i64, max: i64) -> Result<(), Conf
     Err(config_validation(format!(
         "{field} must be less than or equal to {max}"
     )))
+}
+
+fn require_min_bytes(field: &str, value: u64, min: u64) -> Result<(), ConfigError> {
+    if value < min {
+        return Err(config_validation(format!(
+            "{field} must be at least {min} bytes, got {value}"
+        )));
+    }
+    Ok(())
 }
 
 fn require_min_secret_length(field: &str, value: &str, min: usize) -> Result<(), ConfigError> {
@@ -429,6 +1316,54 @@ fn require_existing_file(field: &str, path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// 只给测试用的最小配置：状态目录 = `root`（SQLite 库与知识库副本都在它下面）。
+///
+/// 为什么集中一份而不是各测试模块各写一遍：`AdminConfig` 字段多，加一个字段就会让
+/// 每一处字面量同时过期 —— 一份就够（`api::tests::TestEnv` 有自己的夹具，那是因为它
+/// 还要挂内容/规则/策略文件；这里只要一个"什么都不配"的干净配置）。
+#[cfg(test)]
+pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
+    AdminConfig {
+        listen_addr: "127.0.0.1:3000".to_string(),
+        public_base_url: "https://127.0.0.1:3000".to_string(),
+        tls_cert_file: root.join("admin-tls.crt.pem"),
+        tls_key_file: root.join("admin-tls.key.pem"),
+        admin_api_token_hash: sha256_hex("test-admin-token-0001"),
+        self_face_allow: Vec::new(),
+        bootstrap_token_ttl_seconds: 900,
+        credential_ttl_seconds: 30 * 24 * 60 * 60,
+        store_file: root.join("state").join("admin-store.json"),
+        database_url: None,
+        sqlite_path: root.join("state").join("wist-gateway.db"),
+        trust_bundle: "internal-ca-stub".to_string(),
+        agent_ca_cert_file: None,
+        agent_ca_key_file: None,
+        client_cert_ttl_seconds: super::agent_ca::DEFAULT_CLIENT_CERT_TTL_SECONDS,
+        tenant_id: "tenant-default".to_string(),
+        environment_id: "env-default".to_string(),
+        victoria_metrics_url: "http://127.0.0.1:18429".to_string(),
+        purpose_rules_file: None,
+        discovery_policies_file: None,
+        content_catalog_file: None,
+        content_packs_file: None,
+        content_templates_file: None,
+        ingest_listen_addr: None,
+        data_plane_work_dir: None,
+        investigation_allowed_topics: None,
+        investigation_max_per_agent_per_hour: DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR,
+        investigation_report_retention_days: DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS,
+        investigation_report_dir: None,
+        allowed_source_roots: default_allowed_source_roots(),
+        knowledge_source_dir: None,
+        knowledge_signing_public_key_file: None,
+        knowledge_signing_public_key: None,
+        log_max_bytes: crate::infra::LogRetention::default().max_bytes,
+        log_keep_files: crate::infra::LogRetention::default().keep_files,
+        log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
+        log: wist_log::LogSection::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +1371,7 @@ mod tests {
         rand as ring_rand,
         signature::{Ed25519KeyPair, KeyPair},
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -464,9 +1400,7 @@ mod tests {
 
     #[test]
     fn loads_config_with_environment_expansion() {
-        let package_file = write_temp_file("wist-agentd");
         unsafe {
-            env::set_var("WARP_INSIGHT_TEST_AGENT_PACKAGE_FILE", &package_file);
             env::set_var("WARP_INSIGHT_TEST_ADMIN_API_TOKEN", "test-admin-token");
         }
         let path = write_temp_config(
@@ -477,7 +1411,6 @@ public_base_url = "https://127.0.0.1:3000/"
 admin_api_token = "${WARP_INSIGHT_TEST_ADMIN_API_TOKEN}"
 
 [agent]
-package_file = "${WARP_INSIGHT_TEST_AGENT_PACKAGE_FILE}"
 enrollment_token = "test-token"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
@@ -487,26 +1420,79 @@ environment_id = "env-default"
 
         let config = AdminConfig::load_from_path(&path).expect("config loads");
 
-        assert_eq!(config.agent_package_file, package_file);
         assert_eq!(config.admin_api_token_hash, sha256_hex("test-admin-token"));
         assert_eq!(config.public_base_url, "https://127.0.0.1:3000");
         assert_eq!(
-            config.install_script_url("x86"),
-            "https://127.0.0.1:3000/api/v1/agent/install/x86/install.sh"
+            config.install_script_url("x86_64-unknown-linux-musl"),
+            "https://127.0.0.1:3000/api/v1/agent/install/x86_64-unknown-linux-musl/install.sh"
         );
         assert_eq!(
-            config.agent_package_url(),
-            "https://127.0.0.1:3000/api/v1/agent/packages/current"
+            config.agent_package_url("x86_64-unknown-linux-musl"),
+            "https://127.0.0.1:3000/api/v1/agent/packages/current?platform=x86_64-unknown-linux-musl"
         );
-        assert!(config.install_script_signing_private_key_file.is_absolute());
-        assert!(
-            config
-                .install_script_signing_public_key_pem
-                .starts_with("-----BEGIN PUBLIC KEY-----\n")
-        );
-
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
+    }
+
+    /// 未解析的占位符 → 拒绝启动（fail-closed），且报出缺哪个变量。
+    #[test]
+    fn unresolved_placeholder_fails_closed() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "${WIST_GW_TEST_MISSING_TOKEN_XYZ}"
+
+[agent]
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+        let err = AdminConfig::load_from_path(&path).expect_err("unresolved secret must fail");
+        assert!(
+            err.to_string().contains("WIST_GW_TEST_MISSING_TOKEN_XYZ"),
+            "{err}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// 支持 `${VAR:default}`：查不到变量时用默认值。
+    #[test]
+    fn env_default_syntax_is_supported() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[agent]
+trust_bundle = "internal-ca-stub"
+tenant_id = "${WIST_GW_TEST_MISSING_TENANT:tenant-default}"
+environment_id = "env-default"
+"#,
+        );
+        let config = AdminConfig::load_from_path(&path).expect("default used");
+        assert_eq!(config.tenant_id, "tenant-default");
+        let _ = fs::remove_file(path);
+    }
+
+    /// 自定义密钥文件（`WIST_GATEWAY_SEC_FILE` 指向的那个）：按键规范成 `SEC_<UPPER>` 载入。
+    #[test]
+    fn custom_sec_file_loads_and_prefixes_keys() {
+        let path = write_temp_file("admin_token: custom-secret-token-1234567890\n");
+        let dict = load_sec_file(&path).expect("load sec file");
+        assert!(dict.get_case_insensitive("SEC_ADMIN_TOKEN").is_some());
+        let _ = fs::remove_file(path);
+    }
+
+    /// 显式指定的密钥文件**缺失** → 明确报错（而不是含糊的「SEC_xxx 未解析」）。
+    #[test]
+    fn missing_explicit_sec_file_is_an_error() {
+        let missing = env::temp_dir().join("wist-gateway-sec-file-that-does-not-exist.yml");
+        let err = load_sec_file(&missing).expect_err("missing explicit sec file must fail");
+        assert!(err.to_string().contains("secrets file not found"), "{err}");
     }
 
     #[test]
@@ -519,11 +1505,9 @@ environment_id = "env-default"
     }
 
     #[test]
-    fn relative_package_file_is_absolutized_against_config_dir() {
+    fn relative_paths_are_absolutized_against_config_dir() {
         let dir = env::temp_dir().join(format!("wist-gateway-dir-{}", unique_suffix()));
         fs::create_dir_all(&dir).expect("create dir");
-        fs::write(dir.join("wist-agent.tar.gz"), "package").expect("write package");
-        write_install_signing_key(&dir.join("install-signing-ed25519.pkcs8.pem"));
         let config_path = dir.join("admin.toml");
         fs::write(
             &config_path,
@@ -536,10 +1520,8 @@ tls_key_file = "admin-tls.key.pem"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "wist-agent.tar.gz"
 enrollment_token = "test-token"
-trust_bundle = "internal-ca-stub"
-install_script_signing_private_key_file = "install-signing-ed25519.pkcs8.pem"
+trust_bundle_file = "trust-bundle.pem"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
@@ -547,22 +1529,304 @@ environment_id = "env-default"
         .expect("write config");
         fs::write(dir.join("admin-tls.crt.pem"), "cert").expect("write cert");
         fs::write(dir.join("admin-tls.key.pem"), "key").expect("write key");
+        fs::write(dir.join("trust-bundle.pem"), "bundle").expect("write trust bundle");
 
         let config = AdminConfig::load_from_path(&config_path).expect("config loads");
 
-        assert_eq!(config.agent_package_file, dir.join("wist-agent.tar.gz"));
         assert_eq!(config.tls_cert_file, dir.join("admin-tls.crt.pem"));
         assert_eq!(config.tls_key_file, dir.join("admin-tls.key.pem"));
-        assert_eq!(
-            config.install_script_signing_private_key_file,
-            dir.join("install-signing-ed25519.pkcs8.pem")
-        );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    const RULES_TOML: &str = r#"
+purpose_version = 1
+[[rule_set]]
+rule_set_id = "macos-v1"
+platform = "macos"
+baseline_class = "MacDaily"
+weak_score = 20
+"#;
+
+    /// 一份合法的发现策略表：七个方向各一条（校验要求不许缺/重）。
+    const DISCOVERY_POLICIES: &str = r#"
+policy_version = 1
+published_at = "2026-09-22T00:00:00Z"
+policies = [
+  { aspect = "host", default_interval_seconds = 900, min_interval_seconds = 300, max_interval_seconds = 3600, baseline = true, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "network", default_interval_seconds = 900, min_interval_seconds = 300, max_interval_seconds = 3600, baseline = false, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "process", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = true, platforms = ["macos", "linux"] },
+  { aspect = "endpoint", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = true, platforms = ["linux"] },
+  { aspect = "container", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = false, platforms = ["macos", "linux"] },
+  { aspect = "k8s", default_interval_seconds = 300, min_interval_seconds = 60, max_interval_seconds = 1800, baseline = false, enabled_by_default = false, platforms = ["macos", "linux"] },
+  { aspect = "package", default_interval_seconds = 1800, min_interval_seconds = 900, max_interval_seconds = 21600, baseline = false, enabled_by_default = true, platforms = ["linux"] },
+]
+"#;
+
+    /// 生成一份最小可用配置，其中 `[purpose]` 表体由调用方给出（可为空）。
+    /// `[purpose]` 放在最前面：`write_temp_config` 会在文末补签名私钥行，
+    /// 那行应落在 `[agent]` 里而不是 `[purpose]` 里。
+    fn config_with_purpose(purpose_body: &str) -> String {
+        format!(
+            "[purpose]\n{purpose_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        )
+    }
+
+    /// 同 `config_with_purpose`，但给出的是 `[discovery]` 表体。
+    fn config_with_discovery(discovery_body: &str) -> String {
+        format!(
+            "[discovery]\n{discovery_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        )
+    }
+
+    /// 同 `config_with_purpose`，但给出的是 `[collection]` 表体。
+    fn config_with_collection(collection_body: &str) -> String {
+        format!(
+            "[collection]\n{collection_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        )
+    }
+
+    /// 同 `config_with_purpose`，但给出的是 `[data_plane]` 表体。
+    fn config_with_data_plane(data_plane_body: &str) -> String {
+        format!(
+            "[data_plane]\n{data_plane_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        )
+    }
+
+    /// 同 `config_with_purpose`，但给出的是 `[investigations]` 表体。
+    fn config_with_investigations(investigations_body: &str) -> String {
+        format!(
+            "[investigations]\n{investigations_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        )
+    }
+
+    #[test]
+    fn investigation_gates_default_and_tighten_via_config() {
+        // 不写 `[investigations]` → 上界全开 / 每小时 12 次 / 保留 7 天：**旧配置不需要改**。
+        // （按机器授权另算：默认全关，与采集面一致。）
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_purpose("")))
+            .expect("config loads");
+        assert_eq!(config.investigation_allowed_topics, None);
+        assert_eq!(
+            config.investigation_max_per_agent_per_hour,
+            DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR
+        );
+        assert_eq!(
+            config.investigation_report_retention_days,
+            DEFAULT_INVESTIGATION_REPORT_RETENTION_DAYS
+        );
+        assert_eq!(
+            config.investigation_report_dir, None,
+            "缺省跟数据面布局（`data/ivsrep`），不是写进配置的一份拷贝"
+        );
+
+        // 空白项被滤掉：允许集是**安全边界**，不该因为多一个逗号就多出一个面。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_investigations(
+            "allowed_topics = [\"disk\", \" \", \"\"]",
+        )))
+        .expect("config loads");
+        assert_eq!(
+            config.investigation_allowed_topics,
+            Some(vec!["disk".to_string()])
+        );
+
+        // 空表 ≠ 没写：`[]` 是「上界一个都不许」，`None` 是「上界全开」。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_investigations(
+            "allowed_topics = []",
+        )))
+        .expect("config loads");
+        assert_eq!(config.investigation_allowed_topics, Some(Vec::new()));
+
+        // `0` 是显式的「不限」，与「没写 → 默认值」区分开。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_investigations(
+            "max_per_agent_per_hour = 0\nreport_retention_days = 0",
+        )))
+        .expect("config loads");
+        assert_eq!(config.investigation_max_per_agent_per_hour, 0);
+        assert_eq!(config.investigation_report_retention_days, 0);
+
+        // 报告目录：相对路径**不**转绝对（基准是 `[data_plane] work_dir`）；空白归成没写。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_investigations(
+            "report_dir = \"reports/ivsrep\"",
+        )))
+        .expect("config loads");
+        assert_eq!(
+            config.investigation_report_dir,
+            Some(PathBuf::from("reports/ivsrep"))
+        );
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_investigations(
+            "report_dir = \"  \"",
+        )))
+        .expect("config loads");
+        assert_eq!(config.investigation_report_dir, None);
+    }
+
+    #[test]
+    fn data_plane_work_dir_is_optional_and_absolutized() {
+        let unset = write_temp_config(&config_with_data_plane(""));
+        let config = AdminConfig::load_from_path(&unset).expect("config loads");
+        assert_eq!(config.data_plane_work_dir, None);
+
+        // 空串归成 None：否则会变成配置目录本身（页面会把整棵目录当工作根）。
+        let blank = write_temp_config(&config_with_data_plane("work_dir = \"\""));
+        let config = AdminConfig::load_from_path(&blank).expect("config loads");
+        assert_eq!(config.data_plane_work_dir, None);
+
+        // 相对路径按配置目录解析（容器部署写绝对路径 /data-plane）。
+        let relative = write_temp_config(&config_with_data_plane("work_dir = \"data-plane\""));
+        let config = AdminConfig::load_from_path(&relative).expect("config loads");
+        let expected = relative.parent().expect("parent").join("data-plane");
+        assert_eq!(
+            config.data_plane_work_dir.as_deref(),
+            Some(expected.as_path())
+        );
+    }
+
+    #[test]
+    fn collection_roots_default_and_are_normalized() {
+        // 不写 `[collection]` → 默认四条（与设计稿 §5.4 一致）。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_purpose("")))
+            .expect("config loads");
+        assert_eq!(config.allowed_source_roots, default_allowed_source_roots());
+
+        // 尾斜杠 + 重复 → 归一（roots 是审计口径，重复只会多噪声）。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_collection(
+            "allowed_source_roots = [\"/data/\", \"/data\", \"/srv\"]",
+        )))
+        .expect("config loads");
+        assert_eq!(
+            config.allowed_source_roots,
+            vec!["/data".to_string(), "/srv".to_string()]
+        );
+    }
+
+    #[test]
+    fn collection_roots_reject_root_and_relative_paths() {
+        // `/` 等于放开整个盘；相对路径把「相对什么」留给运行期 cwd；`..` 绕过 roots。
+        for body in [
+            "allowed_source_roots = [\"/\"]",
+            "allowed_source_roots = [\"data/pg\"]",
+            "allowed_source_roots = [\"/data/../etc\"]",
+            "allowed_source_roots = [\"/data/*\"]",
+        ] {
+            let path = write_temp_config(&config_with_collection(body));
+            let err = AdminConfig::load_from_path(&path).expect_err("must reject");
+            assert!(
+                err.to_string().contains("allowed_source_roots"),
+                "{body}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn purpose_rules_file_is_none_when_unset_or_blank() {
+        let unset = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&unset).expect("config loads");
+        assert_eq!(config.purpose_rules_file, None);
+
+        // 空串必须归成 None；否则会变成 config 目录本身，校验时报“不是文件”。
+        let blank = write_temp_config(&config_with_purpose("rules_file = \"\""));
+        let config = AdminConfig::load_from_path(&blank).expect("config loads");
+        assert_eq!(config.purpose_rules_file, None);
+    }
+
+    #[test]
+    fn purpose_rules_file_is_absolutized_and_must_load() {
+        // 规则表写进 temp_dir（与 write_temp_config 同目录），所以相对路径可解析。
+        let rules = write_temp_file(RULES_TOML);
+        let name = rules
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        let path = write_temp_config(&config_with_purpose(&format!("rules_file = \"{name}\"")));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(config.purpose_rules_file.as_deref(), Some(rules.as_path()));
+
+        // 配了就必须能读到：不存在的文件在启动时就被拒。
+        let missing =
+            write_temp_config(&config_with_purpose("rules_file = \"no-such-rules.toml\""));
+        assert!(AdminConfig::load_from_path(&missing).is_err());
+
+        // 语法坏掉同样在启动时被拒，不拖到“收到第一份事实才报错”。
+        let broken = write_temp_file("[[rule_set]\nbroken");
+        let broken_name = broken
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        let path = write_temp_config(&config_with_purpose(&format!(
+            "rules_file = \"{broken_name}\""
+        )));
+        assert!(AdminConfig::load_from_path(&path).is_err());
+    }
+
+    #[test]
+    fn discovery_policies_file_is_none_when_unset_or_blank() {
+        let unset = write_temp_config(&config_with_discovery(""));
+        let config = AdminConfig::load_from_path(&unset).expect("config loads");
+        assert_eq!(config.discovery_policies_file, None);
+
+        // 空串必须归成 None；否则会变成 config 目录本身，校验时报“不是文件”。
+        let blank = write_temp_config(&config_with_discovery("policies_file = \"\""));
+        let config = AdminConfig::load_from_path(&blank).expect("config loads");
+        assert_eq!(config.discovery_policies_file, None);
+    }
+
+    #[test]
+    fn discovery_policies_file_is_absolutized_and_must_load() {
+        // 策略表写进 temp_dir（与 write_temp_config 同目录），所以相对路径可解析。
+        let policies = write_temp_file(DISCOVERY_POLICIES);
+        let name = policies
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        let path = write_temp_config(&config_with_discovery(&format!(
+            "policies_file = \"{name}\""
+        )));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(
+            config.discovery_policies_file.as_deref(),
+            Some(policies.as_path())
+        );
+
+        // 配了就必须能读到：不存在的文件在启动时就被拒。
+        let missing = write_temp_config(&config_with_discovery(
+            "policies_file = \"no-such-policies.toml\"",
+        ));
+        assert!(AdminConfig::load_from_path(&missing).is_err());
+
+        // 语法坏掉同样在启动时被拒，不拖到“Agent 来拉表才发现”。
+        let broken = write_temp_file("policy_version = 1\n[[policies]\nbroken");
+        let broken_name = broken
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        let path = write_temp_config(&config_with_discovery(&format!(
+            "policies_file = \"{broken_name}\""
+        )));
+        assert!(AdminConfig::load_from_path(&path).is_err());
+
+        // 语法合法但**内容非法**（缺方向）也要在启动时被拒 —— 这正是把真实装载器
+        // 接进 validate 的意义：否则一份半截表会被当成配好了而下发。
+        let incomplete = write_temp_file(
+            "policy_version = 1\npublished_at = \"x\"\n[[policies]]\naspect = \"host\"\ndefault_interval_seconds = 900\nmin_interval_seconds = 300\nmax_interval_seconds = 3600\nbaseline = true\nenabled_by_default = true\nplatforms = [\"linux\"]\n",
+        );
+        let incomplete_name = incomplete
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        let path = write_temp_config(&config_with_discovery(&format!(
+            "policies_file = \"{incomplete_name}\""
+        )));
+        let err = AdminConfig::load_from_path(&path).expect_err("incomplete table rejected");
+        assert!(err.to_string().contains("discovery.policies_file"), "{err}");
     }
 
     #[test]
     fn rejects_missing_tls_certificate_file() {
-        let package_file = write_temp_file("wist-agentd");
         let key_file = write_temp_file("key");
         let missing_cert = env::temp_dir().join(format!(
             "warp-insight-missing-admin-tls-{}.crt.pem",
@@ -578,26 +1842,64 @@ tls_key_file = "{}"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "{}"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
             missing_cert.display(),
             key_file.display(),
-            package_file.display()
         ));
 
         let err = AdminConfig::load_from_path(&path).expect_err("missing TLS cert rejected");
 
         assert!(err.to_string().contains("server.tls_cert_file"));
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
         let _ = fs::remove_file(key_file);
     }
 
     #[test]
-    fn rejects_missing_agent_package_file() {
+    fn rejects_short_admin_api_token() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "short"
+
+[agent]
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+
+        let err = AdminConfig::load_from_path(&path).expect_err("short token rejected");
+
+        assert!(err.to_string().contains("server.admin_api_token"));
+        assert!(err.to_string().contains("at least 8 bytes"));
+        let _ = fs::remove_file(path);
+    }
+
+    /// `init-config` 直接把仓库里的 `wist-gateway.toml` 模板写出去（`default_config_text`），
+    /// 所以模板里的键名必须仍是当前配置结构认的 —— 否则现场 `wist-gateway init-config`
+    /// 生成的配置一启动就报 missing field。改模板/改结构时这条会当场报。
+    #[test]
+    fn generated_config_template_parses() {
+        let text = default_config_text("test-admin-token");
+        let parsed: RawAdminConfig = toml::from_str(&text).expect("config template parses");
+
+        assert_eq!(parsed.server.listen_addr, "127.0.0.1:3000");
+        assert_eq!(parsed.server.public_base_url, "https://127.0.0.1:3000");
+        assert_eq!(parsed.agent.tenant_id, "tenant-default");
+        assert_eq!(parsed.agent.environment_id, "env-default");
+        // 安装包不是配置项（`agent.package_file` 已删）：模板里不该再有这个键。
+        assert!(!text.contains("package_file"));
+    }
+
+    /// 0.1.8 起 `agent.package_file` 已删。既有部署渲染出的配置里还留着这一行，
+    /// 把镜像升上去后必须照常启动 —— 所以 `RawAgentConfig` **有意不**给 deny_unknown_fields。
+    #[test]
+    fn legacy_agent_package_file_key_does_not_block_startup() {
         let path = write_temp_config(
             r#"
 [server]
@@ -606,51 +1908,22 @@ public_base_url = "https://127.0.0.1:3000"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "/tmp/warp-insight-missing-agent-package.tar.gz"
-enrollment_token = "test-token"
+package_file = "/config/wist-agentd.tar.gz"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
         );
 
-        let err = AdminConfig::load_from_path(&path).expect_err("invalid URL rejected");
+        let config = AdminConfig::load_from_path(&path).expect("legacy key must not block startup");
 
-        assert!(err.to_string().contains("agent.package_file"));
+        assert_eq!(config.public_base_url, "https://127.0.0.1:3000");
         let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn rejects_short_admin_api_token() {
-        let package_file = write_temp_file("wist-agentd");
-        let path = write_temp_config(&format!(
-            r#"
-[server]
-listen_addr = "127.0.0.1:3000"
-public_base_url = "https://127.0.0.1:3000"
-admin_api_token = "short"
-
-[agent]
-package_file = "{}"
-trust_bundle = "internal-ca-stub"
-tenant_id = "tenant-default"
-environment_id = "env-default"
-"#,
-            package_file.display()
-        ));
-
-        let err = AdminConfig::load_from_path(&path).expect_err("short token rejected");
-
-        assert!(err.to_string().contains("server.admin_api_token"));
-        assert!(err.to_string().contains("at least 8 bytes"));
-        let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
     }
 
     #[test]
     fn rejects_long_bootstrap_token_ttl() {
-        let package_file = write_temp_file("wist-agentd");
-        let path = write_temp_config(&format!(
+        let path = write_temp_config(
             r#"
 [server]
 listen_addr = "127.0.0.1:3000"
@@ -658,30 +1931,71 @@ public_base_url = "https://127.0.0.1:3000"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "{}"
-bootstrap_token_ttl_seconds = 7200
+bootstrap_ttl_seconds = 7200
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
-            package_file.display()
-        ));
+        );
 
         let err = AdminConfig::load_from_path(&path).expect_err("long ttl rejected");
 
-        assert!(
-            err.to_string()
-                .contains("agent.bootstrap_token_ttl_seconds")
-        );
+        assert!(err.to_string().contains("agent.bootstrap_ttl_seconds"));
         assert!(err.to_string().contains("less than or equal to 3600"));
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
+    }
+
+    /// 缺席 `[logs]` 段 = 用默认保留策略（64 MiB / 4 卷 / 7 天）。
+    #[test]
+    fn agent_log_retention_defaults_when_the_logs_section_is_absent() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[agent]
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(
+            config.agent_log_retention(),
+            crate::infra::LogRetention::default()
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// 单文件上限太小（每次追加都轮转 = 等于不留日志）→ 启动就拒。
+    #[test]
+    fn rejects_a_tiny_log_max_bytes() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[logs]
+max_bytes = 1024
+
+[agent]
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+        let err = AdminConfig::load_from_path(&path).expect_err("tiny max_bytes rejected");
+        assert!(err.to_string().contains("logs.max_bytes"), "{err}");
+        let _ = fs::remove_file(path);
     }
 
     #[test]
     fn rejects_http_public_base_url() {
-        let package_file = write_temp_file("wist-agentd");
-        let path = write_temp_config(&format!(
+        let path = write_temp_config(
             r#"
 [server]
 listen_addr = "0.0.0.0:3000"
@@ -689,26 +2003,22 @@ public_base_url = "http://127.0.0.1:3000"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "{}"
 enrollment_token = "test-token"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
-            package_file.display()
-        ));
+        );
 
         let err = AdminConfig::load_from_path(&path).expect_err("insecure URL rejected");
 
         assert!(err.to_string().contains("must start with https://"));
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
     }
 
     #[test]
     fn accepts_https_public_base_url() {
-        let package_file = write_temp_file("wist-agentd");
-        let path = write_temp_config(&format!(
+        let path = write_temp_config(
             r#"
 [server]
 listen_addr = "127.0.0.1:3000"
@@ -716,25 +2026,21 @@ public_base_url = "https://localhost:3000/"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "{}"
 enrollment_token = "test-token"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
-            package_file.display()
-        ));
+        );
 
         let config = AdminConfig::load_from_path(&path).expect("https config loads");
 
         assert_eq!(config.public_base_url, "https://localhost:3000");
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
     }
 
     #[test]
     fn rejects_public_base_url_with_shell_metacharacters() {
-        let package_file = write_temp_file("wist-agentd");
         let text = r#"
 [server]
 listen_addr = "127.0.0.1:3000"
@@ -742,13 +2048,11 @@ public_base_url = "https://127.0.0.1:3000\"; touch /tmp/pwned"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "__PACKAGE__"
 trust_bundle = "internal-ca-stub"
 tenant_id = "tenant-default"
 environment_id = "env-default"
-"#
-        .replace("__PACKAGE__", &package_file.display().to_string());
-        let path = write_temp_config(&text);
+"#;
+        let path = write_temp_config(text);
 
         let err = AdminConfig::load_from_path(&path).expect_err("injected URL rejected");
 
@@ -757,12 +2061,16 @@ environment_id = "env-default"
                 .contains("unsafe in generated install scripts")
         );
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
     }
 
     #[test]
-    fn loads_multiline_trust_bundle() {
-        let package_file = write_temp_file("wist-agentd");
+    fn loads_trust_bundle_from_file() {
+        let bundle_path = env::temp_dir().join(format!("trust-bundle-{}.pem", unique_suffix()));
+        fs::write(
+            &bundle_path,
+            "-----BEGIN CERTIFICATE-----\nMIIBfromfile\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write trust bundle");
         let path = write_temp_config(&format!(
             r#"
 [server]
@@ -771,43 +2079,385 @@ public_base_url = "https://localhost:3000/"
 admin_api_token = "test-admin-token"
 
 [agent]
-package_file = "{}"
-trust_bundle = '''-----BEGIN CERTIFICATE-----
-MIIBtest
------END CERTIFICATE-----
-'''
+trust_bundle_file = "{}"
 tenant_id = "tenant-default"
 environment_id = "env-default"
 "#,
-            package_file.display()
+            bundle_path.display()
         ));
 
         let config = AdminConfig::load_from_path(&path).expect("config loads");
 
         assert_eq!(
             config.trust_bundle,
-            "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n"
+            "-----BEGIN CERTIFICATE-----\nMIIBfromfile\n-----END CERTIFICATE-----\n"
         );
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(package_file);
+        let _ = fs::remove_file(bundle_path);
+    }
+
+    #[test]
+    fn missing_trust_bundle_file_is_an_error() {
+        let missing = env::temp_dir().join(format!("does-not-exist-{}.pem", unique_suffix()));
+        let path = write_temp_config(&format!(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://localhost:3000/"
+admin_api_token = "test-admin-token"
+
+[agent]
+trust_bundle_file = "{}"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+            missing.display()
+        ));
+
+        assert!(AdminConfig::load_from_path(&path).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    // ── `[content]` 三件套 ────────────────────────────────────────────
+
+    /// 把三份内容写进 temp 目录（与 `write_temp_config` 同目录），再用相对路径引用。
+    fn config_with_content(catalog: &str, packs: &str, templates: &str) -> String {
+        let catalog_file = write_temp_file(catalog);
+        let packs_file = write_temp_file(packs);
+        let templates_file = write_temp_file(templates);
+        let rel = |path: &PathBuf| {
+            path.file_name()
+                .expect("name")
+                .to_string_lossy()
+                .to_string()
+        };
+        format!(
+            "[content]\ncatalog_file = \"{}\"\npacks_file = \"{}\"\ntemplates_file = \"{}\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+            rel(&catalog_file),
+            rel(&packs_file),
+            rel(&templates_file),
+        )
+    }
+
+    #[test]
+    fn knowledge_signing_public_key_is_loaded_and_must_parse() {
+        // 不配 → 不验签（现有部署不受影响）。
+        let path = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&path).expect("load config");
+        assert!(config.knowledge_signing_public_key.is_none());
+        assert!(config.knowledge_signing_public_key_file.is_none());
+
+        // 配了合法公钥 → 装载出**裸公钥**（验签用的那 32 字节）。
+        let rng = ring_rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate key");
+        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse key");
+        let raw = key_pair.public_key().as_ref().to_vec();
+        let pem = crate::infra::ed25519_public_key_pem_for_tests(&raw);
+        let pem_path = write_temp_file(&pem);
+        let path = write_temp_config(&format!(
+            "[knowledge]\nsigning_public_key_file = \"{}\"\n\n{}",
+            pem_path.display(),
+            config_with_purpose("")
+        ));
+        let config = AdminConfig::load_from_path(&path).expect("load config");
+        assert_eq!(
+            config.knowledge_signing_public_key.as_deref(),
+            Some(raw.as_slice())
+        );
+        assert_eq!(
+            config.knowledge_signing_public_key_file.as_deref(),
+            Some(pem_path.as_path())
+        );
+
+        // 配了个不是公钥的文件 → **拒绝启动**：它是信任锚，含糊地接受比验不了更糟。
+        let bad_path = write_temp_file("not a pem");
+        let path = write_temp_config(&format!(
+            "[knowledge]\nsigning_public_key_file = \"{}\"\n\n{}",
+            bad_path.display(),
+            config_with_purpose("")
+        ));
+        let err = AdminConfig::load_from_path(&path).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("knowledge signing public key"),
+            "{err}"
+        );
+    }
+
+    /// 启动期知识源（`[knowledge] source_dir`）：可选、相对配置目录绝对化、置空当没配。
+    ///
+    /// 刻意**不校验存在性**（配了读不到只告警回落），所以这里只验“值怎么落到 `AdminConfig`”，
+    /// 不验目录在不在 —— 那一条由 `app::knowledge` 的用具管。
+    #[test]
+    fn knowledge_source_dir_is_optional_and_resolved_against_the_config_dir() {
+        // 不配 → `None`（现有部署不受影响）。
+        let path = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&path).expect("load config");
+        assert!(config.knowledge_source_dir.is_none());
+
+        // 配了**相对路径** → 相对配置目录绝对化。
+        let path = write_temp_config(&format!(
+            "[knowledge]\nsource_dir = \"knowledge/initial\"\n\n{}",
+            config_with_purpose("")
+        ));
+        let config = AdminConfig::load_from_path(&path).expect("load config");
+        assert_eq!(
+            config.knowledge_source_dir.as_deref(),
+            Some(
+                path.parent()
+                    .expect("config dir")
+                    .join("knowledge/initial")
+                    .as_path()
+            )
+        );
+
+        // 置空 = 当没配（而不是“空路径的目录”）。
+        let path = write_temp_config(&format!(
+            "[knowledge]\nsource_dir = \"\"\n\n{}",
+            config_with_purpose("")
+        ));
+        let config = AdminConfig::load_from_path(&path).expect("blank source_dir loads as unset");
+        assert!(config.knowledge_source_dir.is_none());
+    }
+
+    #[test]
+    fn content_files_are_none_when_unset_or_blank() {
+        let unset = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&unset).expect("config loads");
+        assert_eq!(config.content_catalog_file, None);
+        assert_eq!(config.content_packs_file, None);
+        assert_eq!(config.content_templates_file, None);
+
+        let blank = write_temp_config(
+            "[content]\ncatalog_file = \"\"\npacks_file = \"\"\ntemplates_file = \"\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        );
+        let config = AdminConfig::load_from_path(&blank).expect("blank content loads as unset");
+        assert_eq!(config.content_catalog_file, None);
+    }
+
+    #[test]
+    fn content_files_must_all_be_provided() {
+        // 只给一份：内容集内部互相引用（模板 → 包 → 单元），缺一不可。
+        let catalog_file = write_temp_file("catalog_version = 1\nunits = []\n");
+        let body = format!(
+            "[content]\ncatalog_file = \"{}\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+            catalog_file.file_name().expect("name").to_string_lossy(),
+        );
+        let path = write_temp_config(&body);
+        let err = AdminConfig::load_from_path(&path).expect_err("partial content must be rejected");
+        assert!(err.to_string().contains("同时提供"), "{err}");
+    }
+
+    #[test]
+    fn content_files_are_validated_at_load() {
+        // 三份都在，但内容不合法（这里 catalog 无单元）→ 启动就被拒，而不是静默不装载。
+        let body = config_with_content("catalog_version = 1\nunits = []\n", "", "");
+        let path = write_temp_config(&body);
+        let err = AdminConfig::load_from_path(&path).expect_err("invalid content must be rejected");
+        assert!(err.to_string().contains("content"), "{err}");
+    }
+
+    #[test]
+    fn log_section_parses_and_absolutizes_file() {
+        let path = write_temp_config(
+            "[log]\nlevel = \"warn\"\nformat = \"json\"\nfile = \"logs/gateway.log\"\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        );
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(config.log.level.as_deref(), Some("warn"));
+        assert_eq!(config.log.format, wist_log::LogFormat::Json);
+        let file = config.log.file.expect("log file resolved");
+        assert!(
+            file.is_absolute(),
+            "log file should be absolutized: {file:?}"
+        );
+        assert!(file.ends_with("logs/gateway.log"), "{file:?}");
+    }
+
+    #[test]
+    fn log_section_defaults_when_absent() {
+        let path = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(config.log.level, None);
+        assert_eq!(config.log.format, wist_log::LogFormat::Text);
+        assert_eq!(config.log.file, None);
+    }
+
+    /// 接口层（pub）与主配置**段可以重合**（`[server]` / `[agent]`），各自的键各写各的。
+    #[test]
+    fn pub_overlay_merges_disjoint_keys_within_the_same_section() {
+        let mut base: toml::Value =
+            toml::from_str("[server]\nlisten_addr = \"0.0.0.0:3000\"\n").expect("base");
+        let overlay: toml::Value =
+            toml::from_str("[server]\npublic_base_url = \"https://gw.example\"\n").expect("pub");
+        wist_config::merge_disjoint(&mut base, overlay, Path::new("wist-gateway-pub.toml"))
+            .expect("merge");
+        let server = base.get("server").expect("server table");
+        assert_eq!(
+            server.get("public_base_url").and_then(|v| v.as_str()),
+            Some("https://gw.example")
+        );
+        assert_eq!(
+            server.get("listen_addr").and_then(|v| v.as_str()),
+            Some("0.0.0.0:3000"),
+            "主配置的键不被接口层动到"
+        );
+    }
+
+    /// 同一个键出现在两份里 —— 归属错乱，必须拒（“哪份说了算”不能靠加载顺序）。
+    #[test]
+    fn pub_overlay_rejects_a_key_defined_in_both_files() {
+        let mut base: toml::Value = toml::from_str("[agent]\ntenant_id = \"t1\"\n").expect("base");
+        let overlay: toml::Value = toml::from_str("[agent]\ntenant_id = \"t2\"\n").expect("pub");
+        assert!(
+            wist_config::merge_disjoint(&mut base, overlay, Path::new("wist-gateway-pub.toml"))
+                .is_err(),
+            "同一个键两处都写必须拒绝"
+        );
+    }
+
+    /// 兄弟文件（`wist-gateway-pub.toml`）**存在才用**；不存在就回到单文件行为。
+    #[test]
+    fn pub_sibling_is_resolved_only_when_it_exists() {
+        let dir = env::temp_dir().join(format!("wist-gateway-pub-{}", unique_suffix()));
+        fs::create_dir_all(&dir).expect("create dir");
+        let main = dir.join("wist-gateway.toml");
+        assert_eq!(
+            wist_config::resolve_overlay_path(&main, &LAYER),
+            None,
+            "兄弟文件不在就不用它"
+        );
+        let pub_path = dir.join("wist-gateway-pub.toml");
+        fs::write(&pub_path, "[server]\n").expect("write pub");
+        assert_eq!(
+            wist_config::resolve_overlay_path(&main, &LAYER),
+            Some(pub_path)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端：主配置（不含对外地址）+ 接口层（给对外地址与归属）→ 合并后可加载。
+    #[test]
+    fn pub_sibling_overlay_is_merged_into_the_loaded_config() {
+        let dir = env::temp_dir().join(format!("wist-gateway-pub-{}", unique_suffix()));
+        fs::create_dir_all(&dir).expect("create dir");
+        let config_path = dir.join("wist-gateway.toml");
+        fs::write(
+            &config_path,
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+tls_cert_file = "admin-tls.crt.pem"
+tls_key_file = "admin-tls.key.pem"
+admin_api_token = "test-admin-token"
+
+[agent]
+trust_bundle_file = "trust-bundle.pem"
+environment_id = "env-default"
+"#,
+        )
+        .expect("write config");
+        fs::write(dir.join("admin-tls.crt.pem"), "cert").expect("write cert");
+        fs::write(dir.join("admin-tls.key.pem"), "key").expect("write key");
+        fs::write(dir.join("trust-bundle.pem"), "bundle").expect("write bundle");
+        // 接口层：**现场选择**（对外地址 / 归属）。
+        fs::write(
+            dir.join("wist-gateway-pub.toml"),
+            "[server]\npublic_base_url = \"https://gw.example.com\"\n\n[agent]\ntenant_id = \"tenant-acme\"\n",
+        )
+        .expect("write pub");
+
+        let config = AdminConfig::load_from_path(&config_path).expect("config loads");
+        assert_eq!(config.public_base_url, "https://gw.example.com");
+        assert_eq!(config.tenant_id, "tenant-acme", "接口层的键生效");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `[server] self_face_allow`：解析成网段（单地址 / CIDR），供环回面准入用。
+    #[test]
+    fn self_face_allow_parses_ips_and_cidrs() {
+        let path = write_temp_config(
+            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\n\
+             admin_api_token = \"test-admin-token\"\n\
+             self_face_allow = [\"172.17.0.1\", \"172.28.0.0/16\"]\n\n\
+             [agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        );
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(config.self_face_allow.len(), 2);
+        // 单个地址 = /32：只命中它自己。
+        assert!(config.self_face_allow[0].contains("172.17.0.1".parse().expect("ip")));
+        assert!(!config.self_face_allow[0].contains("172.17.0.2".parse().expect("ip")));
+        // CIDR：命中网段内。
+        assert!(config.self_face_allow[1].contains("172.28.9.9".parse().expect("ip")));
+    }
+
+    /// 缺省（不写该项）= 空 —— 容器里靠自动认默认网关，不是配置错。
+    #[test]
+    fn self_face_allow_defaults_to_empty() {
+        let path = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+        assert!(config.self_face_allow.is_empty());
+    }
+
+    /// 形态不对 → **启动即拒**（而不是拖到第一个请求才爆），且报出是哪个字段。
+    #[test]
+    fn self_face_allow_rejects_a_bad_value() {
+        let path = write_temp_config(
+            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\n\
+             admin_api_token = \"test-admin-token\"\n\
+             self_face_allow = [\"not-an-ip\"]\n\n\
+             [agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        );
+        let err = AdminConfig::load_from_path(&path).expect_err("bad allow entry must be rejected");
+        let text = err.to_string();
+        assert!(text.contains("server.self_face_allow"), "{text}");
+    }
+
+    /// `0.0.0.0/0` = 「谁都放」：这几个面无鉴权，必须**拒启**（fail-closed），不能静默生效。
+    #[test]
+    fn self_face_allow_rejects_the_unbounded_net() {
+        let path = write_temp_config(
+            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\n\
+             admin_api_token = \"test-admin-token\"\n\
+             self_face_allow = [\"0.0.0.0/0\"]\n\n\
+             [agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        );
+        let err = AdminConfig::load_from_path(&path).expect_err("/0 must be rejected");
+        let text = err.to_string();
+        assert!(text.contains("server.self_face_allow"), "{text}");
+        assert!(text.contains("/0"), "{text}");
     }
 
     fn write_temp_config(content: &str) -> PathBuf {
         let path = env::temp_dir().join(format!("wist-gateway-{}.toml", unique_suffix()));
-        let key_path = path.with_extension("ed25519.pkcs8.pem");
         let tls_cert_path = path.with_extension("tls.crt.pem");
         let tls_key_path = path.with_extension("tls.key.pem");
-        write_install_signing_key(&key_path);
+        let bundle_path = path.with_extension("trust-bundle.pem");
         fs::write(&tls_cert_path, "cert").expect("write TLS cert");
         fs::write(&tls_key_path, "key").expect("write TLS key");
-        let content = if content.contains("install_script_signing_private_key_file") {
-            content.to_string()
-        } else {
-            format!(
-                "{content}\ninstall_script_signing_private_key_file = \"{}\"\n",
-                key_path.display()
-            )
-        };
+        fs::write(
+            &bundle_path,
+            "-----BEGIN CERTIFICATE-----\ntest-bundle\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write trust bundle");
+        // 信任锚只走文件：把内联 `trust_bundle = ...` 改写成 `trust_bundle_file = "<...>"`；
+        // 原配置若没有锚字段，再注入一行（见下方 inject_agent_field）。
+        let mut has_bundle = false;
+        let content = content
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("trust_bundle =") {
+                    has_bundle = true;
+                    let indent = &line[..line.len() - trimmed.len()];
+                    format!("{indent}trust_bundle_file = \"{}\"", bundle_path.display())
+                } else {
+                    if trimmed.starts_with("trust_bundle_file =") {
+                        has_bundle = true;
+                    }
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let content = if content.contains("tls_cert_file") {
             content
         } else {
@@ -824,6 +2474,15 @@ environment_id = "env-default"
                 &content,
                 "tls_key_file",
                 &tls_key_path.display().to_string(),
+            )
+        };
+        let content = if has_bundle {
+            content
+        } else {
+            inject_agent_field(
+                &content,
+                "trust_bundle_file",
+                &bundle_path.display().to_string(),
             )
         };
         fs::write(&path, content).expect("write config");
@@ -844,6 +2503,20 @@ environment_id = "env-default"
         format!("{}\n", output.join("\n"))
     }
 
+    fn inject_agent_field(content: &str, key: &str, value: &str) -> String {
+        let mut output = Vec::new();
+        let mut inserted = false;
+        for line in content.lines() {
+            output.push(line.to_string());
+            if !inserted && line.trim() == "[agent]" {
+                output.push(format!("{key} = \"{value}\""));
+                inserted = true;
+            }
+        }
+        assert!(inserted, "test config must include [agent]");
+        format!("{}\n", output.join("\n"))
+    }
+
     fn write_temp_file(content: &str) -> PathBuf {
         let path = env::temp_dir().join(format!("warp-insight-agent-package-{}", unique_suffix()));
         fs::write(&path, content).expect("write file");
@@ -851,28 +2524,118 @@ environment_id = "env-default"
     }
 
     fn unique_suffix() -> u128 {
+        // 加一个自增序号：只用纳秒时，并行跑的测试有几率拿到同一个后缀从而互相覆写
+        // 临时配置文件（曾表现为「不存在的策略表竟然装载成功」这种偶发失败）。
+        // `src/api/tests.rs` 的同名函数早就踩过并这么修了，这里补上。
+        static NEXT_SUFFIX: AtomicU64 = AtomicU64::new(1);
+        let seq = NEXT_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos()
+            + seq
     }
 
-    fn write_install_signing_key(path: &Path) {
-        let rng = ring_rand::SystemRandom::new();
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate signing key");
-        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse signing key");
-        assert_eq!(key_pair.public_key().as_ref().len(), 32);
-        fs::write(path, private_key_pem(pkcs8.as_ref())).expect("write signing key");
+    /// 只给一半的 agent CA 是配置错误：宁可起不来，也不静默降级成「没有 mTLS」。
+    #[test]
+    fn agent_ca_requires_certificate_and_key_together() {
+        let (ca_cert_name, _) = write_agent_ca_files();
+        let only_cert = write_temp_config(&agent_config_toml(&format!(
+            "ca_cert_file = \"{ca_cert_name}\"\n"
+        )));
+        let err = AdminConfig::load_from_path(&only_cert).expect_err("cert without key");
+        assert!(err.to_string().contains("ca_key_file"), "{err}");
+        let _ = fs::remove_file(only_cert);
+
+        let (_, ca_key_name) = write_agent_ca_files();
+        let only_key = write_temp_config(&agent_config_toml(&format!(
+            "ca_key_file = \"{ca_key_name}\"\n"
+        )));
+        let err = AdminConfig::load_from_path(&only_key).expect_err("key without cert");
+        assert!(err.to_string().contains("ca_cert_file"), "{err}");
+        let _ = fs::remove_file(only_key);
     }
 
-    fn private_key_pem(der: &[u8]) -> String {
-        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der);
-        let mut output = String::from("-----BEGIN PRIVATE KEY-----\n");
-        for chunk in encoded.as_bytes().chunks(64) {
-            output.push_str(std::str::from_utf8(chunk).expect("base64 utf8"));
-            output.push('\n');
-        }
-        output.push_str("-----END PRIVATE KEY-----\n");
-        output
+    /// 文件不是可解析的 CA 时，配置加载就应失败（fail fast），而不是等签发/握手才炸。
+    #[test]
+    fn agent_ca_with_unparsable_certificate_fails_at_load() {
+        let cert = write_temp_file("not a certificate");
+        let key = write_temp_file("not a key");
+        let path = write_temp_config(&agent_config_toml(&format!(
+            "ca_cert_file = \"{}\"\nca_key_file = \"{}\"\n",
+            file_name(&cert),
+            file_name(&key),
+        )));
+        let err = AdminConfig::load_from_path(&path).expect_err("unparsable CA");
+        assert!(err.to_string().contains("agent CA certificate"), "{err}");
+        let _ = fs::remove_file(path);
+    }
+
+    /// 两个都不给 = 关闭 mTLS 签发（双轨期），且签发有效期缺省 37 天（= 保底 30 + 提前 7）。
+    #[test]
+    fn agent_ca_absent_disables_mtls_and_defaults_ttl_to_37_days() {
+        let path = write_temp_config(&agent_config_toml(""));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+
+        assert!(config.agent_ca_cert_file.is_none());
+        assert!(config.agent_ca_key_file.is_none());
+        assert_eq!(
+            config.client_cert_ttl_seconds,
+            crate::infra::agent_ca::DEFAULT_CLIENT_CERT_TTL_SECONDS
+        );
+        assert_eq!(config.client_cert_ttl_seconds, 37 * 24 * 60 * 60);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn agent_ca_paths_are_absolutized_and_ttl_override_is_honored() {
+        let (ca_cert_name, ca_key_name) = write_agent_ca_files();
+        let path = write_temp_config(&agent_config_toml(&format!(
+            "ca_cert_file = \"{ca_cert_name}\"\nca_key_file = \"{ca_key_name}\"\nclient_cert_ttl_seconds = 1000\n",
+        )));
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+
+        assert_eq!(
+            config.agent_ca_cert_file,
+            Some(env::temp_dir().join(&ca_cert_name))
+        );
+        assert_eq!(
+            config.agent_ca_key_file,
+            Some(env::temp_dir().join(&ca_key_name))
+        );
+        assert_eq!(config.client_cert_ttl_seconds, 1000);
+        assert!(config.agent_ca_files().is_some(), "both paths = mTLS on");
+        let _ = fs::remove_file(path);
+    }
+
+    /// 一份可用的 agent CA（证书 + 私钥）PEM，落到临时目录，返回**文件名**（相对临时目录）。
+    fn write_agent_ca_files() -> (String, String) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+        };
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "Wist Test Agent CA");
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        let key = KeyPair::generate().expect("ca key");
+        let certificate = params.self_signed(&key).expect("ca cert");
+        let cert_path = write_temp_file(&certificate.pem());
+        let key_path = write_temp_file(&key.serialize_pem());
+        (file_name(&cert_path), file_name(&key_path))
+    }
+
+    fn file_name(path: &Path) -> String {
+        path.file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// 最小的可加载配置：`[server]` + `[agent]`，其余交给 `write_temp_config` 注入。
+    fn agent_config_toml(extra_agent_lines: &str) -> String {
+        format!(
+            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n{extra_agent_lines}",
+        )
     }
 }

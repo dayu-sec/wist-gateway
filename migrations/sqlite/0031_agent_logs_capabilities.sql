@@ -1,0 +1,14 @@
+-- agentd 上报的**日志能力清单**（D7，`LogsCapabilities`）：只保留最近一份。
+--
+-- 为什么需要它：`active` 单元只是「目录说这个面能采」，而某台机器**真能不能采**取决于
+-- 它手里的 agentd —— 单层 glob 是 W1 才有的能力，`journalctl-kernel` 是 W3 才有的导出器。
+-- 只按契约（`is_executable_source`）判，会出现「网关把活派下去、agent 回 unsupported」——
+-- 而且这种矛盾在回滚场景里最容易发生（agentd 回滚 + 新目录）。
+--
+-- 与同处的 `local_work` / `uplink_state` 同口径：
+--   - 行随 ON CONFLICT (instance_id) DO UPDATE 覆盖，只需加列，无需回填历史；
+--   - 旧 agentd 不报该字段 → 写库时**保持上一次的值**（不被一条老报文清掉）。
+--
+-- 列里存的是 `LogsCapabilities` 的 JSON：`file_inputs` / `multiline_modes` / `exporters` …
+-- （桶的形状会随能力演进而加，不适合拆成固定列）。
+ALTER TABLE agent_instances ADD COLUMN logs_capabilities TEXT;

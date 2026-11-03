@@ -9,10 +9,11 @@ use axum::{
 use serde::Serialize;
 
 use crate::infra::victoria_metrics::query_json;
-use crate::infra::{AgentMetricSample, StoredAgentRegistration};
+use crate::infra::{AgentQuery, AgentStatusMetricSample, StoredAgentRegistration};
 use wist_control::types::{AgentRuntimeStatus, DateTime};
 
 use super::admin_auth::require_admin_bearer;
+use super::admin_ops::cpu_percent_of_machine;
 use super::{AdminRuntimeState, ApiState, rate_limit};
 
 #[derive(Debug, Clone, Serialize, ::jumo_derive::Jumo)]
@@ -31,19 +32,34 @@ pub struct AgentOverviewMetrics {
 pub struct RecentOnlineRegisteredAgent {
     pub agent_id: String,
     pub instance_id: String,
+    /// 机器名：页面主标题用它；agent_id 只作为排障/日志关联的次级标识。
+    pub hostname: String,
+    /// 机器级最近一次已知网卡地址（可能为空；新 agentd 才会报）。
+    pub ip_addresses: Vec<String>,
     pub version: String,
     pub registered_at: DateTime,
     pub online_since: DateTime,
     pub online_duration_seconds: i64,
     pub source: RecentOnlineRegisteredAgentSource,
     pub memory_bytes: Option<u64>,
+    /// 单核口径的进程 CPU 占比（100% = 占满一个核，可能 >100），只统计 agent 进程自身。
     pub cpu_percent: Option<f64>,
+    /// 整机口径的 CPU 占比（0..100），由 `cpu_percent / cpu_cores` 派生；算不出时为 null。
+    ///
+    /// 缺省表示后端没测到，页面显示「—」而不是 0。
+    pub cpu_percent_of_machine: Option<f64>,
+    /// agent 所在机器的逻辑核数；缺省表示老版本 agentd 没报。
+    pub cpu_cores: Option<u32>,
     pub admin_latency_ms: Option<u64>,
-    pub metrics_history: Vec<AgentMetricSample>,
+    pub metrics_history: Vec<AgentStatusMetricSample>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// 这条「最近上线 Agent」是真实注册的，还是没有真 Agent 时的空态演示数据。
+///
+/// 必须能区分（而不是靠 id 命名习惯去猜）：演示数据被读成真实资产，后果是运维去查一台不存在的机器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ::jumo_derive::Jumo)]
 #[serde(rename_all = "snake_case")]
+#[jumo(kind = "state", domain = "Control", module = "Control.Agent.Status")]
 pub enum RecentOnlineRegisteredAgentSource {
     Real,
     Example,
@@ -70,30 +86,44 @@ pub async fn get_agent_overview(
     Json(agent_overview(&state).await).into_response()
 }
 
+/// 总览页「最近上线注册 Agent」一次最多给多少台。
+///
+/// 这里以前是 **6**：卡片列表被截断到 6 张，而左上角「已接入 Agent」的指标是对**全部** Agent 算的 ——
+/// 于是 7 台的网关会出现「总数 7、下面只列 6」的矛盾，多出来的那台在总览页**根本看不到**（也没有
+/// 任何提示说被截断了）。现在按「一页」给（与 Agent 列表的 `DEFAULT_AGENT_PAGE_LIMIT` 同量级），
+/// 真正的截断由前端明说（少于总数时给出「去 Agent 机队看全部」）。
+///
+/// 保留上限的理由是这个端点喂的是一屏卡片网格（每张卡还带指标迷你趋势），不设界的话上千台机队
+/// 会把一屏拖垮；100 台是「看得见全部常见机队」与「一屏放得下」的折中。
+pub(crate) const OVERVIEW_RECENT_AGENT_LIMIT: usize = 100;
+
 const ONLINE_WINDOW_SECONDS: i64 = 300;
 const HISTORY_WINDOW_SECONDS: i64 = 3600;
 const HISTORY_STEP_SECONDS: i64 = 30;
 
 pub async fn agent_overview(state: &ApiState) -> AgentOverview {
-    let snapshot = state.store.load().unwrap_or_default();
+    // 有意吞掉存储错误：总览页在存储不可用时降级为空列表，而不是整页 500。
+    let agents = state
+        .store
+        .list_agents(&AgentQuery::default())
+        .await
+        .unwrap_or_default();
     let now = DateTime::now();
 
-    // 总览指标对「全部 agent」计算，而不是只对最近 6 张卡片（卡片列表单独 truncate）。
-    let total_agents = snapshot.agents.len() as i64;
-    let online_agents = snapshot
-        .agents
-        .values()
+    // 总览指标对「全部 agent」计算，卡片列表另行截断到 `OVERVIEW_RECENT_AGENT_LIMIT`。
+    let total_agents = agents.len() as i64;
+    let online_agents = agents
+        .iter()
         .filter(|agent| agent_is_online(&agent.last_seen_at, &now))
         .count() as i64;
-    let last_seen_lag_seconds = snapshot
-        .agents
-        .values()
+    let last_seen_lag_seconds = agents
+        .iter()
         .filter_map(|agent| DateTime::from_rfc3339(&agent.last_seen_at))
         .map(|last_seen| last_seen.seconds_until(&now))
         .max()
         .unwrap_or(0);
 
-    let stored_agents = snapshot.agents.into_values().collect::<Vec<_>>();
+    let stored_agents = agents;
     let memory_agents = state
         .runtime
         .lock()
@@ -110,7 +140,7 @@ pub async fn agent_overview(state: &ApiState) -> AgentOverview {
         }
     }
     recent_online_agents.sort_by(|left, right| right.registered_at.cmp(&left.registered_at));
-    recent_online_agents.truncate(6);
+    recent_online_agents.truncate(OVERVIEW_RECENT_AGENT_LIMIT);
 
     let agent_ids: Vec<String> = recent_online_agents
         .iter()
@@ -150,6 +180,8 @@ fn recent_online_agents_from_store(
             recent_online_registered_agent_at(
                 &agent.agent_id,
                 &agent.instance_id,
+                &agent.hostname,
+                agent.ip_addresses.clone(),
                 &agent.version,
                 registered_at,
                 online_since,
@@ -157,6 +189,7 @@ fn recent_online_agents_from_store(
                 RecentOnlineRegisteredAgentSource::Real,
                 agent.last_memory_bytes,
                 agent.last_cpu_percent,
+                agent.last_cpu_cores,
                 agent.last_admin_latency_ms,
             )
         })
@@ -176,11 +209,14 @@ pub fn record_recent_online_agent(
     let agent = recent_online_registered_agent_at(
         agent_id,
         instance_id,
+        "",
+        Vec::new(),
         version,
         registered_at,
         now,
         online_duration_seconds,
         RecentOnlineRegisteredAgentSource::Real,
+        None,
         None,
         None,
         None,
@@ -190,13 +226,17 @@ pub fn record_recent_online_agent(
         .recent_online_agents
         .retain(|existing| existing.agent_id != agent_id);
     state.recent_online_agents.insert(0, agent);
-    state.recent_online_agents.truncate(6);
+    state
+        .recent_online_agents
+        .truncate(OVERVIEW_RECENT_AGENT_LIMIT);
 }
 
 #[allow(clippy::too_many_arguments)]
 fn recent_online_registered_agent_at(
     agent_id: &str,
     instance_id: &str,
+    hostname: &str,
+    ip_addresses: Vec<String>,
     version: &str,
     registered_at: DateTime,
     online_since: DateTime,
@@ -204,11 +244,14 @@ fn recent_online_registered_agent_at(
     source: RecentOnlineRegisteredAgentSource,
     memory_bytes: Option<u64>,
     cpu_percent: Option<f64>,
+    cpu_cores: Option<u32>,
     admin_latency_ms: Option<u64>,
 ) -> RecentOnlineRegisteredAgent {
     RecentOnlineRegisteredAgent {
         agent_id: agent_id.to_string(),
         instance_id: instance_id.to_string(),
+        hostname: hostname.to_string(),
+        ip_addresses,
         version: version.to_string(),
         registered_at,
         online_since,
@@ -216,12 +259,17 @@ fn recent_online_registered_agent_at(
         source,
         memory_bytes,
         cpu_percent,
+        cpu_percent_of_machine: cpu_percent_of_machine(cpu_percent, cpu_cores),
+        cpu_cores,
         admin_latency_ms,
         metrics_history: Vec::new(),
     }
 }
 
-fn agent_is_online(last_seen_at: &str, now: &DateTime) -> bool {
+/// 在线判据：`last_seen_at` 落在 `ONLINE_WINDOW_SECONDS` 内。
+///
+/// `pub(super)`：Agent 列表要用**同一份判据**标 `status`（不能一处算在线、一处写死 online）。
+pub(super) fn agent_is_online(last_seen_at: &str, now: &DateTime) -> bool {
     let Some(last_seen) = DateTime::from_rfc3339(last_seen_at) else {
         return false;
     };
@@ -231,14 +279,14 @@ fn agent_is_online(last_seen_at: &str, now: &DateTime) -> bool {
 async fn agent_metrics_histories(
     vm_url: &str,
     agent_ids: &[String],
-) -> HashMap<String, Vec<AgentMetricSample>> {
-    let mut histories: HashMap<String, Vec<AgentMetricSample>> = HashMap::new();
+) -> HashMap<String, Vec<AgentStatusMetricSample>> {
+    let mut histories: HashMap<String, Vec<AgentStatusMetricSample>> = HashMap::new();
     if agent_ids.is_empty() {
         return histories;
     }
 
-    // 一次拉取三个 agent 自身上报指标，再按 (agent, 时间戳) 对齐合并成历史样本。
-    let query = r#"{__name__=~"agent.memory.bytes|agent.cpu.percent|agent.admin_latency.ms"}"#;
+    // 一次拉取四个 agent 自身上报指标，再按 (agent, 时间戳) 对齐合并成历史样本。
+    let query = r#"{__name__=~"agent.memory.bytes|agent.cpu.percent|agent.cpu.cores|agent.admin_latency.ms"}"#;
     let now = chrono::Utc::now().timestamp();
     let start = (now - HISTORY_WINDOW_SECONDS).to_string();
     let end = now.to_string();
@@ -260,7 +308,7 @@ async fn agent_metrics_histories(
     };
 
     let wanted: HashSet<&str> = agent_ids.iter().map(String::as_str).collect();
-    let mut per_agent: HashMap<String, BTreeMap<i64, AgentMetricSample>> = HashMap::new();
+    let mut per_agent: HashMap<String, BTreeMap<i64, AgentStatusMetricSample>> = HashMap::new();
 
     for item in range["data"]["result"]
         .as_array()
@@ -290,10 +338,12 @@ async fn agent_metrics_histories(
                 .entry(agent.clone())
                 .or_default()
                 .entry(timestamp_ms)
-                .or_insert_with(|| AgentMetricSample {
+                .or_insert_with(|| AgentStatusMetricSample {
                     at: timestamp_rfc3339(timestamp_ms),
                     memory_bytes: None,
                     cpu_percent: None,
+                    cpu_percent_of_machine: None,
+                    cpu_cores: None,
                     admin_latency_ms: None,
                 });
             match name {
@@ -302,6 +352,9 @@ async fn agent_metrics_histories(
                 }
                 "agent.cpu.percent" => {
                     entry.cpu_percent = value.parse::<f64>().ok();
+                }
+                "agent.cpu.cores" => {
+                    entry.cpu_cores = value.parse::<f64>().ok().map(|value| value as u32);
                 }
                 "agent.admin_latency.ms" => {
                     entry.admin_latency_ms = value.parse::<f64>().ok().map(|value| value as u64);
@@ -312,7 +365,13 @@ async fn agent_metrics_histories(
     }
 
     for (agent, by_timestamp) in per_agent {
-        histories.insert(agent, by_timestamp.into_values().collect());
+        let mut samples: Vec<AgentStatusMetricSample> = by_timestamp.into_values().collect();
+        // 整机占比同样在读取路径派生（与当前值同一个 helper）：历史序列也要能给出这个值。
+        for sample in &mut samples {
+            sample.cpu_percent_of_machine =
+                cpu_percent_of_machine(sample.cpu_percent, sample.cpu_cores);
+        }
+        histories.insert(agent, samples);
     }
     histories
 }
