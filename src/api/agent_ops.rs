@@ -1293,6 +1293,12 @@ fn gateway_digest(input: &ReportAgentFactSummary) -> String {
         input.probed_paths.clone(),
         input.present_paths.clone(),
     )
+    // 推断证据必须一起进摘要：漏掉它，证据变化会被判成 `duplicate` 直接丢掉，
+    // 指标就永远带着旧 `app`（且没有任何一层能发现）。
+    .with_evidence(wist_contracts::fact_summary::FactEvidence {
+        service_units: input.service_units.clone(),
+        container_names: input.container_names.clone(),
+    })
     .content_digest()
 }
 
@@ -1315,6 +1321,9 @@ const MAX_HOST_FIELD_BYTES: usize = 512;
 /// 网卡条数上限：一台宿主机（含 docker 网桥 / veth / VPN）几十块网卡是常态，256 留足余量。
 /// 上界存在的意义只是让一条上报撑不爆单行与页面，不是去猜机器该有几块网卡。
 const MAX_NETWORK_ADDRESSES: usize = 256;
+/// 推断证据条数上限。agentd 侧截断在 64，这里放宽到 128：多留一倍余量是为了
+/// **第三方实现**（或以后的采集扩展）不必精确对齐这个常量，而不是为了收更大的表。
+const MAX_INFERENCE_EVIDENCE: usize = 128;
 
 fn validate_fact_summary(input: &ReportAgentFactSummary) -> Result<(), String> {
     if input.content_digest.len() > MAX_CONTENT_DIGEST_BYTES {
@@ -1355,6 +1364,18 @@ fn validate_fact_summary(input: &ReportAgentFactSummary) -> Result<(), String> {
         "network_addresses",
         &input.network_addresses,
         MAX_NETWORK_ADDRESSES,
+    )?;
+    // 推断证据的上限与 agentd 的截断上限同量级（各 64）：超了说明上报方没守约定，
+    // 拒收比静默截断好 —— 后者会让「同一台机器两次上报的证据集不同」，摘要跟着抖。
+    check_list(
+        "service_units",
+        &input.service_units,
+        MAX_INFERENCE_EVIDENCE,
+    )?;
+    check_list(
+        "container_names",
+        &input.container_names,
+        MAX_INFERENCE_EVIDENCE,
     )?;
     Ok(())
 }

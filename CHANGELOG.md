@@ -3,6 +3,14 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.38.1-alpha] - 2026-11-03
+
+### 修复
+
+- **推断证据参与网关自算的内容摘要**：`gateway_digest` 漏了新字段，后果是「只换了服务单元」
+  的上报被判成 `duplicate` 丢掉 —— 指标会永远带着旧 `app`，且没有任何一层能发现。
+  补了回归用例（证据变化不算重复上报）。
+
 ## [0.38.0-alpha] - 2026-11-03
 
 ### 新增

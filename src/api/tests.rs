@@ -1921,6 +1921,11 @@ fn digest_of(report: &ReportAgentFactSummary) -> String {
         report.probed_paths.clone(),
         report.present_paths.clone(),
     )
+    // 与生产实现保持同一份规范化：证据也进摘要（`fact-v4`）。
+    .with_evidence(wist_contracts::fact_summary::FactEvidence {
+        service_units: report.service_units.clone(),
+        container_names: report.container_names.clone(),
+    })
     .content_digest()
 }
 
@@ -17436,4 +17441,33 @@ async fn a_registry_edit_takes_effect_without_a_restart() {
     let body: serde_json::Value =
         decode_json_response(poll_metrics_labels(&env, &credential).await).await;
     assert_eq!(body["labels"]["app"], "orders");
+}
+
+#[tokio::test]
+async fn a_change_of_inference_evidence_is_not_a_duplicate_report() {
+    // 证据进内容摘要。漏掉它，网关会把「只换了服务单元」的上报当 duplicate 丢掉，
+    // 于是指标永远带着旧 `app` —— 而且没有任何一层能发现。
+    let env = TestEnv::new().await;
+    enroll_agent_credential(&env).await;
+
+    let first = fact_report(&["/usr/bin/java"]);
+    let accepted = post_to_ingest_router(&env, &data_plane_record("agent-node-a", &first)).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    // 内容字段都没变，只多了一条推断证据 → 摘要必须变，落库的不是 duplicate。
+    let mut second = first.clone();
+    second.report_id = "report-2".to_string();
+    second.service_units = vec!["kafka@broker-1".to_string()];
+    second.content_digest = digest_of(&second);
+    let accepted = post_to_ingest_router(&env, &data_plane_record("agent-node-a", &second)).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let stored = env
+        .store
+        .get_agent_fact_summary("agent-node-a")
+        .await
+        .expect("store read")
+        .expect("fact summary");
+    assert_eq!(stored.service_units, vec!["kafka@broker-1".to_string()]);
+    assert_eq!(stored.content_digest, digest_of(&second));
 }
