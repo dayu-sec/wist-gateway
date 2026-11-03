@@ -13,7 +13,7 @@
 //! * 注册 token 的「预留 → 落库 / 回滚」协议保持原样（`reserved_at` + TTL），
 //!   只是从「整体重写 JSON」换成单事务，因此并发下不再依赖文件锁。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use async_trait::async_trait;
@@ -616,6 +616,7 @@ pub struct UnreadablePath {
 ///   * `origin = override` 的行由人显式指定（**优先级最高**），但**同样受 roots 约束**：
 ///     写入时就校验，不从这一行反推「人可以越权」；
 ///   * 覆盖与解析值**并存**：删覆盖即回落，不必等下一次发现 tick。
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StoredLogSource {
@@ -645,6 +646,25 @@ impl StoredLogSource {
     pub fn is_override(&self) -> bool {
         self.origin == "override"
     }
+}
+
+// ── 选择类 label 的手工覆盖 ──
+
+/// 一台机器的选择类 label **手工覆盖**（三层取值里的最后一层）。
+///
+/// 只存「人写了什么」：生效值 = 部署默认 ∪ 推断 ∪ 本表，合并留在读路径做
+/// （见 `app::metrics_labels`）。落库合并结果会让「改了部署默认」与「库里的旧值」分不开。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredAgentMetricsLabels {
+    pub agent_id: String,
+    /// 扁平覆盖表（键 ⊆ 选择类闭集，值为字符串）。空表 = 没覆盖任何一个键。
+    pub overrides: BTreeMap<String, String>,
+    /// 这台机器覆盖值的版本；没有行时视为 0。每次写入 +1。
+    pub revision: i64,
+    pub updated_at: String,
+    /// 写的人（`admin:<token 指纹>`），审计用。
+    pub updated_by: String,
 }
 
 /// 一条命中依据（对应模型 `PurposeSignal`）。
@@ -1534,7 +1554,7 @@ pub trait Store: Send + Sync + fmt::Debug {
     /// 按 `work_id` 读一份常驻工作。
     async fn get_standing_work(&self, work_id: &str) -> StoreResult<Option<StandingWork>>;
 
-    /// 某 Agent 的**全部**常驻工作（含暂停/被取代/已撤回 —— 留痕要看得到）。
+    /// 某台 Agent 的**全部**常驻工作（含暂停/被取代/已撤回 —— 留痕要看得到）。
     async fn list_standing_work(&self, agent_id: &str) -> StoreResult<Vec<StandingWork>>;
 
     /// 写入/覆盖一份一次性工作（`work_id` 为主键）。
@@ -1581,6 +1601,23 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 读授权序号；从未授权过任何工作时返回 0。
     async fn work_sequence(&self, agent_id: &str) -> StoreResult<i64>;
+
+    // ── 选择类 label 的手工覆盖 ──
+
+    /// 某台 agent 的选择类 label 手工覆盖；没有行返回 `None`（= 没有覆盖）。
+    async fn get_agent_metrics_labels(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<StoredAgentMetricsLabels>>;
+
+    /// 写入/覆盖一台 agent 的覆盖值（整表替换：调用方先把上一版的键合并好）。
+    async fn upsert_agent_metrics_labels(
+        &self,
+        labels: &StoredAgentMetricsLabels,
+    ) -> StoreResult<()>;
+
+    /// 清空一台 agent 的全部手工覆盖，返回是否真的删掉了行。
+    async fn delete_agent_metrics_labels(&self, agent_id: &str) -> StoreResult<bool>;
 
     // ── 灰度发布计划 ──
 

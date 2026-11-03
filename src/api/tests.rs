@@ -9881,6 +9881,8 @@ impl TestEnv {
             knowledge_source_dir: None,
             knowledge_signing_public_key_file: None,
             knowledge_signing_public_key: None,
+            // 选择类 label 的部署默认：测试默认不贴（要测的用例自己填）。
+            metrics_labels: std::collections::BTreeMap::new(),
             log_max_bytes: crate::infra::LogRetention::default().max_bytes,
             log_keep_files: crate::infra::LogRetention::default().keep_files,
             log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
@@ -17015,4 +17017,238 @@ async fn gateway_agents_allows_the_configured_peer_and_rejects_the_rest() {
         .await
         .expect("response");
     assert_eq!(external.status(), StatusCode::FORBIDDEN);
+}
+
+// ── 选择类 label（env / cluster / app / …）的下发与管理面 ──────────────────────
+
+/// 拉一次 agent 面的选择类 label（mTLS 身份由路由扩展注入）。
+async fn poll_metrics_labels(env: &TestEnv, credential: &str) -> axum::response::Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/metrics-labels:poll",
+        Some(credential),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "poll_agent_metrics_labels",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "requested_at": "2026-11-03T00:00:00Z",
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn metrics_labels_come_from_deployment_defaults_then_manual_overrides() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    // 部署默认：一个部署一套。没有手工覆盖时 agent 直接拿到它。
+    env.config.metrics_labels = std::collections::BTreeMap::from([
+        ("env".to_string(), "prod".to_string()),
+        ("cluster".to_string(), "kafka-prod".to_string()),
+    ]);
+
+    let body: serde_json::Value =
+        decode_json_response(poll_metrics_labels(&env, &credential).await).await;
+    assert_eq!(body["labels"]["env"], "prod");
+    assert_eq!(body["labels"]["cluster"], "kafka-prod");
+    assert_eq!(body["sources"]["env"], "default");
+    assert_eq!(body["revision"], 0);
+
+    // 手工覆盖只改动的那个键；另一个键仍是部署默认。
+    let response = put_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/metrics-labels",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "set_agent_metrics_labels",
+            "overrides": {"cluster": "kafka-canary"},
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["revision"], 1);
+    assert_eq!(view["labels"]["cluster"], "kafka-canary");
+    assert_eq!(view["labels"]["env"], "prod");
+    assert_eq!(view["sources"]["cluster"], "manual");
+    assert_eq!(view["sources"]["env"], "default");
+    assert_eq!(view["overrides"]["cluster"], "kafka-canary");
+
+    let body: serde_json::Value =
+        decode_json_response(poll_metrics_labels(&env, &credential).await).await;
+    assert_eq!(body["labels"]["cluster"], "kafka-canary");
+    assert_eq!(body["revision"], 1);
+
+    // 清空手工覆盖 → 回落到部署默认，并且版本继续前进（agent 才知道要换）。
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/metrics-labels",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["revision"], 2);
+    assert_eq!(view["labels"]["cluster"], "kafka-prod");
+    assert!(view["overrides"].as_object().expect("object").is_empty());
+
+    let body: serde_json::Value =
+        decode_json_response(poll_metrics_labels(&env, &credential).await).await;
+    assert_eq!(body["labels"]["cluster"], "kafka-prod");
+    assert_eq!(body["revision"], 2);
+}
+
+#[tokio::test]
+async fn metrics_labels_reject_invalid_values_before_writing_anything() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    for (overrides, expected_code) in [
+        (
+            serde_json::json!({"env": "production"}),
+            "invalid_metric_env",
+        ),
+        (
+            serde_json::json!({"cluster": "Kafka Prod"}),
+            "invalid_metric_label_value",
+        ),
+        (
+            serde_json::json!({"service": "kafka"}),
+            "unknown_metric_label",
+        ),
+        // `role` 的含义随 `app` 变（没有登记表无法校验键组合）。
+        (
+            serde_json::json!({"role": "broker"}),
+            "metric_label_requires_app",
+        ),
+    ] {
+        let response = put_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-node-a/metrics-labels",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({
+                "api_version": "v1",
+                "kind": "set_agent_metrics_labels",
+                "overrides": overrides,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{overrides}");
+        let body: serde_json::Value = decode_json_response(response).await;
+        assert_eq!(body["error"]["code"], "metrics_labels_invalid");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains(expected_code),
+            "错误文案要带稳定原因码（got {body}）"
+        );
+    }
+
+    // 一次都没写进去：管理面读到的还是「没有覆盖」。
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/metrics-labels").await,
+    )
+    .await;
+    assert!(view["overrides"].as_object().expect("object").is_empty());
+    assert_eq!(view["revision"], 0);
+}
+
+#[tokio::test]
+async fn a_metrics_labels_write_queues_a_refresh_command_for_that_agent() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = put_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/metrics-labels",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "set_agent_metrics_labels",
+            "overrides": {"app": "kafka"},
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 命令不需要新的推送面：下一次状态上报的回执就把它带下去。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.21.2",
+            "command_acks": [],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(ack.commands.len(), 1);
+    assert_eq!(ack.commands[0].kind, "refresh");
+    let params: serde_json::Value =
+        serde_json::from_str(&ack.commands[0].params).expect("refresh params");
+    assert_eq!(params["what"], serde_json::json!(["metrics-labels"]));
+}
+
+#[tokio::test]
+async fn metrics_labels_poll_requires_the_agent_certificate_identity() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    // 证书说是 agent-node-a，请求体说是别人 → 拒。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/metrics-labels:poll",
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "poll_agent_metrics_labels",
+            "agent_id": "agent-node-b",
+            "instance_id": "node-a",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 没有证书身份 → 拒（这条端点不给 bearer 通道）。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/metrics-labels:poll",
+        None,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "poll_agent_metrics_labels",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn metrics_labels_admin_endpoints_require_the_admin_bearer() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/metrics-labels",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }

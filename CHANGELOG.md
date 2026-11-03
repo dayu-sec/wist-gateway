@@ -3,6 +3,23 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.37.0-alpha] - 2026-11-03
+
+### 新增
+
+- **选择类 label 由网关下发**（`env` / `cluster` / `app` / `role` …）：
+  - `[agent] metrics_labels`：部署默认值，启动期校验（键闭集 / 值文法 / `env` 闭集 / ≤ 6 对）；
+  - `POST /api/v1/agent/metrics-labels:poll`：agent 拉取生效值（mTLS，身份取客户端证书）；
+  - `GET|PUT|DELETE /api/v1/admin/agents/{id}/metrics-labels`：查看 / 逐键手工覆盖 / 清空覆盖。
+    写入后给该 agent 排一条 `refresh` 命令，下一次状态上报（≤3s）即送达。
+- 生效值 = 部署默认 ∪ 推断 ∪ 手工覆盖（优先级依次升高）；三层都没有的键**不发**，不猜。
+- 手工覆盖与部署默认合并后再校验一次：两层各自合法不代表合起来合法
+  （例如删掉 `app` 而部署默认里有 `role`）。
+
+### 变更（不兼容）
+
+- 依赖 `wist-api 0.10`（新增 `metrics_labels` seam 与 `refresh` 命令 kind）。
+
 ## [0.36.0-alpha] - 2026-11-03
 
 ### 变更（不兼容）

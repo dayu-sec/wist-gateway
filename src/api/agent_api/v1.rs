@@ -12,6 +12,7 @@ use super::super::agent_ops::{
     submit_agent_status, submit_work_result,
 };
 use super::super::enrollment::enroll_agent;
+use super::super::metrics_labels::poll_agent_metrics_labels;
 use super::super::preflight::agent_preflight;
 use super::super::source_search_policy::poll_source_search_policy;
 use super::ApiState;
@@ -49,6 +50,9 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
             "/source-search-policy:poll",
             post(poll_source_search_policy),
         ),
+        // 选择类 label（`env` / `cluster` / `app` / …）的拉取。与其它 `:poll` 同形：身份在请求体，
+        // `:poll` 表明它是幂等拉取。旧网关 404 → 新 agentd 按「没有选择类 label」继续跑。
+        ("/metrics-labels:poll", post(poll_agent_metrics_labels)),
         // 确认收到某份工作（常驻工作带生效版本）。
         ("/work:ack", post(ack_work)),
         // 一次性工作的执行结果（进度/终态）。与 ack 分开：确认回答「我收到了」，结果回答

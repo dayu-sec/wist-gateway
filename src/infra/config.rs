@@ -154,6 +154,15 @@ pub struct AdminConfig {
     /// 缺省 `None` → `data/ivsrep`（与数据面 `business.d/agent_ivsrep.toml` 的 `base` 对齐）。
     /// 改这个值 = 数据面 sink 的 `base` 也改了，或报告单独挂了一个卷；两侧必须一起改。
     pub investigation_report_dir: Option<PathBuf>,
+    /// `[agent] metrics_labels`：本部署的选择类 label 默认值（`env` / `cluster` 必需）。
+    ///
+    /// 这些值会贴到**该部署里每台 agent** 的指标序列上；agent 侧没有配置（见
+    /// `wist-agentd/docs/design/metrics-selection-labels.md`）。放部署级是因为
+    /// `env` / `cluster` 是「这台机器属于哪个环境/部署单元」，只有控制面知道 ——
+    /// 让 agent 拿机器名或路径猜一个，不同部署单元会静默合流。
+    ///
+    /// 缺省空表 = 不贴任何选择类 label（合法，但查询侧只能在 `{cluster=""}` 里找到它们）。
+    pub metrics_labels: std::collections::BTreeMap<String, String>,
     /// 日志源（`from_dir` / 人工覆盖）允许落地的目录 roots。
     ///
     /// **这是网关策略，对所有人一致**：agent 上报什么、人显式指定什么，都要过这一关。
@@ -442,6 +451,12 @@ struct RawAgentConfig {
     client_cert_ttl_seconds: i64,
     tenant_id: String,
     environment_id: String,
+    /// 选择类 label 的**部署默认值**（`[agent] metrics_labels`）。
+    /// 与 `environment_id` 是两件事：后者是租户/环境的**内部标识**，前者是要贴到指标上的
+    /// `env` 值（闭集 `prod` / `staging` / `dev` / `test`）。不自动映射 —— 内部标识的取值
+    /// 由接入流程决定，猜错会把两个环境的序列合到一起。
+    #[serde(default)]
+    metrics_labels: std::collections::BTreeMap<String, String>,
 }
 
 pub fn default_config_path() -> String {
@@ -686,6 +701,7 @@ impl AdminConfig {
             knowledge_source_dir,
             knowledge_signing_public_key_file,
             knowledge_signing_public_key,
+            metrics_labels: raw.agent.metrics_labels,
             log_max_bytes: raw.logs.max_bytes,
             log_keep_files: raw.logs.keep_files,
             log_max_age_seconds: raw.logs.max_age_seconds,
@@ -823,6 +839,10 @@ impl AdminConfig {
                 )));
             }
         }
+        // 部署默认的选择类 label：**启动期就判**。值不合法会让每条指标序列带上一个
+        // 无法查询的键（比如 `env = "production"`），而现场只会看到「加了 label 还是选不出来」。
+        crate::app::metrics_labels::validate_defaults(&self.metrics_labels)
+            .map_err(|err| config_validation(format!("[agent] metrics_labels: {err}")))?;
         if let Some(database_url) = self.database_url.as_deref()
             && !database_url.starts_with("sqlite:")
         {
@@ -1357,6 +1377,7 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         knowledge_source_dir: None,
         knowledge_signing_public_key_file: None,
         knowledge_signing_public_key: None,
+        metrics_labels: std::collections::BTreeMap::new(),
         log_max_bytes: crate::infra::LogRetention::default().max_bytes,
         log_keep_files: crate::infra::LogRetention::default().keep_files,
         log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
@@ -1596,6 +1617,51 @@ policies = [
     fn config_with_investigations(investigations_body: &str) -> String {
         format!(
             "[investigations]\n{investigations_body}\n\n[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
+        )
+    }
+
+    #[test]
+    fn metrics_labels_defaults_load_and_are_validated_at_startup() {
+        // 不写这一段：合法（不贴任何选择类 label）。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_purpose("")))
+            .expect("config loads");
+        assert!(config.metrics_labels.is_empty());
+
+        // 正常的一段：一个部署一套的 `env` / `cluster`。
+        let config = AdminConfig::load_from_path(write_temp_config(&config_with_metrics_labels(
+            "{ env = \"prod\", cluster = \"kafka-prod\" }",
+        )))
+        .expect("config loads");
+        assert_eq!(
+            config.metrics_labels,
+            std::collections::BTreeMap::from([
+                ("env".to_string(), "prod".to_string()),
+                ("cluster".to_string(), "kafka-prod".to_string()),
+            ])
+        );
+
+        // 写错的值必须**起不来**：贴上去以后查询永远选不中，而现场只会看到“加了 label 还是查不到”。
+        for body in [
+            "{ env = \"production\" }",
+            "{ cluster = \"Kafka Prod\" }",
+            "{ service = \"kafka\" }",
+            "{ app = \"kafka\", role = \"leader\" }",
+            "{ env = \"prod\", cluster = \"a\", region = \"b\", zone = \"c\", app = \"d\", shard = \"0\", tier = \"hot\" }",
+        ] {
+            let err =
+                AdminConfig::load_from_path(write_temp_config(&config_with_metrics_labels(body)))
+                    .expect_err("config must be rejected");
+            assert!(
+                err.to_string().contains("metrics_labels"),
+                "错误要指向 [agent] metrics_labels（got {err}）"
+            );
+        }
+    }
+
+    /// 生成一份最小可用配置，其中 `[agent] metrics_labels` 表体由调用方给出。
+    fn config_with_metrics_labels(labels_body: &str) -> String {
+        format!(
+            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\nmetrics_labels = {labels_body}\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n",
         )
     }
 

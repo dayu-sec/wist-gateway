@@ -24,6 +24,15 @@ environment_id = "env-default"
 # 签发的客户端证书有效期（秒）；缺省 37 天 = 保底 30 天 + 提前 7 天续期（§4.2）。
 # client_cert_ttl_seconds = 3196800
 
+# 选择类 label 的**部署默认值**：贴到本网关下每台 agent 的指标序列上。
+# 由网关（而不是各机 agentd.toml）拥有，是因为「这台机器属于哪个环境 / 部署单元」
+# 只有控制面知道；让 agent 猜一个会让不同部署单元静默合流。
+# 键闭集：app / env / cluster / role / shard / tier / region / zone（≤ 6 对）；
+# env 闭集：prod / staging / dev / test。单机可以逐台覆盖（管理面 metrics-labels）。
+# [agent.metrics_labels]
+# env = "prod"
+# cluster = "kafka-prod"
+
 [ingest]
 # 数据面（wparse）内部接入端点：明文 HTTP，默认只绑环回；容器里要绑网卡（0.0.0.0）才连得上。
 listen_addr = "127.0.0.1:3001"

@@ -73,6 +73,7 @@ const DELETE_AGENT_TABLES: &[(&str, &str)] = &[
     ("agent_fact_summary", "delete agent fact summary"),
     ("agent_path_probe", "delete agent path probe"),
     ("agent_log_source", "delete agent log source"),
+    ("agent_metrics_labels", "delete agent metrics labels"),
     ("agent_classification", "delete agent classification"),
     (
         "agent_software_inventory",
@@ -3074,6 +3075,72 @@ impl Store for SqliteStore {
         Ok(sequence.unwrap_or(0))
     }
 
+    async fn get_agent_metrics_labels(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<StoredAgentMetricsLabels>> {
+        let row = sqlx::query(
+            "SELECT agent_id, overrides_json, revision, updated_at, updated_by \
+             FROM agent_metrics_labels WHERE agent_id = ?1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select agent metrics labels"))?;
+        row.map(|row| {
+            let text: String = column!(row, "overrides_json");
+            let overrides = serde_json::from_str(&text).map_err(|err| {
+                StoreReason::Sql
+                    .to_err()
+                    .with_detail(format!("decode agent metrics labels overrides: {err}"))
+            })?;
+            Ok(StoredAgentMetricsLabels {
+                agent_id: column!(row, "agent_id"),
+                overrides,
+                revision: column!(row, "revision"),
+                updated_at: column!(row, "updated_at"),
+                updated_by: column!(row, "updated_by"),
+            })
+        })
+        .transpose()
+    }
+
+    async fn upsert_agent_metrics_labels(
+        &self,
+        labels: &StoredAgentMetricsLabels,
+    ) -> StoreResult<()> {
+        let overrides_json = serde_json::to_string(&labels.overrides).map_err(|err| {
+            StoreReason::Sql
+                .to_err()
+                .with_detail(format!("encode agent metrics labels overrides: {err}"))
+        })?;
+        sqlx::query(
+            "INSERT INTO agent_metrics_labels (agent_id, overrides_json, revision, updated_at, \
+             updated_by) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (agent_id) DO UPDATE SET overrides_json = excluded.overrides_json, \
+             revision = excluded.revision, updated_at = excluded.updated_at, \
+             updated_by = excluded.updated_by",
+        )
+        .bind(&labels.agent_id)
+        .bind(overrides_json)
+        .bind(labels.revision)
+        .bind(&labels.updated_at)
+        .bind(&labels.updated_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert agent metrics labels"))?;
+        Ok(())
+    }
+
+    async fn delete_agent_metrics_labels(&self, agent_id: &str) -> StoreResult<bool> {
+        let result = sqlx::query("DELETE FROM agent_metrics_labels WHERE agent_id = ?1")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "delete agent metrics labels"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn save_rollout_plan(&self, plan: &StoredRolloutPlan) -> StoreResult<()> {
         let phases_json = serialize_json_array(&plan.phases, "encode rollout plan phases")?;
         sqlx::query(
@@ -3876,6 +3943,15 @@ mod tests {
         .execute(&store.pool)
         .await
         .expect("seed path probe");
+        // 选择类 label 的手工覆盖：同样 per-agent、同样没有外键。
+        sqlx::query(
+            "INSERT INTO agent_metrics_labels \
+             (agent_id, overrides_json, revision, updated_at, updated_by) \
+             VALUES ('agent-del', '{\"env\":\"prod\"}', 1, '2026-01-01T00:00:00Z', 'admin')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("seed metrics labels");
 
         assert!(store.delete_agent("agent-del").await.expect("delete"));
 
@@ -3884,6 +3960,7 @@ mod tests {
             "agent_classification",
             "agent_commands",
             "agent_path_probe",
+            "agent_metrics_labels",
             "agent_instances",
             "agent_credentials",
         ] {
@@ -5490,6 +5567,58 @@ mod tests {
     }
 
     /// 日志源候选：一台多行、`(service, source_ref)` 唯一、覆盖排在解析值前面。
+    #[tokio::test]
+    async fn upserts_reads_and_clears_agent_metrics_label_overrides() {
+        let store = store().await;
+        // 没有行 = 没有手工覆盖（不是错误）。
+        assert!(
+            store
+                .get_agent_metrics_labels("agent-a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let row = StoredAgentMetricsLabels {
+            agent_id: "agent-a".to_string(),
+            overrides: std::collections::BTreeMap::from([(
+                "cluster".to_string(),
+                "kafka-canary".to_string(),
+            )]),
+            revision: 1,
+            updated_at: "2026-11-03T00:00:00Z".to_string(),
+            updated_by: "admin:test".to_string(),
+        };
+        store.upsert_agent_metrics_labels(&row).await.unwrap();
+        assert_eq!(
+            store.get_agent_metrics_labels("agent-a").await.unwrap(),
+            Some(row.clone())
+        );
+
+        // 整表替换（调用方先把上一版合并好），不是追加。
+        let next = StoredAgentMetricsLabels {
+            overrides: std::collections::BTreeMap::from([("app".to_string(), "kafka".to_string())]),
+            revision: 2,
+            updated_at: "2026-11-03T00:01:00Z".to_string(),
+            ..row.clone()
+        };
+        store.upsert_agent_metrics_labels(&next).await.unwrap();
+        let stored = store
+            .get_agent_metrics_labels("agent-a")
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(stored.revision, 2);
+        assert_eq!(
+            stored.overrides,
+            std::collections::BTreeMap::from([("app".to_string(), "kafka".to_string())])
+        );
+
+        // 删除是幂等的：第二次返回 false。
+        assert!(store.delete_agent_metrics_labels("agent-a").await.unwrap());
+        assert!(!store.delete_agent_metrics_labels("agent-a").await.unwrap());
+    }
+
     #[tokio::test]
     async fn upserts_lists_and_deletes_agent_log_sources() {
         let store = store().await;

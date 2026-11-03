@@ -73,6 +73,11 @@ mod log_sources;
 // 独立端点而不是给已有报文加字段：两侧契约都是 `deny_unknown_fields`。
 // 见 api/agent_log_sources.rs 与设计 `doc/design/edge/log-source-resolution.md` §6.1。
 mod agent_log_sources;
+// NOTE(hand-added): 选择类 label（`env` / `cluster` / `app` / `role` …）的下发与管理面。
+// 独立端点而不是给已有报文加字段：`AgentStatusReport` / `WorkGrant` 等两侧都是
+// `deny_unknown_fields`，加字段会让旧 agentd 整份拒收。见 api/metrics_labels.rs 与
+// `wist-agentd/docs/design/metrics-selection-labels.md`。重新生成控制面代码时需回补本模块与下方路由。
+mod metrics_labels;
 // NOTE(hand-added): L3 搜索根的下发（`POST /api/v1/agent/source-search-policy:poll`）。
 // 生效值 = 知识库 `[[units]] search_roots` ∩ `[collection] allowed_source_roots`；
 // agentd 侧不留配置，拿不到策略就不搜索。见 api/source_search_policy.rs 与设计 §6.1.1。
@@ -150,6 +155,9 @@ use log_sources::{
     delete_agent_log_source, delete_agent_log_sources, list_agent_log_sources, put_agent_log_source,
 };
 use logs::{MAX_LOG_INGEST_BODY_BYTES, ingest_agent_logs, view_agent_logs};
+use metrics_labels::{
+    delete_agent_metrics_labels, put_agent_metrics_labels, view_agent_metrics_labels,
+};
 use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
 use pipeline::get_pipeline_topology;
 use preflight::{run_agent_preflight, view_agent_preflight};
@@ -489,6 +497,12 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agents/{agent_id}/host-metrics",
             get(get_agent_host_metrics),
+        )
+        .route(
+            "/api/v1/admin/agents/{agent_id}/metrics-labels",
+            get(view_agent_metrics_labels)
+                .put(put_agent_metrics_labels)
+                .delete(delete_agent_metrics_labels),
         )
         // NOTE(hand-added): 数据采集吞吐视图（见 api/pipeline.rs 顶部说明）
         .route(

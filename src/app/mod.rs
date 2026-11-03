@@ -4,6 +4,11 @@
 pub mod global_service;
 pub use global_service::*;
 
+// NOTE(hand-added): 选择类 label 的生效值合并（部署默认 ∪ 推断 ∪ 手工覆盖）。
+// 三层里只有最后一层是数据库里人写的；合并留在读路径，避免“库里的旧值 vs 新配置”分不清。
+// 重新生成控制面代码时需回补本模块。
+pub mod metrics_labels;
+
 // NOTE(hand-added): 用途推断（按规则表从事实摘要算建议）。对应 jumo 模型
 // Control.Agent.Purpose 的 IngestAgentFactSummaryFlow 里那一步 InferPurpose；
 // 规则表是策展数据，只读不内嵌。重新生成控制面代码时需回补本模块。
