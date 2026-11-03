@@ -110,34 +110,42 @@ impl AppRegistry {
             .collect();
 
         // 命中集合：同一台机器可能同时命中多个 app（混跑），那时不猜。
-        let mut hits: Vec<(&AppEntry, &'static str, String)> = Vec::new();
+        // 每个命中的元素是一组证据（同一 app 可能有多条），`role` 要跨整组看。
+        let mut hits: Vec<(&AppEntry, &'static str, Vec<String>)> = Vec::new();
         for entry in &self.entries {
-            // 命中判定：**模板名相同**即可（注册表登 `kafka`，事实里可能是 `kafka@broker-1`）；
-            // 报出去的是事实里的那个全名 —— `role` 要从实例名里取词。
-            if let Some(found) = units.iter().find(|unit| {
-                entry
-                    .units
-                    .iter()
-                    .any(|registered| unit_template(registered) == unit_template(unit))
-            }) {
-                hits.push((entry, "unit", found.clone()));
+            // 命中判定：**模板名相同**即可（注册表登 `kafka`，事实里可能是 `kafka@broker-1`）。
+            // 报出去的是事实里的全名 —— `role` 要从实例名里取词；一台机器可能有多条同 app
+            // 的证据（`kafka@broker-1` 与 `kafka@controller-1`），所以这里整组传下去。
+            let matched_units: Vec<String> = units
+                .iter()
+                .filter(|unit| {
+                    entry
+                        .units
+                        .iter()
+                        .any(|registered| unit_template(registered) == unit_template(unit))
+                })
+                .cloned()
+                .collect();
+            if !matched_units.is_empty() {
+                hits.push((entry, "unit", matched_units));
                 continue;
             }
-            if let Some(container) = entry
-                .containers
+            let matched_containers: Vec<String> = containers
                 .iter()
-                .find(|container| containers.contains(*container))
-            {
-                hits.push((entry, "container", container.clone()));
+                .filter(|container| entry.containers.contains(*container))
+                .cloned()
+                .collect();
+            if !matched_containers.is_empty() {
+                hits.push((entry, "container", matched_containers));
             }
         }
 
         match hits.as_slice() {
             [] => InferredLabels::default(),
-            [(entry, kind, value)] => InferredLabels {
+            [(entry, kind, values)] => InferredLabels {
                 app: Some(entry.app.clone()),
-                role: infer_role(entry, kind, value),
-                detail: format!("app={} {kind}:{value}", entry.app),
+                role: infer_role(entry, values),
+                detail: format!("app={} {kind}:{}", entry.app, values.join(",")),
             },
             many => {
                 // 多命中不是错误，是**这台机器的形态**（或注册表还欠一次登记）。
@@ -156,16 +164,21 @@ impl AppRegistry {
     }
 }
 
-/// 从命中的证据字符串里认出**静态角色词**。
+/// 从命中的**整组证据**里认出**静态角色词**。
 ///
 /// 只看该 `app` 自己登记的 `roles`（规范：扩展必须先登记）：`kafka-broker-1` 里的 `broker`
 /// 命中 → `role=broker`；`orders-api` 里的 `api` 没登记 → 不写。
-/// 同时出现两个不同角色（`kafka-broker-controller`）→ 有歧义，不写。
-fn infer_role(entry: &AppEntry, _kind: &str, value: &str) -> Option<String> {
+///
+/// **跨整组看**：一台机器可能同时跑 `kafka@broker-1` 与 `kafka@controller-1`。
+/// 只取字典序靠前的那条会随机挑一个角色写出去，而规范要求多角色节点只写**主**角色、
+/// 其余用 one-hot 指标（§13 补充约定 2）—— 判不出谁是主的时候宁可不写。
+fn infer_role(entry: &AppEntry, values: &[String]) -> Option<String> {
     let mut found: BTreeSet<String> = BTreeSet::new();
-    for token in value.split(['-', '_', '.', '@']) {
-        if entry.roles.contains(token) {
-            found.insert(token.to_string());
+    for value in values {
+        for token in value.split(['-', '_', '.', '@']) {
+            if entry.roles.contains(token) {
+                found.insert(token.to_string());
+            }
         }
     }
     match found.len() {
@@ -442,6 +455,40 @@ roles = ["primary", "replica"]
                 .as_deref(),
             Some("kafka")
         );
+    }
+
+    #[test]
+    fn multiple_instances_of_one_app_do_not_pick_an_arbitrary_role() {
+        // 同机跑 broker 与 controller 两个实例：规范要求只写主角色、其余用 one-hot 指标；
+        // 我们判不出谁是主 → 不写（而不是「字典序靠前那个」）。
+        let registry = parse(
+            r#"
+schema_version = "v1"
+
+[[apps]]
+app = "kafka"
+units = ["kafka"]
+roles = ["broker", "controller"]
+"#,
+        )
+        .expect("parses");
+
+        let both = registry.infer(
+            &[
+                "kafka@broker-1".to_string(),
+                "kafka@controller-1".to_string(),
+            ],
+            &[],
+        );
+        assert_eq!(both.app.as_deref(), Some("kafka"), "app 仍然判得出");
+        assert!(both.role.is_none(), "两个不同角色词 → 有歧义，不写");
+
+        // 两个实例都是同一个角色 → 可以写（没有歧义）。
+        let same = registry.infer(
+            &["kafka@broker-1".to_string(), "kafka@broker-2".to_string()],
+            &[],
+        );
+        assert_eq!(same.role.as_deref(), Some("broker"));
     }
 
     #[test]

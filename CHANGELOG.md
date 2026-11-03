@@ -3,6 +3,20 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.38.3-alpha] - 2026-11-03
+
+### 修复（label 机制 review 第二轮）
+
+- **同机多实例不再随机挑角色**：一台机器同时跑 `kafka@broker-1` 与 `kafka@controller-1` 时，
+  原先按字典序取第一条证据定 `role`，等于随机写一个角色。现在跨**整组证据**看：
+  只有一个不同角色词才写，多个 → 不写（规范 §13：多角色节点只写主角色，其余用 one-hot 指标）。
+- 注：注册表注册一个实例（`kafka@broker-1`）仍会让同模板的其它实例命中 `app`
+  （模板名比对），这是有意的。
+
+### 测试
+
+- 新增「多实例 → app 仍判定、role 留空」「同角色多实例 → role 写出」用例。
+
 ## [0.38.2-alpha] - 2026-11-03
 
 ### 修复（label 机制专项 review）
