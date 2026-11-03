@@ -218,9 +218,7 @@ async fn query_all_host_metrics(
     // 避免把全部 filesystem series 都拉给列表页。
     // 注意：VictoriaMetrics 的 PromQL 字符串字面量里 `\.` 不是合法转义，
     // 用 `.`（匹配任意字符）分隔即可。
-    //
-    // 双写期同时匹配旧名：网关先于 agent 升级时，旧名仍然能出图。
-    let query = r#"{__name__=~"system_load_average_1m|system.load_average.1m|system_memory_total_bytes|system.memory.total|system_memory_available_bytes|system.memory.available|system_disk_usage_ratio|system.disk.usage|system_filesystem_usage_ratio|system.filesystem.usage"}"#;
+    let query = r#"{__name__=~"system_load_average_1m|system_memory_total_bytes|system_memory_available_bytes|system_disk_usage_ratio|system_filesystem_usage_ratio"}"#;
     let instant = query_json(vm_url, "/api/v1/query", &[("query", query)]).await?;
 
     let mut map: std::collections::HashMap<String, AgentHostMetricsSummary> =
@@ -252,33 +250,21 @@ async fn query_all_host_metrics(
                 max_filesystem_usage_mount: None,
             });
         match name {
-            "system_load_average_1m" | "system.load_average.1m" => {
-                entry.load_average_1m = parse_f64(value)
-            }
+            "system_load_average_1m" => entry.load_average_1m = parse_f64(value),
             "system_memory_total_bytes" => {
                 entry.memory_total_kb = parse_i64(value).map(|bytes| bytes / 1024)
             }
-            "system.memory.total" => entry.memory_total_kb = parse_i64(value),
             "system_memory_available_bytes" => {
                 entry.memory_available_kb = parse_i64(value).map(|bytes| bytes / 1024)
             }
-            "system.memory.available" => entry.memory_available_kb = parse_i64(value),
             "system_disk_usage_ratio" if is_system_disk(&item) => {
                 entry.disk_usage_percent = parse_f64(value).map(|ratio| ratio * 100.0)
             }
-            "system.disk.usage" => entry.disk_usage_percent = parse_f64(value),
             "system_filesystem_usage_ratio" => {
                 if let Some(mountpoint) = item["metric"]["mountpoint"].as_str()
                     && let Some(usage) = parse_f64(value).map(|ratio| ratio * 100.0)
                 {
                     record_filesystem_usage(entry, mountpoint, usage);
-                }
-            }
-            "system.filesystem.usage" => {
-                if let Some(mount) = item["metric"]["mount"].as_str()
-                    && let Some(usage) = parse_f64(value)
-                {
-                    record_filesystem_usage(entry, mount, usage);
                 }
             }
             _ => {}
@@ -349,19 +335,12 @@ fn build_metrics(
     {
         let name = item["metric"]["__name__"].as_str().unwrap_or("");
         let value = scalar_value(&item);
-        // 双写期：旧名用 `mount`，新名用 `mountpoint`。
-        let mountpoint = item["metric"]["mountpoint"]
-            .as_str()
-            .or_else(|| item["metric"]["mount"].as_str());
         if matches!(
             name,
             "system_filesystem_usage_ratio"
                 | "system_filesystem_total_bytes"
                 | "system_filesystem_available_bytes"
-                | "system.filesystem.usage"
-                | "system.filesystem.total"
-                | "system.filesystem.available"
-        ) && let Some(mountpoint) = mountpoint
+        ) && let Some(mountpoint) = item["metric"]["mountpoint"].as_str()
         {
             let fstype = item["metric"]["fstype"].as_str();
             let entry = filesystems
@@ -380,50 +359,36 @@ fn build_metrics(
                 "system_filesystem_usage_ratio" => {
                     entry.usage_percent = parse_f64(value).map(|ratio| ratio * 100.0)
                 }
-                "system.filesystem.usage" => entry.usage_percent = parse_f64(value),
                 "system_filesystem_total_bytes" => {
                     entry.total_kb = parse_i64(value).map(|bytes| bytes / 1024)
                 }
-                "system.filesystem.total" => entry.total_kb = parse_i64(value),
                 "system_filesystem_available_bytes" => {
                     entry.available_kb = parse_i64(value).map(|bytes| bytes / 1024)
                 }
-                "system.filesystem.available" => entry.available_kb = parse_i64(value),
                 _ => {}
             }
             continue;
         }
         match name {
-            "system_load_average_1m" | "system.load_average.1m" => {
-                metrics.load_average_1m = parse_f64(value)
-            }
-            "system_load_average_5m" | "system.load_average.5m" => {
-                metrics.load_average_5m = parse_f64(value)
-            }
-            "system_load_average_15m" | "system.load_average.15m" => {
-                metrics.load_average_15m = parse_f64(value)
-            }
-            "system_uptime_seconds" | "system.uptime" => metrics.uptime_seconds = parse_f64(value),
+            "system_load_average_1m" => metrics.load_average_1m = parse_f64(value),
+            "system_load_average_5m" => metrics.load_average_5m = parse_f64(value),
+            "system_load_average_15m" => metrics.load_average_15m = parse_f64(value),
+            "system_uptime_seconds" => metrics.uptime_seconds = parse_f64(value),
             "system_memory_total_bytes" => {
                 metrics.memory_total_kb = parse_i64(value).map(|bytes| bytes / 1024)
             }
-            "system.memory.total" => metrics.memory_total_kb = parse_i64(value),
             "system_memory_available_bytes" => {
                 metrics.memory_available_kb = parse_i64(value).map(|bytes| bytes / 1024)
             }
-            "system.memory.available" => metrics.memory_available_kb = parse_i64(value),
             "system_disk_usage_ratio" if is_system_disk(&item) => {
                 metrics.disk_usage_percent = parse_f64(value).map(|ratio| ratio * 100.0)
             }
-            "system.disk.usage" => metrics.disk_usage_percent = parse_f64(value),
             "system_disk_total_bytes" if is_system_disk(&item) => {
                 metrics.disk_total_kb = parse_i64(value).map(|bytes| bytes / 1024)
             }
-            "system.disk.total" => metrics.disk_total_kb = parse_i64(value),
             "system_disk_available_bytes" if is_system_disk(&item) => {
                 metrics.disk_available_kb = parse_i64(value).map(|bytes| bytes / 1024)
             }
-            "system.disk.available" => metrics.disk_available_kb = parse_i64(value),
             _ => {}
         }
     }
@@ -441,21 +406,16 @@ fn build_metrics(
         let name = item["metric"]["__name__"].as_str().unwrap_or("");
         let points = series_points(&item);
         match name {
-            "system_load_average_1m" | "system.load_average.1m" => history.load_average_1m = points,
-            "system_load_average_5m" | "system.load_average.5m" => history.load_average_5m = points,
-            "system_load_average_15m" | "system.load_average.15m" => {
-                history.load_average_15m = points
-            }
+            "system_load_average_1m" => history.load_average_1m = points,
+            "system_load_average_5m" => history.load_average_5m = points,
+            "system_load_average_15m" => history.load_average_15m = points,
             "system_memory_total_bytes" => {
                 history.memory_total_kb = scale_points(points, 1.0 / 1024.0)
             }
-            "system.memory.total" => history.memory_total_kb = points,
             "system_memory_available_bytes" => {
                 history.memory_available_kb = scale_points(points, 1.0 / 1024.0)
             }
-            "system.memory.available" => history.memory_available_kb = points,
             "system_disk_usage_ratio" => history.disk_usage_percent = scale_points(points, 100.0),
-            "system.disk.usage" => history.disk_usage_percent = points,
             _ => {}
         }
     }
@@ -659,24 +619,16 @@ mod tests {
     }
 
     #[test]
-    fn build_metrics_reads_legacy_names_during_dual_write() {
-        // 双写期：网关可能先于 agent 升级，旧名必须还能出图，
-        // 且旧口径（KiBy / percent）要换算成 API 现在用的字段单位。
+    fn build_metrics_ignores_legacy_names() {
+        // 旧名已下线：即使 VM 里还留有旧版本 agent 的历史序列，网关也不再解读。
         let instant = json!({
             "data": {
                 "result": [
                     {"metric": {"__name__": "system.load_average.1m"}, "value": [1, "0.25"]},
-                    {"metric": {"__name__": "system.load_average.5m"}, "value": [1, "0.5"]},
-                    {"metric": {"__name__": "system.load_average.15m"}, "value": [1, "0.75"]},
                     {"metric": {"__name__": "system.uptime"}, "value": [1, "3600"]},
                     {"metric": {"__name__": "system.memory.total"}, "value": [1, "1048576"]},
-                    {"metric": {"__name__": "system.memory.available"}, "value": [1, "524288"]},
                     {"metric": {"__name__": "system.disk.usage"}, "value": [1, "26.5"]},
-                    {"metric": {"__name__": "system.disk.total"}, "value": [1, "20971520"]},
-                    {"metric": {"__name__": "system.disk.available"}, "value": [1, "1048576"]},
-                    {"metric": {"__name__": "system.filesystem.usage", "mount": "/var", "fstype": "xfs"}, "value": [1, "95"]},
-                    {"metric": {"__name__": "system.filesystem.total", "mount": "/var"}, "value": [1, "20971520"]},
-                    {"metric": {"__name__": "system.filesystem.available", "mount": "/var"}, "value": [1, "1048576"]}
+                    {"metric": {"__name__": "system.filesystem.usage", "mount": "/var"}, "value": [1, "95"]}
                 ]
             }
         });
@@ -691,30 +643,14 @@ mod tests {
 
         let metrics = build_metrics("agent-001", &instant, &range);
 
-        assert_eq!(metrics.load_average_1m, Some(0.25));
-        assert_eq!(metrics.load_average_5m, Some(0.5));
-        assert_eq!(metrics.load_average_15m, Some(0.75));
-        assert_eq!(metrics.uptime_seconds, Some(3600.0));
-        assert_eq!(metrics.memory_total_kb, Some(1_048_576));
-        assert_eq!(metrics.memory_available_kb, Some(524_288));
-        assert_eq!(metrics.disk_usage_percent, Some(26.5));
-        assert_eq!(metrics.disk_total_kb, Some(20_971_520));
-        assert_eq!(metrics.disk_available_kb, Some(1_048_576));
-
-        let var = metrics
-            .filesystems
-            .iter()
-            .find(|filesystem| filesystem.mount == "/var")
-            .expect("/var filesystem");
-        assert_eq!(var.fstype.as_deref(), Some("xfs"));
-        assert_eq!(var.usage_percent, Some(95.0));
-        assert_eq!(var.total_kb, Some(20_971_520));
-        assert_eq!(var.available_kb, Some(1_048_576));
+        assert_eq!(metrics.load_average_1m, None);
+        assert_eq!(metrics.uptime_seconds, None);
+        assert_eq!(metrics.memory_total_kb, None);
+        assert_eq!(metrics.disk_usage_percent, None);
+        assert!(metrics.filesystems.is_empty());
 
         let history = metrics.history.expect("history");
-        assert_eq!(history.memory_total_kb.len(), 1);
-        assert_eq!(history.memory_total_kb[0].1, 1_048_576.0);
-        assert_eq!(history.disk_usage_percent.len(), 1);
-        assert_eq!(history.disk_usage_percent[0].1, 26.5);
+        assert!(history.memory_total_kb.is_empty());
+        assert!(history.disk_usage_percent.is_empty());
     }
 }
