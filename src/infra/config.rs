@@ -163,6 +163,11 @@ pub struct AdminConfig {
     ///
     /// 缺省空表 = 不贴任何选择类 label（合法，但查询侧只能在 `{cluster=""}` 里找到它们）。
     pub metrics_labels: std::collections::BTreeMap<String, String>,
+    /// `app` / `role` 的推断注册表（策展数据，`[metrics] registry_file`）。
+    ///
+    /// `None` = 不推断（`app` 留空，合法状态）。注册表是**闭集**：写出去的值必须已登记 ——
+    /// 选择类 label 会把指标序列分段，自由发挥的值等于把历史切断且查不回来。
+    pub metrics_registry_file: Option<PathBuf>,
     /// 日志源（`from_dir` / 人工覆盖）允许落地的目录 roots。
     ///
     /// **这是网关策略，对所有人一致**：agent 上报什么、人显式指定什么，都要过这一关。
@@ -231,11 +236,25 @@ struct RawAdminConfig {
     investigations: RawInvestigationConfig,
     #[serde(default)]
     knowledge: RawKnowledgeConfig,
+    /// `[metrics]` 段：选择类 label 的推断注册表（`app` / `role` 的取值闭集）。
+    #[serde(default)]
+    metrics: RawMetricsConfig,
     #[serde(default)]
     logs: RawLogsConfig,
     /// `[log]` 段：**本网关进程自己**的运行日志（与上面 `[logs]` 的“被采集 agent 日志落盘保留”不同）。
     #[serde(default)]
     log: RawLogConfig,
+}
+
+/// `[metrics]` 段：选择类 label 的推断注册表。
+///
+/// 缺省 = 不推断：`env` / `cluster` 照常下发，`app` 留空（`{app=""}` 可查）。
+#[derive(Debug, Default, Deserialize)]
+struct RawMetricsConfig {
+    /// 注册表文件（相对配置目录）。源头是知识库仓 `wist-knowledge/metrics-app-registry.toml`。
+    /// 为什么不做内嵌默认副本：那会有两份真相，改登记时必然漂移。
+    #[serde(default)]
+    registry_file: Option<String>,
 }
 
 /// `[knowledge]` 段：知识库内容包的**信任配置**（设计 §9）。
@@ -702,6 +721,14 @@ impl AdminConfig {
             knowledge_signing_public_key_file,
             knowledge_signing_public_key,
             metrics_labels: raw.agent.metrics_labels,
+            metrics_registry_file: normalize_optional(
+                raw.metrics
+                    .registry_file
+                    .as_deref()
+                    .map(|value| expand(&env, value))
+                    .transpose()?,
+            )
+            .map(|value| absolutize_path(config_dir, Path::new(&value))),
             log_max_bytes: raw.logs.max_bytes,
             log_keep_files: raw.logs.keep_files,
             log_max_age_seconds: raw.logs.max_age_seconds,
@@ -843,6 +870,17 @@ impl AdminConfig {
         // 无法查询的键（比如 `env = "production"`），而现场只会看到「加了 label 还是选不出来」。
         crate::app::metrics_labels::validate_defaults(&self.metrics_labels)
             .map_err(|err| config_validation(format!("[agent] metrics_labels: {err}")))?;
+        // 注册表写错必须在**启动时**被拒，而不是静默降级成「不推断」——
+        // 后者在查询侧只表现为 `{app=""}`，与"这台机器确实还没判定"无法区分。
+        if let Some(registry_file) = self.metrics_registry_file.as_deref() {
+            require_existing_file("metrics.registry_file", registry_file)?;
+            crate::app::metrics_registry::load(registry_file).map_err(|err| {
+                config_validation(format!(
+                    "metrics.registry_file {}: {err}",
+                    registry_file.display()
+                ))
+            })?;
+        }
         if let Some(database_url) = self.database_url.as_deref()
             && !database_url.starts_with("sqlite:")
         {
@@ -1378,6 +1416,7 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         knowledge_signing_public_key_file: None,
         knowledge_signing_public_key: None,
         metrics_labels: std::collections::BTreeMap::new(),
+        metrics_registry_file: None,
         log_max_bytes: crate::infra::LogRetention::default().max_bytes,
         log_keep_files: crate::infra::LogRetention::default().keep_files,
         log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
@@ -1656,6 +1695,36 @@ policies = [
                 "错误要指向 [agent] metrics_labels（got {err}）"
             );
         }
+    }
+
+    #[test]
+    fn a_broken_metrics_registry_refuses_to_start() {
+        // 注册表写错必须**起不来**：静默降级成“不推断”后，查询侧只看到 `{app=""}`，
+        // 与“这台机器确实还没判定”无法区分 —— 那种问题现场查一整天。
+        let dir = env::temp_dir().join(format!("wist-metrics-registry-{}", unique_suffix()));
+        fs::create_dir_all(&dir).expect("create dir");
+        let bad = dir.join("registry.toml");
+        fs::write(&bad, "schema_version = \"v1\"\n[[apps]]\napp = \"kafka\"\n").expect("write");
+        let path = write_temp_config(&config_with_metrics_registry(&bad.display().to_string()));
+        let err = AdminConfig::load_from_path(path).expect_err("must be rejected");
+        assert!(err.to_string().contains("metrics.registry_file"), "{err}");
+
+        // 一份合法的注册表能起。
+        fs::write(
+            &bad,
+            "schema_version = \"v1\"\n[[apps]]\napp = \"kafka\"\nunits = [\"kafka\"]\n",
+        )
+        .expect("write");
+        let path = write_temp_config(&config_with_metrics_registry(&bad.display().to_string()));
+        let config = AdminConfig::load_from_path(path).expect("config loads");
+        assert_eq!(config.metrics_registry_file.as_deref(), Some(bad.as_path()));
+    }
+
+    /// 最小配置 + `[metrics] registry_file`。
+    fn config_with_metrics_registry(registry_file: &str) -> String {
+        format!(
+            "[server]\nlisten_addr = \"127.0.0.1:3000\"\npublic_base_url = \"https://127.0.0.1:3000\"\nadmin_api_token = \"test-admin-token\"\n\n[agent]\ntrust_bundle = \"internal-ca-stub\"\ntenant_id = \"tenant-default\"\nenvironment_id = \"env-default\"\n\n[metrics]\nregistry_file = \"{registry_file}\"\n",
+        )
     }
 
     /// 生成一份最小可用配置，其中 `[agent] metrics_labels` 表体由调用方给出。

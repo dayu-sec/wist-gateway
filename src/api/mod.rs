@@ -10,6 +10,7 @@ use axum::{
 };
 
 use crate::app::knowledge::LoadedKnowledge;
+use crate::app::metrics_registry::RegistrySource;
 use crate::infra::{AdminConfig, AgentCa, LocalPeers, Store};
 
 mod admin_auth;
@@ -214,6 +215,8 @@ pub struct ApiState {
     /// 环回面的「本机对端」判据（环回 ∪ 容器默认网关 ∪ `[server] self_face_allow`）。
     /// 启动时解析一次（见 [`crate::infra::LocalPeers`]）。
     pub local_peers: LocalPeers,
+    /// `app` / `role` 的推断注册表。按文件 mtime 缓存 —— 补登记不必重启网关。
+    pub metrics_registry: Arc<RegistrySource>,
 }
 
 impl ApiState {
@@ -302,6 +305,7 @@ pub fn build_state_with_knowledge(
         agent_ca,
         link_request: Arc::new(Mutex::new(None)),
         local_peers,
+        metrics_registry: Arc::new(RegistrySource::default()),
     }
 }
 

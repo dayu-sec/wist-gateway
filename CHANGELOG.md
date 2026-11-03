@@ -3,6 +3,26 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.38.0-alpha] - 2026-11-03
+
+### 新增
+
+- **`app` / `role` 的推断**（`app::metrics_registry`）：拿事实里的**高置信度证据**
+  （systemd 单元 / 容器名）命中注册表闭集，判不出就留空（`{app=""}` 可查），绝不猜。
+  - `kafka@broker-1` 按模板名 `kafka` 命中 app，实例名里的 `broker` 用来定 `role`；
+  - 一台机器命中两个 app（混跑）→ 留空并记一条事件（主机口径不适用，规范 §3.4 规则 5）；
+  - 注册表按文件 **mtime 缓存**：补登记**不必重启网关**；读坏时沿用上一份。
+- `[metrics] registry_file`：注册表路径（策展数据，来自 `wist-knowledge`）。
+  **写错就起不来**（静默降级成“不推断”在查询侧与“还没判定”无法区分）。
+- 事实摘要新增 `service_units` / `container_names` 两列（`fact-v4`）。
+- 管理面视图与 agent 拉取都按 手工 > 推断 > 部署默认 合并，`sources` 如实标 `inferred`。
+
+### 变更（不兼容）
+
+- 依赖 `wist-api 0.10.2+` / `wist-contracts 0.10`。
+- **网关与 agentd 必须同批升级**：新 agentd 上报的摘要带两个新字段，
+  旧网关（`deny_unknown_fields`）会 400 整包拒收。
+
 ## [0.37.1-alpha] - 2026-11-03
 
 ### 修复

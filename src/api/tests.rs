@@ -9883,6 +9883,8 @@ impl TestEnv {
             knowledge_signing_public_key: None,
             // 选择类 label 的部署默认：测试默认不贴（要测的用例自己填）。
             metrics_labels: std::collections::BTreeMap::new(),
+            // `app` 推断注册表：测试默认不装（要测的用例自己挂文件）。
+            metrics_registry_file: None,
             log_max_bytes: crate::infra::LogRetention::default().max_bytes,
             log_keep_files: crate::infra::LogRetention::default().keep_files,
             log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
@@ -9940,6 +9942,7 @@ async fn test_state() -> ApiState {
         knowledge: Arc::new(RwLock::new(Arc::new(knowledge))),
         link_request: Arc::new(Mutex::new(None)),
         local_peers: LocalPeers::resolve(&env.config),
+        metrics_registry: Arc::new(crate::app::metrics_registry::RegistrySource::default()),
     }
 }
 
@@ -17251,4 +17254,186 @@ async fn metrics_labels_admin_endpoints_require_the_admin_bearer() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── `app` / `role` 的推断（注册表 + 事实证据） ────────────────────────────────
+
+const TEST_METRICS_REGISTRY: &str = r#"
+schema_version = "v1"
+
+[[apps]]
+app = "kafka"
+units = ["kafka.service", "kafka@broker-1.service"]
+containers = ["kafka"]
+roles = ["broker", "controller"]
+
+[[apps]]
+app = "postgres"
+units = ["postgresql.service"]
+roles = ["primary", "replica"]
+"#;
+
+fn facts_with_evidence(
+    agent_id: &str,
+    units: &[&str],
+    containers: &[&str],
+) -> crate::infra::StoredAgentFactSummary {
+    crate::infra::StoredAgentFactSummary {
+        agent_id: agent_id.to_string(),
+        content_digest: "fact-v4:sha256:test".to_string(),
+        revision: 1,
+        observed_at: "2026-11-03T00:00:00Z".to_string(),
+        os: "linux".to_string(),
+        arch: "x86_64".to_string(),
+        process_count: 10,
+        process_executables: vec!["/usr/bin/java".to_string()],
+        packages: Vec::new(),
+        listen_ports: Vec::new(),
+        probed_paths: Vec::new(),
+        present_paths: Vec::new(),
+        host_id: "host-1".to_string(),
+        host_name: "host-a".to_string(),
+        network_addresses: Vec::new(),
+        service_units: units.iter().map(|value| value.to_string()).collect(),
+        container_names: containers.iter().map(|value| value.to_string()).collect(),
+        received_at: "2026-11-03T00:00:01Z".to_string(),
+    }
+}
+
+/// 把注册表写进 temp 目录并挂到配置上。
+fn with_metrics_registry(env: &mut TestEnv) -> std::path::PathBuf {
+    let path = env._root.join("metrics-app-registry.toml");
+    std::fs::write(&path, TEST_METRICS_REGISTRY).expect("write registry");
+    env.config.metrics_registry_file = Some(path.clone());
+    path
+}
+
+#[tokio::test]
+async fn app_and_role_are_inferred_from_high_confidence_evidence() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    with_metrics_registry(&mut env);
+    env.config.metrics_labels = std::collections::BTreeMap::from([
+        ("env".to_string(), "prod".to_string()),
+        ("cluster".to_string(), "kafka-prod".to_string()),
+    ]);
+    env.store_handle
+        .upsert_agent_fact_summary(&facts_with_evidence(
+            "agent-node-a",
+            &["kafka@broker-1"],
+            &[],
+        ))
+        .await
+        .expect("store facts");
+
+    let body: serde_json::Value =
+        decode_json_response(poll_metrics_labels(&env, &credential).await).await;
+    assert_eq!(body["labels"]["app"], "kafka");
+    assert_eq!(
+        body["sources"]["app"], "inferred",
+        "app 来自推断，不是部署默认"
+    );
+    assert_eq!(body["labels"]["role"], "broker");
+    assert_eq!(body["sources"]["role"], "inferred");
+    // `env` / `cluster` 仍是部署默认：推断只补它认得的键。
+    assert_eq!(body["sources"]["env"], "default");
+
+    // 手工覆盖压过推断（优先级：手工 > 推断 > 部署默认）。
+    let response = put_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/metrics-labels",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "set_agent_metrics_labels",
+            "overrides": {"app": "kafka-manual"},
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["labels"]["app"], "kafka-manual");
+    assert_eq!(view["sources"]["app"], "manual");
+
+    // 清掉覆盖 → 回落到推断值。
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/metrics-labels",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["labels"]["app"], "kafka");
+    assert_eq!(view["sources"]["app"], "inferred");
+}
+
+#[tokio::test]
+async fn without_a_registry_the_app_stays_empty_and_env_still_arrives() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    env.config.metrics_labels =
+        std::collections::BTreeMap::from([("env".to_string(), "prod".to_string())]);
+    env.store_handle
+        .upsert_agent_fact_summary(&facts_with_evidence("agent-node-a", &["kafka"], &[]))
+        .await
+        .expect("store facts");
+
+    let body: serde_json::Value =
+        decode_json_response(poll_metrics_labels(&env, &credential).await).await;
+    assert_eq!(body["labels"]["env"], "prod");
+    assert!(
+        body["labels"].get("app").is_none(),
+        "没有注册表 = 不推断，而不是猜一个"
+    );
+}
+
+#[tokio::test]
+async fn two_apps_on_one_host_leave_the_app_empty() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    with_metrics_registry(&mut env);
+    env.store_handle
+        .upsert_agent_fact_summary(&facts_with_evidence(
+            "agent-node-a",
+            &["kafka", "postgresql"],
+            &[],
+        ))
+        .await
+        .expect("store facts");
+
+    let body: serde_json::Value =
+        decode_json_response(poll_metrics_labels(&env, &credential).await).await;
+    assert!(
+        body["labels"].get("app").is_none(),
+        "一机多用途时主机口径不可用（规范 §3.4 规则 5），留空可被 {{app=\"\"}} 发现"
+    );
+}
+
+#[tokio::test]
+async fn a_registry_edit_takes_effect_without_a_restart() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    let registry_path = with_metrics_registry(&mut env);
+    env.store_handle
+        .upsert_agent_fact_summary(&facts_with_evidence("agent-node-a", &["orders"], &[]))
+        .await
+        .expect("store facts");
+
+    // 还没登记 `orders` → 留空。
+    let body: serde_json::Value =
+        decode_json_response(poll_metrics_labels(&env, &credential).await).await;
+    assert!(body["labels"].get("app").is_none());
+
+    // 补登记后**不重启**即生效：注册表是数据，改数据要等一次重启是不合理的。
+    std::fs::write(
+        &registry_path,
+        format!("{TEST_METRICS_REGISTRY}\n[[apps]]\napp = \"orders\"\nunits = [\"orders\"]\n"),
+    )
+    .expect("rewrite registry");
+    let body: serde_json::Value =
+        decode_json_response(poll_metrics_labels(&env, &credential).await).await;
+    assert_eq!(body["labels"]["app"], "orders");
 }

@@ -33,6 +33,12 @@ environment_id = "env-default"
 # env = "prod"
 # cluster = "kafka-prod"
 
+# `app` / `role` 的推断注册表（策展数据，来自 wist-knowledge）。缺省 = 不推断：
+# env / cluster 照常下发，app 留空（查询侧 {app=""} 可找到未判定的机器）。
+# 只接受高置信度证据（服务管理器单元名 / 容器名）并**命中注册表闭集**，否则留空。
+# [metrics]
+# registry_file = "state/metrics-app-registry.toml"
+
 [ingest]
 # 数据面（wparse）内部接入端点：明文 HTTP，默认只绑环回；容器里要绑网卡（0.0.0.0）才连得上。
 listen_addr = "127.0.0.1:3001"

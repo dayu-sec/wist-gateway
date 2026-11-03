@@ -4,6 +4,11 @@
 pub mod global_service;
 pub use global_service::*;
 
+// NOTE(hand-added): `app` / `role` 的推断注册表（策展数据）与推断逻辑。
+// 只接受高置信度证据（服务管理器单元 / 容器名），命不中注册表就留空。
+// 重新生成控制面代码时需回补本模块。
+pub mod metrics_registry;
+
 // NOTE(hand-added): 选择类 label 的生效值合并（部署默认 ∪ 推断 ∪ 手工覆盖）。
 // 三层里只有最后一层是数据库里人写的；合并留在读路径，避免“库里的旧值 vs 新配置”分不清。
 // 重新生成控制面代码时需回补本模块。

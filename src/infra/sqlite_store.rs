@@ -2039,7 +2039,7 @@ impl Store for SqliteStore {
         let row = sqlx::query(
             "SELECT agent_id, content_digest, revision, observed_at, os, arch, process_count, \
              process_executables, packages, listen_ports, probed_paths, present_paths, host_id, \
-             host_name, network_addresses, received_at \
+             host_name, network_addresses, service_units, container_names, received_at \
              FROM agent_fact_summary WHERE agent_id = ?1",
         )
         .bind(agent_id)
@@ -2323,11 +2323,17 @@ impl Store for SqliteStore {
             serialize_json_array(&summary.present_paths, "serialize present paths")?;
         let network_addresses =
             serialize_json_array(&summary.network_addresses, "serialize network addresses")?;
+        let service_units =
+            serialize_json_array(&summary.service_units, "serialize service units")?;
+        let container_names =
+            serialize_json_array(&summary.container_names, "serialize container names")?;
         sqlx::query(
             "INSERT INTO agent_fact_summary (agent_id, content_digest, revision, observed_at, os, \
              arch, process_count, process_executables, packages, listen_ports, probed_paths, \
-             present_paths, host_id, host_name, network_addresses, received_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+             present_paths, host_id, host_name, network_addresses, service_units, \
+             container_names, received_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+             ?17, ?18) \
              ON CONFLICT (agent_id) DO UPDATE SET content_digest = excluded.content_digest, \
              revision = excluded.revision, observed_at = excluded.observed_at, os = excluded.os, \
              arch = excluded.arch, process_count = excluded.process_count, \
@@ -2335,7 +2341,8 @@ impl Store for SqliteStore {
              listen_ports = excluded.listen_ports, probed_paths = excluded.probed_paths, \
              present_paths = excluded.present_paths, host_id = excluded.host_id, \
              host_name = excluded.host_name, network_addresses = excluded.network_addresses, \
-             received_at = excluded.received_at",
+             service_units = excluded.service_units, \
+             container_names = excluded.container_names, received_at = excluded.received_at",
         )
         .bind(&summary.agent_id)
         .bind(&summary.content_digest)
@@ -2352,6 +2359,8 @@ impl Store for SqliteStore {
         .bind(&summary.host_id)
         .bind(&summary.host_name)
         .bind(network_addresses)
+        .bind(service_units)
+        .bind(container_names)
         .bind(&summary.received_at)
         .execute(&self.pool)
         .await
@@ -3536,6 +3545,8 @@ fn fact_summary_from_row(row: &SqliteRow) -> StoreResult<StoredAgentFactSummary>
     let probed_paths: String = column!(row, "probed_paths");
     let present_paths: String = column!(row, "present_paths");
     let network_addresses: String = column!(row, "network_addresses");
+    let service_units: String = column!(row, "service_units");
+    let container_names: String = column!(row, "container_names");
     Ok(StoredAgentFactSummary {
         agent_id: column!(row, "agent_id"),
         content_digest: column!(row, "content_digest"),
@@ -3555,6 +3566,8 @@ fn fact_summary_from_row(row: &SqliteRow) -> StoreResult<StoredAgentFactSummary>
         host_id: column!(row, "host_id"),
         host_name: column!(row, "host_name"),
         network_addresses: deserialize_json_array(&network_addresses, "read network addresses")?,
+        service_units: deserialize_json_array(&service_units, "read service units")?,
+        container_names: deserialize_json_array(&container_names, "read container names")?,
         received_at: column!(row, "received_at"),
     })
 }

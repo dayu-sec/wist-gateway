@@ -267,22 +267,39 @@ pub async fn delete_agent_metrics_labels(
         tombstone.updated_by
     );
     enqueue_labels_refresh(&state, &agent_id).await;
-    let effective = metrics_labels::merge(
-        &state.config.metrics_labels,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-    );
-    Json(AgentMetricsLabelsView {
-        api_version: API_VERSION_V1.to_string(),
-        kind: AGENT_METRICS_LABELS_KIND.to_string(),
-        agent_id,
-        revision: revision.max(0) as u64,
-        labels: effective.labels,
-        sources: effective.sources,
-        overrides: BTreeMap::new(),
-        updated_at: now,
-    })
-    .into_response()
+    // 回显走**同一条读路径**：清空覆盖后生效值里还有推断层，
+    // 手写一份「默认 + 空覆盖」会让响应漏掉 `app`（而 agent 拉到的却有）。
+    let _ = now;
+    view_response(&state, &agent_id).await
+}
+
+/// 按事实里的**高置信度证据**推断 `app` / `role`。
+///
+/// 三条约束：
+///   * 注册表是闭集：证据必须命中已登记的 `app`，否则留空（不猜）；
+///   * 一机多用途（多个 app 命中）→ 留空（规范 §3.4 规则 5：主机口径不适用）；
+///   * 读不到事实 / 读不到注册表 → 留空。**推断失败不该让拉取失败** ——
+///     `env` / `cluster` 仍然有用，agent 拿不到整包才是更糟的结果。
+async fn infer_labels(state: &ApiState, agent_id: &str) -> BTreeMap<String, String> {
+    if state.config.metrics_registry_file.is_none() {
+        return BTreeMap::new();
+    }
+    let facts = match state.store.get_agent_fact_summary(agent_id).await {
+        Ok(Some(facts)) => facts,
+        Ok(None) => return BTreeMap::new(),
+        Err(err) => {
+            log::warn!(
+                "event=MetricsLabelInferenceSkipped agent_id={agent_id} detail=\"load fact summary: {err}\""
+            );
+            return BTreeMap::new();
+        }
+    };
+    let registry = state
+        .metrics_registry
+        .resolve(state.config.metrics_registry_file.as_deref());
+    registry
+        .infer(&facts.service_units, &facts.container_names)
+        .as_map()
 }
 
 /// 渲染一台机器的管理面视图（生效值 + 来源 + 手工覆盖）。
@@ -340,12 +357,8 @@ async fn load_effective(
         .as_ref()
         .map(|row| row.overrides.clone())
         .unwrap_or_default();
-    let effective = metrics_labels::merge(
-        &state.config.metrics_labels,
-        // 推断层本阶段为空（事实里还没有高置信度来源，见 `app::metrics_labels`）。
-        &BTreeMap::new(),
-        &overrides,
-    );
+    let inferred = infer_labels(state, agent_id).await;
+    let effective = metrics_labels::merge(&state.config.metrics_labels, &inferred, &overrides);
     let revision = row
         .as_ref()
         .map(|row| row.revision.max(0) as u64)

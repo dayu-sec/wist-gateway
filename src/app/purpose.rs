@@ -482,6 +482,8 @@ weight = 40
             host_id: String::new(),
             host_name: String::new(),
             network_addresses: Vec::new(),
+            service_units: Vec::new(),
+            container_names: Vec::new(),
             received_at: "2026-09-22T00:00:01Z".to_string(),
         }
     }

@@ -553,6 +553,10 @@ pub struct StoredAgentFactSummary {
     pub host_name: String,
     /// 网卡地址，每块网卡一条，形如 `en0 192.168.1.5/24`。
     pub network_addresses: Vec<String>,
+    /// 服务管理器单元（已归一）。**推断输入**：进内容摘要。
+    pub service_units: Vec<String>,
+    /// 容器名（小写）。**推断输入**：进内容摘要。
+    pub container_names: Vec<String>,
     pub received_at: String,
 }
 

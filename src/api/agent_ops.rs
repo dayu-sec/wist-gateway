@@ -1203,6 +1203,8 @@ pub(super) async fn ingest_fact_summary(
         host_id: input.host_id.clone(),
         host_name: input.host_name.clone(),
         network_addresses: input.network_addresses.clone(),
+        service_units: input.service_units.clone(),
+        container_names: input.container_names.clone(),
         received_at: received_at.clone(),
     };
     // 先落事实再算建议：规则表坏了不该连带把 Agent 报上来的事实丢掉。
