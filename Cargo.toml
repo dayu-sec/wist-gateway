@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.35.0" #@gxl:set(version)
+version = "0.36.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 

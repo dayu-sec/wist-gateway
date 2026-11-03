@@ -3,6 +3,14 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.36.0-alpha] - 2026-11-03
+
+### 变更（不兼容）
+
+- **主机指标只读规范名**：删除 `system.memory.total`、`system.load_average.1m`、
+  `system.disk.usage`、`system.filesystem.usage` 等旧名的回退解析。
+- 旧版本 agent 上报的旧名数据不再展示；Agent 与网关应在同一个版本窗口内升级。
+
 ## [0.35.0-alpha] - 2026-11-03
 
 ### 变更（主机指标查询对齐指标规范 v1）
