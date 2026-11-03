@@ -3,6 +3,30 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.39.0-alpha] - 2026-11-03
+
+### 新增
+
+- 管理面**手工刷新入口** `POST /api/v1/admin/agents/{agent_id}/refresh`：`what` 为闭集
+  （与 CLI `refresh --only …` 同一套词），复用通用 `refresh` 命令面，不另开端点。
+  `what` 空表 / 未知来源 → 400（`empty_refresh_what` / `unknown_refresh_source`），未知 agent → 404。
+
+### 修复
+
+- **Agent 总览的资源趋势恢复**：读 VM 时改回规范名（`agent_cpu_ratio` / `agent_admin_latency_seconds` …）。
+  0.21 改名前，写侧用规范名、读侧还在查旧点分名（`agent.cpu.percent`），曲线一直是空的，
+  而两侧各自的单测都能过。
+
+### 变更
+
+- **agent 自身指标只由数据面写入**：网关不再把状态报文里的同组值写进 VM（两个写入者会在同一台
+  VM 上产生两条同义序列，`count`/`sum` 类查询双计）。状态里的值仍入库，页面即时值不变。
+- 指标名 / label / 单位换算改由 `wist-metrics::names` 提供（与 agentd、center 同一份常量）。
+
+### 升级注意
+
+- `agentd < 0.20`（不发自观测指标帧）的机器没有自观测历史；即时值仍在。
+
 ## [0.38.3-alpha] - 2026-11-03
 
 ### 修复（label 机制 review 第二轮）
