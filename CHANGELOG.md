@@ -1,7 +1,23 @@
 # 更新日志
 
-本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
+本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
+
+## [0.35.0-alpha] - 2026-11-03
+
+### 变更（主机指标查询对齐指标规范 v1）
+
+- 主机指标查询改用新指标名（`system_load_average_1m`、`system_memory_total_bytes`、
+  `system_disk_usage_ratio`、`system_filesystem_usage_ratio` 等）与语义化 label
+  （`mountpoint` / `disk_role`）。
+- 双写期**同时读旧名**：agent 未升级或新旧数据混杂时都能出图，网关与 agent 可以
+  各自独立发版，不会出现空看板。
+- 字节 / 比例在展示层换算回 `*_kb` / `*_percent` 字段，接口形状不变，前端无需改动。
+
+### 修复
+
+- 磁盘相关旧字段只读 `disk_role="system"` 的序列，`NaN` / `±Inf` 按缺值处理，
+  不再返回 `null` 破坏前端解析。
 
 ## [0.34.4-alpha] - 2026-11-01
 
