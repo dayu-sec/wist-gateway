@@ -53,7 +53,7 @@ pub struct AgentHostMetrics {
     pub disk_total_kb: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_available_kb: Option<i64>,
-    /// 逐挂载点容量（`system.filesystem.*`）。旧字段保留兼容，但无法定位具体挂载点。
+    /// 逐挂载点容量（`system_filesystem_*`）。上面的 `disk_*` 是整盘汇总字段，二者不是同一粒度。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filesystems: Vec<AgentFilesystemMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,6 +205,15 @@ pub async fn get_all_agents_host_metrics(
     }
 }
 
+/// 列表页只需要的指标名（白名单）。新增旧名会让列表页退回到旧口径，由测试钉住。
+const SUMMARY_METRIC_NAMES: &[&str] = &[
+    "system_load_average_1m",
+    "system_memory_total_bytes",
+    "system_memory_available_bytes",
+    "system_disk_usage_ratio",
+    "system_filesystem_usage_ratio",
+];
+
 /// 拉一次所有主机的 `system.*` 指标，按 `agent` 标签分组，并给注册表里认识的机器 join 上身份。
 async fn query_all_host_metrics(
     vm_url: &str,
@@ -213,13 +222,10 @@ async fn query_all_host_metrics(
     if identities.is_empty() {
         return Ok(Vec::new());
     }
-    // 只拉列表页实际用到的 system 指标，再按 `agent` 标签分组。
-    // 逐挂载点容量上线后 `system.filesystem.*` 会按挂载点数展开；这里用名称白名单
-    // 避免把全部 filesystem series 都拉给列表页。
-    // 注意：VictoriaMetrics 的 PromQL 字符串字面量里 `\.` 不是合法转义，
-    // 用 `.`（匹配任意字符）分隔即可。
-    let query = r#"{__name__=~"system_load_average_1m|system_memory_total_bytes|system_memory_available_bytes|system_disk_usage_ratio|system_filesystem_usage_ratio"}"#;
-    let instant = query_json(vm_url, "/api/v1/query", &[("query", query)]).await?;
+    // 只拉列表页实际用到的指标，按名称白名单过滤：
+    // 逐挂载点容量会按挂载点数展开，不能把全部序列都拉给列表页。
+    let query = format!("{{__name__=~\"{}\"}}", SUMMARY_METRIC_NAMES.join("|"));
+    let instant = query_json(vm_url, "/api/v1/query", &[("query", query.as_str())]).await?;
 
     let mut map: std::collections::HashMap<String, AgentHostMetricsSummary> =
         std::collections::HashMap::new();
@@ -230,6 +236,7 @@ async fn query_all_host_metrics(
     {
         let agent = item["metric"]["agent"].as_str().unwrap_or("").to_string();
         // 只保留注册表里认识的 agent：`/hosts` 的语义是「有指标上报的已注册机器」。
+        // 注意：未升级的旧 agent 只写旧名（已不再解析），会暂时从这个列表消失，升级后自动回来。
         let Some(identity) = identities.get(&agent) else {
             continue;
         };
@@ -457,8 +464,9 @@ fn record_filesystem_usage(entry: &mut AgentHostMetricsSummary, mount: &str, usa
     }
 }
 
-/// 旧字段（`diskUsagePercent` 等）只对应“系统盘”：磁盘序列按 `disk_role` 分组，
-/// 不过滤会让 `system` 与 `data` 互相覆盖。
+/// 整盘汇总字段（`diskUsagePercent` 等）只对应“系统盘”：磁盘序列按 `disk_role` 分组，
+/// 不过滤会让 `system` 与 `data` 互相覆盖。缺 label 视为 `system`：唯一生产者（agentd）
+/// 一定带该 label，缺失只可能来自不完整序列。
 fn is_system_disk(item: &serde_json::Value) -> bool {
     match item["metric"]["disk_role"].as_str() {
         Some(role) => role == "system",
@@ -488,7 +496,9 @@ fn parse_i64(value: Option<&str>) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentHostMetricsSummary, build_metrics, record_filesystem_usage};
+    use super::{
+        AgentHostMetricsSummary, SUMMARY_METRIC_NAMES, build_metrics, record_filesystem_usage,
+    };
     use serde_json::json;
 
     fn summary() -> AgentHostMetricsSummary {
@@ -503,6 +513,15 @@ mod tests {
             disk_usage_percent: None,
             max_filesystem_usage_percent: None,
             max_filesystem_usage_mount: None,
+        }
+    }
+
+    #[test]
+    fn summary_whitelist_only_contains_canonical_names() {
+        // 规范名不含 `.`；旧名（system.memory.total 等）不得回流到列表页查询。
+        for name in SUMMARY_METRIC_NAMES {
+            assert!(!name.contains('.'), "legacy name in whitelist: {name}");
+            assert!(name.starts_with("system_"), "unexpected namespace: {name}");
         }
     }
 
@@ -546,7 +565,7 @@ mod tests {
         assert_eq!(data.fstype, None, "missing fstype stays None");
         assert_eq!(data.usage_percent, Some(50.0));
 
-        // 旧字段仍然独立解析，保持兼容。
+        // 整盘汇总字段与逐挂载点列表各自独立解析。
         assert_eq!(metrics.disk_usage_percent, Some(26.5));
 
         // 序列化保持 camelCase，前端按这个形状消费。
@@ -597,9 +616,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_disk_fields_only_read_the_system_role() {
+    fn disk_summary_fields_only_read_the_system_role() {
         // `system_disk_*` 按 `disk_role` 分成 system / data 两条序列，
-        // 旧字段只对应系统盘；否则 data 会随机覆盖 system。
+        // 整盘汇总字段只对应系统盘；否则 data 会随机覆盖 system。
         let instant = json!({
             "data": {
                 "result": [
