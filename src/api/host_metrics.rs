@@ -110,7 +110,7 @@ pub struct AgentHostMetricsSummary {
     pub memory_available_kb: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_usage_percent: Option<f64>,
-    /// 当前最紧张的挂载点使用率（`system.filesystem.usage` 的最大值）。
+    /// 当前最紧张的挂载点使用率（`system_filesystem_usage_ratio` 的最大值）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_filesystem_usage_percent: Option<f64>,
     /// 当前最紧张的挂载点路径（与上面的百分比成对返回）。
