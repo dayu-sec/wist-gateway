@@ -13,7 +13,6 @@ use crate::infra::{
     StoredAgentCertificateStatus, StoredAgentFactSummary, StoredAgentRegistration,
     StoredDiscoverySnapshotSetting, StoredPurposeSuggestion, StoredWorkResult,
     VerifiedAgentIdentity, effective_standing, new_secret_token, outstanding_one_shot,
-    victoria_metrics::{import_lines, metric_line},
 };
 use wist_api::action_result::{ActionResultAck, ReportActionResult};
 use wist_api::discovery_policies::{
@@ -76,7 +75,6 @@ pub async fn submit_agent_status(
         Ok(agent) => {
             let now_utc = chrono::Utc::now();
             let last_seen_at = now_utc.to_rfc3339();
-            let timestamp_ms = now_utc.timestamp_millis();
             let memory_bytes = input.memory_bytes;
             let cpu_percent = input.cpu_percent;
             let cpu_cores = input.cpu_cores;
@@ -169,25 +167,11 @@ pub async fn submit_agent_status(
                     agent.agent_id
                 );
             }
-            // 统一进 VM：agent 自身运行指标以时间序列写入，文件只保留最新值缓存。
-            let lines = agent_status_metric_lines(
-                &agent.agent_id,
-                memory_bytes,
-                cpu_percent,
-                cpu_cores,
-                admin_latency_ms,
-                discovery_policy_version,
-                timestamp_ms,
-            );
-            if !lines.is_empty()
-                && let Err(err) = import_lines(&state.config.victoria_metrics_url, &lines).await
-            {
-                log::warn!(
-                    "warn agent metrics import failed agent_id={} instance_id={}: {err}",
-                    agent.agent_id,
-                    agent.instance_id
-                );
-            }
+            // agent 自身的运行指标**不在这里写时序**：自观测属于指标面，由 agentd 的
+            // 指标帧经数据面（wparse）落到这台 VM，网关只把状态里的值留给页面即时展示。
+            // 两条链路都写同一组 `agent_*` 名时，VM 上会出现两条同义序列（label 集还不一样），
+            // `count`/`sum` 类查询会双计 —— 所以写入权只保留在数据面那一条。
+            // 代价：`agentd < 0.20`（不发自观测指标帧）的机器没有自观测历史。
             // 一次性命令：先把 agent 回传的结果落库（条件更新），再取待下发的。
             // 顺序不能反 —— 反了会把刚回传结果的命令又下发一次（agent 会去重，但白一个来回）。
             for ack in &input.command_acks {
@@ -260,77 +244,6 @@ pub async fn submit_agent_status(
         }
         Err(response) => response,
     }
-}
-
-/// agent 状态上报对应的 VM 指标行（只含有值的项）。
-///
-/// 缺值（`None`）**不产生行、更不补 0**：把「没上报」写成 0 会在图上伪造出一段真实读数。
-/// 对 `discovery_policy_version` 尤其致命 —— 0 代表确实生效了第 0 版，与「还没拉到策略表」
-/// 是两回事，混为一谈正好毁掉运维要回答的那句「哪些机器还没生效」。
-///
-/// 注意 `agent_cpu_ratio` 是**单核口径**（1.0 = 占满一个核，多线程进程可 >1），
-/// 只统计 agent 进程自身；整机占比由管理面读投影按 `cpu_percent / cpu_cores` 派生，
-/// 不在这条上报链路上另发一条线。
-pub(super) fn agent_status_metric_lines(
-    agent_id: &str,
-    memory_bytes: Option<u64>,
-    cpu_percent: Option<f64>,
-    cpu_cores: Option<u32>,
-    admin_latency_ms: Option<u64>,
-    discovery_policy_version: Option<i64>,
-    timestamp_ms: i64,
-) -> Vec<serde_json::Value> {
-    [
-        memory_bytes.map(|value| {
-            metric_line(
-                "agent_memory_bytes",
-                agent_id,
-                "agent_metrics",
-                value as f64,
-                timestamp_ms,
-            )
-        }),
-        cpu_percent.map(|value| {
-            metric_line(
-                "agent_cpu_ratio",
-                agent_id,
-                "agent_metrics",
-                value / 100.0,
-                timestamp_ms,
-            )
-        }),
-        cpu_cores.map(|value| {
-            metric_line(
-                // 单位=个（逻辑核数）：gauge 型。整机占比的分母，随状态上报一起进时序。
-                "agent_cpu_cores",
-                agent_id,
-                "agent_metrics",
-                value as f64,
-                timestamp_ms,
-            )
-        }),
-        admin_latency_ms.map(|value| {
-            metric_line(
-                "agent_admin_latency_seconds",
-                agent_id,
-                "agent_metrics",
-                value as f64 / 1000.0,
-                timestamp_ms,
-            )
-        }),
-        discovery_policy_version.map(|value| {
-            metric_line(
-                "agent_discovery_policy_version",
-                agent_id,
-                "agent_metrics",
-                value as f64,
-                timestamp_ms,
-            )
-        }),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
 }
 
 pub async fn poll_control_commands(

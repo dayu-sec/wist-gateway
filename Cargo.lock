@@ -3641,6 +3641,7 @@ dependencies = [
  "wist-control",
  "wist-error",
  "wist-log",
+ "wist-metrics",
  "wist-release",
  "wist-shared",
  "x509-parser",
@@ -3656,6 +3657,17 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "wist-metrics"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7ca222265ba41fb67ee9ddda32952232df2e0118225bb3717def4d6d778d995"
+dependencies = [
+ "jumo-derive",
+ "serde",
+ "wist-contracts",
 ]
 
 [[package]]

@@ -1,8 +1,9 @@
-//! VictoriaMetrics HTTP 访问助手（控制面读写 VM）。
+//! VictoriaMetrics HTTP 访问助手（控制面**只读**）。
 //!
-//! 数据面（warp-parse）经 `vm_metrics_sink` 以 NDJSON POST 到 `/api/v1/import` 写入主机/进程指标；
-//! 这里提供控制面（wist-gateway）同构的读写入口：`query_json` 走 PromQL 查询、`import_lines`
-//! 走 `/api/v1/import`（NDJSON + `application/json`），使 agent 自身上报的状态指标也统一进 VM。
+//! 这台 VM 的时序只有一个写入者：数据面（warp-parse 的 `vm_metrics_sink` → `/api/v1/import`）。
+//! 控制面因此只保留查询入口 `query_json`（PromQL）；**不提供写入助手** —— 曾经有一份
+//! `import_lines` 让网关把 agent 自身状态也写成时序，结果与 agentd 的指标帧形成两条同义序列
+//! （label 集还不一样），`count`/`sum` 类查询会双计。
 
 use std::time::Duration;
 
@@ -36,49 +37,4 @@ pub async fn query_json(
         .json()
         .await
         .map_err(|err| format!("invalid victoria metrics response: {err}"))
-}
-
-/// POST 一组 VM JSON line（NDJSON）到 `/api/v1/import`。
-pub async fn import_lines(vm_url: &str, lines: &[serde_json::Value]) -> Result<(), String> {
-    if lines.is_empty() {
-        return Ok(());
-    }
-    let body = lines
-        .iter()
-        .map(serde_json::Value::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let response = client()
-        .post(format!("{vm_url}/api/v1/import"))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-        .await
-        .map_err(|err| format!("victoria metrics import failed: {err}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "victoria metrics import returned {}",
-            response.status()
-        ));
-    }
-    Ok(())
-}
-
-/// 构造一条 VM JSON line：`{"metric":{...},"values":[v],"timestamps":[ts_ms]}`。
-pub fn metric_line(
-    name: &str,
-    agent_id: &str,
-    kind: &str,
-    value: f64,
-    timestamp_ms: i64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "metric": {
-            "__name__": name,
-            "agent": agent_id,
-            "kind": kind,
-        },
-        "values": [value],
-        "timestamps": [timestamp_ms],
-    })
 }

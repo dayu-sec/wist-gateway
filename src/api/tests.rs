@@ -4153,97 +4153,40 @@ async fn admin_discovery_view_lists_per_agent_applied_versions() {
     assert!(agents[2]["last_seen_at"].is_null(), "{agents:?}");
 }
 
-#[tokio::test]
-async fn agent_status_metric_reports_policy_version_only_when_present() {
-    // 缺值不能补 0：0 是「确实生效了第 0 版」，与「还没拉到策略表」在图上必须分开。
-    let with = super::agent_ops::agent_status_metric_lines(
-        "agent-node-a",
-        None,
-        None,
-        None,
-        None,
-        Some(2),
-        1_700_000_000_000,
-    );
-    let version_line = with
-        .iter()
-        .find(|line| line["metric"]["__name__"] == "agent_discovery_policy_version")
-        .expect("discovery policy version metric line");
-    assert_eq!(version_line["values"][0], 2.0);
-    assert_eq!(version_line["metric"]["agent"], "agent-node-a");
-    assert_eq!(with.len(), 1);
+/// 读侧要把规范单位换回页面口径：`agent_cpu_ratio`（0–1 单核）→ percent，
+/// `agent_admin_latency_seconds` → ms；同一时间戳的多条线合成一个样本。
+///
+/// 名字口径与 agentd 侧规范一致（唯一写入者是 agentd 的指标帧）：0.21 改名时读侧漏跟
+/// （还在查 `agent.cpu.percent` 一类旧点分名），趋势一直空白而两侧单测都能过。
+#[test]
+fn agent_self_metric_history_merges_spec_names_and_restores_page_units() {
+    let range = serde_json::json!({
+        "data": {"result": [
+            {"metric": {"__name__": "agent_memory_bytes", "agent": "agent-node-a"},
+             "values": [[1_700_000_000.0, "12345678"]]},
+            {"metric": {"__name__": "agent_cpu_ratio", "agent": "agent-node-a"},
+             "values": [[1_700_000_000.0, "0.5"]]},
+            {"metric": {"__name__": "agent_cpu_cores", "agent": "agent-node-a"},
+             "values": [[1_700_000_000.0, "4"]]},
+            {"metric": {"__name__": "agent_admin_latency_seconds", "agent": "agent-node-a"},
+             "values": [[1_700_000_000.0, "0.25"]]},
+            // 没被问到的 agent 不进结果（列表页只关心当前这一屏的机器）。
+            {"metric": {"__name__": "agent_memory_bytes", "agent": "agent-node-b"},
+             "values": [[1_700_000_000.0, "1"]]},
+        ]}
+    });
+    let wanted: std::collections::HashSet<&str> = ["agent-node-a"].into_iter().collect();
 
-    let without = super::agent_ops::agent_status_metric_lines(
-        "agent-node-a",
-        None,
-        None,
-        None,
-        None,
-        None,
-        1_700_000_000_000,
-    );
-    assert!(without.is_empty(), "{without:?}");
-}
-
-#[tokio::test]
-async fn agent_status_metric_reports_cpu_cores_when_present() {
-    // 核数是整机占比的分母，随状态上报一起进时序；缺值同样不发线（与 cpu.percent 同一规矩）。
-    let with = super::agent_ops::agent_status_metric_lines(
-        "agent-node-a",
-        None,
-        Some(50.0),
-        Some(4),
-        None,
-        None,
-        1_700_000_000_000,
-    );
-    let cores_line = with
-        .iter()
-        .find(|line| line["metric"]["__name__"] == "agent_cpu_cores")
-        .expect("cpu cores metric line");
-    assert_eq!(cores_line["values"][0], 4.0);
-    assert_eq!(cores_line["metric"]["agent"], "agent-node-a");
-
-    let without = super::agent_ops::agent_status_metric_lines(
-        "agent-node-a",
-        None,
-        Some(50.0),
-        None,
-        None,
-        None,
-        1_700_000_000_000,
-    );
-    assert!(
-        without
-            .iter()
-            .all(|line| line["metric"]["__name__"] != "agent_cpu_cores"),
-        "{without:?}"
-    );
-}
-
-#[tokio::test]
-async fn agent_status_metric_scales_cpu_and_latency_into_spec_units() {
-    // 规范单位：CPU 是 0–1 比例（单核口径），延迟是秒；上报入参仍是百分比 / 毫秒。
-    let lines = super::agent_ops::agent_status_metric_lines(
-        "agent-node-a",
-        None,
-        Some(50.0),
-        Some(4),
-        Some(250),
-        None,
-        1_700_000_000_000,
-    );
-    let find = |name: &str| {
-        lines
-            .iter()
-            .find(|line| line["metric"]["__name__"] == name)
-            .unwrap_or_else(|| panic!("missing metric line {name}"))
-            .clone()
-    };
-
-    assert_eq!(find("agent_cpu_ratio")["values"][0], 0.5);
-    assert_eq!(find("agent_admin_latency_seconds")["values"][0], 0.25);
-    assert_eq!(find("agent_cpu_cores")["values"][0], 4.0);
+    let histories = super::overview::merge_agent_metric_range(&range, &wanted);
+    assert_eq!(histories.len(), 1, "只合并被问到的 agent");
+    let samples = histories.get("agent-node-a").expect("agent-node-a");
+    assert_eq!(samples.len(), 1, "同一时间戳的四条线合成一个样本");
+    let sample = &samples[0];
+    assert_eq!(sample.memory_bytes, Some(12_345_678));
+    assert_eq!(sample.cpu_percent, Some(50.0), "ratio 0.5 → 50%");
+    assert_eq!(sample.cpu_cores, Some(4));
+    assert_eq!(sample.admin_latency_ms, Some(250), "0.25s → 250ms");
+    assert_eq!(sample.cpu_percent_of_machine, Some(12.5), "50% / 4 核");
 }
 
 /// 用**真实策展策略表**跑通下发：装载校验通过，且下发的是七个方向那一版。
@@ -17208,6 +17151,206 @@ async fn a_metrics_labels_write_queues_a_refresh_command_for_that_agent() {
     let params: serde_json::Value =
         serde_json::from_str(&ack.commands[0].params).expect("refresh params");
     assert_eq!(params["what"], serde_json::json!(["metrics-labels"]));
+}
+
+/// 手工刷新入口：排一条 `kind = refresh` 的命令，`params.what` 原样带走。
+///
+/// 这是「改了但 agent 没拿到」的排障路径，必须与 CLI `refresh --only …` 产生**同一种**命令
+/// （kind 与 params 逐字一致），否则命令台账里读到的值抄不回 CLI。
+#[tokio::test]
+async fn admin_refresh_dispatches_a_refresh_command_with_the_requested_sources() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/refresh",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "what": ["metrics-labels"] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let command_id = body["command_id"].as_str().expect("command id").to_string();
+    assert_eq!(body["agent_id"], "agent-node-a");
+    assert_eq!(body["kind"], "refresh");
+    assert!(body["requested_at"].is_string());
+    assert!(body["acknowledged_at"].is_null());
+
+    // 不新开推送面：下一个状态上报的回执把它带下去。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.21.2",
+            "command_acks": [],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(ack.commands.len(), 1);
+    assert_eq!(ack.commands[0].command_id, command_id);
+    assert_eq!(ack.commands[0].kind, "refresh");
+    assert_eq!(
+        ack.commands[0].params,
+        serde_json::json!({ "what": ["metrics-labels"] }).to_string()
+    );
+}
+
+/// 空表（或 `what` 缺失）→ 400，**不排任何命令**。
+///
+/// agent 会把空表当“无效参数”，而页面会把 200 渲染成“刷新成功”——两边都不会报错，
+/// 于是运维以为发出去了。所以这里必须硬拒。
+#[tokio::test]
+async fn admin_refresh_rejects_empty_what_without_queueing_anything() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/refresh",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "what": [] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "empty_refresh_what");
+
+    // 缺 `what` 字段也归到同一个原因码：契约说它必填，页面就靠 `code` 分支。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/refresh",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "empty_refresh_what");
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.21.2",
+            "command_acks": [],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert!(ack.commands.is_empty(), "被拒的请求不应留下命令");
+}
+
+/// 不在闭集里的来源 → 400 `unknown_refresh_source`，同样不排命令。
+#[tokio::test]
+async fn admin_refresh_rejects_unknown_sources() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/refresh",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "what": ["metrics-labels", "bogus"] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "unknown_refresh_source");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("bogus"),
+        "文案要点出是哪个来源（got {body}）"
+    );
+}
+
+/// 未知 agent → 404，与 metrics-labels 三接口同口径。
+#[tokio::test]
+async fn admin_refresh_unknown_agent_is_not_found() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-not-enrolled/refresh",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "what": ["metrics-labels"] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "agent_not_found");
+}
+
+/// 连点两次 = 两条命令。
+///
+/// `refresh` 的 `params.what` 可以不同（policies / work / metrics-labels …），若按 kind 覆盖
+/// 待执行命令，先刷 policies 再刷 metrics-labels 会静默丢掉前者。所以这里是追加语义。
+#[tokio::test]
+async fn admin_refresh_twice_queues_two_commands() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    for what in [vec!["metrics-labels"], vec!["policies", "work"]] {
+        let response = post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-node-a/refresh",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({ "what": what }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.21.2",
+            "command_acks": [],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(ack.commands.len(), 2, "两次下发不能被覆盖成一条");
+    let mut whats: Vec<String> = ack
+        .commands
+        .iter()
+        .map(|command| {
+            let params: serde_json::Value =
+                serde_json::from_str(&command.params).expect("refresh params");
+            params["what"].to_string()
+        })
+        .collect();
+    whats.sort();
+    assert_eq!(
+        whats,
+        vec!["[\"metrics-labels\"]", "[\"policies\",\"work\"]"]
+    );
 }
 
 #[tokio::test]

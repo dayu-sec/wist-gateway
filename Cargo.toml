@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.38.3" #@gxl:set(version)
+version = "0.39.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -36,6 +36,10 @@ wist-config = { version = "0.1" }
 # 跨进程错误投影 wire 类型（`ProtocolError` / `Severity`），见 `api/error.rs`。
 wist-shared = { version = "0.2" }
 #wist-shared = { version = "0.2", path = "../wist-shared" }
+# 规范指标名 / label 键 / 单位换算的唯一来源（与 agentd 写入侧、center 读侧共用）。
+# 本地联调切 path：
+#wist-metrics = { path = "../wist-metrics" }
+wist-metrics = "0.9"
 # 管理面鉴权原语（Bearer token / sha256 / 常数时间比较 / 失败限流桶）。
 # 已发布到 crates.io（CI 发版）。本地联调可临时切 path：
 #wist-auth = { path = "../wist-auth" }

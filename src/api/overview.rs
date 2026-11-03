@@ -11,6 +11,9 @@ use serde::Serialize;
 use crate::infra::victoria_metrics::query_json;
 use crate::infra::{AgentQuery, AgentStatusMetricSample, StoredAgentRegistration};
 use wist_control::types::{AgentRuntimeStatus, DateTime};
+// 规范指标名 / label 键 / 单位换算的**唯一来源**：与 agentd（写入）和 center 共用。
+// 曾经这两侧各写字符串，0.21 改名后读侧失联，页面曲线全空而两侧单测都能过。
+use wist_metrics::names::{agent as agent_metric, ratio_to_percent, seconds_to_millis};
 
 use super::admin_auth::require_admin_bearer;
 use super::admin_ops::cpu_percent_of_machine;
@@ -280,13 +283,14 @@ async fn agent_metrics_histories(
     vm_url: &str,
     agent_ids: &[String],
 ) -> HashMap<String, Vec<AgentStatusMetricSample>> {
-    let mut histories: HashMap<String, Vec<AgentStatusMetricSample>> = HashMap::new();
+    let histories: HashMap<String, Vec<AgentStatusMetricSample>> = HashMap::new();
     if agent_ids.is_empty() {
         return histories;
     }
 
     // 一次拉取四个 agent 自身上报指标，再按 (agent, 时间戳) 对齐合并成历史样本。
-    let query = r#"{__name__=~"agent.memory.bytes|agent.cpu.percent|agent.cpu.cores|agent.admin_latency.ms"}"#;
+    // 名字跟写入侧共用同一份常量（`agent_ops`），不在这里手写字符串。
+    let query = format!("{{__name__=~\"{}\"}}", agent_metric::HISTORY.join("|"));
     let now = chrono::Utc::now().timestamp();
     let start = (now - HISTORY_WINDOW_SECONDS).to_string();
     let end = now.to_string();
@@ -295,7 +299,7 @@ async fn agent_metrics_histories(
         vm_url,
         "/api/v1/query_range",
         &[
-            ("query", query),
+            ("query", query.as_str()),
             ("start", start.as_str()),
             ("end", end.as_str()),
             ("step", step.as_str()),
@@ -308,6 +312,18 @@ async fn agent_metrics_histories(
     };
 
     let wanted: HashSet<&str> = agent_ids.iter().map(String::as_str).collect();
+    merge_agent_metric_range(&range, &wanted)
+}
+
+/// 把 VM `query_range` 的响应合并成「每 agent 一串按时间排序的样本」。
+///
+/// 名字口径见 [`agent_metric::HISTORY`]：唯一写入者是 agentd（数据面指标帧），网关只读。
+/// 单位在这里换算回**对外口径**（`percent` / `ms`），页面字段语义不变。
+pub(super) fn merge_agent_metric_range(
+    range: &serde_json::Value,
+    wanted: &HashSet<&str>,
+) -> HashMap<String, Vec<AgentStatusMetricSample>> {
+    let mut histories: HashMap<String, Vec<AgentStatusMetricSample>> = HashMap::new();
     let mut per_agent: HashMap<String, BTreeMap<i64, AgentStatusMetricSample>> = HashMap::new();
 
     for item in range["data"]["result"]
@@ -346,18 +362,23 @@ async fn agent_metrics_histories(
                     cpu_cores: None,
                     admin_latency_ms: None,
                 });
+            let Ok(parsed) = value.parse::<f64>() else {
+                continue;
+            };
             match name {
-                "agent.memory.bytes" => {
-                    entry.memory_bytes = value.parse::<f64>().ok().map(|value| value as u64);
+                agent_metric::MEMORY_BYTES => {
+                    entry.memory_bytes = Some(parsed as u64);
                 }
-                "agent.cpu.percent" => {
-                    entry.cpu_percent = value.parse::<f64>().ok();
+                // 写入侧存的是**单核比例**（1.0 = 占满一个核），对外历史字段仍然是 percent。
+                agent_metric::CPU_RATIO => {
+                    entry.cpu_percent = Some(ratio_to_percent(parsed));
                 }
-                "agent.cpu.cores" => {
-                    entry.cpu_cores = value.parse::<f64>().ok().map(|value| value as u32);
+                agent_metric::CPU_CORES => {
+                    entry.cpu_cores = Some(parsed as u32);
                 }
-                "agent.admin_latency.ms" => {
-                    entry.admin_latency_ms = value.parse::<f64>().ok().map(|value| value as u64);
+                // 同理：写入侧是秒，历史字段是毫秒。
+                agent_metric::ADMIN_LATENCY_SECONDS => {
+                    entry.admin_latency_ms = Some(seconds_to_millis(parsed));
                 }
                 _ => {}
             }
