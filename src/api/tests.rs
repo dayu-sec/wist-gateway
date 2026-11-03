@@ -17471,3 +17471,230 @@ async fn a_change_of_inference_evidence_is_not_a_duplicate_report() {
     assert_eq!(stored.service_units, vec!["kafka@broker-1".to_string()]);
     assert_eq!(stored.content_digest, digest_of(&second));
 }
+
+#[tokio::test]
+async fn metrics_labels_responses_declare_the_documented_kind() {
+    // `kind` 是线上契约的一部分（前端/脚本按它分支）。管理面视图与 agent 拉取视图
+    // 是两个不同的 kind —— 以前两处都写成了 agent 的那个，只有 golden 用例没覆盖到。
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let body: serde_json::Value =
+        decode_json_response(poll_metrics_labels(&env, &credential).await).await;
+    assert_eq!(body["kind"], "agent_metrics_labels");
+
+    let view: serde_json::Value = decode_json_response(
+        get_admin(&env, "/api/v1/admin/agents/agent-node-a/metrics-labels").await,
+    )
+    .await;
+    assert_eq!(view["kind"], "admin_agent_metrics_labels");
+}
+
+#[tokio::test]
+async fn metrics_labels_endpoints_reject_an_unknown_agent() {
+    let env = TestEnv::new().await;
+    for response in [
+        get_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-missing/metrics-labels",
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await,
+        put_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-missing/metrics-labels",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({
+                "api_version": "v1",
+                "kind": "set_agent_metrics_labels",
+                "overrides": {"app": "kafka"},
+            }),
+        )
+        .await,
+        delete_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-missing/metrics-labels",
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await,
+    ] {
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn an_empty_override_request_does_not_bump_the_revision() {
+    // 空改动不该制造新版本：每写一次所有 agent 都会被要求重拉一遍。
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    let view: serde_json::Value = decode_json_response(
+        put_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/agents/agent-node-a/metrics-labels",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({
+                "api_version": "v1",
+                "kind": "set_agent_metrics_labels",
+                "overrides": {},
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(view["revision"], 0);
+    assert!(view["labels"].as_object().expect("object").is_empty());
+    assert!(
+        env.store
+            .get_agent_metrics_labels("agent-node-a")
+            .await
+            .expect("store")
+            .is_none(),
+        "空改动不该写出任何行"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_manual_app_is_allowed_when_inference_supplies_it() {
+    // 修复前：`apply_overrides` 只看「覆盖层」，`{app:null}` 会让 `role` 变成孤儿键而被 400。
+    // 但推断层能给出 `app` 时，合并后的生效值完全合法 —— 写路径不该拦它。
+    let mut env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    with_metrics_registry(&mut env);
+    env.store_handle
+        .upsert_agent_fact_summary(&facts_with_evidence(
+            "agent-node-a",
+            &["kafka@broker-1"],
+            &[],
+        ))
+        .await
+        .expect("store facts");
+
+    // 先手工写 app + role。
+    let response = put_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/metrics-labels",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "set_agent_metrics_labels",
+            "overrides": {"app": "kafka-manual", "role": "broker"},
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 再删掉 app 覆盖：`role` 留在覆盖里，`app` 由推断给出 → 合法。
+    let response = put_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/metrics-labels",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "set_agent_metrics_labels",
+            "overrides": {"app": null},
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["labels"]["app"], "kafka");
+    assert_eq!(view["sources"]["app"], "inferred");
+    assert_eq!(view["labels"]["role"], "broker");
+    assert_eq!(view["sources"]["role"], "manual");
+}
+
+#[tokio::test]
+async fn an_inferred_role_is_dropped_when_admin_overrides_the_app() {
+    // 推断出 app=kafka + role=broker 后，把 app 改成 redis：
+    // `role=broker` 只在 kafka 的登记表里成立，留着它就是语义错误。
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    with_metrics_registry(&mut env);
+    env.store_handle
+        .upsert_agent_fact_summary(&facts_with_evidence(
+            "agent-node-a",
+            &["kafka@broker-1"],
+            &[],
+        ))
+        .await
+        .expect("store facts");
+
+    let response = put_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/metrics-labels",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "set_agent_metrics_labels",
+            "overrides": {"app": "redis"},
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: serde_json::Value =
+        decode_json_response(poll_metrics_labels(&env, &credential).await).await;
+    assert_eq!(body["labels"]["app"], "redis");
+    assert!(
+        body["labels"].get("role").is_none(),
+        "推断出的角色不能挂在被覆盖掉的 app 上"
+    );
+}
+
+#[tokio::test]
+async fn metrics_labels_reject_a_wrong_kind_and_an_over_cap_request() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    // 拉取：kind 对不上 → 400（别静默当成一次正常拉取）。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/metrics-labels:poll",
+        Some(&credential),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "something_else",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "invalid_metrics_labels_poll");
+
+    // 写入：7 个键超过上限 → 400（键都合法，问题在数量）。
+    let response = put_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/metrics-labels",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "set_agent_metrics_labels",
+            "overrides": {
+                "app": "kafka", "env": "prod", "cluster": "c",
+                "role": "broker", "region": "cn-north", "zone": "az1", "shard": "0",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("too_many_metric_labels"),
+        "{body}"
+    );
+}

@@ -27,7 +27,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use wist_api::metrics_labels::{
-    AGENT_METRICS_LABELS_KIND, AgentMetricsLabels, AgentMetricsLabelsView,
+    ADMIN_METRICS_LABELS_KIND, AgentMetricsLabels, AgentMetricsLabelsView,
     POLL_AGENT_METRICS_LABELS_KIND, PollAgentMetricsLabels, SetAgentMetricsLabelsRequest,
 };
 use wist_api::status::{RefreshParams, command_kind, refresh_what};
@@ -162,9 +162,10 @@ pub async fn put_agent_metrics_labels(
             .into_response();
         }
     };
-    // 「手工覆盖 + 部署默认」合并后也要过一遍：两层各自合法不代表合起来合法
-    // （例如手工删掉 `app` 但部署默认里有 `role`）。
-    let effective = metrics_labels::merge(&state.config.metrics_labels, &BTreeMap::new(), &merged);
+    // 组合校验必须看**三层合并后的生效值**：只判「默认 + 覆盖」会误伤 ——
+    // 手工删掉 `app`、而推断层仍能给出 `app` 时，那组值完全合法。
+    let inferred = infer_labels(&state, &agent_id).await;
+    let effective = metrics_labels::merge(&state.config.metrics_labels, &inferred, &merged);
     if let Err(err) = wist_api::metrics_labels::rules::validate_labels(&effective.labels) {
         return ApiError::bad_request(
             codes::METRICS_LABELS_INVALID,
@@ -197,17 +198,9 @@ pub async fn put_agent_metrics_labels(
         row.updated_by
     );
     enqueue_labels_refresh(&state, &agent_id).await;
-    Json(AgentMetricsLabelsView {
-        api_version: API_VERSION_V1.to_string(),
-        kind: AGENT_METRICS_LABELS_KIND.to_string(),
-        agent_id,
-        revision: revision.max(0) as u64,
-        labels: effective.labels,
-        sources: effective.sources,
-        overrides: row.overrides,
-        updated_at: now,
-    })
-    .into_response()
+    // 回显走**同一条读路径**：手写一份「默认 + 覆盖」会漏掉推断层，
+    // 于是响应与 agent 实际拉到的值不一致。
+    view_response(&state, &agent_id).await
 }
 
 /// `DELETE /api/v1/admin/agents/{agent_id}/metrics-labels`
@@ -269,7 +262,6 @@ pub async fn delete_agent_metrics_labels(
     enqueue_labels_refresh(&state, &agent_id).await;
     // 回显走**同一条读路径**：清空覆盖后生效值里还有推断层，
     // 手写一份「默认 + 空覆盖」会让响应漏掉 `app`（而 agent 拉到的却有）。
-    let _ = now;
     view_response(&state, &agent_id).await
 }
 
@@ -321,7 +313,7 @@ async fn view_response(state: &ApiState, agent_id: &str) -> Response {
     };
     Json(AgentMetricsLabelsView {
         api_version: API_VERSION_V1.to_string(),
-        kind: AGENT_METRICS_LABELS_KIND.to_string(),
+        kind: ADMIN_METRICS_LABELS_KIND.to_string(),
         agent_id: agent_id.to_string(),
         revision,
         labels: effective.labels,
@@ -358,7 +350,9 @@ async fn load_effective(
         .map(|row| row.overrides.clone())
         .unwrap_or_default();
     let inferred = infer_labels(state, agent_id).await;
-    let effective = metrics_labels::merge(&state.config.metrics_labels, &inferred, &overrides);
+    // 永不下发非法值集：agent 对选择类 label 是整包拒收的，一份坏响应会让它保留旧缓存。
+    let effective =
+        metrics_labels::merge_validated(&state.config.metrics_labels, &inferred, &overrides);
     let revision = row
         .as_ref()
         .map(|row| row.revision.max(0) as u64)
