@@ -1616,9 +1616,6 @@ pub trait Store: Send + Sync + fmt::Debug {
         labels: &StoredAgentMetricsLabels,
     ) -> StoreResult<()>;
 
-    /// 清空一台 agent 的全部手工覆盖，返回是否真的删掉了行。
-    async fn delete_agent_metrics_labels(&self, agent_id: &str) -> StoreResult<bool>;
-
     // ── 灰度发布计划 ──
 
     /// 写入/覆盖一份灰度发布计划（`plan_id` 为主键）。

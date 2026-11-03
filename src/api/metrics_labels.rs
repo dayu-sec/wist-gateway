@@ -135,8 +135,10 @@ pub async fn put_agent_metrics_labels(
         // 空改动不是错误，但也不该写一条新版本（每次空写都让所有 agent 白拉一次）。
         return view_response(&state, &agent_id).await;
     }
-    let current = match state.store.get_agent_metrics_labels(&agent_id).await {
-        Ok(row) => row.map(|row| row.overrides).unwrap_or_default(),
+    // 只读一次：版本号与“现有覆盖”必须来自同一份快照，否则并发两次写入会各自基于
+    // 同一版 +1，其中一次被静默覆盖（版本还前进了，问题更难发现）。
+    let stored = match state.store.get_agent_metrics_labels(&agent_id).await {
+        Ok(row) => row,
         Err(err) => {
             return ApiError::internal(
                 codes::METRICS_LABELS_UNAVAILABLE,
@@ -146,6 +148,10 @@ pub async fn put_agent_metrics_labels(
             .into_response();
         }
     };
+    let current = stored
+        .as_ref()
+        .map(|row| row.overrides.clone())
+        .unwrap_or_default();
     let merged = match metrics_labels::apply_overrides(&current, &input.overrides) {
         Ok(merged) => merged,
         Err(err) => {
@@ -166,17 +172,7 @@ pub async fn put_agent_metrics_labels(
         )
         .into_response();
     }
-    let revision = match state.store.get_agent_metrics_labels(&agent_id).await {
-        Ok(row) => row.map(|row| row.revision).unwrap_or(0) + 1,
-        Err(err) => {
-            return ApiError::internal(
-                codes::METRICS_LABELS_UNAVAILABLE,
-                "failed to load agent metrics labels",
-                err,
-            )
-            .into_response();
-        }
-    };
+    let revision = stored.as_ref().map(|row| row.revision).unwrap_or(0) + 1;
     let now = chrono::Utc::now().to_rfc3339();
     let row = StoredAgentMetricsLabels {
         agent_id: agent_id.clone(),
@@ -245,17 +241,11 @@ pub async fn delete_agent_metrics_labels(
         // 没有手工覆盖：删除是幂等的，返回当前生效值即可（不制造一个空版本）。
         return view_response(&state, &agent_id).await;
     };
-    if let Err(err) = state.store.delete_agent_metrics_labels(&agent_id).await {
-        return ApiError::internal(
-            codes::METRICS_LABELS_STORE_FAILED,
-            "failed to delete agent metrics labels",
-            err,
-        )
-        .into_response();
-    }
     let now = chrono::Utc::now().to_rfc3339();
-    // 保留版本号继续上涨：agent 只看「版本或内容变了」就替换，删掉行后回到 0 会让
-    // 「先清空再写回同一份」在 agent 侧看起来像没变过。
+    // 不删行、而是写一条**空覆盖**（版本 +1）：
+    //   * agent 只看「版本或内容变了」就替换 —— 删行后版本回到 0，会让「先清空再写回
+    //     同一份」在 agent 侧看起来像没变过；
+    //   * 版本号因此永远单调，排障时能按 revision 复原操作序列。
     let revision = previous.revision + 1;
     let tombstone = StoredAgentMetricsLabels {
         agent_id: agent_id.clone(),

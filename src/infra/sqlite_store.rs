@@ -3132,15 +3132,6 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    async fn delete_agent_metrics_labels(&self, agent_id: &str) -> StoreResult<bool> {
-        let result = sqlx::query("DELETE FROM agent_metrics_labels WHERE agent_id = ?1")
-            .bind(agent_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|err| sql_error(err, "delete agent metrics labels"))?;
-        Ok(result.rows_affected() > 0)
-    }
-
     async fn save_rollout_plan(&self, plan: &StoredRolloutPlan) -> StoreResult<()> {
         let phases_json = serialize_json_array(&plan.phases, "encode rollout plan phases")?;
         sqlx::query(
@@ -5614,9 +5605,22 @@ mod tests {
             std::collections::BTreeMap::from([("app".to_string(), "kafka".to_string())])
         );
 
-        // 删除是幂等的：第二次返回 false。
-        assert!(store.delete_agent_metrics_labels("agent-a").await.unwrap());
-        assert!(!store.delete_agent_metrics_labels("agent-a").await.unwrap());
+        // “清空覆盖” = 写一条空覆盖（版本继续 +1），不是删行：
+        // 删行会让版本回到 0，agent 侧就看不出“先清空再写回同一份”的变化。
+        let cleared = StoredAgentMetricsLabels {
+            overrides: std::collections::BTreeMap::new(),
+            revision: 3,
+            updated_at: "2026-11-03T00:02:00Z".to_string(),
+            ..next
+        };
+        store.upsert_agent_metrics_labels(&cleared).await.unwrap();
+        let stored = store
+            .get_agent_metrics_labels("agent-a")
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(stored.revision, 3);
+        assert!(stored.overrides.is_empty());
     }
 
     #[tokio::test]
