@@ -3,6 +3,17 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.40.0-alpha] - 2026-11-05
+
+### 变更（内容平台：认识 `container_cri` 读法）
+
+- **依赖 `wist-contracts 0.10.1`**（从 0.10.0）：读法词表 `MULTILINE_MODES` 新增
+  `container_cri`，采集目录可以声明它（kubelet `/var/log/containers` 的 CRI 日志多行合并）。
+  没有代码改动 —— 词表在 contracts 里，网关只是把包里的值原样校验、原样下发给 agent。
+- 搭配关系：知识库 `wist-knowledge 0.9.1` 的 `compat.json` 要求 `wist-gateway >= 0.40.0`；
+  本版是第一个能**载入**该目录的构建（旧版会在校验目录时把 `container_cri` 当成未知读法，
+  整包拒载）。agentd 侧需要 `>= 0.25.0` 才能真正折叠，旧 agent 由能力清单裁掉这条来源（不阻断）。
+
 ## [0.39.0-alpha] - 2026-11-03
 
 ### 新增
