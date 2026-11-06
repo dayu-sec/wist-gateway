@@ -49,8 +49,8 @@ use super::{
         validate_bootstrap_token_for_config,
     },
     install_package::{
-        AgentPackageSource, PLATFORM_LINUX_ARM, PLATFORM_LINUX_X86, package_id_for_sha256,
-        read_package_identity,
+        AgentPackageSource, PLATFORM_LINUX_ARM, PLATFORM_LINUX_X86, PLATFORM_MACOS_ARM,
+        package_id_for_sha256, read_package_identity,
     },
     overview::{
         OVERVIEW_RECENT_AGENT_LIMIT, RecentOnlineRegisteredAgentSource, agent_is_online,
@@ -119,11 +119,8 @@ async fn set_install_package_source(env: &TestEnv, name: &str, bytes: &[u8]) -> 
     (source, bytes_sha256_hex(bytes))
 }
 
-/// Self-signed TLS cert (CN=localhost, RSA) written into each TestEnv so the
-/// macOS install code can compute its `--pinnedpubkey` pin.
+/// Self-signed TLS leaf (CN=localhost, RSA) written into each TestEnv —— 测试服务端用。
 const TEST_TLS_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDCTCCAfGgAwIBAgIUVlBq6CYit7aQR8CpShgLhKef76gwDQYJKoZIhvcNAQEL\nBQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDkwODE0MzIzMFoXDTI3MDkw\nODE0MzIzMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF\nAAOCAQ8AMIIBCgKCAQEAowBkJchsMBeZcyW2Hntz9fHbM2EYg4Phfn+S4RB2oCzc\n7hXmxB3FUMZ4VKWhF3ruhIFM7Tc6pfSUPx6AqgDJBtvkeA2v+oFR6P0Fsv2Xlczp\neBKpK0vygKjL7jGrHmbofKL5om/ytyQMVjgxhEWW5K54+bvldpa7JnBN3GAJU5KA\nxIAH/5lQSKzlvD6emuUJd62062sVkc9EX7bzM0fOWV2xMEn6JuW9Pa0sCDKZz71u\nIw4sT70inxl7djXxthq/fMekWCrjeNcoLODmMDJgiSUYki1ox1uT9YuXThgIIwHO\nERXzp3xrbO6gOeJgbX4C/aYxcMoaXQGmh89NRmK8MwIDAQABo1MwUTAdBgNVHQ4E\nFgQUDzbiNfr4kpFl2+bL6RmiPBCEgSYwHwYDVR0jBBgwFoAUDzbiNfr4kpFl2+bL\n6RmiPBCEgSYwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEARPZy\nXsWS0A8jnXSRbTxHCSciwic0pFDc9vo+8WyMkz1t754cbrStEhSU9Rl1hE1ZON6v\nVJpdG4Yezhdmx8zfqBbjDNhSjBlrdVRbOyC6oO5KDZHTIVI6mEqAQaRmohHY41y+\nUza+pZL6TIvol3F99ZOmPevIREmGDY9Xy6CxeaiTkSoCg/0XIO/55GeEQSix9YSM\nuvISELAaKycvD37ltjgr4DigLquxs03mCntBcKX7KvpPF6142KLvQxiHyI+VJdtK\nTapJeaMTcQ0i/jLOd47lwGDnQL2Q1RpF6Lp1uTkSDeBFjpJlRzZGnrssHX4vEA0L\nmSymA2FI5OPMsMzExQ==\n-----END CERTIFICATE-----\n";
-/// Expected `sha256//` pin (base64 of the sha256 of the SPKI) of the cert above.
-const TEST_TLS_CERT_PIN: &str = "uq4O4EN3e09Xmlo5euGldyHw+y27baJ+Jm/OBnFHrZc=";
 
 /// 用手边的本地制品签发一份安装代码：下面几个测试关心的是安装命令/引导包的形态。
 async fn local_package_install_code(env: &TestEnv) -> wist_control::types::AgentInstallCode {
@@ -135,7 +132,6 @@ async fn local_package_install_code(env: &TestEnv) -> wist_control::types::Agent
         &[(TEST_PLATFORM.to_string(), local_package(env))],
         &env.config.public_base_url,
     )
-    .expect("install code")
 }
 
 /// linux 两份命令要按平台算脚本摘要，因此夹具里得有对应平台的包。
@@ -157,7 +153,6 @@ async fn linux_package_install_code(env: &TestEnv) -> wist_control::types::Agent
         ],
         &env.config.public_base_url,
     )
-    .expect("install code")
 }
 
 #[tokio::test]
@@ -264,8 +259,7 @@ async fn linux_install_code_digest_follows_the_advertise_base() {
             chrono::Utc::now() + chrono::Duration::seconds(900),
             &[(PLATFORM_LINUX_X86.to_string(), package.clone())],
             base,
-        )
-        .expect("install code");
+        );
         let digest = bytes_sha256_hex(
             super::install::install_script(&env.config, PLATFORM_LINUX_X86, &package, base)
                 .as_bytes(),
@@ -342,8 +336,7 @@ async fn linux_install_codes_handle_a_partly_recorded_platform_set() {
             local_package_for(&env, PLATFORM_LINUX_X86),
         )],
         &env.config.public_base_url,
-    )
-    .expect("install code");
+    );
 
     assert!(
         code.x86_linux_install_code.contains("install.sh")
@@ -474,8 +467,7 @@ async fn linux_install_command_runs_on_ubuntu_2004() {
         chrono::Utc::now() + chrono::Duration::seconds(900),
         &[(platform.to_string(), source.clone())],
         &env.config.public_base_url,
-    )
-    .expect("install code");
+    );
     let command = if platform == PLATFORM_LINUX_X86 {
         &install_code.x86_linux_install_code
     } else {
@@ -589,19 +581,285 @@ async fn linux_install_command_runs_on_ubuntu_2004() {
 }
 
 #[tokio::test]
-async fn macos_install_code_pins_gateway_certificate() {
+async fn macos_install_code_pins_script_digest() {
     let env = TestEnv::new().await;
     let install_code = local_package_install_code(&env).await;
     let macos = &install_code.macos_install_code;
 
-    assert!(macos.contains("\"$(uname -s)\" != \"Darwin\""));
-    assert!(macos.contains(&format!(
-        "curl -fsSLk --pinnedpubkey \"sha256//{TEST_TLS_CERT_PIN}\" \"https://127.0.0.1:3000/api/v1/agent/install/aarch64-apple-darwin/install.sh\""
-    )));
+    // 与 Linux 同形：钉的是**脚本字节**，不是网关证书公钥 —— 前置终止 TLS 的代理/LB、
+    // 或证书换钥，都不会让已发出的命令失效（旧实现两者都会）。
+    assert!(!macos.contains("--pinnedpubkey"), "{macos}");
+    let expected = bytes_sha256_hex(
+        super::install::install_script(
+            &env.config,
+            PLATFORM_MACOS_ARM,
+            &local_package_for(&env, PLATFORM_MACOS_ARM),
+            &env.config.public_base_url,
+        )
+        .as_bytes(),
+    );
+    assert!(macos.contains(&expected), "{macos}");
+    assert!(macos.contains(
+        "curl -fsSLk \"https://127.0.0.1:3000/api/v1/agent/install/aarch64-apple-darwin/install.sh\""
+    ));
+    // macOS 没有 sha256sum，靠 install_command 里的 shasum 兜底分支。
+    assert!(macos.contains("shasum -a 256"), "{macos}");
     assert!(macos.contains("sh \"$D/s\""));
     assert!(!macos.contains("working dir"));
-    // macOS 靠 curl 的证书锁定认证，不靠 Ed25519 脚本签名（系统自带的 LibreSSL 验不了）。
     assert!(!macos.contains("openssl pkeyutl"));
+}
+
+#[tokio::test]
+async fn install_code_does_not_need_the_tls_certificate() {
+    let env = TestEnv::new().await;
+    // 旧实现从 tls_cert_file 算 macOS 的 SPKI pin：证书读不到，整份安装代码就生成不了。
+    // 现在三个平台都钉脚本摘要，证书与安装代码无关（前面挡终止 TLS 的代理也能用）。
+    std::fs::remove_file(&env.config.tls_cert_file).expect("remove tls cert");
+    let install_code = local_package_install_code(&env).await;
+    assert!(!install_code.macos_install_code.contains("--pinnedpubkey"));
+}
+
+/// 三个平台各押各的摘要：一件命令里不能挟带另一平台的摘要或地址。
+///
+/// 这是「同一份制品、不同平台渲染出不同脚本」的直接推论 —— 取错脚本就是验错脚本。
+#[tokio::test]
+async fn install_codes_carry_per_platform_digests_for_all_three_platforms() {
+    let env = TestEnv::new().await;
+    let platforms = [PLATFORM_LINUX_X86, PLATFORM_LINUX_ARM, PLATFORM_MACOS_ARM];
+    let packages: Vec<(String, AgentPackageSource)> = platforms
+        .iter()
+        .map(|platform| (platform.to_string(), local_package_for(&env, platform)))
+        .collect();
+    let code = agent_install_code(
+        &env.config,
+        "token-a",
+        chrono::Utc::now() + chrono::Duration::seconds(900),
+        &packages,
+        &env.config.public_base_url,
+    );
+    let digest_for = |platform: &str| {
+        bytes_sha256_hex(
+            super::install::install_script(
+                &env.config,
+                platform,
+                &local_package_for(&env, platform),
+                &env.config.public_base_url,
+            )
+            .as_bytes(),
+        )
+    };
+    let x86 = digest_for(PLATFORM_LINUX_X86);
+    let arm = digest_for(PLATFORM_LINUX_ARM);
+    let macos = digest_for(PLATFORM_MACOS_ARM);
+
+    let commands = [
+        (x86.clone(), &code.x86_linux_install_code),
+        (arm.clone(), &code.arm_linux_install_code),
+        (macos.clone(), &code.macos_install_code),
+    ];
+    for (digest, command) in &commands {
+        assert!(command.contains(digest), "{command}");
+        assert!(!command.contains("--pinnedpubkey"), "{command}");
+        for (other, _) in &commands {
+            if other != digest {
+                assert!(!command.contains(other), "错拿了别的平台的摘要：{command}");
+            }
+        }
+    }
+    // 地址也只能指自己平台 —— 包括 macOS 不能指到 linux 那两条。
+    assert!(code.macos_install_code.contains(PLATFORM_MACOS_ARM));
+    assert!(!code.macos_install_code.contains(PLATFORM_LINUX_X86));
+    assert!(!code.macos_install_code.contains(PLATFORM_LINUX_ARM));
+    assert!(!code.x86_linux_install_code.contains(PLATFORM_MACOS_ARM));
+}
+
+/// 只录了 linux 包时：macOS 那条必须是「去哪补包」的说明，而不是一条能下载却注定校验不过的命令。
+/// 与 linux 侧的 `linux_install_codes_handle_a_partly_recorded_platform_set` 同一口径。
+#[tokio::test]
+async fn macos_install_code_without_package_explains_instead_of_running() {
+    let env = TestEnv::new().await;
+    let code = linux_package_install_code(&env).await;
+
+    assert!(code.macos_install_code.contains(PLATFORM_MACOS_ARM));
+    assert!(code.macos_install_code.contains("这条命令不会做任何改动"));
+    assert!(!code.macos_install_code.contains("https://"));
+    assert!(!code.macos_install_code.contains("curl"));
+}
+
+/// 摘要随**生效基址**变化（脚本里含分发地址与 initial-config 地址），且等于新基址下那份
+/// 脚本的 sha256 —— 防住「macOS 这条复用/缓存了旧摘要」。
+#[tokio::test]
+async fn macos_install_code_digest_follows_the_advertise_base() {
+    let env = TestEnv::new().await;
+    let package = local_package_for(&env, PLATFORM_MACOS_ARM);
+    let render = |base: &str| {
+        let code = agent_install_code(
+            &env.config,
+            "token-a",
+            chrono::Utc::now() + chrono::Duration::seconds(900),
+            &[(PLATFORM_MACOS_ARM.to_string(), package.clone())],
+            base,
+        );
+        let digest = bytes_sha256_hex(
+            super::install::install_script(&env.config, PLATFORM_MACOS_ARM, &package, base)
+                .as_bytes(),
+        );
+        (code.macos_install_code, digest)
+    };
+
+    let (command_a, digest_a) = render("https://a.example.com");
+    let (command_b, digest_b) = render("https://b.example.com");
+    assert_ne!(digest_a, digest_b);
+    assert!(command_a.contains(&digest_a));
+    assert!(command_b.contains(&digest_b));
+    assert!(!command_a.contains(&digest_b));
+    assert!(
+        command_a
+            .contains("https://a.example.com/api/v1/agent/install/aarch64-apple-darwin/install.sh")
+    );
+    assert!(!command_a.contains("https://b.example.com"));
+}
+
+/// 换包之后，已发出的 macOS 命令押的是旧脚本摘要 → 对新脚本必然不匹配（fail-closed）。
+/// 与 `linux_install_code_is_bound_to_the_package_at_issue_time` 同一性质，单钉 macOS 这条。
+#[tokio::test]
+async fn macos_install_code_is_bound_to_the_package_at_issue_time() {
+    let env = TestEnv::new().await;
+    // 夹具里的包平台就是 macOS（`TEST_PLATFORM`），因此这条 install_code 的 macOS 槽是完整命令。
+    let issued = local_package_install_code(&env).await;
+
+    let other_path = env._root.join("package-macos-v2.tar.gz");
+    std::fs::write(&other_path, b"another mac build").expect("write package v2");
+    let other = AgentPackageSource::from_local_file(
+        &env.config,
+        &env.config.public_base_url,
+        PLATFORM_MACOS_ARM,
+        other_path,
+    )
+    .expect("package source");
+    let digest_after_reupload = bytes_sha256_hex(
+        super::install::install_script(
+            &env.config,
+            PLATFORM_MACOS_ARM,
+            &other,
+            &env.config.public_base_url,
+        )
+        .as_bytes(),
+    );
+    assert!(!issued.macos_install_code.contains(&digest_after_reupload));
+
+    // 而旧命令的摘要本身仍然有效（包没换时）：它等于签发时那份脚本的 sha256。
+    let digest_at_issue = bytes_sha256_hex(
+        super::install::install_script(
+            &env.config,
+            PLATFORM_MACOS_ARM,
+            &local_package(&env),
+            &env.config.public_base_url,
+        )
+        .as_bytes(),
+    );
+    assert!(issued.macos_install_code.contains(&digest_at_issue));
+}
+
+/// 命令里钉的摘要，必须**就是端点实际下发的那份字节**的 sha256。
+///
+/// 把「签发命令」与「分发脚本」两次渲染钉在一起：两侧的输入（包来源、生效基址、信任锚）
+/// 只要有一侧不同源，这里就会露出来 —— 在目标机上就是那句「安装脚本摘要不匹配」。
+#[tokio::test]
+async fn macos_install_code_digest_matches_the_served_script() {
+    let env = TestEnv::new().await;
+    // 走真实管理面 POST 录入（平台从制品读不出 → 回落 macOS 夹具平台）。
+    set_install_package_source(&env, "mirror-macos", b"macOS package bytes").await;
+
+    let install_code = issue_agent_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("install code");
+    // 已录包 ⇒ macOS 槽是一条真命令（不是「去哪补包」的说明）。
+    assert!(install_code.macos_install_code.contains("sh \"$D/s\""));
+    assert!(!install_code.macos_install_code.contains("--pinnedpubkey"));
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/agent/install/{PLATFORM_MACOS_ARM}/install.sh"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let served = body_bytes(response).await.to_vec();
+
+    assert!(
+        install_code
+            .macos_install_code
+            .contains(&bytes_sha256_hex(&served)),
+        "命令钉的摘要必须等于端点下发的字节：{}\n{served:?}",
+        install_code.macos_install_code
+    );
+}
+
+/// macOS 与 Linux 现在**共用同一条命令模板**（`install_command`）。这条在真 `sh` 上钉住模板行为
+/// （不联网：`curl` 换成把本地文件拷到 `-o` 的桩）：摘要对上才执行；对不上就拒跑，
+/// 且被换掉的脚本一个字节都没执行。
+#[cfg(unix)]
+#[tokio::test]
+async fn install_command_executes_the_script_only_when_the_digest_matches() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = TestEnv::new().await;
+    let dir = env._root.join("command-harness");
+    std::fs::create_dir_all(dir.join("bin")).expect("harness dir");
+
+    let script = "#!/bin/sh\nprintf 'SCRIPT_RAN\\n'\n";
+    std::fs::write(dir.join("script.sh"), script).expect("script");
+    std::fs::write(
+        dir.join("tampered.sh"),
+        "#!/bin/sh\nprintf 'TAMPERED_RAN\\n'\n",
+    )
+    .expect("tampered script");
+
+    // 桩 curl：只认 `-o`，把目标写成 `$FAKE_SCRIPT` 的内容（其余参数忽略）。
+    let shim = dir.join("bin/curl");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o) out=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n \"$out\" ] || exit 0\ncat \"$FAKE_SCRIPT\" > \"$out\"\n",
+    )
+    .expect("fake curl");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let command = super::install::install_command(
+        "https://gw.example.com/api/v1/agent/install/aarch64-apple-darwin/install.sh",
+        &bytes_sha256_hex(script.as_bytes()),
+    );
+    let path = std::env::var("PATH").expect("PATH");
+    let run = |fake_script: &std::path::Path| -> (bool, String) {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .env("PATH", format!("{}:{path}", dir.join("bin").display()))
+            .env("FAKE_SCRIPT", fake_script)
+            .output()
+            .expect("run install command");
+        (
+            out.status.success(),
+            format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+
+    // ① 摘要对：放行并执行。
+    let (ok, log) = run(&dir.join("script.sh"));
+    assert!(ok, "摘要正确时应当执行脚本：\n{log}");
+    assert!(log.contains("校验安装脚本摘要"), "{log}");
+    assert!(log.contains("SCRIPT_RAN"), "{log}");
+
+    // ② 摘要不对（被换掉的脚本）：拒跑，且被换的脚本没有被执行。
+    let (ok, log) = run(&dir.join("tampered.sh"));
+    assert!(!ok, "摘要不匹配时必须失败：\n{log}");
+    assert!(log.contains("安装脚本摘要不匹配"), "{log}");
+    assert!(!log.contains("TAMPERED_RAN"), "{log}");
 }
 
 #[tokio::test]
@@ -4883,6 +5141,10 @@ async fn spawn_victoria_metrics_stub(agent_id: &str, load_1m: f64) -> String {
                 {
                     "metric": { "__name__": "system_filesystem_usage_ratio", "agent": agent, "mountpoint": "/var" },
                     "value": [1_700_000_000, "0.95"],
+                },
+                {
+                    "metric": { "__name__": "system_host_info", "agent": agent, "host_name": "dp-host", "host_ip": "10.0.0.9" },
+                    "value": [1_700_000_000, "1"],
                 },
             ],
         },

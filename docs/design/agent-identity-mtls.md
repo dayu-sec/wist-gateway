@@ -91,8 +91,8 @@ spiffe://<tenant_id>/<environment_id>/agent/<agent_id>
 | 自定义扩展 | 自造 OID + 自写 ASN.1 | **可能被中间工具链丢弃** | **自写 ASN.1** + x509 解析库 |
 
 关键判据：**网关无论如何都要新增一个 x509 解析库** —— 现有 `webpki::EndEntityCert` 只能验链、
-取 SPKI（`src/api/install.rs:456` 即以此取 SPKI pin），**取不到 Subject/SAN**。既然三种方案的
-解析成本一样，就选最标准的 SAN，而非自造扩展。配套约束：
+取 SPKI（当时的 macOS 安装命令即以此取 SPKI pin，已改为钉脚本摘要，那个用法已移除），
+**取不到 Subject/SAN**。既然三种方案的解析成本一样，就选最标准的 SAN，而非自造扩展。配套约束：
 `basicConstraints=CA:FALSE`、`keyUsage=digitalSignature`、`EKU=clientAuth`。
 
 **CSR 只贡献公钥，主体由网关填充**：agent 提交 CSR，网关**忽略 CSR 里的主体**、用自己的

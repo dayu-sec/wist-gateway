@@ -130,10 +130,12 @@ the path or set via `WIST_GATEWAY_COS_REGION`; a whole lookup is capped at 60 se
 
 ## Supported target hosts (agent install)
 
-The Linux install command the gateway hands out downloads `install.sh`, checks it against the
-sha256 **embedded in the command itself**, and only then runs it. It needs **no OpenSSL**: the
-previous `openssl pkeyutl -verify -rawin` path required OpenSSL ≥ 3.0, which was stricter than
-every other link in the install chain (the script and agentd only ever needed systemd + curl).
+The install command the gateway hands out downloads `install.sh`, checks it against the
+sha256 **embedded in the command itself**, and only then runs it. All three published platforms
+(Linux x86_64/ARM64, macOS ARM) share that shape, so the command needs nothing beyond a POSIX
+`sh`, `curl` and `sha256sum`/`shasum` — **no OpenSSL, no certificate pinning**. The previous
+`openssl pkeyutl -verify -rawin` path required OpenSSL ≥ 3.0, which was stricter than every other
+link in the install chain (the script and agentd only ever needed systemd + curl).
 
 Baseline a target host must provide:
 
@@ -150,13 +152,17 @@ neither `curl` nor `awk` — install those first, the floor does not assume them
 `WIST_AGENTD_SERVICE=0` runs the agent in the foreground and drops the systemd requirement, at the
 cost of no supervised restart — for containers and other self-managed setups.
 
-macOS keeps its own command: `curl --pinnedpubkey` authenticates the TLS channel by pinning the
-gateway's serving certificate, because macOS ships LibreSSL (no Ed25519 raw verification either).
+Earlier builds gave macOS a `curl --pinnedpubkey` variant instead, because macOS ships LibreSSL
+(no Ed25519 raw verification either). It has been dropped: pinning the gateway's own serving
+certificate breaks the command whenever TLS terminates in front of the gateway (a proxy or load
+balancer presents a different certificate) or the certificate is re-keyed. The digest form has
+neither problem, and `shasum - a 256` is part of every macOS install.
 
 The digest is fixed **when the install code is issued** (the rendered script embeds the package
 address and the package digest). Re-uploading a package or changing the advertise URL afterwards
 makes an already issued command fail closed with a digest mismatch — re-copy the command instead
-of reusing the old one.
+of reusing the old one. The digest carries no token and no certificate, so re-issuing a code or
+rotating the gateway's TLS certificate leaves it unchanged.
 
 ## Repository layout
 

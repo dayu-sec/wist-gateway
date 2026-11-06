@@ -14,10 +14,6 @@ use crate::infra::{
     StoredEnrollmentTokenStatus, VerifiedAgentIdentity, bytes_sha256_hex, new_secret_token,
     sha256_hex,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use ring::digest::{SHA256, digest};
-use rustls_pki_types::{CertificateDer, pem::PemObject};
-use webpki::EndEntityCert;
 use wist_control::types::{AgentBootstrapBundle, AgentInstallCode, AgentPlatformPackage, DateTime};
 
 use super::ApiState;
@@ -407,7 +403,9 @@ pub async fn issue_agent_install_code(
                 .to_string(),
         );
     }
-    agent_install_code(config, &token, expires_at, &packages, &base)
+    Ok(agent_install_code(
+        config, &token, expires_at, &packages, &base,
+    ))
 }
 
 /// 生效的对外基址：管理面设置过就用它（去掉尾斜杠），否则回落 `server.public_base_url`。
@@ -494,8 +492,8 @@ pub fn agent_install_code(
     expires_at: chrono::DateTime<chrono::Utc>,
     packages: &[(String, AgentPackageSource)],
     base: &str,
-) -> Result<AgentInstallCode, String> {
-    let macos_install_code = macos_install_command(config, base)?;
+) -> AgentInstallCode {
+    let macos_install_code = platform_install_command(config, packages, base, PLATFORM_MACOS_ARM);
     // 每平台一份：安装脚本地址（平台限定）+ 网关托管包地址/摘要。
     let platforms: Vec<AgentPlatformPackage> = packages
         .iter()
@@ -506,10 +504,20 @@ pub fn agent_install_code(
             agent_package_sha256: source.sha256.clone(),
         })
         .collect();
-    Ok(AgentInstallCode {
-        x86_linux_install_code: linux_install_command(config, packages, base, PLATFORM_LINUX_X86),
+    AgentInstallCode {
+        x86_linux_install_code: platform_install_command(
+            config,
+            packages,
+            base,
+            PLATFORM_LINUX_X86,
+        ),
         bootstrap_enrollment_token: token.to_string(),
-        arm_linux_install_code: linux_install_command(config, packages, base, PLATFORM_LINUX_ARM),
+        arm_linux_install_code: platform_install_command(
+            config,
+            packages,
+            base,
+            PLATFORM_LINUX_ARM,
+        ),
         macos_install_code,
         bootstrap_bundle: AgentBootstrapBundle {
             bundle_id: format!("agent-bootstrap-{}", short_token_id(token)),
@@ -521,7 +529,7 @@ pub fn agent_install_code(
                 .unwrap_or_else(DateTime::now),
             platforms,
         },
-    })
+    }
 }
 
 /// 渲染 install.sh，并把生效的安装包地址与校验摘要写进模板。
@@ -545,18 +553,22 @@ pub fn install_script(
         .replace("{{TRUST_BUNDLE}}", &config.trust_bundle)
 }
 
-/// Linux 引导命令：下载安装脚本，**按内嵌的 sha256 校验通过后才执行**。
+/// 引导命令：下载安装脚本，**按内嵌的 sha256 校验通过后才执行**。三个平台（Linux
+/// x86_64/ARM64 + macOS-ARM）同形。
 ///
 /// 下载带 `-k`（跳过证书校验）：管理面用的是自签 CA，全新主机还不信任它。这安全的前提是
 /// **完整性由命令里内嵌的摘要保证** —— 摘要是运维从已认证的管理面**带外**粘贴过来的，
-/// TLS 在这里只当传输层用。macOS 走另一条路（`curl --pinnedpubkey`，见
-/// [`macos_install_command`]）。
+/// TLS 在这里只当传输层用。
+///
+/// 钉**脚本字节**而不是网关证书公钥：证书那条路（`curl --pinnedpubkey`）绑的是
+/// 「网关自己那张证书」，一旦网关前面挡着终止 TLS 的代理/LB（客户端看到的是另一张证书），
+/// 或证书重签时换了钥，已发出的命令就整批失效。脚本摘要不含 token、不依赖任何证书。
 ///
 /// 老写法（Ed25519 + `openssl pkeyutl -verify -rawin`）已弃用：它要求目标机有
 /// **OpenSSL ≥ 3.0**，把兼容底线抬到 EL9+ / Ubuntu 22.04+，与 `install.sh`、agentd 自己的
 /// 口径（systemd + curl 的老发行版）不一致。取摘要工具的写法与 `install.sh` 一致
 /// （`sha256sum` 优先、`shasum` 兜底）—— 两者都只在底线内。
-fn install_command(script_url: &str, script_sha256: &str) -> String {
+pub(super) fn install_command(script_url: &str, script_sha256: &str) -> String {
     format!(
         r#"set -eu; D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT INT TERM
 curl -fsSLk "{script_url}" -o "$D/s"
@@ -569,11 +581,13 @@ sh "$D/s""#,
     )
 }
 
-/// 某一 linux 平台的引导命令。
+/// 某一平台（target-triple）的引导命令。
 ///
 /// 摘要**必须**取自与脚本端点**同一次渲染**（同 `platform` + 同包来源）：端点下发的就是
 /// [`install_script`] 用同一个包渲染出来的字节，换一份来源摘要就对不上、校验白装。
-fn linux_install_command(
+///
+/// 该平台没录包时给 [`package_unavailable_command`]（算不出可校验的摘要，就不下发能下载的命令）。
+fn platform_install_command(
     config: &AdminConfig,
     packages: &[(String, AgentPackageSource)],
     base: &str,
@@ -611,41 +625,6 @@ printf '%s\n' "网关当前没有 {platform} 的 agent 安装包，这条命令�
 printf '%s\n' "到网关「安装包」页为该平台录入安装包，再回本页重新复制命令。" >&2
 exit 1"#
     )
-}
-
-/// sha256 of the TLS serving certificate's SubjectPublicKeyInfo (DER), base64.
-/// curl's `--pinnedpubkey sha256//<pin>` uses the same value, so the macOS
-/// install command can authenticate the gateway with the built-in curl even
-/// though macOS ships LibreSSL (which cannot verify the Ed25519 script
-/// signature the Linux command relies on).
-fn server_tls_spki_pin(config: &AdminConfig) -> Result<String, String> {
-    let cert = CertificateDer::from_pem_file(&config.tls_cert_file).map_err(|err| {
-        format!(
-            "failed to read tls certificate {}: {err}",
-            config.tls_cert_file.display()
-        )
-    })?;
-    let end_entity = EndEntityCert::try_from(&cert)
-        .map_err(|err| format!("failed to parse tls certificate: {err}"))?;
-    let spki = end_entity.subject_public_key_info();
-    Ok(BASE64_STANDARD.encode(digest(&SHA256, spki.as_ref()).as_ref()))
-}
-
-/// macOS install command: the built-in curl authenticates the TLS channel by
-/// pinning the gateway's serving certificate, so the target host needs no
-/// external OpenSSL 3 / Ed25519 CLI support. 只发布 macOS-ARM（`aarch64-apple-darwin`），
-/// 脚本按**平台**寻址（`/api/v1/agent/install/<triple>/install.sh`）。
-fn macos_install_command(config: &AdminConfig, base: &str) -> Result<String, String> {
-    let pin = server_tls_spki_pin(config)?;
-    let script_url = config.install_script_url_at(base, PLATFORM_MACOS_ARM);
-    Ok(format!(
-        r#"set -eu; D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT INT TERM
-if [ "$(uname -s)" != "Darwin" ]; then echo "this install command is for macOS only" >&2; exit 2; fi
-curl -fsSLk --pinnedpubkey "sha256//{pin}" "{script_url}" -o "$D/s"
-sh "$D/s""#,
-        pin = pin,
-        script_url = script_url,
-    ))
 }
 
 pub fn agent_initial_config_toml(

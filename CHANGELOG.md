@@ -3,6 +3,27 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 变更
+
+- 主机指标端点（`/api/v1/admin/agents/{id}/host-metrics` 与 `/host-metrics`）在注册表
+  机器画像为空时（证书首触重建 / 老数据 / 被手删），回落到数据面 `system_host_info`
+  的 `host_name` / `host_ip`；两处都有值时仍以注册表为准（它带全量网卡列表，指标侧只有单值主 IP）。
+  `node_id` 不受影响：它只在注册表，指标侧没有对应值。
+- 兜底时 `ipAddresses` 是**裸地址**（如 `10.0.0.9`，指标侧不带网卡名）；注册表来源仍是
+  `en0 10.0.0.9/24` 原格式，前端 `summarizeAddresses` 两种都能解析。
+
+## [0.40.1-alpha] - 2026-11-06
+
+### 修复
+
+- **macOS 主机的安装命令现在可用了**：此前它靠「钉住网关证书」校验下载到的安装脚本 ——
+  网关前面挡着终止 TLS 的代理 / 负载均衡、或网关重签证书换了钥时，命令一律报
+  `curl: (90) public key does not match pinned public key`，且已发出去的命令会整批失效。
+  现在与 Linux 同形：校验脚本自身的 sha256，证书怎么换都不影响。
+  **已发出的 macOS 安装命令需要重新复制一次**（形态变了）。
+
 ## [0.40.0-alpha] - 2026-11-05
 
 ### 变更（内容平台：认识 `container_cri` 读法）
