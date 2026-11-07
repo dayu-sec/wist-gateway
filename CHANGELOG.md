@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **采集目录认识外部系统指标来源**（配合 `wist-knowledge 0.9.2` / `wist-contracts 0.10.3`）：
+  `SOURCE_KINDS` 不再手抄，改为从契约的 `CollectionSourceKind` 取；
+  「active 单元必须有可采来源」的闸门改为**按能力分派**：
+  `collect_metrics` 额外接受 `KafkaCluster` / `MysqlInstance` / `PostgresInstance` / `DorisCluster`
+  （后四者的 `target` 只认 `auto`），`collect_logs` 仍只认文件 / 导出器 / 指标周期。
+  单元详情接口的 `executable` 标记同步按能力判定。
+- `FAMILIES` / `LINUX_ONLY_FAMILIES` 追加 `KafkaMetrics` / `PostgresMetrics` / `MysqlMetrics` /
+  `DorisMetrics`（与模型 `families.mju`、知识库 `[[families]]` 逐字一致）。
+
 ### 变更
 
 - 主机指标端点（`/api/v1/admin/agents/{id}/host-metrics` 与 `/host-metrics`）在注册表

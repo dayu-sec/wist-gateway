@@ -60,6 +60,11 @@ pub const FAMILIES: &[&str] = &[
     "BackupJob",
     "NetworkService",
     "TrafficInspection",
+    // 外部系统指标（端点由 agentd 自探；平台 linux）。
+    "KafkaMetrics",
+    "PostgresMetrics",
+    "MysqlMetrics",
+    "DorisMetrics",
 ];
 /// 只在 macOS 出现的面（照 `families.mju` 的分类）。**仅用于旧包回落**：
 /// 带 `[[families]]` 的包按词表里的 `platforms` 判，不看这里。
@@ -74,16 +79,51 @@ const LINUX_ONLY_FAMILIES: &[&str] = &[
     "BackupJob",
     "NetworkService",
     "TrafficInspection",
+    // 外部系统指标：自探读 /proc，只有 Linux。
+    "KafkaMetrics",
+    "PostgresMetrics",
+    "MysqlMetrics",
+    "DorisMetrics",
 ];
 /// 能力闭集。
 pub const CAPABILITIES: &[&str] = &["collect_logs", "collect_metrics"];
 /// 采集来源类型闭集（与模型 `variant CollectionSourceKind` 一致）。
-pub const SOURCE_KINDS: &[&str] = &[
-    "FileGlob",
-    "Exporter",
-    "UnifiedLogPredicate",
-    "MetricInterval",
-];
+/// 来源 kind 闭集：**直接复用契约词表**（与 agentd 同源）。
+///
+/// 以前这里是手抄的一份数组 —— 与 `MULTILINE_MODES` 同一次教训：
+/// 加一种 kind（如外部系统指标的 `KafkaCluster` / `MysqlInstance` /
+/// `PostgresInstance` / `DorisCluster`）只改契约一处，网关自动认识。
+pub fn is_known_source_kind(kind: &str) -> bool {
+    wist_contracts::work::CollectionSourceKind::parse(kind).is_some()
+}
+
+/// 这条来源在**这个采集能力**下，agentd 今天真能采吗？
+///
+/// 日志与指标的可执行词表不同：
+/// - `collect_logs`：契约的 [`is_executable_source`]（FileGlob / MetricInterval / Exporter…）；
+/// - `collect_metrics`：在上面基础上再认**外部系统**（Kafka / MySQL / PG / Doris），
+///   后四者的 `target` **只认 `auto`**（端点由 agentd 自探，不接受显式地址）。
+///
+/// 为什么不直接改契约的 `is_executable_source`：agentd 用它判断「这条来源能不能变成
+/// 一个日志输入」，把指标 kind 塞进去会让它把 Kafka/DB 当成文件去 tail。
+pub fn is_collectable_source(capability: &str, kind: &str, target: &str) -> bool {
+    if is_executable_source(kind, target) {
+        return true;
+    }
+    if capability != wist_contracts::work::capability::COLLECT_METRICS {
+        return false;
+    }
+    wist_contracts::work::CollectionSourceKind::parse(kind)
+        .is_some_and(|kind| kind.auto_target_only() && kind.accepts_target(target))
+}
+
+/// 可执行的来源 kind（用于报错文案）：与 [`is_known_source_kind`] 同一个词表。
+fn known_source_kinds() -> Vec<&'static str> {
+    wist_contracts::work::CollectionSourceKind::ALL
+        .into_iter()
+        .map(|kind| kind.as_str())
+        .collect()
+}
 /// 来源的读法闭集：**直接复用契约词表**（与 agentd `MultilineMode` 同源）。
 ///
 /// 以前这里是手抄的一份数组 —— 加一种读法（W4 的 `mysql_slow` / `postgres_csv`）
@@ -874,10 +914,11 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
         return Err(invalid(format!("unit {id}: no sources")));
     }
     for source in &unit.sources {
-        if !SOURCE_KINDS.contains(&source.kind.as_str()) {
+        if !is_known_source_kind(&source.kind) {
             return Err(invalid(format!(
-                "unit {id}: unknown source kind {:?}",
-                source.kind
+                "unit {id}: unknown source kind {:?} (allowed: {:?})",
+                source.kind,
+                known_source_kinds()
             )));
         }
         // 字面值 / `from_dir` **二选一**（fail-closed：两个都给说明策展没想清楚要采哪）。
@@ -1032,12 +1073,13 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
         && !unit
             .sources
             .iter()
-            .any(|source| is_executable_source(&source.kind, &source.target))
+            .any(|source| is_collectable_source(&unit.capability, &source.kind, &source.target))
     {
         return Err(invalid(format!(
             "unit {id}: status = active but no source agentd can collect \
-             (kind 要去 {EXECUTABLE_SOURCE_KINDS:?}；FileGlob 的 target 要是绝对路径 \
-             （显式路径或单层 glob，不支持 `**`）、Exporter 的 ID 要在 EXPORTER_IDS 里)"
+             (collect_logs：kind 要去 {EXECUTABLE_SOURCE_KINDS:?}，FileGlob 的 target 要是绝对路径、\
+             Exporter 的 ID 要在 EXPORTER_IDS 里；collect_metrics 额外接受 MetricInterval 与\
+             KafkaCluster / MysqlInstance / PostgresInstance / DorisCluster，后四者 target 只认 auto)"
         )));
     }
     Ok(())
@@ -2682,8 +2724,9 @@ target = "/var/log/x.log"
 
     #[test]
     fn linux_host_expands_the_collect_ready_families() {
-        // LinuxHost 模板（`linux-base` 包）10 个面全采集就绪：文件来源 + 导出器
-        // （含 W3 的内核日志 `journalctl-kernel`）+ 指标面。
+        // LinuxHost 模板（`linux-base` 包）11 个面全采集就绪：文件来源 + 导出器
+        // （含 W3 的内核日志 `journalctl-kernel`）+ 指标面 + Kafka 指标面
+        // （其余三个外部系统面是 draft，不会进这里）。
         // 别让「Linux 只能采指标」的旧状态悄悄回来。
         let set = load_content(
             &crate::test_support::knowledge_file("catalog.toml"),
@@ -2720,7 +2763,9 @@ target = "/var/log/x.log"
                 "RebootPower",
                 "KernelSystem",
                 "StorageHealth",
-                "HostMetrics"
+                "HostMetrics",
+                // 外部系统指标：Kafka 已验（active）；PG / MySQL / Doris 仍是 draft。
+                "KafkaMetrics"
             ]
         );
         assert_eq!(
@@ -2740,6 +2785,10 @@ target = "/var/log/x.log"
             vec![
                 "linux-container-stdout",
                 "linux-docker-container-stdout",
+                // 三个 draft 的外部系统单元：已进包，但派单闸门（status=active）不放行。
+                "linux-postgres-metrics",
+                "linux-mysql-metrics",
+                "linux-doris-metrics",
                 "linux-suricata-eve"
             ],
             "LinuxHost 只应排除事实门不成立的单元（容器根 / Suricata 输出）"

@@ -5,7 +5,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use wist_contracts::work::{ContainerFilters, is_executable_source};
+use wist_contracts::work::ContainerFilters;
+
+use crate::app::content::is_collectable_source;
 
 use super::{ApiState, admin_auth::require_admin_bearer, rate_limit};
 
@@ -174,7 +176,11 @@ pub async fn view_content(
                     exclude_globs: source.exclude_globs.clone(),
                     filters: source.filters.clone(),
                     drop_if_contains: source.drop_if_contains.clone(),
-                    executable: is_executable_source(&source.kind, &source.target),
+                    executable: is_collectable_source(
+                        &unit.capability,
+                        &source.kind,
+                        &source.target,
+                    ),
                 })
                 .collect();
             UnitView {
