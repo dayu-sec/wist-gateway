@@ -3,6 +3,15 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.40.4-alpha] - 2026-11-07
+
+### 修复
+
+- **`Cargo.toml` 的版本自 0.40.1 起就没再跟上 `version.txt`**：`gx adm` 只改
+  `version.txt`，而发版提交漏了 stage `Cargo.toml` —— 导致 `v0.40.3-alpha` 的二进制
+  `--version` 仍报 0.40.1（镜像 tag 却是 0.40.3）。本版补上并重新发一版。
+  （后续建议：CI 加一条「`cargo metadata` 版本 == `version.txt`」的闸门。）
+
 ## [0.40.3-alpha] - 2026-11-07
 
 ### 新增
