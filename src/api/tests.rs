@@ -9247,11 +9247,14 @@ async fn admin_investigation_dispatch_and_report_directory_round_trip() {
     env.config.data_plane_work_dir = Some(env._root.clone());
     let report_dir = env._root.join("data").join("ivsrep");
     std::fs::create_dir_all(&report_dir).expect("create report dir");
+    // 保留期是**相对现在**算的（默认 7 天）：写死时间戳会随墙钟过期，
+    // 让用例自己变红（本次发版就撞上了：固定 10-30）。
+    let observed_at = wist_shared::time::now_rfc3339();
     let body = serde_json::json!({
         "command_id": "cmd_prev",
         "topic": "disk",
         "report_schema": "wist.investigation.disk/v1",
-        "observed_at": "2026-10-30T10:00:05Z",
+        "observed_at": observed_at,
         "findings": [],
         "summary": { "ok": 3, "warn": 1, "fail": 0, "overall": "warn" },
         "verdict": "3 项正常 / 1 项警告 / 0 项失败"
@@ -9260,7 +9263,7 @@ async fn admin_investigation_dispatch_and_report_directory_round_trip() {
     let line = serde_json::json!({
         "schema": "v1",
         "agent": "agent-node-a",
-        "ts": "2026-10-30T10:00:05Z",
+        "ts": observed_at,
         "seq": 7,
         "body": body,
     })
@@ -9597,7 +9600,13 @@ async fn admin_investigation_reads_reports_from_a_configured_directory() {
         report_dir.join("agent-ivsrep.jsonl"),
         format!(
             "{}\n",
-            ivsrep_line("agent-node-a", 3, "cmd-abs", "2026-10-30T10:00:05Z")
+            // 同上：保留期是相对现在的，写死日期会过期。
+            ivsrep_line(
+                "agent-node-a",
+                3,
+                "cmd-abs",
+                &wist_shared::time::now_rfc3339()
+            )
         ),
     )
     .expect("write report");

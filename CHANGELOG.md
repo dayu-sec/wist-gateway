@@ -3,7 +3,7 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.40.3-alpha] - 2026-11-07
 
 ### 新增
 
@@ -15,6 +15,12 @@
   单元详情接口的 `executable` 标记同步按能力判定。
 - `FAMILIES` / `LINUX_ONLY_FAMILIES` 追加 `KafkaMetrics` / `PostgresMetrics` / `MysqlMetrics` /
   `DorisMetrics`（与模型 `families.mju`、知识库 `[[families]]` 逐字一致）。
+
+### 修复
+
+- **调查报告用例里的固定时间戳会随墙钟过期**（`ts = 2026-10-30`，而报告保留期默认 7 天）：
+  到期后 `admin_investigation_*` 两条用例会把「报告被保留期清掉」误报成红灯。
+  改用相对当前时间生成。
 
 ### 变更
 
