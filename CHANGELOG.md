@@ -3,6 +3,23 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.40.8-alpha] - 2026-11-08
+
+### 变更
+
+- **镜像构建不再走 QEMU**（docker job 从 13:49 → 预期 2~4 分钟）：`docker/Dockerfile`
+  的目标架构阶段里原来有两层 `RUN`（`apt-get install ca-certificates` 与 `useradd`），
+  `linux/arm64` 那一侧只能靠 QEMU 模拟，一次就是几分钟，而且没有构建缓存，
+  **每发一个 tag 就重付一次**。现在：
+  - 根证书在 `FROM --platform=$BUILDPLATFORM alpine:3` 阶段用 `apk` 装（原生架构，几秒），`COPY` 进最终镜像；
+  - 删掉没用的 `useradd`：栈的 compose 已钉 `user: "999:999"`，镜像改成同一数值
+    （`COPY --chown=999:999` + `USER 999:999`），以前那个 `wist` 系统用户根本没人用；
+  - 最终阶段不再有任何 `RUN`，因此 release 流水线也去掉了 `setup-qemu-action`；
+  - 加 `cache-from/to: type=gha`，基础镜像层不再每次重拉。
+
+  实测（本地 M2，同一 Dockerfile）：改前 amd64 152.9s / arm64 211.9s，其中
+  `RUN apt-get` 一层就 136.0s；改后双平台合计 52.5s，除 `apk` 外每层 0.1s。
+
 ## [0.40.7-alpha] - 2026-11-08
 
 ### 修复
