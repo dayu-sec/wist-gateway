@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "wist-gateway"
-version = "0.40.8"
+version = "0.40.9"
 dependencies = [
  "async-trait",
  "axum",

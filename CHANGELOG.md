@@ -3,6 +3,26 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.40.9-alpha] - 2026-11-08
+
+### 变更
+
+- **运行镜像换成 `distroless/base-debian13:nonroot`**（原 `ubuntu:24.04`）：压缩后
+  **38.2 MB → 19.2 MB**（本地实测）。为什么不用 debian12 / alpine：二进制是 glibc 动态链接，
+  最高需要 `GLIBC_2.38`，debian12 的 2.36 不够，alpine 是 musl 更不行。
+  - 镜像里**没有 shell**：gateway 的排障脚本（`show-wparse-state.sh` /
+    `diagnose-wparse-drift.sh`）都是 `docker exec` 到 **wparse** 容器，不受影响；
+    但直接 `docker exec --it wist-gateway sh` 现在会失败。
+  - 时区不受影响：栈的 compose 本来就挂 `TZ=:/etc/tz-runtime/localtime`，不依赖镜像内置 tzdata。
+- **镜像发布拆成每架构一个 job + manifest 合并**（原是 `--platform amd64,arm64` 一次构建）：
+  两个架构并行，每个 job 只下载自己的一份二进制（~25 MB 而不是 50 MB），一个架构失败
+  不再拖死另一个；最终 tag 由 `docker buildx imagetools create` 合并（与 Prometheus
+  官方发布流水线同形）。
+- `cache-to` 从 `mode=max` 改为 `mode=min`：单镜像只有三层，`max` 会把基础镜像层也导出到
+  gha cache（官方文档里 `preparing build cache for export … maximum timeout reached` 的成因）；
+  按架构分 scope，避免两个 job 互相覆盖。
+- `provenance: false`：合并 manifest 时不再多出 `unknown/unknown` 条目。
+
 ## [0.40.8-alpha] - 2026-11-08
 
 ### 变更

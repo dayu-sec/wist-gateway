@@ -48,30 +48,45 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # 2. 用 Linux 二进制构建并推送多架构 Docker 镜像（ghcr.io）
+  # 2. 用 Linux 二进制打包并推送**单平台**镜像（每架构一个 job，并行）
+  #
+  # 为什么不 `--platform linux/amd64,linux/arm64` 一次构建（Prometheus 官方发布流水线
+  # 也是拆开做的：每架构 build+push，最后 `docker buildx imagetools create` 合并）：
+  #   · 单次多平台构建是**串行**的，两个架构一个接一个；
+  #   · build context 里要同时放两份二进制（~50MB），一次传给 builder；
+  #   · 一个架构失败会拖死整条链；拆开 + `fail-fast: false` 时另一份照常产出。
+  # manifest list 由下面的 `manifest` job 合并。
   docker:
     needs: [build-binaries]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            platform: linux/arm64
+            target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/download-artifact@v8
         with:
-          pattern: wist-gateway-*-linux-gnu
+          name: wist-gateway-${{ matrix.target }}
           path: staged
-          merge-multiple: true
 
-      - name: Stage binaries for docker build
+      - name: Stage binary for docker build
         run: |
-          mkdir -p docker/amd64 docker/arm64
-          tar -xzf "staged/wist-gateway-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz" -C docker/amd64
-          tar -xzf "staged/wist-gateway-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz" -C docker/arm64
-          ls -R docker/amd64 docker/arm64
+          mkdir -p "docker/${{ matrix.arch }}"
+          tar -xzf "staged/wist-gateway-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C "docker/${{ matrix.arch }}"
+          ls -R "docker/${{ matrix.arch }}"
 
-      # 不需要 QEMU：Dockerfile 的目标架构阶段里没有任何 RUN（都在 $BUILDPLATFORM 跑）。
+      # 不需要 QEMU：Dockerfile 里没有任何 `RUN`（distroless 自带运行时依赖）。
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -82,32 +97,24 @@ jobs:
 
       # 国内镜像源（腾讯云 TCR）：国内服务器拉 ghcr.io 很慢，客户端改用 TCR 地址。
       # 凭据在 TCR 控制台生成（访问凭证），存 GitHub Secrets：TCR_USERNAME / TCR_PASSWORD。
+      # `TCR_HOST` 是个 **variable**（不是 secret）：换中转地域（如香港实例）只改这一个值，
+      # 不配时回落到现有境内实例，行为与以前一致。
       - name: Login to TCR
         uses: docker/login-action@v3
         with:
-          registry: dy-sec.tencentcloudcr.com
+          registry: ${{ vars.TCR_HOST || 'dy-sec.tencentcloudcr.com' }}
           username: ${{ secrets.TCR_USERNAME }}
           password: ${{ secrets.TCR_PASSWORD }}
 
+      # 单平台 tag 带架构后缀（`:v0.40.9-alpha-amd64`）；最终 tag 由 manifest job 合并出来。
       - name: Compute image tags
         id: meta
         run: |
-          # 预发布 tag（v0.1.3-alpha / -beta / -rc …）只推该 tag，**不覆盖 :latest**：
-          # 否则 :latest 会指向预发布产物，而 wist-gateway-stack 是按 :latest 拉镜像的。
-          # 注意 on.push.tags 的 `v*.*.*` 也会匹配 `v0.1.3-alpha`，不能指望触发条件区分。
-          # 两个源（ghcr / TCR）同进退。
-          ghcr="ghcr.io/${{ github.repository }}"
-          tcr="dy-sec.tencentcloudcr.com/cloud/wist-gateway"
-          tags="$(printf '%s\n%s' "$ghcr:${{ github.ref_name }}" "$tcr:${{ github.ref_name }}")"
-          case "${{ github.ref_name }}" in
-            *-*)
-              ;;
-            *)
-              tags="$(printf '%s\n%s' "$tags" "$ghcr:latest")"
-              tags="$(printf '%s\n%s' "$tags" "$tcr:latest")"
-              ;;
-          esac
-          printf 'tags<<__EOF__\n%s\n__EOF__\n' "$tags" >> "$GITHUB_OUTPUT"
+          tcr_host="${{ vars.TCR_HOST || 'dy-sec.tencentcloudcr.com' }}"
+          printf 'tags<<__EOF__\n%s\n%s\n__EOF__\n' \
+            "ghcr.io/${{ github.repository }}:${{ github.ref_name }}-${{ matrix.arch }}" \
+            "${tcr_host}/cloud/wist-gateway:${{ github.ref_name }}-${{ matrix.arch }}" \
+            >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -115,12 +122,65 @@ jobs:
           context: docker
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          platforms: linux/amd64,linux/arm64
-          # 缓存基础镜像层：没有它，每发一个 tag 都要重拉 ubuntu + 重跑所有层。
-          cache-from: type=gha,scope=wist-gateway
-          cache-to: type=gha,mode=max,scope=wist-gateway
+          platforms: ${{ matrix.platform }}
+          # 关掉 provenance：合并 manifest 时它只会多出 `unknown/unknown` 条目。
+          provenance: false
+          # `mode=min`（默认）：单镜像就三层，`max` 会把基础镜像层也导出到 gha cache，
+          # 官方文档里那种 `preparing build cache for export … maximum timeout reached`
+          # 就是这么撞出来的。按架构分 scope，避免两个 job 互相覆盖。
+          cache-from: type=gha,scope=wist-gateway-${{ matrix.arch }}
+          cache-to: type=gha,mode=min,scope=wist-gateway-${{ matrix.arch }}
 
-  # 3. 发布 tarball 到 GitHub Release
+  # 3. 把两个单平台镜像合并成 manifest list（最终 tag / latest 在这里产生）
+  manifest:
+    name: Merge manifest list
+    needs: [docker]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to TCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.TCR_HOST || 'dy-sec.tencentcloudcr.com' }}
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
+      - name: Create manifest lists
+        run: |
+          set -euo pipefail
+          ref="${{ github.ref_name }}"
+          tcr_host="${{ vars.TCR_HOST || 'dy-sec.tencentcloudcr.com' }}"
+
+          merge() {
+            local repo="$1"
+            docker buildx imagetools create -t "${repo}:${ref}" \
+              "${repo}:${ref}-amd64" "${repo}:${ref}-arm64"
+            # 预发布 tag（`-alpha` / `-beta` / `-rc`）**不覆盖 :latest**：
+            # 否则 :latest 会指向预发布产物。注意 on.push.tags 的 `v*.*.*`
+            # 也会匹配 `v0.1.3-alpha`，不能指望触发条件区分。
+            case "${ref}" in
+              *-*) ;;
+              *)
+                docker buildx imagetools create -t "${repo}:latest" \
+                  "${repo}:${ref}-amd64" "${repo}:${ref}-arm64"
+                ;;
+            esac
+          }
+
+          merge "ghcr.io/${{ github.repository }}"
+          merge "${tcr_host}/cloud/wist-gateway"
+
+  # 4. 发布 tarball 到 GitHub Release
   release:
     needs: [build-binaries]
     runs-on: ubuntu-24.04
