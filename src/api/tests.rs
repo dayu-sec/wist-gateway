@@ -14440,6 +14440,40 @@ async fn knowledge_record_reports_a_compatible_package() {
     assert_eq!(body["compatibility"]["status"], "ok");
 }
 
+// 预发布通道：包名里的版本带 `-alpha` / `-beta`，而 `compat.json` 声明的是**组件版本**
+// （= `version.txt`，不带后缀）。两者是同一份内容，不能报「身份不一致」——
+// 否则每个预发布包录入时都挂一条无关的 warn，把真正的兼容性问题淹掉。
+#[tokio::test]
+async fn a_prerelease_package_version_is_not_an_identity_mismatch() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let root = crate::test_support::unique_temp_dir("wist-knowledge-prerelease-identity");
+    // 包内目录名是 `wist-knowledge-9.9.9-test`；compat.json 写的是核心版本 `9.9.9`。
+    let tarball = crate::test_support::knowledge_package_tarball_with_compat(
+        &root,
+        false,
+        Some(r#"{"component":"wist-knowledge","version":"9.9.9"}"#),
+    );
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages",
+        &serde_json::json!({
+            "source": tarball.to_string_lossy(),
+            "sha256": crate::infra::bytes_sha256_hex(
+                &std::fs::read(&tarball).expect("read tarball")
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(
+        body["compatibility"]["status"], "ok",
+        "预发布后缀不该算身份不一致：{}",
+        body["compatibility"]
+    );
+}
+
 #[tokio::test]
 async fn knowledge_activation_rechecks_compatibility() {
     let env = TestEnv::new().await;

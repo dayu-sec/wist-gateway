@@ -3,6 +3,16 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.40.7-alpha] - 2026-11-08
+
+### 修复
+
+- **预发布知识包不再挂一条无关的“身份不一致”警告**：`wist-release` 升到 0.6.2，
+  `compat.json` 的 `version`（组件版本，= `version.txt`）与包版本（tag，带 `-alpha` / `-beta`）
+  只比数字核心。之前每个 `-alpha` 包录入时 `compatibility.status` 都是 `warn`，
+  报「`compat.json` 自报 version 是 `0.9.3`，与包的版本 `0.9.3-alpha` 不一致」——不影响安装，
+  但会把真正的兼容性问题淹掉。
+
 ## [0.40.6-alpha] - 2026-11-08
 
 ### 变更
