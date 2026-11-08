@@ -3,6 +3,17 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.40.10-alpha] - 2026-11-08
+
+### 修复
+
+- **0.40.9 的镜像起不来**（容器无重启，退出码 `127`）：
+  `error while loading shared libraries: libgcc_s.so.1: cannot open shared object file`。
+  Rust 产物动态链接了 `libgcc_s.so.1`（panic 展开用），而 `distroless/**base**-debian13`
+  不含它。改用 **`cc`** 变体（实测只大 1.1 MB：压缩后 20.3 vs 19.2 MB）。
+  - 误判原因：发布前用**从 0.40.7 镜像里提取的旧二进制**做的本地验证，那个没依赖
+    libgcc；CI 新构建的产物有。已把“必须用 cc 而不是 base”写进 Dockerfile 注释。
+
 ## [0.40.9-alpha] - 2026-11-08
 
 ### 变更

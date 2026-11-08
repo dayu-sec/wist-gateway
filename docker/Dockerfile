@@ -12,17 +12,20 @@
 #   只能靠 QEMU 模拟（一次 `apt-get` 就是几分钟，而且没有缓存，每发一个 tag 重付一次）。
 #   需要执行的东西要么在 CI 上做完（二进制就是），要么挑自带依赖的基础镜像。
 #
-# 为什么是 distroless **base**/debian13（而不是 cc / debian12 / alpine）：
+# 为什么是 distroless **cc**/debian13（而不是 base / debian12 / alpine）：
 #   · 二进制是 **glibc 动态链接**（`-unknown-linux-gnu`），最高需要 `GLIBC_2.38`；
 #     debian12 的 2.36 不够，alpine 是 musl 更不行，debian13 的 glibc 2.41 满足。
-#   · 用 `base` 而不是 `cc`：我们不链 C++ 运行时，`cc` 那层白带 ~40MB。
-#   · `base` 自带 ca-certificates（走 rustls 只需要这一份根证书），因此
-#     不需要 apt/apk，镜像里也一个 `RUN` 都不需要。
+#   · **必须是 `cc` 而不是 `base`**：Rust 产物动态链接了 `libgcc_s.so.1`（panic 展开用），
+#     `base` 变体不含它 —— 容器起来就是
+#     `error while loading shared libraries: libgcc_s.so.1`（退出码 127，无限重启）。
+#     实测 `cc` 只比 `base` 大 1.1 MB（压缩后 20.3 vs 19.2 MB），不值得为省这点去静态链接 libgcc。
+#   · `cc` 自带 ca-certificates（走 rustls 只需要这一份根证书），因此不需要 apt/apk，
+#     镜像里也一个 `RUN` 都不需要。
 #   · 代价：**镜像里没有 shell**。gateway 的排障脚本（`show-wparse-state.sh` /
 #     `diagnose-wparse-drift.sh`）都 `docker exec` 到 **wparse** 容器，不是这个镜像。
 # ===========================================================================
 
-FROM gcr.io/distroless/base-debian13:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot
 
 ARG TARGETARCH
 
