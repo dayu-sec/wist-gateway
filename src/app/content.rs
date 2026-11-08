@@ -78,8 +78,8 @@ const LINUX_ONLY_FAMILIES: &[&str] = &[
     "BackupJob",
     "NetworkService",
     "TrafficInspection",
-    // 外部系统指标：自探读 /proc，只有 Linux。
-    "DatabaseMetrics",
+    // 外部系统指标：自探读 /proc（macOS 已支持，见 `platforms` 词表；
+    // 这个常量只用于**旧包回落**，带 `[[families]]` 的包不看它）。
     "MessageQueueMetrics",
 ];
 /// 能力闭集。
@@ -147,6 +147,10 @@ pub const MATCH_KINDS: &[&str] = &[
     "not_path_exists",
     "device",
     "service",
+    // 容器名：`container:postgres` 命中本机跑着名字/镜像含 postgres 的容器。
+    // 为什么需要：macOS 上的库跑在 Docker 的 Linux VM 里，宿主既没有它的进程，
+    // 发布端口也常常落在临时端口段（`>= 32768`，不进 `port:` 事实）。
+    "container",
     "resource",
     // 跨 kind 的 OR：`any:port:5432|path_exists:/var/log/postgresql`。
     // 为什么需要：多条条件是 **AND**，`|` 只在同一 kind 内做 OR ——
@@ -1819,6 +1823,9 @@ fn eval_condition(condition: &Condition, facts: &StoredAgentFactSummary) -> Trut
     let haystack: &[String] = match condition.kind.as_str() {
         // 已装包清单：探针没实现时**恒空** → 空表示“没采”，不是“没装”。
         "installed" => &facts.packages,
+        // 容器名（含镜像名里的关键词）：由容器探针压进摘要。
+        // 空表 = 没采到（没 Docker / 旧 agentd）→ 下面统一按“无法判定”。
+        "container" => &facts.container_names,
         // 设备 / 服务单元 / 资源量：摘要里**没有**这些事实 → 恒为“无法判定”。
         "device" | "service" | "resource" => return Truth::Unknown,
         // 未知 kind 也按“无法判定”，不冒充否定。
@@ -2813,18 +2820,28 @@ target = "/var/log/x.log"
                 .collect::<Vec<_>>()
         );
 
-        // 三个 DB 单元是 draft：面在包里，但派单闸门（status=active）不放行。
+        // 三个 DB 单元自知识包 0.9.5 起是 active，且 `match` 为空（在 `linux-datastore` 包里）：
+        // 它们应该**被展开**，而不是躺在 `excluded_units` 里。
+        let selected: Vec<&str> = expansion
+            .works
+            .iter()
+            .filter(|work| work.family == "DatabaseMetrics")
+            .flat_map(|work| work.selected_units.iter().map(String::as_str))
+            .collect();
         for unit_id in [
             "linux-postgres-metrics",
             "linux-mysql-metrics",
             "linux-doris-metrics",
         ] {
-            let excluded = expansion
-                .excluded_units
-                .iter()
-                .find(|unit| unit.unit_id == unit_id)
-                .unwrap_or_else(|| panic!("{unit_id} 应在 excluded_units 里"));
-            assert_eq!(excluded.reason_code, "collect_not_ready", "{unit_id}");
+            assert!(
+                selected.contains(&unit_id),
+                "{unit_id} 应被展开；实际 selected={selected:?}，excluded={:?}",
+                expansion
+                    .excluded_units
+                    .iter()
+                    .map(|unit| (&unit.unit_id, &unit.reason_code))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
@@ -2988,6 +3005,98 @@ target = "/var/log/x.log"
         );
     }
 
+    /// macOS 数据库指标：**只在该机真的有库时**才展开。
+    ///
+    /// 三个单元都靠 `match` 门控（`port:<默认端口>` 或 Homebrew 数据目录）——
+    /// `macos-dev` 是开发机大包，不门控会把“没装库”的机器也派上活，
+    /// 采集结果就会恒为「没有目标」。
+    #[test]
+    fn macos_database_metrics_expand_only_when_the_host_has_one() {
+        let set = load_content(
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
+        )
+        .expect("load checked-in content");
+
+        let metrics_units = |facts: &StoredAgentFactSummary| -> Vec<String> {
+            // 单元声明了 `min_agentd_version = 0.30.0`：模拟一台已升级的 agent。
+            let sources = crate::app::log_source::SourceContext {
+                agent_version: Some("0.30.0"),
+                ..Default::default()
+            };
+            let expansion = set.expand("macos-dev", facts, sources).expect("expand");
+            expansion
+                .works
+                .iter()
+                .filter(|work| work.family == "DatabaseMetrics")
+                .flat_map(|work| work.selected_units.iter().cloned())
+                .collect()
+        };
+
+        // 1) 什么都没装、端口也不在：一个指标单元都不该选中。
+        let mut bare = facts("macos", &[]);
+        bare.probed_paths = vec!["/opt/homebrew/var/mysql".to_string()];
+        assert!(
+            metrics_units(&bare).is_empty(),
+            "没有库的 Mac 不该被派数据库指标"
+        );
+
+        // 2) Homebrew 的 MySQL 数据目录在 → 只选 MySQL。
+        let mut mysql = facts("macos", &[]);
+        mysql.probed_paths = vec!["/opt/homebrew/var/mysql".to_string()];
+        mysql.present_paths = vec!["/opt/homebrew/var/mysql".to_string()];
+        assert_eq!(metrics_units(&mysql), vec!["mac-mysql-metrics".to_string()]);
+
+        // 3) 端口在听（装在非标准目录也用得上同一个单元）。
+        let mut pg = facts("macos", &[]);
+        pg.listen_ports = vec!["tcp:5432".to_string()];
+        assert_eq!(metrics_units(&pg), vec!["mac-postgres-metrics".to_string()]);
+
+        // 4) 容器里的库（macOS 最主流的现场）：宿主看不到进程，但容器名能被看见；
+        //    发布端口常落在临时端口段（不进 `port:` 事实），所以靠 `container:` 门控。
+        let mut docker = facts("macos", &[]);
+        docker.container_names = vec!["pg-probe-test".to_string()];
+        assert_eq!(
+            metrics_units(&docker),
+            vec!["mac-postgres-metrics".to_string()],
+            "容器名里有 pg 就该选中（否则 Docker 里的库永远被门控挡掉）"
+        );
+
+        // 个人机（MacDaily）不带这个面：包边界保证不会把开发机的采集推到普通机器上。
+        let daily = set
+            .expand(
+                "macos-daily",
+                &mysql,
+                crate::app::log_source::SourceContext {
+                    agent_version: Some("0.30.0"),
+                    ..Default::default()
+                },
+            )
+            .expect("expand");
+        assert!(
+            daily
+                .works
+                .iter()
+                .all(|work| work.family != "DatabaseMetrics"),
+            "MacDaily 不应带上数据库指标面"
+        );
+
+        // 路径白名单：新增单元的 `path_exists` 必须进探测名单（否则事实永远无法判定），
+        // 且不能把日志面原有的路径挤掉。
+        let probed = set.probe_paths_for_platform("macos");
+        for path in [
+            "/opt/homebrew/var/mysql",
+            "/opt/homebrew/var/postgresql@16",
+            "/opt/homebrew/var/log",
+        ] {
+            assert!(
+                probed.iter().any(|entry| entry == path),
+                "macOS 探测名单应包含 {path}；实际：{probed:?}"
+            );
+        }
+    }
+
     #[test]
     fn path_exists_is_three_state_and_needs_probing() {
         let expr = "path_exists:/var/log/sudo.log";
@@ -3040,6 +3149,66 @@ target = "/var/log/x.log"
         assert_eq!(
             eval_match(expr, &facts_with(&[], &["/var/log/sudo.log"])),
             Truth::Unknown
+        );
+    }
+
+    /// `container:` 读的是容器名（事实摘要里的 `container_names`）。
+    ///
+    /// 为什么需要这个 kind：macOS 上的库跑在 Docker 的 Linux VM 里，宿主没有它的进程，
+    /// 发布端口又常常落在临时端口段（`>= 32768`，不进 `port:` 事实）—— 不靠容器名就说不了
+    /// 「这台机器上有 postgres」。
+    #[test]
+    fn container_match_is_three_state_and_uses_container_names() {
+        assert!(
+            MATCH_KINDS.contains(&"container"),
+            "装载期校验必须认得这个 kind，否则目录里的条件会被静默丢掉"
+        );
+        let facts_with = |names: &[&str]| StoredAgentFactSummary {
+            container_names: names.iter().map(|value| value.to_string()).collect(),
+            ..Default::default()
+        };
+
+        // 没采到（没 Docker / 旧 agentd）→ 无法判定，不是「没有」。
+        assert_eq!(
+            eval_match("container:postgres", &facts_with(&[])),
+            Truth::Unknown
+        );
+        // 采到了但没有匹配的容器 → 不满足。
+        assert_eq!(
+            eval_match("container:postgres", &facts_with(&["nginx", "redis"])),
+            Truth::No
+        );
+        // 子串匹配：「pg-probe-test」不等于 postgres；所以目录里两个关键词都写。
+        assert_eq!(
+            eval_match("container:postgres", &facts_with(&["pg-probe-test"])),
+            Truth::No
+        );
+        assert_eq!(
+            eval_match("container:pg", &facts_with(&["pg-probe-test"])),
+            Truth::Yes
+        );
+        assert_eq!(
+            eval_match(
+                "container:postgres",
+                &facts_with(&["pg-probe-test", "postgres-main"])
+            ),
+            Truth::Yes
+        );
+        // 与 `any:` 跨 kind 组合：容器没命中、但路径也没探 → 无法判定。
+        assert_eq!(
+            eval_match(
+                "any:container:postgres|path_exists:/opt/homebrew/var/postgres",
+                &facts_with(&[])
+            ),
+            Truth::Unknown
+        );
+        // 容器命中 → `any:` 直接成立（命中优先于「无法判定」）。
+        assert_eq!(
+            eval_match(
+                "any:container:postgres|path_exists:/opt/homebrew/var/postgres",
+                &facts_with(&["postgres-main"])
+            ),
+            Truth::Yes
         );
     }
 
