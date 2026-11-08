@@ -158,6 +158,7 @@ codes! {
     PACKAGE_CONTENT_INVALID => "package_content_invalid",
     PACKAGE_INCOMPATIBLE => "package_incompatible",
     PACKAGE_MANIFEST_INCONSISTENT => "package_manifest_inconsistent",
+    PACKAGE_MATURITY_NOT_ALLOWED => "package_maturity_not_allowed",
     PACKAGE_NOT_FOUND => "package_not_found",
     PACKAGE_SHA256_MISMATCH => "package_sha256_mismatch",
     PACKAGE_SIGNATURE_INVALID => "package_signature_invalid",

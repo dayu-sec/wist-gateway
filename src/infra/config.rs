@@ -179,6 +179,9 @@ pub struct AdminConfig {
     /// 只在管理面**没有可用生效包**时启用 —— 出厂初始包放这里；它自己不可用也只告警回落，
     /// 绝不把网关挡在启动之外（见 [`crate::app::knowledge::LoadedKnowledge::resolve`]）。
     pub knowledge_source_dir: Option<PathBuf>,
+    /// 允许的知识包成熟度（`experimental` / `preview` / `stable` / `unknown`）。
+    /// 缺省 `["stable", "unknown"]`，见 [`RawKnowledgeConfig::allowed_maturity`]。
+    pub knowledge_allowed_maturity: Vec<String>,
     /// 知识库内容包的签名公钥文件（Ed25519 SPKI PEM）。`None` = 不验签（只记 sha256）。
     pub knowledge_signing_public_key_file: Option<PathBuf>,
     /// 上面那个文件解析出的**裸公钥**（32 字节）。验签用它，省得每次重解 PEM。
@@ -275,6 +278,12 @@ struct RawKnowledgeConfig {
     /// **故意不做存在性校验**：配了却读不到只告警回落，不能反过来把网关挡在启动之外。
     #[serde(default)]
     source_dir: Option<String>,
+    /// 允许录入 / 激活的知识包**成熟度**（打包侧 `manifest.maturity`）。
+    ///
+    /// 缺省 `["stable", "unknown"]`：`unknown` 是给**没有该字段的旧包**留的，
+    /// 不放行的话升级网关后连旧包都录不进来。收紧成只认 `stable`，就把 `unknown` 去掉。
+    #[serde(default)]
+    allowed_maturity: Option<Vec<String>>,
 }
 
 /// `[ingest]` 段：数据面（warp-parse）**订阅端**的内部接入端点。
@@ -376,6 +385,18 @@ pub fn default_allowed_source_roots() -> Vec<String> {
     ["/var/log", "/data", "/srv", "/opt"]
         .iter()
         .map(|root| (*root).to_string())
+        .collect()
+}
+
+/// `[knowledge] allowed_maturity` 缺省值：`stable` + `unknown`。
+///
+/// `unknown` 专给**没有 `maturity` 字段的旧包**（0.9.2 及更早）：一上来只认 `stable`，
+/// 会让存量现场升级网关后连已有的旧包都无法重新录入。要收紧就显式写配置，
+/// 让“旧包被拒”是一个**有意的动作**而不是默认行为。
+pub fn default_knowledge_allowed_maturity() -> Vec<String> {
+    ["stable", "unknown"]
+        .iter()
+        .map(|maturity| (*maturity).to_string())
         .collect()
 }
 
@@ -564,6 +585,23 @@ impl AdminConfig {
                 .transpose()?,
         )
         .map(|value| absolutize_path(config_dir, Path::new(&value)));
+        let knowledge_allowed_maturity = {
+            let values = raw
+                .knowledge
+                .allowed_maturity
+                .unwrap_or_else(default_knowledge_allowed_maturity);
+            for value in &values {
+                if !matches!(
+                    value.as_str(),
+                    "stable" | "preview" | "experimental" | "unknown"
+                ) {
+                    return Err(config_validation(format!(
+                        "knowledge.allowed_maturity: 不认识 {value:?}（只认 stable / preview / experimental / unknown）"
+                    )));
+                }
+            }
+            values
+        };
         require_non_empty("server.admin_api_token", &admin_api_token)?;
         require_min_secret_length(
             "server.admin_api_token",
@@ -718,6 +756,7 @@ impl AdminConfig {
                 })?
             },
             knowledge_source_dir,
+            knowledge_allowed_maturity,
             knowledge_signing_public_key_file,
             knowledge_signing_public_key,
             metrics_labels: raw.agent.metrics_labels,
@@ -1413,6 +1452,7 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         investigation_report_dir: None,
         allowed_source_roots: default_allowed_source_roots(),
         knowledge_source_dir: None,
+        knowledge_allowed_maturity: default_knowledge_allowed_maturity(),
         knowledge_signing_public_key_file: None,
         knowledge_signing_public_key: None,
         metrics_labels: std::collections::BTreeMap::new(),
@@ -2352,6 +2392,35 @@ environment_id = "env-default"
         ));
         let config = AdminConfig::load_from_path(&path).expect("blank source_dir loads as unset");
         assert!(config.knowledge_source_dir.is_none());
+    }
+
+    /// 知识包成熟度策略：缺省 `stable` + `unknown`（后者给没有该字段的旧包），
+    /// 可收紧；写错值启动即拒 —— 它是装载闸门，含糊接受比拦下来更糟。
+    #[test]
+    fn knowledge_allowed_maturity_defaults_and_rejects_typos() {
+        let path = write_temp_config(&config_with_purpose(""));
+        let config = AdminConfig::load_from_path(&path).expect("load config");
+        assert_eq!(
+            config.knowledge_allowed_maturity,
+            vec!["stable".to_string(), "unknown".to_string()]
+        );
+
+        let path = write_temp_config(&format!(
+            "[knowledge]\nallowed_maturity = [\"stable\"]\n\n{}",
+            config_with_purpose("")
+        ));
+        let config = AdminConfig::load_from_path(&path).expect("load config");
+        assert_eq!(
+            config.knowledge_allowed_maturity,
+            vec!["stable".to_string()]
+        );
+
+        let path = write_temp_config(&format!(
+            "[knowledge]\nallowed_maturity = [\"alpha\"]\n\n{}",
+            config_with_purpose("")
+        ));
+        let err = AdminConfig::load_from_path(&path).expect_err("bogus value must be refused");
+        assert!(err.to_string().contains("allowed_maturity"), "{err}");
     }
 
     #[test]

@@ -3,6 +3,23 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布] - 2026-11-08
+
+### 新增
+
+- **知识包成熟度闸门（`[knowledge] allowed_maturity`）**：录入包时校验包内 `manifest.json`
+  的 `maturity`（`wist-knowledge` 打包侧按 tag 通道写入：`-alpha`=experimental /
+  `-beta`=preview / 无后缀=stable）。
+  - 不在允许列表 → **409 `package_maturity_not_allowed`**（包本身合法，是策略不允许）；
+  - `maturity` 写错值 → 422 `package_manifest_inconsistent`（是包自己的错）；
+  - 缺省 `["stable", "unknown"]`：`unknown` 给**没有该字段的旧包**（0.9.2 及更早），
+    否则升级网关后连旧包都录不进来。要收紧就在配置里显式写。
+
+### 修复
+
+- `Cargo.lock` 里 `wist-gateway` 的版本停在 `0.40.2`（与 `Cargo.toml` 的 `0.40.4` 不一致），
+  随手更新 —— 否则 `--locked` 构建会因自身版本漂移而失败。
+
 ## [0.40.4-alpha] - 2026-11-07
 
 ### 修复

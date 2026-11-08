@@ -164,7 +164,9 @@ pub(super) fn record_error_response(err: KnowledgeRecordError) -> Response {
         KnowledgeRecordError::ManifestInconsistent(_)
         | KnowledgeRecordError::ContentInvalid(_)
         | KnowledgeRecordError::SignatureInvalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
-        KnowledgeRecordError::Compatibility(_) => StatusCode::CONFLICT,
+        KnowledgeRecordError::Compatibility(_) | KnowledgeRecordError::MaturityNotAllowed(_) => {
+            StatusCode::CONFLICT
+        }
         KnowledgeRecordError::SourceUnavailable(_) => StatusCode::BAD_GATEWAY,
         KnowledgeRecordError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };

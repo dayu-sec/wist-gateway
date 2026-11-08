@@ -10061,6 +10061,7 @@ impl TestEnv {
             admin_api_token_hash: sha256_hex(TEST_ADMIN_API_TOKEN),
             self_face_allow: Vec::new(),
             allowed_source_roots: crate::infra::config::default_allowed_source_roots(),
+            knowledge_allowed_maturity: crate::infra::config::default_knowledge_allowed_maturity(),
             bootstrap_token_ttl_seconds: 900,
             credential_ttl_seconds: 30 * 24 * 60 * 60,
             store_file,

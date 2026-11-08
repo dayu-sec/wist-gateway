@@ -327,6 +327,8 @@ pub enum KnowledgeRecordError {
     SignatureInvalid(String),
     /// 包的 `compat.json` 声明与当前网关不兼容。
     Compatibility(String),
+    /// 包的成熟度（`manifest.maturity`）不在 `[knowledge] allowed_maturity` 里。
+    MaturityNotAllowed(String),
     /// 落库失败。
     Store(String),
 }
@@ -342,6 +344,7 @@ impl KnowledgeRecordError {
             Self::ContentInvalid(_) => "package_content_invalid",
             Self::SignatureInvalid(_) => "package_signature_invalid",
             Self::Compatibility(_) => "package_incompatible",
+            Self::MaturityNotAllowed(_) => "package_maturity_not_allowed",
             Self::Store(_) => "package_store_failed",
         }
     }
@@ -357,6 +360,7 @@ impl fmt::Display for KnowledgeRecordError {
             | Self::ContentInvalid(message)
             | Self::SignatureInvalid(message)
             | Self::Compatibility(message)
+            | Self::MaturityNotAllowed(message)
             | Self::Store(message) => f.write_str(message),
         }
     }
@@ -385,6 +389,23 @@ struct PackageManifest {
     version: String,
     content_versions: serde_json::Map<String, serde_json::Value>,
     files: std::collections::BTreeMap<String, String>,
+    /// 包成熟度（打包侧按 tag 通道写入：`-alpha`=experimental / `-beta`=preview / 无后缀=stable）。
+    /// **旧包没有这个字段** → `None`，按 `unknown` 处理。
+    maturity: Option<String>,
+}
+
+/// 包成熟度的有效值：`manifest.maturity` 缺省（旧包）按 `unknown` 处理。
+///
+/// 写错值（如 `alpha`）是包自己的错，归 `manifest_inconsistent`；
+/// “这个成熟度现在能不能装”是网关策略，归 `maturity_not_allowed`。
+fn effective_maturity(declared: Option<&str>) -> Result<&str, KnowledgeRecordError> {
+    match declared {
+        None => Ok("unknown"),
+        Some(value @ ("experimental" | "preview" | "stable")) => Ok(value),
+        Some(other) => Err(KnowledgeRecordError::ManifestInconsistent(format!(
+            "manifest.json 的 maturity 只能是 experimental / preview / stable（当前：{other}）"
+        ))),
+    }
 }
 
 /// 校验链（设计 §5.4）：拉字节 → 摘要 → 解到**临时目录** → 逐条核对 → manifest 自洽
@@ -468,6 +489,23 @@ pub async fn record_package(
             return Err(err);
         }
     };
+
+    // 成熟度闸门：包自报的 `maturity` 必须落在 `[knowledge] allowed_maturity` 里。
+    // 缺省允许 `stable` + `unknown` —— `unknown` 是给没有该字段的旧包留的，
+    // 否则升级网关后连已有的旧包都录不进来。
+    let maturity = effective_maturity(validated.manifest.maturity.as_deref())?;
+    if !config
+        .knowledge_allowed_maturity
+        .iter()
+        .any(|allowed| allowed == maturity)
+    {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(KnowledgeRecordError::MaturityNotAllowed(format!(
+            "知识包成熟度是 {maturity}，当前网关只允许 {:?}。\
+             -alpha / -beta 包先在测试环境验证；确要装，就改 `[knowledge] allowed_maturity`",
+            config.knowledge_allowed_maturity
+        )));
+    }
 
     // 兼容性：包内 `compat.json` 的 `requires`（上游，如 `wist-gateway`）不满足当前节点时，
     // 默认拒绝录入，并明确提示“先升级当前节点”。没有声明 → 不阻止（页面显示 unknown）。
@@ -798,6 +836,24 @@ mod tests {
                 .unwrap_or_else(|err| panic!("copy {name}: {err}"));
         }
         dir
+    }
+
+    /// 旧包没有 `maturity` 字段 —— 一律按 `unknown`，由网关策略决定放不放。
+    #[test]
+    fn legacy_packages_without_maturity_are_unknown() {
+        assert_eq!(effective_maturity(None).expect("legacy"), "unknown");
+        assert_eq!(
+            effective_maturity(Some("preview")).expect("preview"),
+            "preview"
+        );
+    }
+
+    /// 写错值（如 `alpha`）是**包自己的错**（manifest），不是“策略不允许”——两者错误码不同：
+    /// 前者让发布侧修包，后者让运维改配置。
+    #[test]
+    fn a_bogus_maturity_is_a_manifest_problem() {
+        let err = effective_maturity(Some("alpha")).expect_err("bogus value");
+        assert_eq!(err.code(), "package_manifest_inconsistent");
     }
 
     #[test]
