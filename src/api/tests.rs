@@ -4708,6 +4708,11 @@ async fn the_work_view_exposes_the_agents_local_work_report() {
                 path: "/var/log/system.log".to_string(),
                 startup_position: "tail".to_string(),
             }],
+            collection: Some(wist_contracts::local_work::AgentLocalCollection {
+                status: wist_contracts::local_work::collection_status::FAILED.to_string(),
+                observed_at: "2026-09-26T08:00:02Z".to_string(),
+                detail: "/var/log/system.log: source path does not exist".to_string(),
+            }),
         }],
         one_shot: Vec::new(),
         local_inputs: vec![wist_contracts::local_work::AgentLocalTask {
@@ -4753,6 +4758,19 @@ async fn the_work_view_exposes_the_agents_local_work_report() {
     );
     assert_eq!(view["local"]["local_inputs"][0]["path"], "/var/log/app.log");
     assert_eq!(view["local"]["metrics_interval_seconds"], 15);
+    // 采集结果：网关只透传，但必须完整落库/回读（页面靠它回答「到底采成没采成」）。
+    assert_eq!(
+        view["local"]["standing"][0]["collection"]["status"],
+        "failed"
+    );
+    assert_eq!(
+        view["local"]["standing"][0]["collection"]["observed_at"],
+        "2026-09-26T08:00:02Z"
+    );
+    assert_eq!(
+        view["local"]["standing"][0]["collection"]["detail"],
+        "/var/log/system.log: source path does not exist"
+    );
 }
 
 /// 上报实际生效的上送状态后，运行状态响应能逐个字段读到它。

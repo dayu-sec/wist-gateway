@@ -3,6 +3,21 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.40.11-alpha] - 2026-11-08
+
+### 新增
+
+- **Agent 采集结果可见**：接受并透传 agentd 上报的 `local.standing[].collection`（采集状态 +
+  原因 + 观测时间），「Agent 工作」页可直接看到每个采集面到底采成没采成。依赖
+  `wist-contracts 0.10.4`。
+  - **升级顺序**：先升 gateway，再升 agentd（旧网关不认识新字段会拒收整份状态上报）。
+
+### 变更
+
+- **采集面闭集删除四个已废弃的指标面**：`KafkaMetrics` / `PostgresMetrics` /
+  `MysqlMetrics` / `DorisMetrics`。它们自 0.9.3 起已无单元、且确认没有历史数据，
+  与知识库 0.9.4 同步删除；旧知识包不再能激活包含这些面的内容。
+
 ## [0.40.10-alpha] - 2026-11-08
 
 ### 修复

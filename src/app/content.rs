@@ -64,11 +64,6 @@ pub const FAMILIES: &[&str] = &[
     // 粒度是**领域**（要看见什么），产品差异在单元与 `CollectionSourceKind`。
     "DatabaseMetrics",
     "MessageQueueMetrics",
-    // 已废弃（0.9.3 起无单元）：保留仅为历史数据可解释与词表追加式校验。
-    "KafkaMetrics",
-    "PostgresMetrics",
-    "MysqlMetrics",
-    "DorisMetrics",
 ];
 /// 只在 macOS 出现的面（照 `families.mju` 的分类）。**仅用于旧包回落**：
 /// 带 `[[families]]` 的包按词表里的 `platforms` 判，不看这里。
@@ -86,11 +81,6 @@ const LINUX_ONLY_FAMILIES: &[&str] = &[
     // 外部系统指标：自探读 /proc，只有 Linux。
     "DatabaseMetrics",
     "MessageQueueMetrics",
-    // 已废弃（0.9.3 起无单元）。
-    "KafkaMetrics",
-    "PostgresMetrics",
-    "MysqlMetrics",
-    "DorisMetrics",
 ];
 /// 能力闭集。
 pub const CAPABILITIES: &[&str] = &["collect_logs", "collect_metrics"];

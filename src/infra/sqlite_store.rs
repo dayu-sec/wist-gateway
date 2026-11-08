@@ -4455,6 +4455,7 @@ mod tests {
                     path: "/var/log/system.log".to_string(),
                     startup_position: "tail".to_string(),
                 }],
+                collection: None,
             }],
             one_shot: Vec::new(),
             // 本机手工加的输入：不在 work.json 里，但也是「在采的文件」。
