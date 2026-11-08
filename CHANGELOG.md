@@ -3,6 +3,15 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布] - 2026-11-08
+
+### 变更
+
+- **采集面词表加两个领域面**：`DatabaseMetrics` / `MessageQueueMetrics`（对应 `wist-knowledge`
+  0.9.3 的指标面收敛）。目的是让「模型 ↔ 网关常量 ↔ 知识库词表」三处保持一致。
+  运行期仍以知识库的 `[[families]]` 为准，本常量只作旧包回落。
+  四个旧面（`KafkaMetrics` / `PostgresMetrics` / `MysqlMetrics` / `DorisMetrics`）保留在词表里（已废弃、无单元）。
+
 ## [0.40.5-alpha] - 2026-11-08
 
 ### 新增

@@ -61,6 +61,10 @@ pub const FAMILIES: &[&str] = &[
     "NetworkService",
     "TrafficInspection",
     // 外部系统指标（端点由 agentd 自探；平台 linux）。
+    // 粒度是**领域**（要看见什么），产品差异在单元与 `CollectionSourceKind`。
+    "DatabaseMetrics",
+    "MessageQueueMetrics",
+    // 已废弃（0.9.3 起无单元）：保留仅为历史数据可解释与词表追加式校验。
     "KafkaMetrics",
     "PostgresMetrics",
     "MysqlMetrics",
@@ -80,6 +84,9 @@ const LINUX_ONLY_FAMILIES: &[&str] = &[
     "NetworkService",
     "TrafficInspection",
     // 外部系统指标：自探读 /proc，只有 Linux。
+    "DatabaseMetrics",
+    "MessageQueueMetrics",
+    // 已废弃（0.9.3 起无单元）。
     "KafkaMetrics",
     "PostgresMetrics",
     "MysqlMetrics",
@@ -2724,10 +2731,9 @@ target = "/var/log/x.log"
 
     #[test]
     fn linux_host_expands_the_collect_ready_families() {
-        // LinuxHost 模板（`linux-base` 包）11 个面全采集就绪：文件来源 + 导出器
-        // （含 W3 的内核日志 `journalctl-kernel`）+ 指标面 + Kafka 指标面
-        // （其余三个外部系统面是 draft，不会进这里）。
-        // 别让「Linux 只能采指标」的旧状态悄悄回来。
+        // LinuxHost 模板（`linux-base` 包）不包含**外部系统指标**面：
+        // 数据库 / 消息队列指标是目的相关的（要 root 读别人的 `/proc`），在
+        // `linux-datastore` / `linux-messaging` 里，只随 `LinuxData` 展开。
         let set = load_content(
             &crate::test_support::knowledge_file("catalog.toml"),
             &crate::test_support::knowledge_file("packs.toml"),
@@ -2764,8 +2770,6 @@ target = "/var/log/x.log"
                 "KernelSystem",
                 "StorageHealth",
                 "HostMetrics",
-                // 外部系统指标：Kafka 已验（active）；PG / MySQL / Doris 仍是 draft。
-                "KafkaMetrics"
             ]
         );
         assert_eq!(
@@ -2785,14 +2789,53 @@ target = "/var/log/x.log"
             vec![
                 "linux-container-stdout",
                 "linux-docker-container-stdout",
-                // 三个 draft 的外部系统单元：已进包，但派单闸门（status=active）不放行。
-                "linux-postgres-metrics",
-                "linux-mysql-metrics",
-                "linux-doris-metrics",
                 "linux-suricata-eve"
             ],
             "LinuxHost 只应排除事实门不成立的单元（容器根 / Suricata 输出）"
         );
+    }
+
+    #[test]
+    fn linux_data_expands_database_and_message_queue_metrics() {
+        // 外部系统指标跟着**目的**走：只有 `linux-data`（`linux-datastore` +
+        // `linux-messaging`）才展开。这是把四个指标单元从 `linux-base` 移出的直接后果。
+        let set = load_content(
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
+        )
+        .expect("load checked-in content");
+        let expansion = set
+            .expand("linux-data", &facts("linux", &[]), Default::default())
+            .expect("expand");
+
+        // Kafka 单元是 active，`target = auto` + `match` 空 → 直接展开。
+        assert!(
+            expansion
+                .works
+                .iter()
+                .any(|work| work.family == "MessageQueueMetrics"),
+            "linux-data 应展开 MessageQueueMetrics；实际：{:?}",
+            expansion
+                .works
+                .iter()
+                .map(|work| work.family.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // 三个 DB 单元是 draft：面在包里，但派单闸门（status=active）不放行。
+        for unit_id in [
+            "linux-postgres-metrics",
+            "linux-mysql-metrics",
+            "linux-doris-metrics",
+        ] {
+            let excluded = expansion
+                .excluded_units
+                .iter()
+                .find(|unit| unit.unit_id == unit_id)
+                .unwrap_or_else(|| panic!("{unit_id} 应在 excluded_units 里"));
+            assert_eq!(excluded.reason_code, "collect_not_ready", "{unit_id}");
+        }
     }
 
     /// 流量检测：**事实门与来源必须是同一个路径**，且是部署契约里的
