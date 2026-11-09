@@ -22,10 +22,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use wist_control::AgentRuntimeStatus;
+use wist_contracts::work::WorkSpec;
 use wist_control::types::DateTime;
+use wist_control::{AgentCollectionEntry, AgentDataManifest, AgentDataSource, AgentRuntimeStatus};
 
-use crate::infra::AgentQuery;
+use crate::infra::{AgentQuery, StoreError, StoredAgentRegistration};
 
 use super::error::ApiError;
 use super::{ApiState, rate_limit};
@@ -91,31 +92,107 @@ async fn gateway_agents(
 ) -> Result<GatewayAgentsReport, crate::infra::StoreError> {
     let agents = state.store.list_agents(&AgentQuery::default()).await?;
     let now = DateTime::now();
+    let mut views = Vec::with_capacity(agents.len());
+    for agent in &agents {
+        views.push(AgentRuntimeStatus {
+            agent_id: agent.agent_id.clone(),
+            instance_id: agent.instance_id.clone(),
+            version: agent.version.clone(),
+            status: if super::overview::agent_is_online(&agent.last_seen_at, &now) {
+                "online".to_string()
+            } else {
+                "offline".to_string()
+            },
+            health: "healthy".to_string(),
+            last_seen_at: DateTime::from_rfc3339(&agent.last_seen_at).unwrap_or_else(DateTime::now),
+            memory_bytes: agent.last_memory_bytes.map(|value| value as i64),
+            cpu_percent: agent.last_cpu_percent,
+            admin_latency_ms: agent.last_admin_latency_ms.map(|value| value as i64),
+            node_id: non_empty(&agent.node_id),
+            hostname: non_empty(&agent.hostname),
+            ip_addresses: (!agent.ip_addresses.is_empty()).then(|| agent.ip_addresses.clone()),
+            data_manifest: Some(agent_data_manifest(state, agent).await?),
+        });
+    }
     Ok(GatewayAgentsReport {
         gateway_id: gateway_id.to_string(),
-        agents: agents
-            .iter()
-            .map(|agent| AgentRuntimeStatus {
-                agent_id: agent.agent_id.clone(),
-                instance_id: agent.instance_id.clone(),
-                version: agent.version.clone(),
-                status: if super::overview::agent_is_online(&agent.last_seen_at, &now) {
-                    "online".to_string()
-                } else {
-                    "offline".to_string()
-                },
-                health: "healthy".to_string(),
-                last_seen_at: DateTime::from_rfc3339(&agent.last_seen_at)
-                    .unwrap_or_else(DateTime::now),
-                memory_bytes: agent.last_memory_bytes.map(|value| value as i64),
-                cpu_percent: agent.last_cpu_percent,
-                admin_latency_ms: agent.last_admin_latency_ms.map(|value| value as i64),
-                node_id: non_empty(&agent.node_id),
-                hostname: non_empty(&agent.hostname),
-                ip_addresses: (!agent.ip_addresses.is_empty()).then(|| agent.ip_addresses.clone()),
-            })
-            .collect(),
+        agents: views,
     })
+}
+
+/// 数据清单里最多带多少份调查报告（摘要，按新 → 旧）。
+///
+/// 与网关自己的「调查报告」页（最近 50 条）不同：上报给中心的是**清单**，
+/// 中心只用来回答「这台机器有哪些调查数据」；正文仍留在网关按需读取。
+const MANIFEST_MAX_INVESTIGATIONS: usize = 20;
+
+/// 生成一台 Agent 的**数据清单**（采集授权 + 调查数据）。
+///
+/// 采集侧：网关注册表里的常驻工作（期望）+ agentd 上报的 `local_work`（实测）按 `work_id` 对齐；
+/// 调查侧：网关本机报告目录里的摘要，口径与调查报告列表页一致。
+async fn agent_data_manifest(
+    state: &ApiState,
+    agent: &StoredAgentRegistration,
+) -> Result<AgentDataManifest, StoreError> {
+    let works = state.store.list_standing_work(&agent.agent_id).await?;
+    let local = agent.local_work.as_ref();
+    let collection = works
+        .iter()
+        // 撤回与被取代的历史版本不进清单：清单答的是「现在被授权采集什么」。
+        .filter(|work| work.status == "active" || work.status == "paused")
+        .map(|work| {
+            let local_work = local.and_then(|local| {
+                local
+                    .standing
+                    .iter()
+                    .find(|entry| entry.work_id == work.work_id)
+            });
+            let collection = local_work.and_then(|entry| entry.collection.as_ref());
+            AgentCollectionEntry {
+                family: work.family.clone(),
+                work_id: work.work_id.clone(),
+                status: work.status.clone(),
+                plan_version: work.plan_version,
+                acknowledged_version: local_work.and_then(|entry| entry.acknowledged_version),
+                collection_status: collection.map(|value| value.status.clone()),
+                // 空说明不是信息：`ok` 的 detail 是空串，统一折成 `null`。
+                collection_detail: collection
+                    .map(|value| value.detail.clone())
+                    .filter(|detail| !detail.is_empty()),
+                inputs: spec_sources(&work.spec),
+            }
+        })
+        .collect();
+    Ok(AgentDataManifest {
+        collected_at: DateTime::now(),
+        collection,
+        investigations: crate::api::investigations::manifest_entries(
+            state,
+            &agent.agent_id,
+            MANIFEST_MAX_INVESTIGATIONS,
+        ),
+    })
+}
+
+/// 从常驻工作的 `spec` 里抽出「采什么」：来源类型 + 目标（去重保序）。
+///
+/// spec 是网关自己物化出来的，解析失败说明库里有一份损坏的工作 —— 那是网关自己的
+/// 不变式问题：清单只跳过它，不因此让整份机队上报失败。
+fn spec_sources(spec: &str) -> Vec<AgentDataSource> {
+    let Ok(spec) = WorkSpec::parse(spec) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut sources = Vec::new();
+    for source in spec.units.into_iter().flat_map(|unit| unit.sources) {
+        if seen.insert((source.kind.clone(), source.target.clone())) {
+            sources.push(AgentDataSource {
+                kind: source.kind,
+                target: source.target,
+            });
+        }
+    }
+    sources
 }
 
 /// 空串不是身份：统一折成 `None`（中心侧落库也保持 `NULL`，不写 `''`）。
@@ -147,6 +224,23 @@ mod tests {
                 node_id: Some("node-1".into()),
                 hostname: Some("host-1".into()),
                 ip_addresses: Some(vec!["en0 192.168.1.5/24".into()]),
+                data_manifest: Some(AgentDataManifest {
+                    collected_at: DateTime::now(),
+                    collection: vec![AgentCollectionEntry {
+                        family: "HostMetrics".into(),
+                        work_id: "work-1".into(),
+                        status: "active".into(),
+                        plan_version: 2,
+                        acknowledged_version: Some(2),
+                        collection_status: Some("ok".into()),
+                        collection_detail: None,
+                        inputs: vec![AgentDataSource {
+                            kind: "MetricInterval".into(),
+                            target: "15s".into(),
+                        }],
+                    }],
+                    investigations: Vec::new(),
+                }),
             }],
         };
         let value: serde_json::Value = serde_json::to_value(&report).expect("serialize");
@@ -171,6 +265,7 @@ mod tests {
                 "admin_latency_ms",
                 "agent_id",
                 "cpu_percent",
+                "data_manifest",
                 "health",
                 "hostname",
                 "instance_id",
@@ -182,6 +277,12 @@ mod tests {
                 "version",
             ]
         );
+        let manifest = &value["agents"][0]["data_manifest"];
+        assert_eq!(manifest["collection"][0]["family"], "HostMetrics");
+        assert_eq!(
+            manifest["collection"][0]["inputs"][0]["kind"],
+            "MetricInterval"
+        );
     }
 
     /// 空串不是身份：`""` → `null`，中心页才不会显示一台“没有名字的机器”。
@@ -190,5 +291,29 @@ mod tests {
         assert_eq!(non_empty(""), None);
         assert_eq!(non_empty("   "), None);
         assert_eq!(non_empty(" host-1 "), Some("host-1".to_string()));
+    }
+
+    /// 清单里的来源从工作 `spec` 里抽：去重（同源只留一条）且保持顺序。
+    #[test]
+    fn spec_sources_dedupes_kind_and_target() {
+        let spec = r#"{"units":[
+            {"unit_id":"u1","capability":"collect_logs","rule_ref":"r1",
+             "requires_privilege":"none",
+             "sources":[{"kind":"FileGlob","target":"/var/log/a.log"},
+                        {"kind":"FileGlob","target":"/var/log/b.log"}]},
+            {"unit_id":"u2","capability":"collect_logs","rule_ref":"r2",
+             "requires_privilege":"none",
+             "sources":[{"kind":"FileGlob","target":"/var/log/a.log"}]}
+        ]}"#;
+        let sources = spec_sources(spec);
+        assert_eq!(sources.len(), 2, "同源只留一条：{sources:?}");
+        assert_eq!(sources[0].target, "/var/log/a.log");
+        assert_eq!(sources[1].target, "/var/log/b.log");
+    }
+
+    /// 损坏的 spec 不让整份机队上报失败：清单里这一条就是空来源。
+    #[test]
+    fn broken_spec_yields_no_sources() {
+        assert!(spec_sources("not-json").is_empty());
     }
 }

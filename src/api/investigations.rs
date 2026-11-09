@@ -55,6 +55,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use wist_contracts::capability_report::InvestigationCapabilities;
+use wist_control::AgentInvestigationEntry;
+use wist_control::types::DateTime;
 
 use super::admin_auth::{admin_actor, require_admin_bearer};
 use super::admin_ops::agent_not_found_response;
@@ -1018,6 +1020,49 @@ fn load_agent_reports(
         .filter(|report| within_retention(&report.view.observed_at, retention_days, now))
         .map(|report| report.view)
         .collect())
+}
+
+/// 数据清单里的**调查数据**段：最近 `limit` 份报告的摘要（新 → 旧）。
+///
+/// 与 `GET /api/v1/admin/agents/{id}/investigations` 的 `reports` **同一读法**（同一目录、
+/// 同一保留期、同一 `command_id` 去重），只是裁剪成上报契约（不带正文）。
+/// 目录没配 / 读不出来 → 空表 + 日志：**不把「读不到」伪装成「没有」**。
+pub(super) fn manifest_entries(
+    state: &ApiState,
+    agent_id: &str,
+    limit: usize,
+) -> Vec<AgentInvestigationEntry> {
+    let Some(dir) = report_dir(state) else {
+        return Vec::new();
+    };
+    let retention_days = state.config.investigation_report_retention_days;
+    match load_agent_reports(&dir, agent_id, retention_days, chrono::Utc::now()) {
+        Ok(reports) => reports
+            .into_iter()
+            .take(limit)
+            .map(|report| AgentInvestigationEntry {
+                command_id: report.command_id,
+                topic: report.topic,
+                observed_at: DateTime::from_rfc3339(&report.observed_at)
+                    .unwrap_or_else(DateTime::now),
+                overall: report.overall,
+                verdict: report.verdict,
+                findings_ok: report.findings_ok as i64,
+                findings_warn: report.findings_warn as i64,
+                findings_fail: report.findings_fail as i64,
+                findings_unknown: report.findings_unknown as i64,
+                judged: report.judged,
+            })
+            .collect(),
+        Err(err) => {
+            log::warn!(
+                "event=AgentManifestReportsUnreadable agent_id={} dir={} detail=\"{err}\"",
+                agent_id,
+                dir.display()
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// 找一份指定 `command_id` 的报告正文。

@@ -17195,6 +17195,8 @@ async fn gateway_agents_lists_the_fleet_over_a_loopback_socket() {
         "node_id",
         "hostname",
         "ip_addresses",
+        // 数据清单：网关每台都派生一份（空表 ≠ 缺字段）。
+        "data_manifest",
     ] {
         assert!(agents[0].get(key).is_some(), "missing key {key}: {body}");
     }
@@ -17215,6 +17217,129 @@ async fn gateway_agents_lists_the_fleet_over_a_loopback_socket() {
     assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
 
     server.abort();
+}
+
+/// 数据清单（端到端）：授权来自网关自己的台账，实测来自 agentd 既有心跳，
+/// 调查数据来自网关报告目录；环回面把三段拼成 `data_manifest`。
+#[tokio::test]
+async fn gateway_agents_report_the_data_manifest_end_to_end() {
+    let mut env = env_with_enrolled_agent().await;
+    let agent_id = "agent-node-a";
+    let work_id = "work-agent-node-a-HostMetrics";
+
+    // 1) 授权：网关自己的 `standing_work` 台账（不是 agentd 上报）。
+    env.store
+        .save_standing_work(&wist_contracts::work::StandingWork {
+            work_id: work_id.to_string(),
+            agent_id: agent_id.to_string(),
+            family: "HostMetrics".to_string(),
+            spec: r#"{"units":[{"unit_id":"mac-metrics","capability":"collect_metrics","rule_ref":"mac/metrics","requires_privilege":"none","sources":[{"kind":"MetricInterval","target":"15s"}]}]}"#.to_string(),
+            catalog_version: 1,
+            proposal_id: None,
+            plan_version: 2,
+            effective_from: "2026-01-01T00:00:00Z".to_string(),
+            status: "active".to_string(),
+            updated_by: "admin".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("save standing work");
+
+    // 2) 实测：agentd 既有的 3s 心跳里的 `local_work`（没有新增上报通道）。
+    let local_work = wist_contracts::local_work::AgentLocalWork {
+        recorded_at: "2026-01-01T00:00:03Z".to_string(),
+        gateway_sequence: 1,
+        standing: vec![wist_contracts::local_work::AgentLocalStandingWork {
+            work_id: work_id.to_string(),
+            family: "HostMetrics".to_string(),
+            status: "active".to_string(),
+            plan_version: 2,
+            acknowledged_version: Some(2),
+            effective_from: "2026-01-01T00:00:00Z".to_string(),
+            tasks: vec![wist_contracts::local_work::AgentLocalTask {
+                input_id: "work-HostMetrics-metrics".to_string(),
+                path: "/var/lib/node_exporter".to_string(),
+                startup_position: "tail".to_string(),
+            }],
+            collection: Some(wist_contracts::local_work::AgentLocalCollection {
+                status: "degraded".to_string(),
+                observed_at: "2026-01-01T00:00:03Z".to_string(),
+                detail: "1/2 sources failed".to_string(),
+            }),
+        }],
+        one_shot: Vec::new(),
+        local_inputs: Vec::new(),
+        metrics_interval_seconds: None,
+    };
+    let status = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(agent_id),
+        &serde_json::json!({
+            "agent_id": agent_id,
+            "instance_id": "node-a",
+            "version": "0.4.0",
+            "local_work": local_work,
+        }),
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::ACCEPTED);
+
+    // 3) 调查数据：报告目录里的一份 IVSREP。
+    env.config.data_plane_work_dir = Some(env._root.clone());
+    let report_dir = env._root.join("data").join("ivsrep");
+    std::fs::create_dir_all(&report_dir).expect("create report dir");
+    let observed_at = wist_shared::time::now_rfc3339();
+    let body = serde_json::json!({
+        "command_id": "cmd-disk",
+        "topic": "disk",
+        "observed_at": observed_at,
+        "findings": [],
+        "summary": { "ok": 3, "warn": 1, "fail": 0, "overall": "warn" },
+        "verdict": "3 项正常 / 1 项警告"
+    })
+    .to_string();
+    let line = serde_json::json!({
+        "schema": "v1",
+        "agent": agent_id,
+        "ts": observed_at,
+        "seq": 7,
+        "body": body,
+    })
+    .to_string();
+    std::fs::write(report_dir.join("agent-ivsrep.jsonl"), format!("{line}\n"))
+        .expect("write report");
+
+    // 4) 环回面读出拼接后的清单。
+    let (addr, server) = spawn_gateway_on_loopback(&env).await;
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/gateway/agents?gateway_id=gw-1"
+        ))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value = response.json().await.expect("json");
+    server.abort();
+
+    let manifest = &json["agents"][0]["data_manifest"];
+    let collection = &manifest["collection"][0];
+    assert_eq!(collection["family"], "HostMetrics");
+    assert_eq!(collection["work_id"], work_id);
+    assert_eq!(collection["status"], "active");
+    assert_eq!(collection["plan_version"], 2);
+    assert_eq!(collection["acknowledged_version"], 2);
+    assert_eq!(collection["collection_status"], "degraded");
+    assert_eq!(collection["collection_detail"], "1/2 sources failed");
+    assert_eq!(collection["inputs"][0]["kind"], "MetricInterval");
+    assert_eq!(collection["inputs"][0]["target"], "15s");
+    let investigation = &manifest["investigations"][0];
+    assert_eq!(investigation["command_id"], "cmd-disk");
+    assert_eq!(investigation["topic"], "disk");
+    assert_eq!(investigation["overall"], "warn");
+    assert_eq!(investigation["findings_warn"], 1);
 }
 
 /// 非环回 / 取不到 peer 一律拒绝（fail-closed）—— 与自述面 / agent-package 同一护栏。

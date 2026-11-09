@@ -3,6 +3,20 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.42.0-alpha] - 2026-11-09
+
+### 新增
+
+- **环回「Agent 明细」面带数据清单**：`GET /api/v1/gateway/agents` 每台 agent 增加
+  `data_manifest` —— 采集授权（面 / 版本 / 实测结论 / 来源）与调查数据（报告摘要）。
+  授权来自网关自己的 `standing_work` 台账，实测来自 agentd 既有状态心跳，调查来自网关
+  报告目录；中心「Agent 状态」页据此回答“这台机器上有什么数据”。
+
+### 兼容性
+
+- 加性字段：旧 gwlinkd 解析时直接忽略（`AgentRuntimeStatus` 没有 `deny_unknown_fields`），
+  旧中心也不受影响。要让清单到达中心，需要 gwlinkd ≥ 0.21.0（负责转报）。
+
 ## [0.41.0-alpha] - 2026-11-09
 
 ### 新增
