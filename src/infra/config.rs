@@ -180,7 +180,10 @@ pub struct AdminConfig {
     /// 绝不把网关挡在启动之外（见 [`crate::app::knowledge::LoadedKnowledge::resolve`]）。
     pub knowledge_source_dir: Option<PathBuf>,
     /// 允许的知识包成熟度（`experimental` / `preview` / `stable` / `unknown`）。
-    /// 缺省 `["stable", "unknown"]`，见 [`RawKnowledgeConfig::allowed_maturity`]。
+    ///
+    /// 装载期已把发布通道名归一成规范值（`alpha` → `experimental`、`beta` → `preview`），
+    /// 所以这里只会出现 manifest 认识的那四个值。缺省 `["stable", "unknown"]`，
+    /// 见 [`RawKnowledgeConfig::allowed_maturity`]。
     pub knowledge_allowed_maturity: Vec<String>,
     /// 知识库内容包的签名公钥文件（Ed25519 SPKI PEM）。`None` = 不验签（只记 sha256）。
     pub knowledge_signing_public_key_file: Option<PathBuf>,
@@ -279,6 +282,11 @@ struct RawKnowledgeConfig {
     #[serde(default)]
     source_dir: Option<String>,
     /// 允许录入 / 激活的知识包**成熟度**（打包侧 `manifest.maturity`）。
+    ///
+    /// 写法有两种，都在装载期归一成 manifest 的规范值：
+    /// - 规范值：`stable` / `preview` / `experimental` / `unknown`；
+    /// - 发布通道名：`beta` = `preview`、`alpha` = `experimental` —— 运维按 tag 通道说话，
+    ///   没必要在配置里再翻译一次。
     ///
     /// 缺省 `["stable", "unknown"]`：`unknown` 是给**没有该字段的旧包**留的，
     /// 不放行的话升级网关后连旧包都录不进来。收紧成只认 `stable`，就把 `unknown` 去掉。
@@ -398,6 +406,36 @@ pub fn default_knowledge_allowed_maturity() -> Vec<String> {
         .iter()
         .map(|maturity| (*maturity).to_string())
         .collect()
+}
+
+/// 把一个成熟度配置项归一成 `manifest.json` 的规范值。
+///
+/// 配置是**人写的**（运维按发布通道说 `-alpha` / `-beta`），manifest 是**机器写的**
+/// （只有 `experimental` / `preview`）。两种写法都认，闸门只跟规范值比 —— 否则同一个语义
+/// 要人在配置里手动翻译一次，写错就是一次启动失败。
+fn canonical_knowledge_maturity(value: &str) -> Result<&'static str, ConfigError> {
+    match value.trim() {
+        "alpha" | "experimental" => Ok("experimental"),
+        "beta" | "preview" => Ok("preview"),
+        "stable" => Ok("stable"),
+        "unknown" => Ok("unknown"),
+        other => Err(config_validation(format!(
+            "knowledge.allowed_maturity: 不认识 {other:?}（只认 stable / preview（或 beta）/ experimental（或 alpha）/ unknown）"
+        ))),
+    }
+}
+
+/// 归一 + 去重（`beta,preview` 这种别名与规范名混写会让白名单出现重复项）。
+/// 写错值启动即拒：它是装载闸门，含糊接受比拦下来更糟。
+fn normalize_knowledge_allowed_maturity(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
+    let mut normalized: Vec<String> = Vec::with_capacity(values.len());
+    for value in &values {
+        let canonical = canonical_knowledge_maturity(value)?;
+        if !normalized.iter().any(|seen| seen == canonical) {
+            normalized.push(canonical.to_string());
+        }
+    }
+    Ok(normalized)
 }
 
 /// `[store]` 段。缺省（旧配置无此段）时回退到本地 SQLite 文件。
@@ -585,23 +623,11 @@ impl AdminConfig {
                 .transpose()?,
         )
         .map(|value| absolutize_path(config_dir, Path::new(&value)));
-        let knowledge_allowed_maturity = {
-            let values = raw
-                .knowledge
+        let knowledge_allowed_maturity = normalize_knowledge_allowed_maturity(
+            raw.knowledge
                 .allowed_maturity
-                .unwrap_or_else(default_knowledge_allowed_maturity);
-            for value in &values {
-                if !matches!(
-                    value.as_str(),
-                    "stable" | "preview" | "experimental" | "unknown"
-                ) {
-                    return Err(config_validation(format!(
-                        "knowledge.allowed_maturity: 不认识 {value:?}（只认 stable / preview / experimental / unknown）"
-                    )));
-                }
-            }
-            values
-        };
+                .unwrap_or_else(default_knowledge_allowed_maturity),
+        )?;
         require_non_empty("server.admin_api_token", &admin_api_token)?;
         require_min_secret_length(
             "server.admin_api_token",
@@ -2395,7 +2421,7 @@ environment_id = "env-default"
     }
 
     /// 知识包成熟度策略：缺省 `stable` + `unknown`（后者给没有该字段的旧包），
-    /// 可收紧；写错值启动即拒 —— 它是装载闸门，含糊接受比拦下来更糟。
+    /// 可收紧；发布通道名（`alpha` / `beta`）归一成规范值；写错值启动即拒。
     #[test]
     fn knowledge_allowed_maturity_defaults_and_rejects_typos() {
         let path = write_temp_config(&config_with_purpose(""));
@@ -2415,8 +2441,34 @@ environment_id = "env-default"
             vec!["stable".to_string()]
         );
 
+        // 通道名与规范名等价：`-alpha` 包自报 `experimental`，`-beta` 包自报 `preview`。
         let path = write_temp_config(&format!(
-            "[knowledge]\nallowed_maturity = [\"alpha\"]\n\n{}",
+            "[knowledge]\nallowed_maturity = [\"stable\", \"beta\", \"alpha\"]\n\n{}",
+            config_with_purpose("")
+        ));
+        let config = AdminConfig::load_from_path(&path).expect("channel names load");
+        assert_eq!(
+            config.knowledge_allowed_maturity,
+            vec![
+                "stable".to_string(),
+                "preview".to_string(),
+                "experimental".to_string()
+            ]
+        );
+
+        // 别名与规范名同时出现时归一后去重（否则白名单里两个 `preview`）。
+        let path = write_temp_config(&format!(
+            "[knowledge]\nallowed_maturity = [\"beta\", \"preview\", \" experimental \"]\n\n{}",
+            config_with_purpose("")
+        ));
+        let config = AdminConfig::load_from_path(&path).expect("aliases dedupe");
+        assert_eq!(
+            config.knowledge_allowed_maturity,
+            vec!["preview".to_string(), "experimental".to_string()]
+        );
+
+        let path = write_temp_config(&format!(
+            "[knowledge]\nallowed_maturity = [\"nightly\"]\n\n{}",
             config_with_purpose("")
         ));
         let err = AdminConfig::load_from_path(&path).expect_err("bogus value must be refused");

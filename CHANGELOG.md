@@ -3,6 +3,23 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.41.0-alpha] - 2026-11-09
+
+### 新增
+
+- **采集目录支持 `container:` 匹配条件**：采集单元可以按「本机跑着哪些容器」门控
+  （命中容器名或镜像名里的关键词，如 `container:postgres`）。macOS 上库/中间件跑在
+  Docker 的 Linux VM 里，宿主既看不到它的进程、发布端口也常落在临时端口段 —— 这条条件让
+  数据库指标这类采集面在容器现场能正确展开。需要 agentd ≥ 0.30.0 上报容器名；旧 agent
+  只是让该条件「无法判定」（单元不展开），不会误判成「不满足」。
+
+### 变更
+
+- **`[knowledge] allowed_maturity` 认发布通道名**：`alpha` = `experimental`、`beta` = `preview`，
+  装载期归一成 `manifest.json` 的规范值并去重（`beta,preview` 不会变成两条 `preview`）。
+  规范值写法保持兼容，未知值仍然拒绝。以前写 `alpha` 会让网关**启动即拒**，与打包侧
+  按 tag 写 `maturity` 的命名对不上。
+
 ## [0.40.11-alpha] - 2026-11-08
 
 ### 新增

@@ -502,7 +502,8 @@ pub async fn record_package(
         let _ = std::fs::remove_dir_all(&staging);
         return Err(KnowledgeRecordError::MaturityNotAllowed(format!(
             "知识包成熟度是 {maturity}，当前网关只允许 {:?}。\
-             -alpha / -beta 包先在测试环境验证；确要装，就改 `[knowledge] allowed_maturity`",
+             -alpha / -beta 包先在测试环境验证；确要装，就把 experimental（或 alpha）/ \
+             preview（或 beta）加进 `[knowledge] allowed_maturity`",
             config.knowledge_allowed_maturity
         )));
     }
