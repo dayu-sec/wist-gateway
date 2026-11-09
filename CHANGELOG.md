@@ -3,6 +3,29 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.43.0-alpha] - 2026-11-10
+
+### 新增
+
+- **中心下发调查（gateway-plane 端点）**：`POST /api/v1/gateway/agents/{agent_id}/investigations`
+  （环回-only，由 gwlinkd 转发）。与 admin 端点**同一个内核**，差别只有三件：
+  `command_id` 可由中心传入、同 id 重试幂等（200）、同 agent 在飞时 409。
+- **机队视图带上调查任务状态**：`GET /api/v1/gateway/agents` 每台 agent 多一个
+  `investigations[]`（最多 3 条 / 7 天，新 → 旧）。状态来自 agentd 已有的心跳回执，
+  不新增拉取通道。
+
+### 修复 / 约束
+
+- 带 `command_id` 的调用**不再静默取代**同 kind 未确认命令（取代会让先发的永不执行，
+  而中心的回执却说「已受理」）；改用 G4 在飞闸。admin 端点行为不变。
+- 新增错误码：`investigation_command_conflict`、`investigation_in_flight`、
+  `gateway_investigation_loopback_only`。
+
+### 兼容性
+
+- 依赖 `wist-control 0.21`（`AgentRuntimeStatus.investigations`）。
+- admin 调查端点、报告目录读、授权面完全不变。
+
 ## [0.42.0-alpha] - 2026-11-09
 
 ### 新增

@@ -9375,6 +9375,146 @@ async fn admin_investigation_dispatch_and_report_directory_round_trip() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+/// 中心下发通道（gateway-plane）：环回限定 + 中心铸号 + 幂等 + 在飞闸。
+///
+/// 这四条都是与 admin 端点的**差别**所在：admin 自己铸号、可被连点取代；
+/// 中心那条 id 要贯通到报告与证据库，所以不能静默取代，只能幂等或 409。
+#[tokio::test]
+async fn gateway_plane_investigation_is_loopback_idempotent_and_serialized() {
+    let mut env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, "agent-node-a", &["disk"], true).await;
+    let response = put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    env.config.data_plane_work_dir = Some(env._root.clone());
+
+    let uri = "/api/v1/gateway/agents/agent-node-a/investigations";
+    let loopback = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 40_000)));
+    let body = serde_json::json!({
+        "command_id": "cmd_center_1",
+        "topic": "disk",
+        "requested_by": "center:alice",
+    });
+
+    // 1) 非环回：拒绝 —— 这条通道只给同机 gwlinkd。
+    let response = post_loopback_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(std::net::SocketAddr::from(([10, 0, 0, 7], 40_000))),
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // 2) 环回：202 + 原样回带中心铸的号，命令行用的是它（不再自己铸）。
+    let response =
+        post_loopback_to_router(&env.config, &env.store_handle, uri, loopback, &body).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let receipt: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(receipt["command_id"], "cmd_center_1");
+    assert_eq!(receipt["topic"], "disk");
+    assert_eq!(receipt["requested_by"], "center:alice");
+    let stored = env
+        .store
+        .get_agent_command("cmd_center_1")
+        .await
+        .expect("store")
+        .expect("command exists");
+    assert_eq!(stored.kind, "investigate");
+    assert_eq!(stored.agent_id, "agent-node-a");
+
+    // 3) 幂等：同 id 同参二次到达 → 200（不是 409），且不新增第二行。
+    let response =
+        post_loopback_to_router(&env.config, &env.store_handle, uri, loopback, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replay: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(replay["command_id"], "cmd_center_1", "重放要回带同一个 id");
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 8)
+        .await
+        .expect("pending commands");
+    assert_eq!(pending.len(), 1, "幂等重试不得入第二行");
+    // 重放不能再记一次“发起次数”：额度拦的是连点，不是重试。
+    let count = env
+        .store
+        .count_agent_commands_since("agent-node-a", "investigate", 0)
+        .await
+        .expect("count");
+    assert_eq!(count, 1, "幂等重放不得重复计入配额");
+
+    // 4) 同 id 不同参 → 409（一个 id 不能有两个答案）。
+    let mut conflicting = body.clone();
+    conflicting["topic"] = serde_json::json!("load");
+    let response =
+        post_loopback_to_router(&env.config, &env.store_handle, uri, loopback, &conflicting).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(error["error"]["code"], "investigation_command_conflict");
+
+    // 5) 在飞闸：新 id 但上一次还没回执 → 409（不取代、不排队）。
+    let response = post_loopback_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        loopback,
+        &serde_json::json!({ "command_id": "cmd_center_2", "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(error["error"]["code"], "investigation_in_flight");
+
+    // 6) 非法 id：带 `/` 会被当成路径分隔符，直接 400。
+    let response = post_loopback_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        loopback,
+        &serde_json::json!({ "command_id": "cmd/1", "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(error["error"]["code"], "investigation_bad_params");
+}
+
+/// 中心没传 id 时网关自己铸一个（与 admin 同口径）；审计落 `center`。
+#[tokio::test]
+async fn gateway_plane_investigation_without_an_id_mints_one_and_audits_center() {
+    let mut env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    report_investigation_capabilities(&env, "agent-node-a", &["disk"], true).await;
+    let response = put_grant(&env, serde_json::json!({ "topics": ["disk"] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    env.config.data_plane_work_dir = Some(env._root.clone());
+
+    let loopback = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 40_000)));
+    let response = post_loopback_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/gateway/agents/agent-node-a/investigations",
+        loopback,
+        &serde_json::json!({ "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let receipt: serde_json::Value = decode_json_response(response).await;
+    let command_id = receipt["command_id"]
+        .as_str()
+        .expect("minted id")
+        .to_string();
+    assert!(
+        command_id.starts_with("cmd_agent-node-a_investigate_"),
+        "缺省铸号沿用 admin 的命名：{command_id}"
+    );
+    assert_eq!(
+        receipt["requested_by"], "center",
+        "没带来源时不得冒充管理员"
+    );
+}
+
 /// `accepted` 阶段回报：**认领不等于完成**。
 ///
 /// 走完整链路（agent 状态上报 → 落库 → 管理面视图），钉三件事：
@@ -10564,6 +10704,33 @@ async fn post_agent_package_push<T: serde::Serialize>(
         ))
         .expect("request");
     if let Some(addr) = addr {
+        request.extensions_mut().insert(MockConnectInfo(addr));
+    }
+    router(config.clone(), Arc::clone(store))
+        .oneshot(request)
+        .await
+        .expect("route response")
+}
+
+/// 直接 POST 到环回路由（用 `MockConnectInfo` 伪造 peer 地址）。
+async fn post_loopback_to_router<T: serde::Serialize>(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    uri: &str,
+    peer: Option<std::net::SocketAddr>,
+    body: &T,
+) -> axum::response::Response {
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(body).expect("serialize body"),
+        ))
+        .expect("request");
+    if let Some(addr) = peer {
         request.extensions_mut().insert(MockConnectInfo(addr));
     }
     router(config.clone(), Arc::clone(store))
@@ -17311,6 +17478,56 @@ async fn gateway_agents_report_the_data_manifest_end_to_end() {
     std::fs::write(report_dir.join("agent-ivsrep.jsonl"), format!("{line}\n"))
         .expect("write report");
 
+    // 3b) 调查**任务状态**：网关 `agent_commands` 里的一行（下发时建行，agentd 心跳时写认领/回执）。
+    // 它与 `data_manifest.investigations` 是两回事：那条答「有什么报告」，这条答「命令跑到哪了」。
+    env.store
+        .enqueue_agent_command(
+            &StoredAgentCommand {
+                command_id: "cmd-disk".to_string(),
+                agent_id: agent_id.to_string(),
+                kind: wist_api::status::command_kind::INVESTIGATE.to_string(),
+                params: r#"{"topic":"disk"}"#.to_string(),
+                requested_at_ms: chrono::Utc::now().timestamp_millis(),
+                acked_at: None,
+                claimed_at: None,
+                outcome: None,
+                detail: None,
+                requested_by: "center:alice".to_string(),
+            },
+            false,
+        )
+        .await
+        .expect("enqueue investigation command");
+    // 再入一条**已回执**的旧任务：状态行要带 outcome，未回执那条必须仍是 null。
+    env.store
+        .enqueue_agent_command(
+            &StoredAgentCommand {
+                command_id: "cmd-done".to_string(),
+                agent_id: agent_id.to_string(),
+                kind: wist_api::status::command_kind::INVESTIGATE.to_string(),
+                params: r#"{"topic":"load"}"#.to_string(),
+                requested_at_ms: chrono::Utc::now().timestamp_millis() - 60_000,
+                acked_at: None,
+                claimed_at: None,
+                outcome: None,
+                detail: None,
+                requested_by: "center".to_string(),
+            },
+            false,
+        )
+        .await
+        .expect("enqueue settled investigation command");
+    env.store
+        .ack_agent_command(
+            agent_id,
+            "cmd-done",
+            &chrono::Utc::now().to_rfc3339(),
+            "succeeded",
+            "load: 无异常",
+        )
+        .await
+        .expect("ack settled command");
+
     // 4) 环回面读出拼接后的清单。
     let (addr, server) = spawn_gateway_on_loopback(&env).await;
     let response = reqwest::Client::new()
@@ -17340,6 +17557,23 @@ async fn gateway_agents_report_the_data_manifest_end_to_end() {
     assert_eq!(investigation["topic"], "disk");
     assert_eq!(investigation["overall"], "warn");
     assert_eq!(investigation["findings_warn"], 1);
+
+    // 任务状态：题面从命令 `params` 取；未回执时 `outcome` 必须是 null（不得冒充 succeeded）。
+    let task = &json["agents"][0]["investigations"][0];
+    assert_eq!(task["command_id"], "cmd-disk");
+    assert_eq!(task["topic"], "disk");
+    assert!(task["requested_at"].is_string());
+    assert!(task["claimed_at"].is_null());
+    assert!(task["acked_at"].is_null());
+    assert!(task["outcome"].is_null());
+
+    // 新 → 旧：第二条是已回执的那条，`outcome` / `acked_at` / `detail` 都要带上来。
+    let settled = &json["agents"][0]["investigations"][1];
+    assert_eq!(settled["command_id"], "cmd-done");
+    assert_eq!(settled["topic"], "load");
+    assert_eq!(settled["outcome"], "succeeded");
+    assert!(settled["acked_at"].is_string());
+    assert_eq!(settled["detail"], "load: 无异常");
 }
 
 /// 非环回 / 取不到 peer 一律拒绝（fail-closed）—— 与自述面 / agent-package 同一护栏。

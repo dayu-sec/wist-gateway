@@ -2806,6 +2806,63 @@ impl Store for SqliteStore {
         row.as_ref().map(agent_command_from_row).transpose()
     }
 
+    async fn get_agent_command(&self, command_id: &str) -> StoreResult<Option<StoredAgentCommand>> {
+        let row = sqlx::query(
+            "SELECT command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail, \
+             requested_by, claimed_at \
+             FROM agent_commands WHERE command_id = ?1",
+        )
+        .bind(command_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select agent command by id"))?;
+        row.as_ref().map(agent_command_from_row).transpose()
+    }
+
+    async fn has_pending_agent_command(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        exclude_command_id: Option<&str>,
+    ) -> StoreResult<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_commands \
+             WHERE agent_id = ?1 AND kind = ?2 AND acked_at IS NULL \
+               AND (?3 IS NULL OR command_id <> ?3)",
+        )
+        .bind(agent_id)
+        .bind(kind)
+        .bind(exclude_command_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "count pending agent commands"))?;
+        Ok(count > 0)
+    }
+
+    async fn list_recent_agent_commands(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        since_ms: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredAgentCommand>> {
+        let rows = sqlx::query(
+            "SELECT command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail, \
+             requested_by, claimed_at \
+             FROM agent_commands \
+             WHERE agent_id = ?1 AND kind = ?2 AND requested_at_ms >= ?3 \
+             ORDER BY requested_at_ms DESC, command_id DESC LIMIT ?4",
+        )
+        .bind(agent_id)
+        .bind(kind)
+        .bind(since_ms)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select recent agent commands"))?;
+        rows.iter().map(agent_command_from_row).collect()
+    }
+
     async fn count_agent_commands_since(
         &self,
         agent_id: &str,
@@ -5387,6 +5444,151 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "已收口的命令不能因为一条 accepted 重新排队"
+        );
+    }
+
+    fn investigate_command(id: &str, agent_id: &str, at_ms: i64) -> StoredAgentCommand {
+        StoredAgentCommand {
+            command_id: id.to_string(),
+            agent_id: agent_id.to_string(),
+            kind: "investigate".to_string(),
+            params: r#"{"topic":"disk"}"#.to_string(),
+            requested_at_ms: at_ms,
+            acked_at: None,
+            claimed_at: None,
+            outcome: None,
+            detail: None,
+            requested_by: "center".to_string(),
+        }
+    }
+
+    /// 某台 agent 的「最近几条调查」：新 → 旧、只看窗口内、只认该 kind、受 limit 约束。
+    ///
+    /// 机队上报里的 `investigations[]` 就靠这条查询：窗口 / 条数错了，中心页会
+    /// 显示一台早就没事的机器「还在查」。
+    #[tokio::test]
+    async fn recent_agent_commands_are_newest_first_windowed_and_limited() {
+        let store = store().await;
+        let now = Utc::now().timestamp_millis();
+        store
+            .enqueue_agent_command(&investigate_command("cmd-new", "agent-a", now), false)
+            .await
+            .unwrap();
+        store
+            .enqueue_agent_command(
+                &investigate_command("cmd-old", "agent-a", now - 86_400_000),
+                false,
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue_agent_command(
+                &investigate_command("cmd-stale", "agent-a", now - 8 * 86_400_000),
+                false,
+            )
+            .await
+            .unwrap();
+        // 别的 kind / 别的 agent 都不能串进来。
+        let mut other_kind = investigate_command("cmd-other-kind", "agent-a", now);
+        other_kind.kind = "fact-refresh".to_string();
+        store
+            .enqueue_agent_command(&other_kind, false)
+            .await
+            .unwrap();
+        store
+            .enqueue_agent_command(
+                &investigate_command("cmd-other-agent", "agent-b", now),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let recent = store
+            .list_recent_agent_commands("agent-a", "investigate", now - 7 * 86_400_000, 3)
+            .await
+            .expect("list recent");
+        let ids: Vec<&str> = recent
+            .iter()
+            .map(|command| command.command_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["cmd-new", "cmd-old"],
+            "新 → 旧、窗口外与别的 kind/agent 都不算"
+        );
+
+        let limited = store
+            .list_recent_agent_commands("agent-a", "investigate", 0, 1)
+            .await
+            .expect("list recent");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].command_id, "cmd-new");
+    }
+
+    /// 按 id 读命令（幂等判断用）：跨 agent 唯一，读不到就是 `None`。
+    #[tokio::test]
+    async fn get_agent_command_reads_by_id_across_agents() {
+        let store = store().await;
+        let now = Utc::now().timestamp_millis();
+        store
+            .enqueue_agent_command(&investigate_command("cmd-a1", "agent-a", now), false)
+            .await
+            .unwrap();
+
+        let found = store
+            .get_agent_command("cmd-a1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(found.agent_id, "agent-a");
+        assert!(
+            store
+                .get_agent_command("cmd-missing")
+                .await
+                .expect("get")
+                .is_none()
+        );
+    }
+
+    /// 在飞闸：已回执的不算；`exclude_command_id` 用于「自查重试」不打自己。
+    #[tokio::test]
+    async fn has_pending_agent_command_ignores_settled_and_excluded_rows() {
+        let store = store().await;
+        let now = Utc::now().timestamp_millis();
+        store
+            .enqueue_agent_command(&investigate_command("cmd-live", "agent-a", now), false)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .has_pending_agent_command("agent-a", "investigate", None)
+                .await
+                .expect("check")
+        );
+        assert!(
+            !store
+                .has_pending_agent_command("agent-a", "investigate", Some("cmd-live"))
+                .await
+                .expect("check"),
+            "自查重试不能把自己当成在飞"
+        );
+
+        store
+            .ack_agent_command(
+                "agent-a",
+                "cmd-live",
+                "2026-01-01T00:00:00Z",
+                "succeeded",
+                "ok",
+            )
+            .await
+            .expect("ack");
+        assert!(
+            !store
+                .has_pending_agent_command("agent-a", "investigate", None)
+                .await
+                .expect("check"),
+            "已回执的不算在飞"
         );
     }
 

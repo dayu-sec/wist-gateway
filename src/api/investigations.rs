@@ -49,13 +49,14 @@ use std::path::{Component, Path, PathBuf};
 use axum::{
     Json,
     extract::{Path as AxumPath, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use wist_contracts::capability_report::InvestigationCapabilities;
 use wist_control::AgentInvestigationEntry;
+use wist_control::AgentInvestigationTask;
 use wist_control::types::DateTime;
 
 use super::admin_auth::{admin_actor, require_admin_bearer};
@@ -119,6 +120,71 @@ pub struct LaunchInvestigationRequest {
     pub depth: Option<u32>,
     #[serde(default)]
     pub max_seconds: Option<u64>,
+}
+
+/// 中心下发（gateway-plane）的一次调查：admin 请求体 + 中心铸的 `command_id`。
+///
+/// 单独一个类型而不是给 [`LaunchInvestigationRequest`] 加字段：admin 端点**不允许**
+/// 调用方指定 id（它自己铸号），同一个结构体“既收又不理”会让「这条 id 是谁的」说不清。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayLaunchInvestigationRequest {
+    /// 中心铸的号（`cmd_…`）。缺省 = 网关自己铸（与 admin 同口径）。
+    #[serde(default)]
+    pub command_id: Option<String>,
+    /// 审计用来源（`center:<actor>`）；缺省 `center`。
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub top: Option<u32>,
+    #[serde(default)]
+    pub min_size: Option<u64>,
+    #[serde(default)]
+    pub depth: Option<u32>,
+    #[serde(default)]
+    pub max_seconds: Option<u64>,
+}
+
+impl GatewayLaunchInvestigationRequest {
+    fn into_launch(self) -> LaunchInvestigationRequest {
+        LaunchInvestigationRequest {
+            topic: self.topic,
+            path: self.path,
+            top: self.top,
+            min_size: self.min_size,
+            depth: self.depth,
+            max_seconds: self.max_seconds,
+        }
+    }
+}
+
+/// 中心铸号的长度上限（与中心侧校验同一个数）。
+const MAX_COMMAND_ID_BYTES: usize = 80;
+
+/// `command_id` 合法性：非空、≤ 80 字节、`[A-Za-z0-9_.:-]`。
+///
+/// 它会被当作证据库的索引键与对象路径的一段：可以宽，但不能带 `/`、空白或控制字符。
+fn valid_command_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_COMMAND_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
+/// 同一个 id 二次到达时比参数：解析失败就退回字面比较（不因脏数据把它当成“不一致”）。
+fn same_params(left: &str, right: &str) -> bool {
+    match (
+        serde_json::from_str::<Value>(left),
+        serde_json::from_str::<Value>(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 /// 把请求收敛成**窄参数**（与 agentd 的夹紧规则同值：网关不放宽，也不替 agent 猜）。
@@ -411,6 +477,186 @@ fn is_safe_absolute_path(path: &str) -> bool {
             .all(|component| !matches!(component, Component::ParentDir))
 }
 
+/// 审计字段的长度上限（字符）。
+const MAX_ACTOR_CHARS: usize = 120;
+
+/// 审计字段压成**一行、有界**。
+///
+/// 它来自中心 / gwlinkd 的报文，会入库并在页面回显：换行与控制字符会把一条审计记录
+/// 看成两条，而过长的值会把日志与页面挤形。空值回落成 `center`（不冒充谁）。
+fn normalize_actor(raw: &str) -> String {
+    let flat: String = raw
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let flat = flat.trim();
+    if flat.is_empty() {
+        return "center".to_string();
+    }
+    flat.chars().take(MAX_ACTOR_CHARS).collect()
+}
+
+/// 一次下发的白口：决定审计前缀与「同 kind 未确认命令怎么处理」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchSource {
+    /// 人类在网关页面点：网关自己铸号，同 kind 未确认命令被取代（连点只留最后一次）。
+    Admin,
+    /// 中心经 gwlinkd 环回下发：`command_id` 由中心铸，**不取代** ——
+    /// 静默取代会让先发的那条永不执行，而中心那条指令的回执却是「已受理」。
+    GatewayPlane,
+}
+
+/// 一次下发的内部结果：admin 端点拼完整的下发视图，gateway-plane 只取回执需要的几项。
+struct LaunchOutcome {
+    command: StoredAgentCommand,
+    topic: String,
+    capabilities: Option<InvestigationCapabilities>,
+    allowed: Vec<&'static str>,
+    granted: Vec<&'static str>,
+    /// 同 `command_id` 同参数二次到达：没有入第二行。
+    replayed: bool,
+}
+
+/// 两道平面共用的「闸门 + 入队」内核。
+///
+/// 顺序是刻意的：先按 `command_id` 幂等（重试不该被重算的闸或额度拦住），
+/// 再问「这个网关让不让」（策略）→「这台机器会不会」（能力）→「这台机器开没开」（授权）
+/// →「现在还能不能再发」（额度）→「上一次跑完没有」（在飞）。
+#[allow(clippy::result_large_err)]
+async fn launch_investigation(
+    state: &ApiState,
+    agent_id: &str,
+    request: &LaunchInvestigationRequest,
+    command_id: Option<String>,
+    requested_by: Option<String>,
+    source: LaunchSource,
+) -> Result<LaunchOutcome, Response> {
+    let (params, topic) = build_params(request).map_err(|err| (*err).into_response())?;
+
+    // 幂等先行：gwlinkd 的租约 / 回执都会重试，同一个 id 二次到达时不能又入一行。
+    // 也刻意放在三道闸之前 —— 授权后来被收紧，不该把一个“已经受理过”的重试变成 403。
+    if let Some(id) = command_id.as_deref() {
+        match state.store.get_agent_command(id).await {
+            Ok(Some(existing)) => {
+                if existing.agent_id == agent_id
+                    && existing.kind == INVESTIGATE_KIND
+                    && same_params(&existing.params, &params)
+                {
+                    return Ok(LaunchOutcome {
+                        command: existing,
+                        topic,
+                        capabilities: None,
+                        allowed: Vec::new(),
+                        granted: Vec::new(),
+                        replayed: true,
+                    });
+                }
+                // 同一个 id 意味着同一次下发意图：参数不同 / 换了机器只能是调用方出错，
+                // 不能静默接受（那会让「这条 id 到底跑了什么」变成两个答案）。
+                return Err(ApiError::conflict(
+                    codes::INVESTIGATION_COMMAND_CONFLICT,
+                    format!("command_id {id:?} already exists with different target or params"),
+                )
+                .into_response());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Err(ApiError::internal(
+                    codes::AGENT_COMMAND_LOAD_FAILED,
+                    "failed to load investigation command",
+                    err,
+                )
+                .into_response());
+            }
+        }
+    }
+
+    // 三道闸，顺序是刻意的：先问「这个网关让不让」（策略），再问「这台机器会不会」（能力），
+    // 最后问「现在还能不能再发」（额度）。三道失败的原因不同，页面能给出不同处置。
+    let allowed = ensure_allowed(state, &topic).map_err(|err| (*err).into_response())?;
+    let capabilities = load_investigation_capabilities(state, agent_id).await?;
+    ensure_supported(capabilities.as_ref(), &topic).map_err(|err| (*err).into_response())?;
+    // G1 的第二层：**这台机器**开没开这个面（上界之上再收一层；页面可改，即时生效）。
+    let grant = load_grant(state, agent_id).await?;
+    let granted = granted_topics(&allowed, grant.as_ref());
+    ensure_granted(&granted, &topic, agent_id).map_err(|err| (*err).into_response())?;
+    let now = chrono::Utc::now();
+    ensure_quota(state, agent_id, now).await?;
+
+    // G4（在飞闸）：中心铸号的调用不取代同 kind 的未确认命令，就必须有人显式拦住并发 ——
+    // 否则两条调查同时下发，报告只能靠 id 区分，页面上的「最近一条」也会错位。
+    // 幂等重试在前一步已经返回（同 id 不会走到这里），所以不会把自己闸住。
+    if source == LaunchSource::GatewayPlane {
+        match state
+            .store
+            .has_pending_agent_command(agent_id, INVESTIGATE_KIND, command_id.as_deref())
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(ApiError::conflict(
+                    codes::INVESTIGATION_IN_FLIGHT,
+                    format!("agent {agent_id} still has an unacknowledged investigation"),
+                )
+                .into_response());
+            }
+            Err(err) => {
+                return Err(ApiError::internal(
+                    codes::AGENT_COMMAND_LOAD_FAILED,
+                    "failed to check in-flight investigations",
+                    err,
+                )
+                .into_response());
+            }
+        }
+    }
+
+    let requested_by = match (source, requested_by) {
+        (LaunchSource::Admin, _) => admin_actor(&state.config),
+        (LaunchSource::GatewayPlane, Some(actor)) => normalize_actor(&actor),
+        (LaunchSource::GatewayPlane, None) => "center".to_string(),
+    };
+    let command = StoredAgentCommand {
+        // 微秒做 id：同一毫秒内连点两次也不能撞成一个（撞了会被 `DO NOTHING` 吞掉）。
+        // 中心铸号时用它给的：那一条 id 要一路贯通到报告正文与证据库索引。
+        command_id: command_id
+            .unwrap_or_else(|| format!("cmd_{}_investigate_{}", agent_id, now.timestamp_micros())),
+        agent_id: agent_id.to_string(),
+        kind: INVESTIGATE_KIND.to_string(),
+        params,
+        requested_at_ms: now.timestamp_millis(),
+        acked_at: None,
+        claimed_at: None,
+        outcome: None,
+        detail: None,
+        // G1：审计——调查读的是客户机上的路径/文件名，必须能回答“这是谁点的”。
+        requested_by,
+    };
+    // admin 端点：同 kind 的未确认命令被覆盖（连点只保留最后一次）—— 调查是只读的，
+    // 跑两遍没有意义，而两份报告只会让「哪份是这次的」说不清。
+    let replace_pending = source == LaunchSource::Admin;
+    if let Err(err) = state
+        .store
+        .enqueue_agent_command(&command, replace_pending)
+        .await
+    {
+        return Err(ApiError::internal(
+            codes::AGENT_COMMAND_STORE_FAILED,
+            "failed to enqueue investigation command",
+            err,
+        )
+        .into_response());
+    }
+    Ok(LaunchOutcome {
+        command,
+        topic,
+        capabilities,
+        allowed,
+        granted,
+        replayed: false,
+    })
+}
+
 /// `POST /api/v1/admin/agents/{agent_id}/investigations`：下发一次调查。
 ///
 /// body 可省（不带 body = 默认的 `disk` 调查）：`curl -X POST` 也能用，
@@ -430,67 +676,80 @@ pub async fn launch_agent_investigation(
         return response;
     }
     let request = body.map(|Json(request)| request).unwrap_or_default();
-    let (params, topic) = match build_params(&request) {
-        Ok(built) => built,
-        Err(err) => return (*err).into_response(),
-    };
-    // 两道闸，顺序是刻意的：先问「这个网关让不让」（策略），再问「这台机器会不会」（能力），
-    // 最后问「现在还能不能再发」（额度）。三道失败的原因不同，页面能给出不同处置。
-    let allowed = match ensure_allowed(&state, &topic) {
-        Ok(allowed) => allowed,
-        Err(err) => return (*err).into_response(),
-    };
-    let capabilities = match load_investigation_capabilities(&state, &agent_id).await {
-        Ok(capabilities) => capabilities,
-        Err(response) => return response,
-    };
-    if let Err(err) = ensure_supported(capabilities.as_ref(), &topic) {
-        return (*err).into_response();
-    }
-    // G1 的第二层：**这台机器**开没开这个面（上界之上再收一层；页面可改，即时生效）。
-    let grant = match load_grant(&state, &agent_id).await {
-        Ok(grant) => grant,
-        Err(response) => return response,
-    };
-    let granted = granted_topics(&allowed, grant.as_ref());
-    if let Err(err) = ensure_granted(&granted, &topic, &agent_id) {
-        return (*err).into_response();
-    }
-    let now = chrono::Utc::now();
-    if let Err(response) = ensure_quota(&state, &agent_id, now).await {
-        return response;
-    }
-    let command = StoredAgentCommand {
-        // 微秒做 id：同一毫秒内连点两次也不能撞成一个（撞了会被 `DO NOTHING` 吞掉）。
-        command_id: format!("cmd_{}_investigate_{}", agent_id, now.timestamp_micros()),
-        agent_id: agent_id.clone(),
-        kind: INVESTIGATE_KIND.to_string(),
-        params,
-        requested_at_ms: now.timestamp_millis(),
-        acked_at: None,
-        claimed_at: None,
-        outcome: None,
-        detail: None,
-        // G1：审计——调查读的是客户机上的路径/文件名，必须能回答“这是谁点的”。
-        requested_by: admin_actor(&state.config),
-    };
-    // 同 kind 的未确认命令被覆盖：连点只保留最后一次 —— 调查是只读的，跑两遍没有意义，
-    // 而两份报告只会让「哪份是这次的」说不清。
-    match state.store.enqueue_agent_command(&command, true).await {
-        Ok(()) => Json(InvestigationLaunchResponse {
+    match launch_investigation(&state, &agent_id, &request, None, None, LaunchSource::Admin).await {
+        Ok(outcome) => Json(InvestigationLaunchResponse {
             agent_id,
-            capabilities: capabilities_view(capabilities.as_ref()),
-            allowed_topics: allowed.into_iter().map(str::to_string).collect(),
-            granted_topics: granted.into_iter().map(str::to_string).collect(),
-            command: command_view(Some(&command)),
+            capabilities: capabilities_view(outcome.capabilities.as_ref()),
+            allowed_topics: outcome.allowed.into_iter().map(str::to_string).collect(),
+            granted_topics: outcome.granted.into_iter().map(str::to_string).collect(),
+            command: command_view(Some(&outcome.command)),
         })
         .into_response(),
-        Err(err) => ApiError::internal(
-            codes::AGENT_COMMAND_STORE_FAILED,
-            "failed to enqueue investigation command",
-            err,
+        Err(response) => response,
+    }
+}
+
+/// `POST /api/v1/gateway/agents/{agent_id}/investigations`（环回；中心 → gwlinkd → 网关）。
+///
+/// 与 admin 端点的差别只有三件：调用方是 gwlinkd（环回而非 bearer）、`command_id` 可传入、
+/// 不取代在飞命令（改成 G4 闸）。
+pub async fn gateway_launch_agent_investigation(
+    State(state): State<ApiState>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    AxumPath(agent_id): AxumPath<String>,
+    body: Option<Json<GatewayLaunchInvestigationRequest>>,
+) -> Response {
+    if !state.is_local_host_peer(client) {
+        return ApiError::forbidden(
+            codes::GATEWAY_INVESTIGATION_LOOPBACK_ONLY,
+            "gateway investigation is loopback-only",
         )
-        .into_response(),
+        .into_response();
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let command_id = match request.command_id.as_deref().map(str::trim) {
+        None => None,
+        Some(id) if valid_command_id(id) => Some(id.to_string()),
+        Some(id) => {
+            return ApiError::bad_request(
+                codes::INVESTIGATION_BAD_PARAMS,
+                format!(
+                    "invalid command_id {id:?}: 1..={MAX_COMMAND_ID_BYTES} bytes of [A-Za-z0-9_.:-]"
+                ),
+            )
+            .into_response();
+        }
+    };
+    let requested_by = request.requested_by.clone();
+    let launch = request.into_launch();
+    match launch_investigation(
+        &state,
+        &agent_id,
+        &launch,
+        command_id,
+        requested_by,
+        LaunchSource::GatewayPlane,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            let receipt = GatewayInvestigationReceipt {
+                agent_id,
+                command_id: outcome.command.command_id.clone(),
+                topic: outcome.topic,
+                requested_by: outcome.command.requested_by.clone(),
+            };
+            let status = if outcome.replayed {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+            (status, Json(receipt)).into_response()
+        }
+        Err(response) => response,
     }
 }
 
@@ -569,6 +828,15 @@ struct InvestigationLaunchResponse {
     /// 这台机器实际被授权的面（上界 ∩ 按 agent 授权）—— 下发时的闸用的就是它。
     granted_topics: Vec<String>,
     command: InvestigationCommandView,
+}
+
+/// gateway-plane 的回执：中心只需要能对上的那几项（不重复下发视图）。
+#[derive(Debug, Serialize)]
+struct GatewayInvestigationReceipt {
+    agent_id: String,
+    command_id: String,
+    topic: String,
+    requested_by: String,
 }
 
 /// 一条报告的**列表视图**（不带正文：列表不该为几十 KB 的报告付费）。
@@ -1065,6 +1333,57 @@ pub(super) fn manifest_entries(
     }
 }
 
+/// 机队视图里的「最近几条调查任务」：网关 `agent_commands` 里本来就有。
+///
+/// `topic` 从建行时的 `params` 里取（与下发同一份），不靠报告文件名或时间窗猜；
+/// `outcome` 未回执时为 `None` —— 「还在跑」不得写成 `succeeded`。
+pub(super) async fn recent_investigation_tasks(
+    state: &ApiState,
+    agent_id: &str,
+    since_ms: i64,
+    limit: usize,
+) -> Result<Vec<AgentInvestigationTask>, crate::infra::StoreError> {
+    let commands = state
+        .store
+        .list_recent_agent_commands(agent_id, INVESTIGATE_KIND, since_ms, limit)
+        .await?;
+    Ok(commands.iter().map(investigation_task).collect())
+}
+
+fn investigation_task(command: &StoredAgentCommand) -> AgentInvestigationTask {
+    AgentInvestigationTask {
+        command_id: command.command_id.clone(),
+        topic: command_topic(&command.params),
+        requested_at: datetime_from_ms(command.requested_at_ms),
+        claimed_at: command
+            .claimed_at
+            .as_deref()
+            .and_then(DateTime::from_rfc3339),
+        acked_at: command.acked_at.as_deref().and_then(DateTime::from_rfc3339),
+        outcome: command.outcome.clone(),
+        detail: command.detail.clone(),
+    }
+}
+
+/// 从命令 `params` 里取题面：解析不了就是空串（页面显示“未知面”，不冒充一种调查）。
+fn command_topic(params: &str) -> String {
+    serde_json::from_str::<Value>(params)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("topic")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+fn datetime_from_ms(ms: i64) -> DateTime {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .and_then(|at| DateTime::from_rfc3339(&at.to_rfc3339()))
+        .unwrap_or_else(DateTime::now)
+}
+
 /// 找一份指定 `command_id` 的报告正文。
 ///
 /// 同样受可见保留期约束：过期后**按 id 也读不回来**（否则“过期”只是列表看不见）。
@@ -1328,6 +1647,21 @@ mod tests {
             "body": body,
         })
         .to_string()
+    }
+
+    /// 审计字段：一行、有界；空值回落成 `center`。
+    #[test]
+    fn actors_are_one_line_and_bounded() {
+        assert_eq!(normalize_actor("center:alice"), "center:alice");
+        assert_eq!(normalize_actor("  center:alice  "), "center:alice");
+        assert_eq!(normalize_actor("a\nb\tc"), "a b c");
+        assert_eq!(normalize_actor("   "), "center");
+        assert_eq!(
+            normalize_actor(&"x".repeat(MAX_ACTOR_CHARS + 20))
+                .chars()
+                .count(),
+            MAX_ACTOR_CHARS
+        );
     }
 
     #[test]

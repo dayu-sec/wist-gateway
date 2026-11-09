@@ -149,8 +149,9 @@ use install::{
     get_agent_install_code, get_agent_install_script,
 };
 use investigations::{
-    launch_agent_investigation, list_agent_investigations, reset_agent_investigation_grant,
-    set_agent_investigation_grant, view_agent_investigation_report,
+    gateway_launch_agent_investigation, launch_agent_investigation, list_agent_investigations,
+    reset_agent_investigation_grant, set_agent_investigation_grant,
+    view_agent_investigation_report,
 };
 use knowledge_ops::{
     activate_knowledge_package, list_knowledge_packages, record_knowledge_package, view_knowledge,
@@ -363,6 +364,12 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/gateway/agents",
             get(gateway_agents::query_gateway_agents),
+        )
+        // NOTE(hand-added): 中心下发调查（环回；gwlinkd → 网关）。与 admin 端点共用内核，
+        // 差别是 `command_id` 由中心铸、不取代在飞命令（G4 闸）。
+        .route(
+            "/api/v1/gateway/agents/{agent_id}/investigations",
+            post(gateway_launch_agent_investigation),
         )
         // NOTE(hand-added): 接入请求通道（环回；CR-003）。见上方 `mod link_request` 说明。
         .route(

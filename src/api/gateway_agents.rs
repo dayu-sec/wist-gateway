@@ -112,6 +112,13 @@ async fn gateway_agents(
             hostname: non_empty(&agent.hostname),
             ip_addresses: (!agent.ip_addresses.is_empty()).then(|| agent.ip_addresses.clone()),
             data_manifest: Some(agent_data_manifest(state, agent).await?),
+            investigations: crate::api::investigations::recent_investigation_tasks(
+                state,
+                &agent.agent_id,
+                chrono::Utc::now().timestamp_millis() - INVESTIGATION_TASK_RETENTION_MS,
+                MAX_INVESTIGATION_TASKS,
+            )
+            .await?,
         });
     }
     Ok(GatewayAgentsReport {
@@ -125,6 +132,15 @@ async fn gateway_agents(
 /// 与网关自己的「调查报告」页（最近 50 条）不同：上报给中心的是**清单**，
 /// 中心只用来回答「这台机器有哪些调查数据」；正文仍留在网关按需读取。
 const MANIFEST_MAX_INVESTIGATIONS: usize = 20;
+
+/// 调查任务状态最多带几条（与中心「最近 3 条」同口径，新 → 旧）。
+const MAX_INVESTIGATION_TASKS: usize = 3;
+
+/// 任务状态只留 7 天：更早的任务不再上报（报告本身仍可在保留期内读到）。
+///
+/// 与 `data_manifest.investigations` 的生命周期不同：清单是「有什么数据」，
+/// 任务状态是「这条命令跑到哪了」—— 后者过期快，以免页面上堆一串没人再关心的旧命令。
+const INVESTIGATION_TASK_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// 生成一台 Agent 的**数据清单**（采集授权 + 调查数据）。
 ///
@@ -241,6 +257,7 @@ mod tests {
                     }],
                     investigations: Vec::new(),
                 }),
+                investigations: Vec::new(),
             }],
         };
         let value: serde_json::Value = serde_json::to_value(&report).expect("serialize");
@@ -269,6 +286,7 @@ mod tests {
                 "health",
                 "hostname",
                 "instance_id",
+                "investigations",
                 "ip_addresses",
                 "last_seen_at",
                 "memory_bytes",

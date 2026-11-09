@@ -1703,6 +1703,34 @@ pub trait Store: Send + Sync + fmt::Debug {
         kind: &str,
     ) -> StoreResult<Option<StoredAgentCommand>>;
 
+    /// 按 `command_id` 读一条命令（跨 agent 唯一）。
+    ///
+    /// 中心下发的幂等判断用它：同一个 id 二次到达时要先比「是不是同一条命令」——
+    /// 一致就幂等返回，不一致就 409，而不是又入一行。
+    async fn get_agent_command(&self, command_id: &str) -> StoreResult<Option<StoredAgentCommand>>;
+
+    /// 某台 agent 是否还有该 kind 的**未确认**命令（`exclude_command_id` 用于自查重试）。
+    ///
+    /// 中心铸号的调用**不取代**同 kind 的未确认命令，所以需要一个显式的在飞闸（设计 §5.1 G4）。
+    async fn has_pending_agent_command(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        exclude_command_id: Option<&str>,
+    ) -> StoreResult<bool>;
+
+    /// 某台 agent 在 `since_ms` 之后请求的某种 kind 命令（新 → 旧，最多 `limit` 条）。
+    ///
+    /// 机队视图里的「最近几条调查任务状态」用它 —— 状态本来就在网关上，
+    /// 不为它新开一条拉取通道。
+    async fn list_recent_agent_commands(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        since_ms: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredAgentCommand>>;
+
     /// 某台 agent 在 `since_ms` 之后**入门过**多少条某种 kind 的命令（含已被覆盖/已确认）。
     ///
     /// 为什么数“入门”而不是“执行完成”：额度要拦的是**发起动作**（连点、脚本误触），
