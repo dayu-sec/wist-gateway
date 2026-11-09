@@ -31,14 +31,28 @@ jobs:
 
       # 跨仓数据：网关的「真实数据」用例要读它们（缺了会**失败**，不再静默跳过）。
       # 摆成同级目录，与本地开发仓组一致：测试期按 `<crate 根>/../<仓名>` 找。
-      # 注意 `ref: main` 是**浮动**的 —— 知识仓改坏会连带这里变红（这正是想要的信号）；
-      # 要可复现就改成两者发布出来的 tag（如 `ref: v0.1.0`），
-      # 把「网关跑过的是哪一版知识/模型」钉在 workflow 里。
+      #
+      # **跨仓检出跟着通道走**：知识仓有 alpha / beta / main 三条通道，检出哪条要跟当前分支
+      # 一致 —— alpha 分支验 alpha 的知识，beta / main 验各自通道（PR 按目标分支算）。
+      # 以前一律钉 `ref: main`，后果是「知识仓 main 还没 promote 的 alpha 期改动」会把 alpha
+      # 上的构建整片染红，真正要看的回归信号被淹没（26 → 22 面收敛就是这样被压住的）。
+      # 设计仓只有 main 一条分支，所以它恒取 main。
+      - name: Resolve cross-repo channel
+        id: channel
+        run: |
+          ref="${{ github.base_ref || github.ref_name }}"
+          case "${ref}" in
+            main | beta) ;;
+            *) ref=alpha ;;
+          esac
+          echo "knowledge_ref=${ref}" >> "${GITHUB_OUTPUT}"
+          echo "跨仓检出通道：${ref}"
+
       - name: Checkout wist-knowledge（策展知识）
         uses: actions/checkout@v7
         with:
           repository: dayu-sec/wist-knowledge
-          ref: main
+          ref: ${{ steps.channel.outputs.knowledge_ref }}
           path: wist-knowledge
 
       - name: Checkout wist-design（jumo 模型）
@@ -75,11 +89,23 @@ jobs:
           path: wist-gateway
 
       # 同上：覆盖统计也要带上这些用例，否则跑不到的分支看不出差距。
+      # 通道解析与 `test` job 保持一致（知识仓跟通道，设计仓恒 main）。
+      - name: Resolve cross-repo channel
+        id: channel
+        run: |
+          ref="${{ github.base_ref || github.ref_name }}"
+          case "${ref}" in
+            main | beta) ;;
+            *) ref=alpha ;;
+          esac
+          echo "knowledge_ref=${ref}" >> "${GITHUB_OUTPUT}"
+          echo "跨仓检出通道：${ref}"
+
       - name: Checkout wist-knowledge（策展知识）
         uses: actions/checkout@v7
         with:
           repository: dayu-sec/wist-knowledge
-          ref: main
+          ref: ${{ steps.channel.outputs.knowledge_ref }}
           path: wist-knowledge
 
       - name: Checkout wist-design（jumo 模型）
