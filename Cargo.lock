@@ -3513,7 +3513,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c629a5c7a75a9bfad5fa9f0eef4bed7b3db922c90c8d726f576e792be73a063e"
 dependencies = [
  "serde",
- "wist-contracts",
+ "wist-contracts 0.9.9",
 ]
 
 [[package]]
@@ -3552,6 +3552,18 @@ name = "wist-contracts"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4aea3aecf66c0117d4c8b8e00a24befb8251ca4882703caebf4cda4f0170837"
+dependencies = [
+ "jumo-derive",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "wist-contracts"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9e9f9cbb3305e26c37dedea4357fc3103e79939e28acef30a17dac8f9454d9d"
 dependencies = [
  "jumo-derive",
  "serde",
@@ -3616,7 +3628,7 @@ dependencies = [
  "wist-api",
  "wist-auth",
  "wist-config",
- "wist-contracts",
+ "wist-contracts 0.10.1",
  "wist-control",
  "wist-error",
  "wist-log",
