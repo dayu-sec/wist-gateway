@@ -1587,7 +1587,7 @@ async fn initial_config_records_uplink_target_stays_idle() {
     // 上送目标记录下来（kind = tcp）...
     assert_eq!(output["tcp"]["addr"].as_str(), Some("10.0.1.9"));
     assert_eq!(output["tcp"]["port"].as_integer(), Some(9100));
-    assert_eq!(output["tcp"]["framing"].as_str(), Some("line"));
+    assert_eq!(output["tcp"]["framing"].as_str(), Some("len"));
     assert_eq!(output["kind"].as_str(), Some("tcp"));
     // ...但 enabled = false：设了地址也不等于开始干活。
     assert_eq!(output["enabled"].as_bool(), Some(false));
