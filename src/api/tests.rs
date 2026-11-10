@@ -9478,6 +9478,51 @@ async fn gateway_plane_investigation_is_loopback_idempotent_and_serialized() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error: serde_json::Value = decode_json_response(response).await;
     assert_eq!(error["error"]["code"], "investigation_bad_params");
+
+    // 7) 过了待执行窗口的旧行不算在飞：离线机器上这条永远不会被回收
+    //    （回收只跑在状态上报 / 管理面读取），拿它拦新下发就是死锁。
+    //    先把第 1 步那条结掉，否则挡住新下发的是它（那是正确的闸）。
+    env.store
+        .ack_agent_command(
+            "agent-node-a",
+            "cmd_center_1",
+            "2026-01-01T00:00:00Z",
+            "succeeded",
+            "ok",
+        )
+        .await
+        .expect("ack first command");
+    env.store
+        .enqueue_agent_command(
+            &StoredAgentCommand {
+                command_id: "cmd-stale-center".to_string(),
+                agent_id: "agent-node-a".to_string(),
+                kind: "investigate".to_string(),
+                params: r#"{"topic":"load"}"#.to_string(),
+                requested_at_ms: chrono::Utc::now().timestamp_millis() - 2 * 60 * 60 * 1000,
+                acked_at: None,
+                claimed_at: None,
+                outcome: None,
+                detail: None,
+                requested_by: "center".to_string(),
+            },
+            false,
+        )
+        .await
+        .expect("enqueue stale command");
+    let response = post_loopback_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        loopback,
+        &serde_json::json!({ "command_id": "cmd_center_3", "topic": "disk" }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "超出待执行窗口的旧行不得堵住新的下发"
+    );
 }
 
 /// 命令队列（只读）：来源、状态、计数、状态词表都要说清楚。

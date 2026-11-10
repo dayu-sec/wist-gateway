@@ -3,6 +3,21 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.44.1-alpha] - 2026-11-10
+
+### 修复
+
+- **在飞闸不再把「已过期但还没回收」的调查当成在跑**：`has_pending_agent_command`
+  增加待执行窗口下界（`requested_at_ms >= now - PENDING_COMMAND_TTL_MS`）。
+  此前回收只跑在「agent 状态上报」与「管理面读取」两个入口上：一台离线机器的
+  一条 `queued` 调查（1h 前）会让中心后续下发**永久 409 `investigation_in_flight`**，
+  而中心只读自己的库，碰不到那两个入口 —— 等于死锁。现在过窗的行自动失效，
+  真正在飞的（窗口内）依旧拦。
+
+### 兼容性
+
+- 纯行为修正，接口与错误码不变。
+
 ## [0.44.0-alpha] - 2026-11-10
 
 ### 新增

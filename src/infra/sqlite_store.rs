@@ -2823,15 +2823,18 @@ impl Store for SqliteStore {
         &self,
         agent_id: &str,
         kind: &str,
+        requested_after_ms: i64,
         exclude_command_id: Option<&str>,
     ) -> StoreResult<bool> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_commands \
              WHERE agent_id = ?1 AND kind = ?2 AND acked_at IS NULL \
-               AND (?3 IS NULL OR command_id <> ?3)",
+               AND requested_at_ms >= ?3 \
+               AND (?4 IS NULL OR command_id <> ?4)",
         )
         .bind(agent_id)
         .bind(kind)
+        .bind(requested_after_ms)
         .bind(exclude_command_id)
         .fetch_one(&self.pool)
         .await
@@ -5637,9 +5640,10 @@ mod tests {
         );
     }
 
-    /// 在飞闸：已回执的不算；`exclude_command_id` 用于「自查重试」不打自己。
+    /// 在飞闸：已回执的不算；`exclude_command_id` 用于「自查重试」不打自己；
+    /// 超出待执行窗口的行也不算（否则一台离线机器会永久堵住后续下发）。
     #[tokio::test]
-    async fn has_pending_agent_command_ignores_settled_and_excluded_rows() {
+    async fn has_pending_agent_command_ignores_settled_excluded_and_expired_rows() {
         let store = store().await;
         let now = Utc::now().timestamp_millis();
         store
@@ -5648,16 +5652,31 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .has_pending_agent_command("agent-a", "investigate", None)
+                .has_pending_agent_command("agent-a", "investigate", now - 3_600_000, None)
                 .await
                 .expect("check")
         );
         assert!(
             !store
-                .has_pending_agent_command("agent-a", "investigate", Some("cmd-live"))
+                .has_pending_agent_command(
+                    "agent-a",
+                    "investigate",
+                    now - 3_600_000,
+                    Some("cmd-live")
+                )
                 .await
                 .expect("check"),
             "自查重试不能把自己当成在飞"
+        );
+
+        // 超出窗口：这条还没被 `expire_pending_agent_commands` 扫到，但已经不再下发，
+        // 不能再堵住新的下发（离线机器上这是唯一的解锁路径）。
+        assert!(
+            !store
+                .has_pending_agent_command("agent-a", "investigate", now + 1, None)
+                .await
+                .expect("check"),
+            "早于待执行窗口的行不算在飞"
         );
 
         store
@@ -5672,7 +5691,7 @@ mod tests {
             .expect("ack");
         assert!(
             !store
-                .has_pending_agent_command("agent-a", "investigate", None)
+                .has_pending_agent_command("agent-a", "investigate", now - 3_600_000, None)
                 .await
                 .expect("check"),
             "已回执的不算在飞"

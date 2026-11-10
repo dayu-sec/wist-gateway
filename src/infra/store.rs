@@ -1712,10 +1712,16 @@ pub trait Store: Send + Sync + fmt::Debug {
     /// 某台 agent 是否还有该 kind 的**未确认**命令（`exclude_command_id` 用于自查重试）。
     ///
     /// 中心铸号的调用**不取代**同 kind 的未确认命令，所以需要一个显式的在飞闸（设计 §5.1 G4）。
+    ///
+    /// `requested_after_ms` 是**待执行窗口**的下界：比它更早的行已经过了网关的下发窗口
+    /// （`PENDING_COMMAND_TTL_MS`），只是还没被 `expire_pending_agent_commands` 扫到 ——
+    /// 那些行不能再当作「在飞」。不把这条写进查询的话，一台离线机器上一条老命令会
+    /// 永久堵住后续下发（回收只跑在状态上报 / 管理面读取这两个入口上）。
     async fn has_pending_agent_command(
         &self,
         agent_id: &str,
         kind: &str,
+        requested_after_ms: i64,
         exclude_command_id: Option<&str>,
     ) -> StoreResult<bool>;
 

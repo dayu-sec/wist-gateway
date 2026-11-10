@@ -587,9 +587,17 @@ async fn launch_investigation(
     // 否则两条调查同时下发，报告只能靠 id 区分，页面上的「最近一条」也会错位。
     // 幂等重试在前一步已经返回（同 id 不会走到这里），所以不会把自己闸住。
     if source == LaunchSource::GatewayPlane {
+        // 只把**还在下发窗口内**的行算作在飞：离线机器上一条过窗的 `queued` 行（回收只跑在
+        // 状态上报与管理面读取两个入口）本来就不会再下发，拿它拦新下发就是死锁。
+        let requested_after_ms = now.timestamp_millis() - PENDING_COMMAND_TTL_MS;
         match state
             .store
-            .has_pending_agent_command(agent_id, INVESTIGATE_KIND, command_id.as_deref())
+            .has_pending_agent_command(
+                agent_id,
+                INVESTIGATE_KIND,
+                requested_after_ms,
+                command_id.as_deref(),
+            )
             .await
         {
             Ok(false) => {}
