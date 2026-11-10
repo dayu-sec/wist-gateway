@@ -3,6 +3,27 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.45.0-alpha] - 2026-11-10
+
+### 新增（采集状态多字段透传）
+
+- Agent 本机工作视图里的采集结果现在给出三个正交字段：`collectionPrerequisites`
+  （`ready` / `blocked`）、`collectionResult`（`success` / `partial` / `failure` /
+  `cancelled` / `pending`）、`collectionReasons`（`[{kind, subject, detail}]`），
+  来自 `wist-contracts 0.11.0`；网关原样透传给中心与页面。
+- 旧 `collectionStatus` / `collectionDetail` 继续输出（由新字段派生），供未升级的
+  中心 / 页面使用。
+
+### 为什么
+
+- 缺 `smartctl` 这类**前置条件不满足**不该显示成采集失败：现在能表达成
+  `blocked` + `cancelled` + `missing_tool`，装上工具自动恢复。
+
+### 兼容性
+
+- 新增字段可选，旧中心忽略即可；但**旧网关会拒收带新字段的 agentd 上报**
+  （`deny_unknown_fields`），所以升级顺序必须是本版网关 → 新 agentd。
+
 ## [0.44.1-alpha] - 2026-11-10
 
 ### 修复

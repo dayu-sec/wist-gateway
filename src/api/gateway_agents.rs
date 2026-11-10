@@ -24,7 +24,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use wist_contracts::work::WorkSpec;
 use wist_control::types::DateTime;
-use wist_control::{AgentCollectionEntry, AgentDataManifest, AgentDataSource, AgentRuntimeStatus};
+use wist_control::{
+    AgentCollectionEntry, AgentCollectionReason, AgentDataManifest, AgentDataSource,
+    AgentRuntimeStatus,
+};
 
 use crate::infra::{AgentQuery, StoreError, StoredAgentRegistration};
 
@@ -170,11 +173,26 @@ async fn agent_data_manifest(
                 status: work.status.clone(),
                 plan_version: work.plan_version,
                 acknowledged_version: local_work.and_then(|entry| entry.acknowledged_version),
-                collection_status: collection.map(|value| value.status.clone()),
-                // 空说明不是信息：`ok` 的 detail 是空串，统一折成 `null`。
-                collection_detail: collection
-                    .map(|value| value.detail.clone())
-                    .filter(|detail| !detail.is_empty()),
+                // 兼容字段：供未升级的中心 / 页面使用。
+                collection_status: collection.and_then(|value| non_empty(&value.status)),
+                collection_detail: collection.and_then(|value| non_empty(&value.detail)),
+                // 新模型三字段：新消费方以 `collection_result` 为准。
+                collection_prerequisites: collection
+                    .and_then(|value| non_empty(&value.prerequisites)),
+                collection_result: collection.and_then(|value| non_empty(&value.result)),
+                collection_reasons: collection.and_then(|value| {
+                    (!value.reasons.is_empty()).then(|| {
+                        value
+                            .reasons
+                            .iter()
+                            .map(|reason| AgentCollectionReason {
+                                kind: reason.kind.clone(),
+                                subject: reason.subject.clone(),
+                                detail: reason.detail.clone(),
+                            })
+                            .collect()
+                    })
+                }),
                 inputs: spec_sources(&work.spec),
             }
         })
@@ -250,6 +268,9 @@ mod tests {
                         acknowledged_version: Some(2),
                         collection_status: Some("ok".into()),
                         collection_detail: None,
+                        collection_prerequisites: None,
+                        collection_result: None,
+                        collection_reasons: None,
                         inputs: vec![AgentDataSource {
                             kind: "MetricInterval".into(),
                             target: "15s".into(),

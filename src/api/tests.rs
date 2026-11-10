@@ -4709,8 +4709,12 @@ async fn the_work_view_exposes_the_agents_local_work_report() {
                 startup_position: "tail".to_string(),
             }],
             collection: Some(wist_contracts::local_work::AgentLocalCollection {
-                status: wist_contracts::local_work::collection_status::FAILED.to_string(),
+                prerequisites: wist_contracts::local_work::collection_prerequisites::READY
+                    .to_string(),
+                result: wist_contracts::local_work::collection_result::FAILURE.to_string(),
+                reasons: Vec::new(),
                 observed_at: "2026-09-26T08:00:02Z".to_string(),
+                status: wist_contracts::local_work::collection_status::FAILED.to_string(),
                 detail: "/var/log/system.log: source path does not exist".to_string(),
             }),
         }],
@@ -17562,8 +17566,12 @@ async fn gateway_agents_report_the_data_manifest_end_to_end() {
                 startup_position: "tail".to_string(),
             }],
             collection: Some(wist_contracts::local_work::AgentLocalCollection {
-                status: "degraded".to_string(),
+                prerequisites: wist_contracts::local_work::collection_prerequisites::READY
+                    .to_string(),
+                result: wist_contracts::local_work::collection_result::PARTIAL.to_string(),
+                reasons: Vec::new(),
                 observed_at: "2026-01-01T00:00:03Z".to_string(),
+                status: "degraded".to_string(),
                 detail: "1/2 sources failed".to_string(),
             }),
         }],
@@ -17683,6 +17691,8 @@ async fn gateway_agents_report_the_data_manifest_end_to_end() {
     assert_eq!(collection["acknowledged_version"], 2);
     assert_eq!(collection["collection_status"], "degraded");
     assert_eq!(collection["collection_detail"], "1/2 sources failed");
+    assert_eq!(collection["collection_prerequisites"], "ready");
+    assert_eq!(collection["collection_result"], "partial");
     assert_eq!(collection["inputs"][0]["kind"], "MetricInterval");
     assert_eq!(collection["inputs"][0]["target"], "15s");
     let investigation = &manifest["investigations"][0];
