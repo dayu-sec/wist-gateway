@@ -3,6 +3,34 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.44.0-alpha] - 2026-11-10
+
+### 新增
+
+- **命令队列只读口**：agentd 要执行的一次性命令现在有统一的观测面 ——
+  `GET /api/v1/admin/agents/{agent_id}/commands`（单机）与
+  `GET /api/v1/admin/agent-commands`（全机队）。把散在各功能页（调查 / 重采 /
+  刷新 / 指标标签）的命令收敛成一队，回答「这台机器现在要执行什么、哪些是中心下发的」。
+  - `state` 闭集：`queued` / `claimed` / `acked` / `expired` / `superseded` / `all`，
+    未知值 400 `invalid_state`。`expired` / `superseded` 虽然写了 `acked_at`，
+    但单独成态 —— 它们**没有执行过**。
+  - 队列态按**先到先执行**升序（谁是下一条一眼可见），终态按新 → 旧。
+  - `source` 由 `requested_by` 派生：`center` / `admin` / `system`。
+  - `counts` 给的是队列态计数（不受 `state` 过滤影响），页面徽标用它。
+  - 只读：不新增入队通道，也不改 agentd 投递协议。
+
+### 修复
+
+- **主机身份兜底**：`GET /api/v1/admin/agents/{agent_id}/host/metrics` 与
+  全机队指标在注册表画像为空时（证书首触重建 / 老数据 / 被手删）回落到数据面的
+  `system_host_info`（`host_name` / `host_ip`），不再返回空主机名与空网卡。
+  注册表有值时仍是权威（它带全量网卡列表），逐字段合并、不整体覆盖。
+
+### 兼容性
+
+- 纯加性：新增两条 GET 路由与一个错误码 `invalid_state`；既有端点与投递协议不变。
+- 依赖 `wist-control 0.21`。
+
 ## [0.43.0-alpha] - 2026-11-10
 
 ### 新增

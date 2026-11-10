@@ -1,5 +1,6 @@
 // NOTE(hand-added): 主机资源指标（管理面代理查询 VictoriaMetrics，并按 `agent_id` join 注册表
-// 机器画像 —— 主机名 / `node_id` / 网卡地址）。对应 jumo 模型 `Control.Agent.HostMetrics`
+// 机器画像 —— 主机名 / `node_id` / 网卡地址）。注册表画像为空时回落到数据面的
+// `system_host_info`（单值主 IP + 主机名）。对应 jumo 模型 `Control.Agent.HostMetrics`
 // （binding：`AdminShowAgentHostMetrics` / `AdminListAgentHostMetrics`），响应字段与模型结构体
 // `AgentHostMetrics` / `AgentHostMetricsSummary` 一致。本模块与这两条路由已声明在模型里，
 // 但代码仍属手加（同 `api/mod.rs` 顶部的 hand-added 说明）：重新生成控制面代码时需回补。
@@ -30,8 +31,9 @@ const HISTORY_STEP_SECONDS: i64 = 30;
 #[serde(rename_all = "camelCase")]
 pub struct AgentHostMetrics {
     pub agent_id: String,
-    /// 机器身份（主机名 / node_id / 网卡地址）：来自注册表 join —— 数据面 VM 里没有这些标签。
-    /// 空串 / 空表 = 注册表里没有这台机器的画像（老数据或被手工删过）。
+    /// 机器身份（主机名 / node_id / 网卡地址）：优先来自注册表 join；注册表画像为空时
+    /// （证书首触重建、老数据、被手删）回落到数据面的 `system_host_info`（`host_name` / `host_ip`）。
+    /// 空串 / 空表 = 两处都拿不到。
     pub node_id: String,
     pub hostname: String,
     pub ip_addresses: Vec<String>,
@@ -98,7 +100,7 @@ pub struct AgentHostMetricsHistory {
 #[serde(rename_all = "camelCase")]
 pub struct AgentHostMetricsSummary {
     pub agent_id: String,
-    /// 机器身份，口径与 [`AgentHostMetrics`] 一致：注册表 join 而来，缺画像时为空。
+    /// 机器身份，口径与 [`AgentHostMetrics`] 一致：注册表优先，空则回落到 `system_host_info`。
     pub node_id: String,
     pub hostname: String,
     pub ip_addresses: Vec<String>,
@@ -149,10 +151,15 @@ pub async fn get_agent_host_metrics(
 
     match query_host_metrics(&state.config.victoria_metrics_url, &agent_id).await {
         Ok(mut metrics) => {
-            // 指标端点自己不带主机名/IP —— 身份只能从注册表拿，这里把它 join 回去。
-            metrics.node_id = agent.node_id.clone();
-            metrics.hostname = agent.hostname.clone();
-            metrics.ip_addresses = agent.ip_addresses.clone();
+            // 指标侧（`system_host_info`）已经带回了主机名 / 主 IP；注册表有值时以注册表为准
+            // —— 它才是**全部**网卡的权威列表（指标侧只有单值主 IP）。逐字段判断：注册表只
+            // 填了主机名而没有网卡时，IP 仍用指标侧的。
+            merge_registry_identity(
+                &mut metrics,
+                &agent.node_id,
+                &agent.hostname,
+                &agent.ip_addresses,
+            );
             Json(metrics).into_response()
         }
         Err(err) => ApiError::internal_with(
@@ -175,7 +182,8 @@ pub async fn get_all_agents_host_metrics(
         return response;
     }
     // 一次性取回注册表里的机器身份（node_id / hostname / ip_addresses），再按 agent_id join 到
-    // 指标上。用轻量投影 `list_agent_identities`（只读身份四列、全表、无过滤）—— 不需要为拿
+    // 指标上；注册表缺的字段由 `system_host_info` 兜底（见 `query_all_host_metrics`）。
+    // 用轻量投影 `list_agent_identities`（只读身份四列、全表、无过滤）—— 不需要为拿
     // 身份把整个注册行（含 local_work / uplink_state）拉进来。
     let identities_list = match state.store.list_agent_identities().await {
         Ok(identities) => identities,
@@ -212,9 +220,14 @@ const SUMMARY_METRIC_NAMES: &[&str] = &[
     "system_memory_available_bytes",
     "system_disk_usage_ratio",
     "system_filesystem_usage_ratio",
+    // 主机身份：注册表画像为空时的兜底（host_name / host_ip）。
+    "system_host_info",
 ];
 
 /// 拉一次所有主机的 `system.*` 指标，按 `agent` 标签分组，并给注册表里认识的机器 join 上身份。
+///
+/// 注册表画像为空（证书首触重建 / 老数据 / 被手删）时，用同批的 `system_host_info`
+/// （`host_name` / `host_ip`）填上空字段；两处都有值时以注册表为准。
 async fn query_all_host_metrics(
     vm_url: &str,
     identities: &HashMap<String, StoredAgentIdentity>,
@@ -274,6 +287,8 @@ async fn query_all_host_metrics(
                     record_filesystem_usage(entry, mountpoint, usage);
                 }
             }
+            // 只补注册表缺的字段：注册表有值时它是权威（全量网卡列表 > 单值主 IP）。
+            "system_host_info" => apply_host_info(entry, &item),
             _ => {}
         }
     }
@@ -396,6 +411,16 @@ fn build_metrics(
             "system_disk_available_bytes" if is_system_disk(&item) => {
                 metrics.disk_available_kb = parse_i64(value).map(|bytes| bytes / 1024)
             }
+            // 数据面自带的主机身份：注册表画像缺失时由 handler 决定是否采用（注册表优先）。
+            // 只取单值主 IP —— 全量网卡地址仍以注册表为准。
+            "system_host_info" => {
+                if let Some(host_name) = item["metric"]["host_name"].as_str() {
+                    metrics.hostname = host_name.to_string();
+                }
+                if let Some(host_ip) = item["metric"]["host_ip"].as_str() {
+                    metrics.ip_addresses = vec![host_ip.to_string()];
+                }
+            }
             _ => {}
         }
     }
@@ -431,6 +456,27 @@ fn build_metrics(
     metrics
 }
 
+/// 注册表身份优先：只覆盖非空字段，空字段保留指标侧（`system_host_info`）的值。
+///
+/// 逐字段而不是「全有或全无」：注册表可能只补到了主机名（网卡列表为空），
+/// 这时 IP 仍应继续用指标侧的主 IP，而不是跟着一起被清空。
+fn merge_registry_identity(
+    metrics: &mut AgentHostMetrics,
+    node_id: &str,
+    hostname: &str,
+    ip_addresses: &[String],
+) {
+    if !node_id.is_empty() {
+        metrics.node_id = node_id.to_string();
+    }
+    if !hostname.is_empty() {
+        metrics.hostname = hostname.to_string();
+    }
+    if !ip_addresses.is_empty() {
+        metrics.ip_addresses = ip_addresses.to_vec();
+    }
+}
+
 /// 即时查询 `value: [timestamp, "value"]` 里的值字符串。
 fn scalar_value(item: &serde_json::Value) -> Option<&str> {
     item["value"].as_array()?.get(1)?.as_str()
@@ -461,6 +507,23 @@ fn record_filesystem_usage(entry: &mut AgentHostMetricsSummary, mount: &str, usa
     if is_worse {
         entry.max_filesystem_usage_percent = Some(usage);
         entry.max_filesystem_usage_mount = Some(mount.to_string());
+    }
+}
+
+/// 用数据面的 `system_host_info` 补注册表缺的身份字段。
+///
+/// 只补空字段：注册表画像才是权威（它带全量网卡列表，指标侧只带单值主 IP）。
+/// `node_id` 不在这里 —— 它只是控制面身份，指标侧没有对应值。
+fn apply_host_info(entry: &mut AgentHostMetricsSummary, item: &serde_json::Value) {
+    if entry.hostname.is_empty()
+        && let Some(host_name) = item["metric"]["host_name"].as_str()
+    {
+        entry.hostname = host_name.to_string();
+    }
+    if entry.ip_addresses.is_empty()
+        && let Some(host_ip) = item["metric"]["host_ip"].as_str()
+    {
+        entry.ip_addresses = vec![host_ip.to_string()];
     }
 }
 
@@ -497,7 +560,8 @@ fn parse_i64(value: Option<&str>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentHostMetricsSummary, SUMMARY_METRIC_NAMES, build_metrics, record_filesystem_usage,
+        AgentHostMetricsSummary, SUMMARY_METRIC_NAMES, apply_host_info, build_metrics,
+        merge_registry_identity, record_filesystem_usage,
     };
     use serde_json::json;
 
@@ -514,6 +578,100 @@ mod tests {
             max_filesystem_usage_percent: None,
             max_filesystem_usage_mount: None,
         }
+    }
+
+    #[test]
+    fn registry_identity_overrides_only_non_empty_fields() {
+        let instant = json!({
+            "data": {
+                "result": [
+                    {"metric": {"__name__": "system_host_info", "host_name": "dp-host", "host_ip": "10.0.0.9"}, "value": [1, "1"]}
+                ]
+            }
+        });
+        let mut metrics = build_metrics("agent-001", &instant, &json!({"data": {"result": []}}));
+        assert_eq!(metrics.hostname, "dp-host");
+        assert_eq!(metrics.ip_addresses, vec!["10.0.0.9".to_string()]);
+
+        // 注册表三个字段都空：指标侧的值全部保留。
+        merge_registry_identity(&mut metrics, "", "", &[]);
+        assert_eq!(metrics.hostname, "dp-host");
+        assert_eq!(metrics.ip_addresses, vec!["10.0.0.9".to_string()]);
+
+        // 注册表只补了主机名：IP 仍用指标侧的（逐字段，不是全有或全无）。
+        merge_registry_identity(&mut metrics, "node-1", "host-1", &[]);
+        assert_eq!(metrics.node_id, "node-1");
+        assert_eq!(metrics.hostname, "host-1");
+        assert_eq!(metrics.ip_addresses, vec!["10.0.0.9".to_string()]);
+
+        // 注册表有网卡列表：整体覆盖（全量列表才是权威），不是追加。
+        merge_registry_identity(
+            &mut metrics,
+            "",
+            "",
+            &[
+                "en0 192.168.1.5/24".to_string(),
+                "utun100 100.64.0.9/32".to_string(),
+            ],
+        );
+        assert_eq!(metrics.node_id, "node-1");
+        assert_eq!(metrics.hostname, "host-1");
+        assert_eq!(
+            metrics.ip_addresses,
+            vec![
+                "en0 192.168.1.5/24".to_string(),
+                "utun100 100.64.0.9/32".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn build_metrics_takes_host_identity_from_system_host_info() {
+        // 详情页的注册表 join 在 handler 里；指标侧的内容只负责把 identity 带回结构体，
+        // 由 handler 决定是否采用（注册表非空时覆盖它）。
+        let instant = json!({
+            "data": {
+                "result": [
+                    {"metric": {"__name__": "system_host_info", "host_name": "web-01", "host_ip": "10.0.0.5"}, "value": [1, "1"]},
+                    {"metric": {"__name__": "system_load_average_1m"}, "value": [1, "0.5"]}
+                ]
+            }
+        });
+        let range = json!({"data": {"result": []}});
+
+        let metrics = build_metrics("agent-001", &instant, &range);
+
+        assert_eq!(metrics.hostname, "web-01");
+        assert_eq!(metrics.ip_addresses, vec!["10.0.0.5".to_string()]);
+        assert_eq!(metrics.load_average_1m, Some(0.5));
+    }
+
+    #[test]
+    fn host_info_only_fills_missing_registry_fields() {
+        // 注册表有值时它是权威：多网卡列表不能被单值主 IP 覆盖。
+        let mut with_registry = summary();
+        with_registry.node_id = "node-1".to_string();
+        with_registry.hostname = "host-1".to_string();
+        with_registry.ip_addresses = vec!["en0 10.0.0.5/24".to_string()];
+        apply_host_info(
+            &mut with_registry,
+            &json!({"metric": {"host_name": "dp-host", "host_ip": "10.0.0.9"}}),
+        );
+        assert_eq!(with_registry.node_id, "node-1");
+        assert_eq!(with_registry.hostname, "host-1");
+        assert_eq!(
+            with_registry.ip_addresses,
+            vec!["en0 10.0.0.5/24".to_string()]
+        );
+
+        // 注册表为空：用指标侧的主机名 / 主 IP 兜底。
+        let mut empty = summary();
+        apply_host_info(
+            &mut empty,
+            &json!({"metric": {"host_name": "dp-host", "host_ip": "10.0.0.9"}}),
+        );
+        assert_eq!(empty.hostname, "dp-host");
+        assert_eq!(empty.ip_addresses, vec!["10.0.0.9".to_string()]);
     }
 
     #[test]

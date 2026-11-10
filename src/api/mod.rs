@@ -28,6 +28,8 @@ mod ingest;
 // 不在 jumo 静态模型 binding.mju 的声明里，重新生成控制面代码时需回补本模块与下方路由。
 mod install;
 mod investigations;
+/// 命令队列（只读）：agentd 待执行 / 执行中 / 已回执，含来源（中心下发 / 页面发起）。
+mod queue;
 // NOTE(hand-added): 安装包的拉取/本地缓存（管理面设置来源地址后网关先拉到本地，
 // 之后统一从网关分发）。对应 jumo 模型 WistGatewayManagementInterface 的
 // AdminSetAgentInstallPackageAddress 与 AgentInstallPackageAddress；新路由未变，
@@ -167,6 +169,7 @@ use metrics_labels::{
 use overview::{RecentOnlineRegisteredAgent, get_agent_overview};
 use pipeline::get_pipeline_topology;
 use preflight::{run_agent_preflight, view_agent_preflight};
+use queue::{admin_agent_command_queue, admin_command_queue};
 use refresh::dispatch_agent_refresh;
 use rollout_ops::{
     advance_rollout_plan, approve_rollout_plan, create_rollout_plan, list_rollout_plans,
@@ -460,6 +463,13 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/admin/agents/{agent_id}/refresh",
             post(dispatch_agent_refresh),
         )
+        // 管理面：命令队列（只读）——「这台机器现在要执行什么 / 哪些是中心下发的」。
+        // 队列本身在 `agent_commands` 里（下发时写入），这里只读不改。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/commands",
+            get(admin_agent_command_queue),
+        )
+        .route("/api/v1/admin/agent-commands", get(admin_command_queue))
         // NOTE(hand-added): 一次性调查。POST 下发（`kind = investigate`），GET 拿「最近一次
         // 下发 + 本机报告列表」；`/{command_id}` 读完整报告（数据面落盘，网关只读）。
         .route(

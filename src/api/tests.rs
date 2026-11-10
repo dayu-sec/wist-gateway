@@ -9480,6 +9480,94 @@ async fn gateway_plane_investigation_is_loopback_idempotent_and_serialized() {
     assert_eq!(error["error"]["code"], "investigation_bad_params");
 }
 
+/// 命令队列（只读）：来源、状态、计数、状态词表都要说清楚。
+#[tokio::test]
+async fn command_queue_shows_source_state_and_counts() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // 一条中心下发（queued）+ 一条页面发起（queued）+ 一条已回执。
+    for (id, by, kind, at) in [
+        ("cmd-center-1", "center", "investigate", now - 3_000),
+        ("cmd-admin-1", "admin:abc123", "investigate", now - 2_000),
+        ("cmd-done-1", "center", "investigate", now - 1_000),
+    ] {
+        env.store
+            .enqueue_agent_command(
+                &StoredAgentCommand {
+                    command_id: id.to_string(),
+                    agent_id: "agent-node-a".to_string(),
+                    kind: kind.to_string(),
+                    params: r#"{"topic":"disk"}"#.to_string(),
+                    requested_at_ms: at,
+                    acked_at: None,
+                    claimed_at: None,
+                    outcome: None,
+                    detail: None,
+                    requested_by: by.to_string(),
+                },
+                false,
+            )
+            .await
+            .expect("enqueue");
+    }
+    env.store
+        .ack_agent_command(
+            "agent-node-a",
+            "cmd-done-1",
+            &chrono::Utc::now().to_rfc3339(),
+            "succeeded",
+            "disk: ok",
+        )
+        .await
+        .expect("ack");
+
+    // 单机视图：队列态先到先执行；来源/状态/摘要都在。
+    let response = get_admin(&env, "/api/v1/admin/agents/agent-node-a/commands").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(view["counts"]["queued"], 2);
+    assert_eq!(view["counts"]["claimed"], 0);
+    let commands = view["commands"].as_array().expect("commands");
+    assert_eq!(commands.len(), 3);
+    // 缺省 `all`：新 → 旧。
+    assert_eq!(commands[0]["command_id"], "cmd-done-1");
+    assert_eq!(commands[0]["state"], "acked");
+    assert_eq!(commands[0]["outcome"], "succeeded");
+    assert_eq!(commands[1]["source"], "admin", "页面发起的要能区分出来");
+    assert_eq!(commands[2]["source"], "center", "中心下发的要能区分出来");
+    assert_eq!(commands[2]["summary"], "topic=disk");
+
+    // 只看待执行：先到先执行（升序）。
+    let response = get_admin(
+        &env,
+        "/api/v1/admin/agents/agent-node-a/commands?state=queued",
+    )
+    .await;
+    let queued: serde_json::Value = decode_json_response(response).await;
+    let ids: Vec<&str> = queued["commands"]
+        .as_array()
+        .expect("queued")
+        .iter()
+        .map(|item| item["command_id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, ["cmd-center-1", "cmd-admin-1"]);
+
+    // 全机队视图：还有谁在等 agentd。
+    let response = get_admin(&env, "/api/v1/admin/agent-commands?state=queued").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fleet: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(fleet["counts"]["queued"], 2);
+    assert!(fleet["agent_id"].is_null());
+
+    // 未知状态是 400，不悄悄当成 all。
+    let response = get_admin(&env, "/api/v1/admin/agent-commands?state=bogus").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(error["error"]["code"], "invalid_state");
+}
+
 /// 中心没传 id 时网关自己铸一个（与 admin 同口径）；审计落 `center`。
 #[tokio::test]
 async fn gateway_plane_investigation_without_an_id_mints_one_and_audits_center() {

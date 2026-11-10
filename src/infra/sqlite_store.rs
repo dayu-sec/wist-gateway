@@ -2863,6 +2863,36 @@ impl Store for SqliteStore {
         rows.iter().map(agent_command_from_row).collect()
     }
 
+    async fn list_agent_commands(
+        &self,
+        agent_id: Option<&str>,
+        state: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredAgentCommand>> {
+        // SQL 必须是 `&'static str`（sqlx 0.9 的注入防护）：过滤片段来自**闭集**，
+        // 用宏在编译期拼出来，运行期没有任何字符串拼接。
+        let rows = sqlx::query(agent_command_queue_list_sql(state))
+            .bind(agent_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "select agent command queue"))?;
+        rows.iter().map(agent_command_from_row).collect()
+    }
+
+    async fn count_agent_commands(
+        &self,
+        agent_id: Option<&str>,
+        state: Option<&str>,
+    ) -> StoreResult<u64> {
+        let count: i64 = sqlx::query_scalar(agent_command_queue_count_sql(state))
+            .bind(agent_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "count agent commands by state"))?;
+        Ok(count.max(0) as u64)
+    }
+
     async fn count_agent_commands_since(
         &self,
         agent_id: &str,
@@ -3627,6 +3657,63 @@ fn fact_summary_from_row(row: &SqliteRow) -> StoreResult<StoredAgentFactSummary>
         container_names: deserialize_json_array(&container_names, "read container names")?,
         received_at: column!(row, "received_at"),
     })
+}
+
+/// 队列查询的 SQL（编译期拼接；过滤片段来自闭集，运行期零拼接）。
+///
+/// 队列态（`queued` / `claimed`）按**先到先执行**升序 —— 页面上一眼看出谁是下一条；
+/// 终态按新 → 旧。`acked_at` 是「终态」谓词，具体哪种终态看 `outcome`
+/// （`expired` / `superseded` 也写 `acked_at`，但它们不是执行完成）。
+macro_rules! queue_sql {
+    (list, $filter:literal, $order:literal) => {
+        concat!(
+            "SELECT command_id, agent_id, kind, params, requested_at_ms, acked_at, outcome, detail, ",
+            "requested_by, claimed_at FROM agent_commands ",
+            "WHERE (?1 IS NULL OR agent_id = ?1) AND ",
+            $filter,
+            " ORDER BY requested_at_ms ", $order, ", command_id ", $order, " LIMIT ?2",
+        )
+    };
+    (count, $filter:literal) => {
+        concat!(
+            "SELECT COUNT(*) FROM agent_commands WHERE (?1 IS NULL OR agent_id = ?1) AND ",
+            $filter,
+        )
+    };
+}
+
+fn agent_command_queue_list_sql(state: Option<&str>) -> &'static str {
+    match state {
+        Some("queued") => {
+            queue_sql!(list, "acked_at IS NULL AND claimed_at IS NULL", "ASC")
+        }
+        Some("claimed") => {
+            queue_sql!(list, "acked_at IS NULL AND claimed_at IS NOT NULL", "ASC")
+        }
+        Some("acked") => queue_sql!(
+            list,
+            "acked_at IS NOT NULL AND (outcome IS NULL OR outcome NOT IN ('expired', 'superseded'))",
+            "DESC"
+        ),
+        Some("expired") => queue_sql!(list, "outcome = 'expired'", "DESC"),
+        Some("superseded") => queue_sql!(list, "outcome = 'superseded'", "DESC"),
+        // 缺省 / `all`：不过滤。
+        _ => queue_sql!(list, "1 = 1", "DESC"),
+    }
+}
+
+fn agent_command_queue_count_sql(state: Option<&str>) -> &'static str {
+    match state {
+        Some("queued") => queue_sql!(count, "acked_at IS NULL AND claimed_at IS NULL"),
+        Some("claimed") => queue_sql!(count, "acked_at IS NULL AND claimed_at IS NOT NULL"),
+        Some("acked") => queue_sql!(
+            count,
+            "acked_at IS NOT NULL AND (outcome IS NULL OR outcome NOT IN ('expired', 'superseded'))"
+        ),
+        Some("expired") => queue_sql!(count, "outcome = 'expired'"),
+        Some("superseded") => queue_sql!(count, "outcome = 'superseded'"),
+        _ => queue_sql!(count, "1 = 1"),
+    }
 }
 
 fn agent_command_from_row(row: &SqliteRow) -> StoreResult<StoredAgentCommand> {
@@ -5589,6 +5676,106 @@ mod tests {
                 .await
                 .expect("check"),
             "已回执的不算在飞"
+        );
+    }
+
+    /// 队列视图：状态过滤、队列态升序（先到先执行）、终态降序、计数。
+    #[tokio::test]
+    async fn agent_command_queue_filters_states_and_orders_by_state() {
+        let store = store().await;
+        let now = Utc::now().timestamp_millis();
+        for (id, agent, at) in [
+            ("cmd-queued-1", "agent-a", now - 3_000),
+            ("cmd-queued-2", "agent-a", now - 2_000),
+        ] {
+            store
+                .enqueue_agent_command(&investigate_command(id, agent, at), false)
+                .await
+                .unwrap();
+        }
+        // 另一台机器的命令不能串进单机视图。
+        store
+            .enqueue_agent_command(
+                &investigate_command("cmd-other-agent", "agent-b", now),
+                false,
+            )
+            .await
+            .unwrap();
+        // 一条已认领、一条已回执。
+        store
+            .ack_agent_command(
+                "agent-a",
+                "cmd-queued-2",
+                &Utc::now().to_rfc3339(),
+                "accepted",
+                "扫描中",
+            )
+            .await
+            .unwrap();
+        store
+            .ack_agent_command(
+                "agent-b",
+                "cmd-other-agent",
+                &Utc::now().to_rfc3339(),
+                "succeeded",
+                "ok",
+            )
+            .await
+            .unwrap();
+
+        let queued = store
+            .list_agent_commands(Some("agent-a"), Some("queued"), 10)
+            .await
+            .expect("queued");
+        assert_eq!(
+            queued
+                .iter()
+                .map(|command| command.command_id.as_str())
+                .collect::<Vec<_>>(),
+            ["cmd-queued-1"],
+            "只出未被取走的那条"
+        );
+
+        let claimed = store
+            .list_agent_commands(Some("agent-a"), Some("claimed"), 10)
+            .await
+            .expect("claimed");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].command_id, "cmd-queued-2");
+
+        let all = store
+            .list_agent_commands(Some("agent-a"), Some("all"), 10)
+            .await
+            .expect("all");
+        assert_eq!(
+            all.iter()
+                .map(|command| command.command_id.as_str())
+                .collect::<Vec<_>>(),
+            ["cmd-queued-2", "cmd-queued-1"],
+            "全部视图按新 → 旧"
+        );
+
+        // 计数：不受 limit / list 内容影响。
+        assert_eq!(
+            store
+                .count_agent_commands(Some("agent-a"), Some("queued"))
+                .await
+                .expect("count queued"),
+            1
+        );
+        assert_eq!(
+            store
+                .count_agent_commands(None, Some("claimed"))
+                .await
+                .expect("count claimed"),
+            1
+        );
+        assert_eq!(
+            store
+                .count_agent_commands(None, Some("acked"))
+                .await
+                .expect("count acked"),
+            1
         );
     }
 

@@ -97,6 +97,7 @@ codes! {
     GITHUB_RELEASE_RESOLVE_FAILED => "github_release_resolve_failed",
     HOST_METRICS_UNAVAILABLE => "host_metrics_unavailable",
     INGEST_LOGS_TOO_MANY_RECORDS => "ingest_logs_too_many_records",
+    INVALID_STATE => "invalid_state",
     INSTALL_CODE_ISSUE_FAILED => "install_code_issue_failed",
     INSTALL_PACKAGE_ADDRESS_INVALID => "install_package_address_invalid",
     INSTALL_PACKAGE_ADDRESS_STORE_FAILED => "install_package_address_store_failed",

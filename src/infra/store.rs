@@ -1731,6 +1731,24 @@ pub trait Store: Send + Sync + fmt::Debug {
         limit: usize,
     ) -> StoreResult<Vec<StoredAgentCommand>>;
 
+    /// 命令队列（只读）：`agent_id = None` = 全机队；`state = None` = 全部。
+    ///
+    /// 队列态（`queued` / `claimed`）按**先到先执行**升序（页面上一眼看出谁是下一条），
+    /// 终态（`acked` / `expired` / `superseded`）按新 → 旧。
+    async fn list_agent_commands(
+        &self,
+        agent_id: Option<&str>,
+        state: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredAgentCommand>>;
+
+    /// 队列计数（过滤口径同 [`Store::list_agent_commands`]）。
+    async fn count_agent_commands(
+        &self,
+        agent_id: Option<&str>,
+        state: Option<&str>,
+    ) -> StoreResult<u64>;
+
     /// 某台 agent 在 `since_ms` 之后**入门过**多少条某种 kind 的命令（含已被覆盖/已确认）。
     ///
     /// 为什么数“入门”而不是“执行完成”：额度要拦的是**发起动作**（连点、脚本误触），
