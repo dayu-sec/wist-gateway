@@ -3,6 +3,21 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.46.0-alpha] - 2026-11-12
+
+### 新增（调查授权 / 能力上报）
+
+- `AgentDataManifest` 增 `investigation_granted`（网关上界 ∩ 本机 grant）与
+  `investigation_capabilities`（agentd 自报能力面），随每 60s 机队上报送到中心：
+  中心开放面据此回答「这台主机实际开了哪些调查面、能跑哪些题」。
+- 两个集合**分开上报**：`Some([])` = 确实全关；`None` = 旧网关 / 旧 agentd 还没报，
+  中心不能把「没上报」当成「全关」。
+
+### 兼容性
+
+- 字段是加性的：旧中心忽略；旧网关不报时中心返回 `grant_reported=false`。
+- 依赖 `wist-control` 的新字段（本地联调走 path；发布需先发 control 新版本）。
+
 ## [0.45.0-alpha] - 2026-11-10
 
 ### 新增（采集状态多字段透传）

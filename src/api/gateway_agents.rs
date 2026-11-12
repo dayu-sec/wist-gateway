@@ -197,6 +197,24 @@ async fn agent_data_manifest(
             }
         })
         .collect();
+
+    // 调查面：上界（`[investigations] allowed_topics`）∩ 本机 grant，以及 agentd 自报的能力面。
+    // 两个集合必须分开上报：`Some([])` = 确实全关；`None` = 旧网关 / 旧 agentd 还没报。
+    let ceiling = super::investigations::effective_allowed_topics(
+        state.config.investigation_allowed_topics.as_deref(),
+    );
+    let grant = state.store.get_investigation_grant(&agent.agent_id).await?;
+    let investigation_granted = Some(
+        super::investigations::granted_topics(&ceiling, grant.as_ref())
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    let investigation_capabilities = agent
+        .investigation_capabilities
+        .as_ref()
+        .map(|capabilities| capabilities.surfaces.clone());
+
     Ok(AgentDataManifest {
         collected_at: DateTime::now(),
         collection,
@@ -205,6 +223,8 @@ async fn agent_data_manifest(
             &agent.agent_id,
             MANIFEST_MAX_INVESTIGATIONS,
         ),
+        investigation_granted,
+        investigation_capabilities,
     })
 }
 
@@ -277,6 +297,8 @@ mod tests {
                         }],
                     }],
                     investigations: Vec::new(),
+                    investigation_granted: None,
+                    investigation_capabilities: None,
                 }),
                 investigations: Vec::new(),
             }],

@@ -22,7 +22,8 @@ use crate::infra::{
     KnowledgeActivation, LocalPeers, SqliteStore, Store, StoredAgentCommand,
     StoredAgentInstallPackage, StoredAgentInstallPackageAddress, StoredAgentRevocation,
     StoredAgentUplinkAddress, StoredCredentialStatus, StoredEnrollmentTokenStatus,
-    StoredKnowledgePackage, VerifiedAgentIdentity, bytes_sha256_hex, sha256_hex,
+    StoredInvestigationGrant, StoredKnowledgePackage, VerifiedAgentIdentity, bytes_sha256_hex,
+    sha256_hex,
 };
 use wist_api::action_result::{ReportActionResult, ResultAttestation};
 use wist_api::discovery_policies::{
@@ -17589,10 +17590,25 @@ async fn gateway_agents_report_the_data_manifest_end_to_end() {
             "instance_id": "node-a",
             "version": "0.4.0",
             "local_work": local_work,
+            "investigation_capabilities": {
+                "surfaces": ["disk", "load"],
+                "privileged": false
+            },
         }),
     )
     .await;
     assert_eq!(status.status(), StatusCode::ACCEPTED);
+
+    // 2b) 调查授权：网关本机台账里的一行（上界 ∩ 本机 grant）。
+    env.store
+        .upsert_investigation_grant(&StoredInvestigationGrant {
+            agent_id: agent_id.to_string(),
+            topics: vec!["disk".to_string(), "load".to_string()],
+            updated_at: wist_shared::time::now_rfc3339(),
+            updated_by: "admin:test".to_string(),
+        })
+        .await
+        .expect("save investigation grant");
 
     // 3) 调查数据：报告目录里的一份 IVSREP。
     env.config.data_plane_work_dir = Some(env._root.clone());
@@ -17700,6 +17716,17 @@ async fn gateway_agents_report_the_data_manifest_end_to_end() {
     assert_eq!(investigation["topic"], "disk");
     assert_eq!(investigation["overall"], "warn");
     assert_eq!(investigation["findings_warn"], 1);
+
+    // 调查面：授权（上界 ∩ 本机 grant）与 agent 自报能力分开上报，中心开放面据此回答
+    // 「这台主机开了哪些授权」；两个字段都是加性的，不能把「没上报」当成「全关」。
+    assert_eq!(
+        manifest["investigation_granted"],
+        serde_json::json!(["disk", "load"])
+    );
+    assert_eq!(
+        manifest["investigation_capabilities"],
+        serde_json::json!(["disk", "load"])
+    );
 
     // 任务状态：题面从命令 `params` 取；未回执时 `outcome` 必须是 null（不得冒充 succeeded）。
     let task = &json["agents"][0]["investigations"][0];

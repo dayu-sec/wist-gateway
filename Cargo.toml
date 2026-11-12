@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.45.0" #@gxl:set(version)
+version = "0.46.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -26,8 +26,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 wist-contracts = "0.11"
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。CI/发布走 registry；本地联调可临时切 path。
 wist-api = "0.11"
-wist-control = { version = "0.22" }
-#wist-control = { version = "0.14", path = "../wist-control" }
+wist-control = { version = "0.23" }
+# 本地联调可临时切 path：wist-control = { version = "0.23", path = "../wist-control" }
 wist-error = { version = "0.2" }
 #wist-error = { version = "0.2", path = "../wist-error" }
 # 分层配置（主配置 + 接口层声明 `${VAR}` + 同目录 `.env`），与 center / gwlinkd 共用。

@@ -247,7 +247,7 @@ fn build_params(request: &LaunchInvestigationRequest) -> Result<(String, String)
 /// 但会从「允许集」里消失 —— 页面看得到的就是真正生效的那几个。
 ///
 /// 参数是 `Option<&[String]>` 而不是 `&ApiState`：这条规则应该能**不搭台也能测**。
-fn effective_allowed_topics(configured: Option<&[String]>) -> Vec<&'static str> {
+pub(crate) fn effective_allowed_topics(configured: Option<&[String]>) -> Vec<&'static str> {
     match configured {
         None => TOPICS.to_vec(),
         Some(allowed) => TOPICS
@@ -280,7 +280,7 @@ fn ensure_allowed(state: &ApiState, topic: &str) -> Result<Vec<&'static str>, Bo
 /// **没有授权行 = 这台机器一个面都没开**（与采集面同一逻辑：没派过活就不采）。
 /// 要放开必须显式写（页面勾选 / `PUT …/investigations/grant`）；
 /// 下界永远不可能超过上界（上界是环境策略，改它要重启）。
-fn granted_topics(
+pub(crate) fn granted_topics(
     ceiling: &[&'static str],
     grant: Option<&StoredInvestigationGrant>,
 ) -> Vec<&'static str> {
