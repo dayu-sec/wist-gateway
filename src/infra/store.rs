@@ -263,12 +263,131 @@ pub const DISCOVERY_SNAPSHOT_SCOPE_APPLIED: &str = "applied";
 /// 一块全量快照（百 KB 级）不能因手滑配置打到秒级。两边都夹，是因为任一侧都可能被单独改。
 pub const DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS: u64 = 60;
 
-/// 云资产采集（harvest）的中心侧开关：单行，网关级（一个网关只服务一个客户）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct StoredHarvestSetting {
-    pub enabled: bool,
+/// 云资产采集（harvest）的 worker 登记。
+///
+/// 身份是**客户端证书**（mTLS，与 agentd 同一套 CA 与接入流程）；这张表只存登记与
+/// 状态，链已经在 TLS 层验过。设计见 `docs/design/harvest-work-grant.md` §3。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HarvestWorker {
+    /// `harvest:<source_code>`
+    pub worker_id: String,
+    pub source_code: String,
+    pub instance_id: String,
+    /// `pending` | `active` | `revoked`
+    pub status: String,
+    pub enrolled_at: String,
+    pub last_seen_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub revoked_by: String,
+}
+
+/// 一张签出去的客户端证书（吊销与审计用）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HarvestCertificateRecord {
+    pub credential_id: String,
+    pub worker_id: String,
+    /// 小写 hex 序列号（吊销依据）。
+    pub cert_serial: String,
+    /// 证书 DER 的 SHA-256（小写 hex）。
+    pub cert_sha256: String,
+    pub issued_at: String,
+    pub not_after: String,
+    pub revoked_at: Option<String>,
+}
+
+/// 常驻工作：一个 worker 一条（`family = inventory`）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StoredHarvestStanding {
+    pub work_id: String,
+    pub worker_id: String,
+    pub family: String,
+    /// 结构化 spec（落库是 JSON，读出后是强类型）。
+    pub spec: wist_api::harvest_work::HarvestSpec,
+    pub catalog_version: i64,
+    pub proposal_id: Option<String>,
+    /// 期望版本：每次改动 +1。
+    pub plan_version: i64,
+    pub effective_from: String,
+    /// `active` | `paused`
+    pub status: String,
     pub updated_by: String,
     pub updated_at: String,
+}
+
+impl StoredHarvestStanding {
+    pub fn is_active(&self) -> bool {
+        self.status == wist_api::harvest_work::STATUS_ACTIVE
+    }
+}
+
+/// harvest 的确认回执（一份工作一条，回答「期望的版本真到了吗」）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredHarvestAck {
+    pub work_id: String,
+    pub worker_id: String,
+    /// `standing` | `one_shot`
+    pub work_kind: String,
+    pub plan_version: i64,
+    pub acknowledged_at: String,
+}
+
+/// 一次性工作的落库形状：契约 [`OneShotHarvestWork`] + **归属 worker**。
+///
+/// 为什么不在契约里加 `worker_id`：快照本身是按 worker 取的，客户端不需要这个字段；
+/// 而表与页面需要。跟 agent 侧 `StoredOneShotWork` 同一个处理：网关侧的信息不进契约。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StoredHarvestOneShot {
+    pub worker_id: String,
+    pub work: wist_api::harvest_work::OneShotHarvestWork,
+}
+
+/// 一次 poll 的快照：standing / one_shot 与 sequence **同一读快照**。
+///
+/// 为什么不能分两次读：`plan_version` 变了但 `sequence` 还是旧值时，采集器会按
+/// 「seq 未变→短路」跳过新 spec，且永远不再重试（静默漂移）。
+#[derive(Debug, Clone, Default)]
+pub struct HarvestGrantSnapshot {
+    pub standing: Option<StoredHarvestStanding>,
+    /// 只带**未了结**的一次性工作（终态的不再下发）。
+    pub one_shot: Vec<StoredHarvestOneShot>,
+    pub sequence: i64,
+}
+
+/// 一次性工作的**执行结果**（覆盖式；终态不被后到的结果覆盖）。
+///
+/// 与 [`StoredHarvestAck`] 分开：确认回答「我收到了」，结果回答「我做得怎么样了」。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredHarvestResult {
+    pub work_id: String,
+    pub worker_id: String,
+    /// `running` | `succeeded` | `failed`。
+    pub status: String,
+    /// 人看的说明（失败原因原样带上）。
+    pub detail: String,
+    pub reported_at: String,
+}
+
+/// 结果上报的处理结果：网关据此回 `accepted` / `stale` / `unknown`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarvestResultOutcome {
+    /// 已落库（同时把一次性工作推进到对应状态）。
+    Recorded,
+    /// 工作已是终态：结果**不覆盖**（默认调用方回 `stale`）。
+    Stale,
+    /// 这个 worker 名下没有这件活（默认回 `unknown`）。
+    Unknown,
+}
+
+/// 一次性接入券（只存 sha256 摘要；明文只在创建响应里出现一次）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredHarvestTicket {
+    pub ticket_hash: String,
+    pub worker_id: String,
+    pub source_code: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub consumed_at: Option<String>,
+    pub created_by: String,
 }
 
 /// 原文快照上送的设置 / 生效值。
@@ -1288,15 +1407,136 @@ pub trait Store: Send + Sync + fmt::Debug {
     /// 写入/覆盖 Agent 数据面上送地址设置。
     async fn upsert_agent_uplink(&self, setting: &StoredAgentUplinkAddress) -> StoreResult<()>;
 
-    /// 读云资产采集开关（harvest 轮询用）。
-    async fn harvest_setting(&self) -> StoreResult<StoredHarvestSetting>;
+    /// 读一个 harvest worker 的登记；没登记过返回 `None`。
+    async fn get_harvest_worker(&self, worker_id: &str) -> StoreResult<Option<HarvestWorker>>;
 
-    /// 写云资产采集开关，返回写入后的行（`updated_at` 由库给出）。
-    async fn set_harvest_setting(
+    /// 列出全部 harvest worker（页面一张表；量级 = 云账号数，不分页）。
+    async fn list_harvest_workers(&self) -> StoreResult<Vec<HarvestWorker>>;
+
+    /// 写入/覆盖 worker 登记（接入与「首触重建」共用）。
+    async fn upsert_harvest_worker(&self, worker: &HarvestWorker) -> StoreResult<()>;
+
+    /// 写一条签出的证书记录。
+    async fn insert_harvest_certificate(
         &self,
-        enabled: bool,
+        record: &HarvestCertificateRecord,
+    ) -> StoreResult<()>;
+
+    /// 吊销一个 worker（状态转 `revoked`，证书记录同步标吊销）。
+    async fn revoke_harvest_worker(
+        &self,
+        worker_id: &str,
+        revoked_by: &str,
+        revoked_at: &str,
+    ) -> StoreResult<()>;
+
+    /// 读写 worker 的心跳（`work:poll` 即心跳）。已撤销的 worker 不会被更新。
+    async fn touch_harvest_worker(&self, worker_id: &str, at: &str) -> StoreResult<()>;
+
+    /// `pending → active`：只改状态与心跳，**不整行覆盖**（否则会把并发写入的吊销擦掉）。
+    async fn promote_harvest_worker(&self, worker_id: &str, at: &str) -> StoreResult<()>;
+
+    /// 读一个 worker 的常驻工作；没有授权过返回 `None`。
+    async fn harvest_standing(&self, worker_id: &str)
+    -> StoreResult<Option<StoredHarvestStanding>>;
+
+    /// 按 `work_id` 读一条常驻工作（管理面按 id 操作时用，避免全表扫）。
+    async fn harvest_standing_by_work_id(
+        &self,
+        work_id: &str,
+    ) -> StoreResult<Option<StoredHarvestStanding>>;
+
+    /// 一次 poll 的快照：standing + sequence 同一读事务（见 [`HarvestGrantSnapshot`]）。
+    async fn harvest_grant(&self, worker_id: &str) -> StoreResult<HarvestGrantSnapshot>;
+
+    /// 写入/覆盖常驻工作。调用方负责先 `plan_version += 1`。
+    /// 只用于测试/迁移种子；管理面改授权请用 [`Self::save_harvest_standing_bump`]。
+    async fn upsert_harvest_standing(&self, standing: &StoredHarvestStanding) -> StoreResult<()>;
+
+    /// 授权 / 改 spec：在同一事务里 `plan_version + 1` 并推进 sequence，返回新版本。
+    ///
+    /// 原子性要求：不能「先读版本再 +1 写回去」（两个管理员并发会丢一次改动，且版本号不变）。
+    async fn save_harvest_standing_bump(
+        &self,
+        standing: &StoredHarvestStanding,
+    ) -> StoreResult<i64>;
+
+    /// 改 standing 状态（暂停 / 继续 / 撤销）：目标行更新 + 版本 +1 + sequence，同一事务。
+    ///
+    /// `revoked` 是终态：已撤销的行**不会被**这个方法再改（返回 `None`）。
+    /// 返回新版本号；行不存在或已撤销返回 `None`。
+    async fn set_harvest_standing_status(
+        &self,
+        work_id: &str,
+        status: &str,
         updated_by: &str,
-    ) -> StoreResult<StoredHarvestSetting>;
+        at: &str,
+    ) -> StoreResult<Option<i64>>;
+
+    /// 列出全部常驻工作（页面只读视图）。
+    async fn list_harvest_standings(&self) -> StoreResult<Vec<StoredHarvestStanding>>;
+
+    /// 读授权序号；从未授权过返回 `0`。
+    async fn harvest_sequence(&self, worker_id: &str) -> StoreResult<i64>;
+
+    /// 授权序号 +1，返回新值（授权 / 改 spec / 暂停 / 继续 / 撤销都调它）。
+    async fn bump_harvest_sequence(&self, worker_id: &str, at: &str) -> StoreResult<i64>;
+
+    /// 写一批确认回执。
+    async fn upsert_harvest_ack(&self, ack: &StoredHarvestAck) -> StoreResult<()>;
+
+    /// 读一份工作的确认回执；没确认过返回 `None`。
+    async fn get_harvest_ack(&self, work_id: &str) -> StoreResult<Option<StoredHarvestAck>>;
+
+    /// 列出全部确认回执（页面判漂移用）。
+    async fn list_harvest_acks(&self) -> StoreResult<Vec<StoredHarvestAck>>;
+
+    // ── 一次性工作（P2）：派发 / 列表 / 到期 / 结果 ──
+
+    /// 派发一件一次性工作（页面按钮 → 落库；同一 work_id 幂等）。
+    async fn save_harvest_one_shot(&self, work: &StoredHarvestOneShot) -> StoreResult<()>;
+
+    /// 某个 worker 名下的一次性工作（页面按 worker 看）。
+    async fn list_harvest_one_shot(
+        &self,
+        worker_id: &str,
+    ) -> StoreResult<Vec<StoredHarvestOneShot>>;
+
+    /// 全部 worker 的一次性工作（页面一张表；量级 = 手工动作数）。
+    async fn list_harvest_one_shot_all(&self) -> StoreResult<Vec<StoredHarvestOneShot>>;
+
+    /// 把**已过 `deadline_at` 且未了结**的工作标成 `expired`，返回条数。
+    ///
+    /// 在 poll 路径上调（惰性回收）：页面不能永远显示一个早就过期的 `dispatched`。
+    async fn expire_harvest_one_shot(&self, now: &str) -> StoreResult<u64>;
+
+    /// 终止一件未了结的工作（取消）；已到终态时不动，返回是否真的改了。
+    async fn finish_harvest_one_shot(&self, work_id: &str, status: &str) -> StoreResult<bool>;
+
+    /// 写入结果：**一个事务**里同步推进工作状态。
+    ///
+    /// 「先查再写」会漏掉并发：两个终态上报同时通过检查就都写进去了。
+    async fn record_harvest_result(
+        &self,
+        result: &StoredHarvestResult,
+    ) -> StoreResult<HarvestResultOutcome>;
+
+    /// 列出全部结果（页面把结果拼到一次性工作上）。
+    async fn list_harvest_results(&self) -> StoreResult<Vec<StoredHarvestResult>>;
+
+    /// 建一张一次性接入券（只存摘要）。
+    async fn create_harvest_ticket(&self, ticket: &StoredHarvestTicket) -> StoreResult<()>;
+
+    /// 消费一张接入券：未过期、未消费、**且归属匹配**才成功（原子），返回被消费的那张。
+    ///
+    /// 归属条件放进 `WHERE`：拿错 worker/source 的请求不能把券烧掉（否则一次误填就要重签）。
+    async fn consume_harvest_ticket(
+        &self,
+        ticket_hash: &str,
+        now: &str,
+        worker_id: &str,
+        source_code: &str,
+    ) -> StoreResult<Option<StoredHarvestTicket>>;
 
     /// 列出原文快照上送的全部行（global / 单机覆盖 / applied 各一份来源）。
     ///

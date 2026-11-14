@@ -16,7 +16,7 @@ use crate::infra::{AdminConfig, AgentCa, LocalPeers, Store};
 mod admin_auth;
 mod admin_ops;
 mod agent_ops;
-mod harvest;
+mod harvest_work;
 // NOTE(hand-added): 管理面错误码的稳定词表（`code` 的唯一来源）。重新生成控制面代码时需回补本模块。
 pub mod codes;
 mod enrollment;
@@ -347,8 +347,6 @@ pub fn ingest_router(state: ApiState) -> Router {
             post(ingest_agent_facts).layer(DefaultBodyLimit::max(MAX_INGEST_BODY_BYTES)),
         )
         // NOTE(hand-added): 采集日志的落盘（同一张内部监听，见 api/logs.rs）。
-        // 云资产采集开关（harvest 自己轮询；明文内网 + admin token，见 api/harvest.rs）。
-        .route("/api/v1/harvest/control", get(harvest::harvest_control))
         .route(
             "/api/v1/ingest/agent-logs",
             post(ingest_agent_logs).layer(DefaultBodyLimit::max(MAX_LOG_INGEST_BODY_BYTES)),
@@ -422,10 +420,47 @@ pub fn router_with_state(state: ApiState) -> Router {
         )
         // agent 面（edge seam B：gateway ↔ agentd）路由集中在 `api/agent_api/`：按 API 版本分表，
         // 由 `agent_api::mount` 统一挂上（版本并存约定见 api-seam-inventory.md §7）。
-        // 云资产采集开关：管理面读写（harvest 的轮询端点在 ingest_router）。
+        // 云资产采集（harvest）的工作授权：worker 面走 mTLS（TLS 监听），管理面走 admin token。
+        // 见 api/harvest_work.rs 与 docs/design/harvest-work-grant.md。
+        .route("/api/v1/harvest/enroll", post(harvest_work::enroll))
         .route(
-            "/api/v1/admin/harvest",
-            get(harvest::view_harvest_setting).put(harvest::set_harvest_setting),
+            "/api/v1/harvest/credentials:renew",
+            post(harvest_work::renew),
+        )
+        .route("/api/v1/harvest/work:poll", post(harvest_work::poll_work))
+        .route("/api/v1/harvest/work:ack", post(harvest_work::ack_work))
+        .route(
+            "/api/v1/harvest/work:result",
+            post(harvest_work::report_result),
+        )
+        .route(
+            "/api/v1/admin/harvest/enroll-ticket",
+            post(harvest_work::create_ticket),
+        )
+        .route(
+            "/api/v1/admin/harvest/workers",
+            get(harvest_work::list_workers),
+        )
+        .route(
+            "/api/v1/admin/harvest/workers/{worker_id}/revoke",
+            post(harvest_work::revoke_worker),
+        )
+        .route(
+            "/api/v1/admin/harvest/standing",
+            put(harvest_work::put_standing),
+        )
+        .route(
+            "/api/v1/admin/harvest/standing/{work_id}/{action}",
+            post(harvest_work::set_standing_status),
+        )
+        .route("/api/v1/admin/harvest/works", get(harvest_work::list_works))
+        .route(
+            "/api/v1/admin/harvest/one-shot",
+            post(harvest_work::dispatch_one_shot),
+        )
+        .route(
+            "/api/v1/admin/harvest/one-shot/{work_id}/cancel",
+            post(harvest_work::cancel_one_shot),
         )
         .route("/api/v1/admin/agents/overview", get(get_agent_overview))
         .route(

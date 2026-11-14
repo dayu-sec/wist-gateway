@@ -3,6 +3,45 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.48.0-alpha] - 2026-11-14
+
+### 新增（云资产采集：工作授权代替开关）
+
+采集指令从「一个共享布尔开关」改成「按 worker 下发授权」。设计见
+`docs/design/harvest-work-grant.md`。
+
+- **worker 面（mTLS，与 agentd 同一把 `agent-ca`）**
+  - `POST /api/v1/harvest/enroll`：一次性接入券 + CSR 换客户端证书（37 天）；
+    **先签后消费券**（CSR 坏了不烧券）；主体由网关按 `worker_id` 填。
+  - `POST /api/v1/harvest/credentials:renew`：用上一张证书链式续期。
+  - `POST /api/v1/harvest/work:poll`：一次性拿到 `standing` + 未了结的 `one_shot` + `sequence`
+    （**同一读事务**，否则客户端会按旧 seq 跳过新 spec）。
+  - `POST /api/v1/harvest/work:ack`：确认收到的 `plan_version`（落后/超前都回 `stale`）。
+  - `POST /api/v1/harvest/work:result`：一次性工作的执行结果，**一个事务**里判终态 →
+    写结果 → 推进工作行；迟到的终态不覆盖已终结的结果。
+- **管理面（admin bearer）**
+  - `POST /admin/harvest/enroll-ticket`、`GET /admin/harvest/workers`、
+    `POST /admin/harvest/workers/{id}/revoke`；
+  - `PUT /admin/harvest/standing`（`plan_version` 在 SQL 里 +1）、
+    `POST /admin/harvest/standing/{work_id}/{pause|resume|revoke}`；
+  - `POST /admin/harvest/one-shot`、`POST /admin/harvest/one-shot/{work_id}/cancel`；
+  - `GET /admin/harvest/works`：standing + ack 三态（`in_sync` / `awaiting_ack` / `drift`）+
+    一次性工作与结果。
+- 新表（`0042_harvest_work.sql`）：worker / credential / standing / one_shot / ack / result / sequence / ticket。
+  过期的一次性工作在 poll 与页面刷新时惰性回收（`expired`）。
+
+### 变更（破坏性）
+
+- **删掉** `GET /api/v1/harvest/control` 与 `harvest_setting` 表（D5：不做兼容层，混版 fail-closed 停采）。
+  迁移把旧表**重命名为** `harvest_setting_removed_0042`（保留审计事实，不删数据）。
+- 升级后不会自动合成 standing：同栈部署由 `wist-harvest bootstrap` 用本机数据源建 `plan_version=1`，
+  跳机部署需要到页面重新授权。
+
+### 升级注意
+
+- 采集器必须同批升到 `wist-harvest >= 0.6.0`：旧采集器只认 `[control]`/旧端点，会在解析配置时直接失败。
+- 需要 `wist-api >= 0.12.0`（`harvest_work` 报文面）。
+
 ## [0.47.0-alpha] - 2026-11-13
 
 ### 新增（云资产采集开关：中心持有，采集器自拉）

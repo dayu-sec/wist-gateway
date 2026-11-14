@@ -23,7 +23,7 @@ use hyper_util::{
 };
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use wist_gateway::infra::VerifiedAgentIdentity;
+use wist_gateway::infra::{VerifiedAgentIdentity, VerifiedHarvestIdentity};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -247,24 +247,26 @@ async fn serve_tls(
                     return;
                 }
             };
-            // mTLS 开启时，从**已完成握手**的连接里取已验的客户端证书并解出 agent 身份。
+            // mTLS 开启时，从**已完成握手**的连接里取已验的客户端证书并解出身份。
+            // 同一把 CA 签两种叶：agent（`/agent/`）与 harvest worker（`/harvest/`）。
             // 链验过了但认不出身份（缺 URI SAN / 段非法）就不当作已认证 ——
             // 交给应用层回 401，而不是静默当成未认证放行。
-            let client_identity = if mtls_enabled {
+            let (client_identity, harvest_identity) = if mtls_enabled {
                 match wist_gateway::infra::peer_leaf_certificate_der(tls_stream.get_ref().1) {
-                    Some(der) => match VerifiedAgentIdentity::from_certificate_der(&der) {
-                        Ok(identity) => Some(identity),
-                        Err(err) => {
+                    Some(der) => {
+                        let agent = VerifiedAgentIdentity::from_certificate_der(&der).ok();
+                        let harvest = VerifiedHarvestIdentity::from_certificate_der(&der).ok();
+                        if agent.is_none() && harvest.is_none() {
                             log::warn!(
-                                "mTLS client certificate from {peer_addr} has no usable agent identity: {err}"
+                                "mTLS client certificate from {peer_addr} has no usable agent/harvest identity"
                             );
-                            None
                         }
-                    },
-                    None => None,
+                        (agent, harvest)
+                    }
+                    None => (None, None),
                 }
             } else {
-                None
+                (None, None)
             };
             let io = TokioIo::new(tls_stream);
             // Inject the real peer address so rate limiting can bucket per client and
@@ -272,6 +274,7 @@ async fn serve_tls(
             let context = ConnectionContext {
                 peer: peer_addr,
                 client_identity,
+                harvest_identity,
             };
             let service = service.layer(from_fn_with_state(context, inject_connection_context));
             let service = TowerToHyperService::new(service);
@@ -291,6 +294,7 @@ async fn serve_tls(
 struct ConnectionContext {
     peer: SocketAddr,
     client_identity: Option<VerifiedAgentIdentity>,
+    harvest_identity: Option<VerifiedHarvestIdentity>,
 }
 
 async fn inject_connection_context(
@@ -302,6 +306,9 @@ async fn inject_connection_context(
         .extensions_mut()
         .insert(ConnectInfo::<SocketAddr>(context.peer));
     if let Some(identity) = context.client_identity {
+        request.extensions_mut().insert(identity);
+    }
+    if let Some(identity) = context.harvest_identity {
         request.extensions_mut().insert(identity);
     }
     next.run(request).await
@@ -364,6 +371,7 @@ mod tests {
                 ConnectionContext {
                     peer: peer.parse().expect("peer addr"),
                     client_identity: None,
+                    harvest_identity: None,
                 },
                 inject_connection_context,
             ));

@@ -626,11 +626,90 @@ fn agent_install_package_address_from_row(
     })
 }
 
-fn harvest_setting_from_row(row: &SqliteRow) -> StoreResult<StoredHarvestSetting> {
-    Ok(StoredHarvestSetting {
-        enabled: row.get::<i64, _>("enabled") != 0,
-        updated_by: row.get::<String, _>("updated_by"),
-        updated_at: row.get::<String, _>("updated_at"),
+fn harvest_worker_from_row(row: &SqliteRow) -> StoreResult<HarvestWorker> {
+    Ok(HarvestWorker {
+        worker_id: column!(row, "worker_id"),
+        source_code: column!(row, "source_code"),
+        instance_id: column!(row, "instance_id"),
+        status: column!(row, "status"),
+        enrolled_at: column!(row, "enrolled_at"),
+        last_seen_at: column!(row, "last_seen_at"),
+        revoked_at: column!(row, "revoked_at"),
+        revoked_by: column!(row, "revoked_by"),
+    })
+}
+
+fn harvest_standing_from_row(row: &SqliteRow) -> StoreResult<StoredHarvestStanding> {
+    let spec_json: String = column!(row, "spec");
+    let spec = serde_json::from_str(&spec_json)
+        .map_err(|err| sql_error(err, "parse harvest standing spec"))?;
+    Ok(StoredHarvestStanding {
+        work_id: column!(row, "work_id"),
+        worker_id: column!(row, "worker_id"),
+        family: column!(row, "family"),
+        spec,
+        catalog_version: column!(row, "catalog_version"),
+        proposal_id: column!(row, "proposal_id"),
+        plan_version: column!(row, "plan_version"),
+        effective_from: column!(row, "effective_from"),
+        status: column!(row, "status"),
+        updated_by: column!(row, "updated_by"),
+        updated_at: column!(row, "updated_at"),
+    })
+}
+
+fn harvest_ack_from_row(row: &SqliteRow) -> StoreResult<StoredHarvestAck> {
+    Ok(StoredHarvestAck {
+        work_id: column!(row, "work_id"),
+        worker_id: column!(row, "worker_id"),
+        work_kind: column!(row, "work_kind"),
+        plan_version: column!(row, "plan_version"),
+        acknowledged_at: column!(row, "acknowledged_at"),
+    })
+}
+
+fn harvest_one_shot_from_row(row: &SqliteRow) -> StoreResult<StoredHarvestOneShot> {
+    let spec_json: String = column!(row, "spec");
+    let spec = serde_json::from_str(&spec_json)
+        .map_err(|err| sql_error(err, "parse harvest one-shot spec"))?;
+    let interruptible: i64 = column!(row, "interruptible");
+    Ok(StoredHarvestOneShot {
+        worker_id: column!(row, "worker_id"),
+        work: wist_api::harvest_work::OneShotHarvestWork {
+            work_id: column!(row, "work_id"),
+            action: column!(row, "action"),
+            spec,
+            scheduled_at: column!(row, "scheduled_at"),
+            deadline_at: column!(row, "deadline_at"),
+            timeout_seconds: column!(row, "timeout_seconds"),
+            interruptible: interruptible != 0,
+            status: column!(row, "status"),
+            attempt: column!(row, "attempt"),
+            issued_by: column!(row, "issued_by"),
+            issued_at: column!(row, "issued_at"),
+        },
+    })
+}
+
+fn harvest_result_from_row(row: &SqliteRow) -> StoreResult<StoredHarvestResult> {
+    Ok(StoredHarvestResult {
+        work_id: column!(row, "work_id"),
+        worker_id: column!(row, "worker_id"),
+        status: column!(row, "status"),
+        detail: column!(row, "detail"),
+        reported_at: column!(row, "reported_at"),
+    })
+}
+
+fn harvest_ticket_from_row(row: &SqliteRow) -> StoreResult<StoredHarvestTicket> {
+    Ok(StoredHarvestTicket {
+        ticket_hash: column!(row, "ticket_hash"),
+        worker_id: column!(row, "worker_id"),
+        source_code: column!(row, "source_code"),
+        created_at: column!(row, "created_at"),
+        expires_at: column!(row, "expires_at"),
+        consumed_at: column!(row, "consumed_at"),
+        created_by: column!(row, "created_by"),
     })
 }
 
@@ -1251,33 +1330,632 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    async fn harvest_setting(&self) -> StoreResult<StoredHarvestSetting> {
-        let row =
-            sqlx::query("SELECT enabled, updated_by, updated_at FROM harvest_setting WHERE id = 1")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|err| sql_error(err, "read harvest setting"))?;
-        harvest_setting_from_row(&row)
+    async fn get_harvest_worker(&self, worker_id: &str) -> StoreResult<Option<HarvestWorker>> {
+        let row = sqlx::query(
+            "SELECT worker_id, source_code, instance_id, status, enrolled_at, last_seen_at, \
+             revoked_at, revoked_by FROM harvest_worker WHERE worker_id = ?1",
+        )
+        .bind(worker_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "read harvest worker"))?;
+        row.as_ref().map(harvest_worker_from_row).transpose()
     }
 
-    async fn set_harvest_setting(
-        &self,
-        enabled: bool,
-        updated_by: &str,
-    ) -> StoreResult<StoredHarvestSetting> {
-        let row = sqlx::query(
-            "INSERT INTO harvest_setting (id, enabled, updated_by, updated_at)
-             VALUES (1, ?1, ?2, datetime('now'))
-             ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled,
-               updated_by = excluded.updated_by, updated_at = excluded.updated_at
-             RETURNING enabled, updated_by, updated_at",
+    async fn list_harvest_workers(&self) -> StoreResult<Vec<HarvestWorker>> {
+        let rows = sqlx::query(
+            "SELECT worker_id, source_code, instance_id, status, enrolled_at, last_seen_at, \
+             revoked_at, revoked_by FROM harvest_worker ORDER BY worker_id",
         )
-        .bind(i64::from(enabled))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list harvest workers"))?;
+        rows.iter().map(harvest_worker_from_row).collect()
+    }
+
+    async fn upsert_harvest_worker(&self, worker: &HarvestWorker) -> StoreResult<()> {
+        // 重接入**不覆盖** `revoked_at` / `revoked_by`：它们是审计事实（谁在何时吊销的）。
+        sqlx::query(
+            "INSERT INTO harvest_worker (worker_id, source_code, instance_id, status, enrolled_at, \
+             last_seen_at, revoked_at, revoked_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT (worker_id) DO UPDATE SET source_code = excluded.source_code, \
+               instance_id = excluded.instance_id, status = excluded.status, \
+               enrolled_at = excluded.enrolled_at, last_seen_at = excluded.last_seen_at",
+        )
+        .bind(&worker.worker_id)
+        .bind(&worker.source_code)
+        .bind(&worker.instance_id)
+        .bind(&worker.status)
+        .bind(&worker.enrolled_at)
+        .bind(&worker.last_seen_at)
+        .bind(&worker.revoked_at)
+        .bind(&worker.revoked_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert harvest worker"))?;
+        Ok(())
+    }
+
+    async fn insert_harvest_certificate(
+        &self,
+        record: &HarvestCertificateRecord,
+    ) -> StoreResult<()> {
+        // 不加 `ON CONFLICT DO NOTHING`：序列号已唯一，重复只能是真异常（而不是默默丢一条审计）。
+        sqlx::query(
+            "INSERT INTO harvest_credential (credential_id, worker_id, cert_serial, cert_sha256, \
+             issued_at, not_after, revoked_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(&record.credential_id)
+        .bind(&record.worker_id)
+        .bind(&record.cert_serial)
+        .bind(&record.cert_sha256)
+        .bind(&record.issued_at)
+        .bind(&record.not_after)
+        .bind(&record.revoked_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "insert harvest certificate"))?;
+        Ok(())
+    }
+
+    async fn revoke_harvest_worker(
+        &self,
+        worker_id: &str,
+        revoked_by: &str,
+        revoked_at: &str,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "UPDATE harvest_worker SET status = 'revoked', revoked_at = ?2, revoked_by = ?3 \
+             WHERE worker_id = ?1",
+        )
+        .bind(worker_id)
+        .bind(revoked_at)
+        .bind(revoked_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "revoke harvest worker"))?;
+        sqlx::query(
+            "UPDATE harvest_credential SET revoked_at = ?2 \
+             WHERE worker_id = ?1 AND revoked_at IS NULL",
+        )
+        .bind(worker_id)
+        .bind(revoked_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "revoke harvest certificates"))?;
+        Ok(())
+    }
+
+    async fn touch_harvest_worker(&self, worker_id: &str, at: &str) -> StoreResult<()> {
+        sqlx::query(
+            "UPDATE harvest_worker SET last_seen_at = ?2 \
+             WHERE worker_id = ?1 AND status <> 'revoked'",
+        )
+        .bind(worker_id)
+        .bind(at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "touch harvest worker"))?;
+        Ok(())
+    }
+
+    async fn promote_harvest_worker(&self, worker_id: &str, at: &str) -> StoreResult<()> {
+        // 目标行更新而不是整行覆盖：否则会把并发写入的吊销擦掉（identity 完全靠这一列）。
+        sqlx::query(
+            "UPDATE harvest_worker SET status = 'active', last_seen_at = ?2 \
+             WHERE worker_id = ?1 AND status = 'pending'",
+        )
+        .bind(worker_id)
+        .bind(at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "promote harvest worker"))?;
+        Ok(())
+    }
+
+    async fn harvest_standing(
+        &self,
+        worker_id: &str,
+    ) -> StoreResult<Option<StoredHarvestStanding>> {
+        let row = sqlx::query(
+            "SELECT work_id, worker_id, family, spec, catalog_version, proposal_id, plan_version, \
+             effective_from, status, updated_by, updated_at FROM harvest_standing_work \
+             WHERE worker_id = ?1",
+        )
+        .bind(worker_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "read harvest standing"))?;
+        row.as_ref().map(harvest_standing_from_row).transpose()
+    }
+
+    async fn harvest_standing_by_work_id(
+        &self,
+        work_id: &str,
+    ) -> StoreResult<Option<StoredHarvestStanding>> {
+        let row = sqlx::query(
+            "SELECT work_id, worker_id, family, spec, catalog_version, proposal_id, plan_version, \
+             effective_from, status, updated_by, updated_at FROM harvest_standing_work \
+             WHERE work_id = ?1",
+        )
+        .bind(work_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "read harvest standing by work id"))?;
+        row.as_ref().map(harvest_standing_from_row).transpose()
+    }
+
+    async fn harvest_grant(&self, worker_id: &str) -> StoreResult<HarvestGrantSnapshot> {
+        // 一个读事务：standing 与 sequence 必须是**同一个快照**，否则客户端会按旧 seq 跳过新 spec。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin harvest grant read"))?;
+        let standing_row = sqlx::query(
+            "SELECT work_id, worker_id, family, spec, catalog_version, proposal_id, plan_version, \
+             effective_from, status, updated_by, updated_at FROM harvest_standing_work \
+             WHERE worker_id = ?1",
+        )
+        .bind(worker_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "read harvest standing snapshot"))?;
+        let sequence_row =
+            sqlx::query("SELECT sequence FROM harvest_work_sequence WHERE worker_id = ?1")
+                .bind(worker_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|err| sql_error(err, "read harvest sequence snapshot"))?;
+        // 未了结的一次性工作也是快照的一部分：客户端一次 poll 拿到全部待办。
+        let one_shot_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {HARVEST_ONE_SHOT_COLUMNS} FROM harvest_one_shot_work \
+             WHERE worker_id = ?1 AND status NOT IN ({}) ORDER BY issued_at",
+            harvest_one_shot_terminal_status_sql()
+        )))
+        .bind(worker_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "read harvest one-shot snapshot"))?;
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit harvest grant read"))?;
+        Ok(HarvestGrantSnapshot {
+            standing: standing_row
+                .as_ref()
+                .map(harvest_standing_from_row)
+                .transpose()?,
+            one_shot: one_shot_rows
+                .iter()
+                .map(harvest_one_shot_from_row)
+                .collect::<StoreResult<Vec<_>>>()?,
+            sequence: sequence_row
+                .map(|row| row.get::<i64, _>("sequence"))
+                .unwrap_or(0),
+        })
+    }
+
+    async fn upsert_harvest_standing(&self, standing: &StoredHarvestStanding) -> StoreResult<()> {
+        let spec = serde_json::to_string(&standing.spec)
+            .map_err(|err| sql_error(err, "encode harvest standing spec"))?;
+        sqlx::query(
+            "INSERT INTO harvest_standing_work (work_id, worker_id, family, spec, catalog_version, \
+             proposal_id, plan_version, effective_from, status, updated_by, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT (work_id) DO UPDATE SET family = excluded.family, \
+               spec = excluded.spec, catalog_version = excluded.catalog_version, \
+               proposal_id = excluded.proposal_id, plan_version = excluded.plan_version, \
+               effective_from = excluded.effective_from, status = excluded.status, \
+               updated_by = excluded.updated_by, updated_at = excluded.updated_at",
+        )
+        .bind(&standing.work_id)
+        .bind(&standing.worker_id)
+        .bind(&standing.family)
+        .bind(spec)
+        .bind(standing.catalog_version)
+        .bind(&standing.proposal_id)
+        .bind(standing.plan_version)
+        .bind(&standing.effective_from)
+        .bind(&standing.status)
+        .bind(&standing.updated_by)
+        .bind(&standing.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert harvest standing"))?;
+        Ok(())
+    }
+
+    async fn save_harvest_standing_bump(
+        &self,
+        standing: &StoredHarvestStanding,
+    ) -> StoreResult<i64> {
+        let spec = serde_json::to_string(&standing.spec)
+            .map_err(|err| sql_error(err, "encode harvest standing spec"))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin harvest standing write"))?;
+        // 版本在 SQL 里 +1：不能「读出来 +1 再写回」（两个管理员并发会丢掉一次改动）。
+        let row = sqlx::query(
+            "INSERT INTO harvest_standing_work (work_id, worker_id, family, spec, catalog_version, \
+             proposal_id, plan_version, effective_from, status, updated_by, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10) \
+             ON CONFLICT (work_id) DO UPDATE SET family = excluded.family, \
+               spec = excluded.spec, catalog_version = excluded.catalog_version, \
+               proposal_id = excluded.proposal_id, \
+               plan_version = harvest_standing_work.plan_version + 1, \
+               effective_from = excluded.effective_from, status = excluded.status, \
+               updated_by = excluded.updated_by, updated_at = excluded.updated_at \
+             RETURNING plan_version",
+        )
+        .bind(&standing.work_id)
+        .bind(&standing.worker_id)
+        .bind(&standing.family)
+        .bind(spec)
+        .bind(standing.catalog_version)
+        .bind(&standing.proposal_id)
+        .bind(&standing.effective_from)
+        .bind(&standing.status)
+        .bind(&standing.updated_by)
+        .bind(&standing.updated_at)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "bump harvest standing"))?;
+        let plan_version: i64 = row.get("plan_version");
+        sqlx::query(
+            "INSERT INTO harvest_work_sequence (worker_id, sequence, updated_at) \
+             VALUES (?1, 1, ?2) ON CONFLICT (worker_id) DO UPDATE SET \
+               sequence = sequence + 1, updated_at = excluded.updated_at",
+        )
+        .bind(&standing.worker_id)
+        .bind(&standing.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "bump harvest sequence"))?;
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit harvest standing write"))?;
+        Ok(plan_version)
+    }
+
+    async fn set_harvest_standing_status(
+        &self,
+        work_id: &str,
+        status: &str,
+        updated_by: &str,
+        at: &str,
+    ) -> StoreResult<Option<i64>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin harvest status write"))?;
+        // `status <> 'revoked'`：撤销是终态，暂停/继续不能把它改回来。
+        let row = sqlx::query(
+            "UPDATE harvest_standing_work SET status = ?2, \
+               plan_version = plan_version + 1, effective_from = ?3, \
+               updated_by = ?4, updated_at = ?3 \
+             WHERE work_id = ?1 AND status <> 'revoked' \
+             RETURNING worker_id, plan_version",
+        )
+        .bind(work_id)
+        .bind(status)
+        .bind(at)
         .bind(updated_by)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "update harvest standing status"))?;
+        let Some(row) = row else {
+            tx.rollback()
+                .await
+                .map_err(|err| sql_error(err, "rollback harvest status write"))?;
+            return Ok(None);
+        };
+        let worker_id: String = row.get("worker_id");
+        let plan_version: i64 = row.get("plan_version");
+        sqlx::query(
+            "INSERT INTO harvest_work_sequence (worker_id, sequence, updated_at) \
+             VALUES (?1, 1, ?2) ON CONFLICT (worker_id) DO UPDATE SET \
+               sequence = sequence + 1, updated_at = excluded.updated_at",
+        )
+        .bind(&worker_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "bump harvest sequence"))?;
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit harvest status write"))?;
+        Ok(Some(plan_version))
+    }
+
+    async fn list_harvest_standings(&self) -> StoreResult<Vec<StoredHarvestStanding>> {
+        let rows = sqlx::query(
+            "SELECT work_id, worker_id, family, spec, catalog_version, proposal_id, plan_version, \
+             effective_from, status, updated_by, updated_at FROM harvest_standing_work \
+             ORDER BY worker_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list harvest standings"))?;
+        rows.iter().map(harvest_standing_from_row).collect()
+    }
+
+    async fn harvest_sequence(&self, worker_id: &str) -> StoreResult<i64> {
+        let row = sqlx::query("SELECT sequence FROM harvest_work_sequence WHERE worker_id = ?1")
+            .bind(worker_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "read harvest sequence"))?;
+        Ok(row.map(|row| row.get::<i64, _>("sequence")).unwrap_or(0))
+    }
+
+    async fn bump_harvest_sequence(&self, worker_id: &str, at: &str) -> StoreResult<i64> {
+        let row = sqlx::query(
+            "INSERT INTO harvest_work_sequence (worker_id, sequence, updated_at) \
+             VALUES (?1, 1, ?2) ON CONFLICT (worker_id) DO UPDATE SET \
+               sequence = sequence + 1, updated_at = excluded.updated_at \
+             RETURNING sequence",
+        )
+        .bind(worker_id)
+        .bind(at)
         .fetch_one(&self.pool)
         .await
-        .map_err(|err| sql_error(err, "write harvest setting"))?;
-        harvest_setting_from_row(&row)
+        .map_err(|err| sql_error(err, "bump harvest sequence"))?;
+        Ok(row.get::<i64, _>("sequence"))
+    }
+
+    async fn upsert_harvest_ack(&self, ack: &StoredHarvestAck) -> StoreResult<()> {
+        // 迟到的 ack（版本更小）不能覆盖新的：否则页面会永久显示假漂移。
+        sqlx::query(
+            "INSERT INTO harvest_work_ack (work_id, worker_id, work_kind, plan_version, \
+             acknowledged_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (work_id) DO UPDATE SET worker_id = excluded.worker_id, \
+               work_kind = excluded.work_kind, plan_version = excluded.plan_version, \
+               acknowledged_at = excluded.acknowledged_at \
+             WHERE excluded.plan_version >= harvest_work_ack.plan_version",
+        )
+        .bind(&ack.work_id)
+        .bind(&ack.worker_id)
+        .bind(&ack.work_kind)
+        .bind(ack.plan_version)
+        .bind(&ack.acknowledged_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert harvest ack"))?;
+        Ok(())
+    }
+
+    async fn get_harvest_ack(&self, work_id: &str) -> StoreResult<Option<StoredHarvestAck>> {
+        let row = sqlx::query(
+            "SELECT work_id, worker_id, work_kind, plan_version, acknowledged_at \
+             FROM harvest_work_ack WHERE work_id = ?1",
+        )
+        .bind(work_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "read harvest ack"))?;
+        row.as_ref().map(harvest_ack_from_row).transpose()
+    }
+
+    async fn list_harvest_acks(&self) -> StoreResult<Vec<StoredHarvestAck>> {
+        let rows = sqlx::query(
+            "SELECT work_id, worker_id, work_kind, plan_version, acknowledged_at \
+             FROM harvest_work_ack ORDER BY worker_id, work_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list harvest acks"))?;
+        rows.iter().map(harvest_ack_from_row).collect()
+    }
+
+    // ── 一次性工作（P2）──
+
+    async fn save_harvest_one_shot(&self, work: &StoredHarvestOneShot) -> StoreResult<()> {
+        let spec = serde_json::to_string(&work.work.spec)
+            .map_err(|err| sql_error(err, "encode harvest one-shot spec"))?;
+        let item = &work.work;
+        sqlx::query(
+            "INSERT INTO harvest_one_shot_work (work_id, worker_id, action, spec, scheduled_at, \
+             deadline_at, timeout_seconds, interruptible, status, attempt, issued_by, issued_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             ON CONFLICT (work_id) DO NOTHING",
+        )
+        .bind(&item.work_id)
+        .bind(&work.worker_id)
+        .bind(&item.action)
+        .bind(&spec)
+        .bind(&item.scheduled_at)
+        .bind(&item.deadline_at)
+        .bind(item.timeout_seconds)
+        .bind(item.interruptible)
+        .bind(&item.status)
+        .bind(item.attempt)
+        .bind(&item.issued_by)
+        .bind(&item.issued_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "insert harvest one-shot work"))?;
+        Ok(())
+    }
+
+    async fn list_harvest_one_shot(
+        &self,
+        worker_id: &str,
+    ) -> StoreResult<Vec<StoredHarvestOneShot>> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {HARVEST_ONE_SHOT_COLUMNS} FROM harvest_one_shot_work \
+             WHERE worker_id = ?1 ORDER BY issued_at"
+        )))
+        .bind(worker_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list harvest one-shot work"))?;
+        rows.iter().map(harvest_one_shot_from_row).collect()
+    }
+
+    async fn list_harvest_one_shot_all(&self) -> StoreResult<Vec<StoredHarvestOneShot>> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {HARVEST_ONE_SHOT_COLUMNS} FROM harvest_one_shot_work \
+             ORDER BY worker_id, issued_at"
+        )))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list harvest one-shot work (all)"))?;
+        rows.iter().map(harvest_one_shot_from_row).collect()
+    }
+
+    async fn expire_harvest_one_shot(&self, now: &str) -> StoreResult<u64> {
+        // 只回收**时间已经过去**且未到终态的行：`deadline_at` 是绝对截止，暂停也不顺延
+        // （本期一次性工作不可暂停，这条等价于「到点没跑完就作废」）。
+        //
+        // 比时间用 `julianday()` 而不是字符串：`to_rfc3339()` 的小数位长度不固定，
+        // 直接按字典序比在边界上会错（与接入券的过期判定同一口径）。
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE harvest_one_shot_work SET status = 'expired' \
+             WHERE julianday(deadline_at) < julianday(?1) AND status NOT IN ({}) ",
+            harvest_one_shot_terminal_status_sql()
+        )))
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "expire harvest one-shot work"))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn finish_harvest_one_shot(&self, work_id: &str, status: &str) -> StoreResult<bool> {
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE harvest_one_shot_work SET status = ?2 \
+             WHERE work_id = ?1 AND status NOT IN ({})",
+            harvest_one_shot_terminal_status_sql()
+        )))
+        .bind(work_id)
+        .bind(status)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "finish harvest one-shot work"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn record_harvest_result(
+        &self,
+        result: &StoredHarvestResult,
+    ) -> StoreResult<HarvestResultOutcome> {
+        // 一个事务：判终态 → 写结果 → 推进工作状态。分三次读写的空档里，
+        // 迟到的终态会把已终结的结果盖掉。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin harvest result write"))?;
+        let row =
+            sqlx::query("SELECT worker_id, status FROM harvest_one_shot_work WHERE work_id = ?1")
+                .bind(&result.work_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|err| sql_error(err, "read harvest one-shot for result"))?;
+        let Some(row) = row else {
+            return Ok(HarvestResultOutcome::Unknown);
+        };
+        let worker_id: String = row.get("worker_id");
+        let status: String = row.get("status");
+        // 归错人 = 这件活不属于你：不泄漏它存不存在，统一 `unknown`。
+        if worker_id != result.worker_id {
+            return Ok(HarvestResultOutcome::Unknown);
+        }
+        if wist_api::harvest_work::ONE_SHOT_TERMINAL_STATUSES.contains(&status.as_str()) {
+            return Ok(HarvestResultOutcome::Stale);
+        }
+        sqlx::query(
+            "INSERT INTO harvest_work_result (work_id, worker_id, status, detail, reported_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (work_id) DO UPDATE SET worker_id = excluded.worker_id, \
+               status = excluded.status, detail = excluded.detail, \
+               reported_at = excluded.reported_at",
+        )
+        .bind(&result.work_id)
+        .bind(&result.worker_id)
+        .bind(&result.status)
+        .bind(&result.detail)
+        .bind(&result.reported_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "upsert harvest work result"))?;
+        // 工作行跟着最新一次上报走（`dispatched → running → 终态`）：页面读一列就能显示
+        // “到底在跑没有”，不用去拼结果表。终态守卫在这里同样生效。
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE harvest_one_shot_work SET status = ?2 \
+             WHERE work_id = ?1 AND status NOT IN ({})",
+            harvest_one_shot_terminal_status_sql()
+        )))
+        .bind(&result.work_id)
+        .bind(&result.status)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "advance harvest one-shot from result"))?;
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit harvest result write"))?;
+        Ok(HarvestResultOutcome::Recorded)
+    }
+
+    async fn list_harvest_results(&self) -> StoreResult<Vec<StoredHarvestResult>> {
+        let rows = sqlx::query(
+            "SELECT work_id, worker_id, status, detail, reported_at FROM harvest_work_result \
+             ORDER BY work_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list harvest work results"))?;
+        rows.iter().map(harvest_result_from_row).collect()
+    }
+
+    async fn create_harvest_ticket(&self, ticket: &StoredHarvestTicket) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO harvest_enrollment_ticket (ticket_hash, worker_id, source_code, \
+             created_at, expires_at, consumed_at, created_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (ticket_hash) DO NOTHING",
+        )
+        .bind(&ticket.ticket_hash)
+        .bind(&ticket.worker_id)
+        .bind(&ticket.source_code)
+        .bind(&ticket.created_at)
+        .bind(&ticket.expires_at)
+        .bind(&ticket.consumed_at)
+        .bind(&ticket.created_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "create harvest ticket"))?;
+        Ok(())
+    }
+
+    async fn consume_harvest_ticket(
+        &self,
+        ticket_hash: &str,
+        now: &str,
+        worker_id: &str,
+        source_code: &str,
+    ) -> StoreResult<Option<StoredHarvestTicket>> {
+        // 原子消费：并发两次接入时只有一次能改到 `consumed_at`。
+        // 归属条件放进 WHERE：拿错 worker/source 的请求不把券烧掉。
+        // 过期判断用 `julianday()`：RFC3339 字符串的字典序只在同一种格式下等价于时间序。
+        let row = sqlx::query(
+            "UPDATE harvest_enrollment_ticket SET consumed_at = ?2 \
+             WHERE ticket_hash = ?1 AND consumed_at IS NULL \
+               AND julianday(expires_at) > julianday(?2) \
+               AND worker_id = ?3 AND source_code = ?4 \
+             RETURNING ticket_hash, worker_id, source_code, created_at, expires_at, \
+                       consumed_at, created_by",
+        )
+        .bind(ticket_hash)
+        .bind(now)
+        .bind(worker_id)
+        .bind(source_code)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "consume harvest ticket"))?;
+        row.as_ref().map(harvest_ticket_from_row).transpose()
     }
 
     async fn list_discovery_snapshot_settings(
@@ -3575,6 +4253,18 @@ const ONE_SHOT_WORK_COLUMNS: &str = "work_id, agent_id, action, spec, scheduled_
      timeout_seconds, interruptible, status, paused_at, pre_pause_status, paused_total_seconds, \
      current_step, completed_steps, attempt, issued_by, issued_at";
 
+const HARVEST_ONE_SHOT_COLUMNS: &str = "work_id, worker_id, action, spec, scheduled_at, \
+     deadline_at, timeout_seconds, interruptible, status, attempt, issued_by, issued_at";
+
+/// harvest 一次性工作的终态取值拼成 `'a', 'b'`（从契约取，不写死字面量）。
+fn harvest_one_shot_terminal_status_sql() -> String {
+    wist_api::harvest_work::ONE_SHOT_TERMINAL_STATUSES
+        .iter()
+        .map(|status| format!("'{status}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// 终态取值拼成 `'a', 'b'`，供 `NOT IN (...)` 用。
 ///
 /// 从契约取（不写死字面量）：它一改，这里跟着改，不会各自漂移。
@@ -3814,6 +4504,208 @@ mod tests {
         SqliteStore::connect("sqlite::memory:")
             .await
             .expect("open sqlite store")
+    }
+
+    fn harvest_worker(worker_id: &str, source: &str, status: &str) -> HarvestWorker {
+        HarvestWorker {
+            worker_id: worker_id.to_string(),
+            source_code: source.to_string(),
+            instance_id: "hinst-1".to_string(),
+            status: status.to_string(),
+            enrolled_at: "2026-11-14T00:00:00Z".to_string(),
+            last_seen_at: None,
+            revoked_at: None,
+            revoked_by: String::new(),
+        }
+    }
+
+    fn harvest_standing(worker_id: &str, plan_version: i64) -> StoredHarvestStanding {
+        StoredHarvestStanding {
+            work_id: format!("hsw:{worker_id}:inventory"),
+            worker_id: worker_id.to_string(),
+            family: "inventory".to_string(),
+            spec: wist_api::harvest_work::HarvestSpec {
+                credential_ref: "tcloud:prod".to_string(),
+                vendor: "TENCENT_CLOUD".to_string(),
+                assets: vec!["vpc".to_string()],
+                regions: wist_api::harvest_work::HarvestRegions::Auto("auto".to_string()),
+                cadence: wist_api::harvest_work::HarvestCadence::on_demand(),
+                rate: None,
+            },
+            catalog_version: 0,
+            proposal_id: None,
+            plan_version,
+            effective_from: "2026-11-14T00:00:00Z".to_string(),
+            status: "active".to_string(),
+            updated_by: "admin".to_string(),
+            updated_at: "2026-11-14T00:00:00Z".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn harvest_standing_bump_is_monotonic_and_bumps_sequence_once() {
+        let store = store().await;
+        let worker = "harvest:demo";
+        // 占位版本被忽略：新行从 1 开始，重复写 +1。
+        assert_eq!(
+            store
+                .save_harvest_standing_bump(&harvest_standing(worker, 0))
+                .await
+                .expect("first save"),
+            1
+        );
+        assert_eq!(
+            store
+                .save_harvest_standing_bump(&harvest_standing(worker, 0))
+                .await
+                .expect("second save"),
+            2
+        );
+        assert_eq!(
+            store.harvest_sequence(worker).await.expect("sequence"),
+            2,
+            "每次授权都要推进 sequence（采集器靠它判断快照变没变）"
+        );
+        let snapshot = store.harvest_grant(worker).await.expect("grant snapshot");
+        assert_eq!(snapshot.sequence, 2);
+        assert_eq!(
+            snapshot.standing.expect("standing").plan_version,
+            2,
+            "快照里的 standing 与 sequence 必须是同一读快照"
+        );
+    }
+
+    #[tokio::test]
+    async fn harvest_ack_never_regresses() {
+        let store = store().await;
+        let work_id = "hsw:harvest:demo:inventory";
+        let mut ack = StoredHarvestAck {
+            work_id: work_id.to_string(),
+            worker_id: "harvest:demo".to_string(),
+            work_kind: "standing".to_string(),
+            plan_version: 5,
+            acknowledged_at: "2026-11-14T01:00:00Z".to_string(),
+        };
+        store.upsert_harvest_ack(&ack).await.expect("ack v5");
+        ack.plan_version = 4;
+        ack.acknowledged_at = "2026-11-14T02:00:00Z".to_string();
+        store.upsert_harvest_ack(&ack).await.expect("late ack v4");
+        let stored = store
+            .get_harvest_ack(work_id)
+            .await
+            .expect("read ack")
+            .expect("ack exists");
+        assert_eq!(stored.plan_version, 5, "迟到的 ack 不能覆盖更新的");
+    }
+
+    #[tokio::test]
+    async fn harvest_ticket_consumption_requires_matching_worker() {
+        let store = store().await;
+        store
+            .create_harvest_ticket(&StoredHarvestTicket {
+                ticket_hash: "hash-1".to_string(),
+                worker_id: "harvest:a".to_string(),
+                source_code: "a".to_string(),
+                created_at: "2026-11-14T00:00:00Z".to_string(),
+                expires_at: "2026-11-15T00:00:00Z".to_string(),
+                consumed_at: None,
+                created_by: "admin".to_string(),
+            })
+            .await
+            .expect("ticket");
+        // 拿错 worker：不能把券烧掉。
+        assert!(
+            store
+                .consume_harvest_ticket("hash-1", "2026-11-14T01:00:00Z", "harvest:b", "b")
+                .await
+                .expect("consume mismatch")
+                .is_none()
+        );
+        // 正确归属：一次性。
+        assert!(
+            store
+                .consume_harvest_ticket("hash-1", "2026-11-14T01:00:00Z", "harvest:a", "a")
+                .await
+                .expect("consume")
+                .is_some()
+        );
+        assert!(
+            store
+                .consume_harvest_ticket("hash-1", "2026-11-14T01:00:00Z", "harvest:a", "a")
+                .await
+                .expect("consume twice")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn harvest_standing_revocation_is_terminal() {
+        let store = store().await;
+        let worker = "harvest:demo";
+        let work_id = format!("hsw:{worker}:inventory");
+        store
+            .save_harvest_standing_bump(&harvest_standing(worker, 0))
+            .await
+            .expect("save");
+        assert!(
+            store
+                .set_harvest_standing_status(&work_id, "revoked", "admin", "2026-11-14T02:00:00Z")
+                .await
+                .expect("revoke")
+                .is_some()
+        );
+        // 暂停/继续不能把终态改回来。
+        assert!(
+            store
+                .set_harvest_standing_status(&work_id, "active", "admin", "2026-11-14T03:00:00Z")
+                .await
+                .expect("resume after revoke")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .harvest_standing(worker)
+                .await
+                .expect("read")
+                .expect("row")
+                .status,
+            "revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn harvest_revoke_worker_cuts_off_and_preserves_audit_on_reenroll() {
+        let store = store().await;
+        let worker = "harvest:demo";
+        store
+            .upsert_harvest_worker(&harvest_worker(worker, "demo", "active"))
+            .await
+            .expect("enroll");
+        store
+            .revoke_harvest_worker(worker, "admin:test", "2026-11-14T02:00:00Z")
+            .await
+            .expect("revoke");
+        let revoked = store
+            .get_harvest_worker(worker)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(revoked.status, "revoked");
+        assert_eq!(revoked.revoked_by, "admin:test");
+
+        // 重新接入：状态回到 pending，但「谁在何时吊销的」是审计事实，不能被清掉。
+        store
+            .upsert_harvest_worker(&harvest_worker(worker, "demo", "pending"))
+            .await
+            .expect("re-enroll");
+        let renewed = store
+            .get_harvest_worker(worker)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(renewed.status, "pending");
+        assert_eq!(renewed.revoked_by, "admin:test");
+        assert_eq!(renewed.revoked_at.as_deref(), Some("2026-11-14T02:00:00Z"));
     }
 
     fn token(token_hash: &str, max_uses: u32) -> StoredEnrollmentToken {
@@ -7348,5 +8240,194 @@ mod tests {
         assert!(log[0].0.is_none());
         assert_eq!(log[0].1.as_str(), "kbp-a");
         assert_eq!((log[2].3.as_str(), log[2].2), ("rollback", 3));
+    }
+}
+
+#[cfg(test)]
+mod harvest_one_shot_tests {
+    use super::*;
+
+    async fn store() -> SqliteStore {
+        SqliteStore::connect("sqlite::memory:")
+            .await
+            .expect("open sqlite store")
+    }
+
+    fn work(work_id: &str, deadline_at: &str) -> StoredHarvestOneShot {
+        StoredHarvestOneShot {
+            worker_id: "harvest:a".to_string(),
+            work: wist_api::harvest_work::OneShotHarvestWork {
+                work_id: work_id.to_string(),
+                action: "inventory.run".to_string(),
+                spec: wist_api::harvest_work::OneShotHarvestSpec::default(),
+                scheduled_at: "2026-11-14T00:00:00Z".to_string(),
+                deadline_at: deadline_at.to_string(),
+                timeout_seconds: 3600,
+                interruptible: true,
+                status: "dispatched".to_string(),
+                attempt: 0,
+                issued_by: "admin".to_string(),
+                issued_at: "2026-11-14T00:00:00Z".to_string(),
+            },
+        }
+    }
+
+    /// 过期回收是**惰性**的（poll 时顺手做）：不回收，页面会永远显示一个早就过期的
+    /// `dispatched`，而客户端也早就不再 poll 它了。
+    #[tokio::test]
+    async fn expired_work_is_reclaimed_and_leaves_the_grant_snapshot() {
+        let store = store().await;
+        store
+            .save_harvest_one_shot(&work("hos:a:run:1", "2026-11-14T01:00:00Z"))
+            .await
+            .expect("save overdue");
+        store
+            .save_harvest_one_shot(&work("hos:a:run:2", "2026-11-14T23:00:00Z"))
+            .await
+            .expect("save live");
+
+        let reclaimed = store
+            .expire_harvest_one_shot("2026-11-14T12:00:00Z")
+            .await
+            .expect("expire");
+        assert_eq!(reclaimed, 1, "只回收真的过期的那件");
+
+        let snapshot = store.harvest_grant("harvest:a").await.expect("grant");
+        assert_eq!(snapshot.one_shot.len(), 1);
+        assert_eq!(snapshot.one_shot[0].work.work_id, "hos:a:run:2");
+
+        let all = store.list_harvest_one_shot_all().await.expect("all");
+        let expired = all
+            .iter()
+            .find(|row| row.work.work_id == "hos:a:run:1")
+            .expect("expired row kept");
+        assert_eq!(
+            expired.work.status, "expired",
+            "行要留着（审计），只是不进快照"
+        );
+    }
+
+    /// 结果写入与工作状态推进必须在一个事务里：迟到的终态不能覆盖已终结的结果。
+    #[tokio::test]
+    async fn late_terminal_result_never_overwrites_a_settled_failure() {
+        let store = store().await;
+        store
+            .save_harvest_one_shot(&work("hos:a:run:3", "2026-11-14T23:00:00Z"))
+            .await
+            .expect("save");
+
+        let failure = StoredHarvestResult {
+            work_id: "hos:a:run:3".to_string(),
+            worker_id: "harvest:a".to_string(),
+            status: "failed".to_string(),
+            detail: "云 API 超时".to_string(),
+            reported_at: "2026-11-14T02:00:00Z".to_string(),
+        };
+        assert_eq!(
+            store.record_harvest_result(&failure).await.expect("first"),
+            HarvestResultOutcome::Recorded
+        );
+        assert_eq!(
+            store
+                .record_harvest_result(&StoredHarvestResult {
+                    status: "running".to_string(),
+                    detail: "复活".to_string(),
+                    ..failure.clone()
+                })
+                .await
+                .expect("late"),
+            HarvestResultOutcome::Stale
+        );
+        // 已终结 = 不进快照。
+        let snapshot = store.harvest_grant("harvest:a").await.expect("grant");
+        assert!(snapshot.one_shot.is_empty());
+        let results = store.list_harvest_results().await.expect("results");
+        assert_eq!(results[0].status, "failed");
+        assert_eq!(results[0].detail, "云 API 超时");
+    }
+
+    /// 归错人的上报不能改任何东西（也不告诉它这件活存不存在）。
+    #[tokio::test]
+    async fn a_result_from_another_worker_is_unknown_and_changes_nothing() {
+        let store = store().await;
+        store
+            .save_harvest_one_shot(&work("hos:a:run:4", "2026-11-14T23:00:00Z"))
+            .await
+            .expect("save");
+
+        assert_eq!(
+            store
+                .record_harvest_result(&StoredHarvestResult {
+                    work_id: "hos:a:run:4".to_string(),
+                    worker_id: "harvest:b".to_string(),
+                    status: "succeeded".to_string(),
+                    detail: String::new(),
+                    reported_at: "2026-11-14T02:00:00Z".to_string(),
+                })
+                .await
+                .expect("intruder"),
+            HarvestResultOutcome::Unknown
+        );
+        let snapshot = store.harvest_grant("harvest:a").await.expect("grant");
+        assert_eq!(snapshot.one_shot.len(), 1, "别人的上报不能终结这件活");
+        assert!(
+            store
+                .list_harvest_results()
+                .await
+                .expect("results")
+                .is_empty()
+        );
+    }
+
+    /// `running` 也要落到工作行上：页面读一列就知「到底在跑没有」。
+    /// 但它不是终态 —— 快照里仍然带着这件活。
+    #[tokio::test]
+    async fn a_running_report_advances_the_work_row_without_settling_it() {
+        let store = store().await;
+        store
+            .save_harvest_one_shot(&work("hos:a:run:6", "2026-11-14T23:00:00Z"))
+            .await
+            .expect("save");
+        assert_eq!(
+            store
+                .record_harvest_result(&StoredHarvestResult {
+                    work_id: "hos:a:run:6".to_string(),
+                    worker_id: "harvest:a".to_string(),
+                    status: "running".to_string(),
+                    detail: "采集中".to_string(),
+                    reported_at: "2026-11-14T02:00:00Z".to_string(),
+                })
+                .await
+                .expect("running"),
+            HarvestResultOutcome::Recorded
+        );
+
+        let all = store.list_harvest_one_shot_all().await.expect("all");
+        assert_eq!(all[0].work.status, "running");
+        let snapshot = store.harvest_grant("harvest:a").await.expect("grant");
+        assert_eq!(snapshot.one_shot.len(), 1, "running 还不是终态");
+    }
+
+    /// 派发幂等：同一 work_id 重复写不改已有行（否则重放会把已跑完的活打回 dispatched）。
+    #[tokio::test]
+    async fn re_dispatching_the_same_work_id_keeps_the_existing_row() {
+        let store = store().await;
+        store
+            .save_harvest_one_shot(&work("hos:a:run:5", "2026-11-14T23:00:00Z"))
+            .await
+            .expect("save");
+        store
+            .finish_harvest_one_shot("hos:a:run:5", "canceled")
+            .await
+            .expect("cancel");
+        store
+            .save_harvest_one_shot(&work("hos:a:run:5", "2027-11-14T23:00:00Z"))
+            .await
+            .expect("replay");
+
+        let all = store.list_harvest_one_shot_all().await.expect("all");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].work.status, "canceled");
+        assert_eq!(all[0].work.deadline_at, "2026-11-14T23:00:00Z");
     }
 }

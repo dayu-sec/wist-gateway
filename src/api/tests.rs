@@ -18696,48 +18696,951 @@ async fn metrics_labels_reject_a_wrong_kind_and_an_over_cap_request() {
 }
 
 #[tokio::test]
-async fn harvest_control_defaults_off_and_follows_admin_writes() {
+async fn harvest_old_control_endpoint_is_gone() {
+    // D5：同一版删掉旧开关与轮询端点，不留兼容层。
+    // 断言必须打在 **TLS 路由** 上：旧实现就挂在 ingest_router，拿它测会永远 404 而证明不了任何事。
     let state = test_state().await;
-
-    // 装上去不等于开始采：默认关闭。
-    let view = get_view(&state, "/api/v1/admin/harvest").await;
-    assert_eq!(view["enabled"], false, "{view}");
-
-    // 管理面打开。
-    let response = super::router_with_state(state.clone())
+    let response = super::router_with_state(state)
         .oneshot(
             Request::builder()
-                .method("PUT")
-                .uri("/api/v1/admin/harvest")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
-                .body(Body::from(r#"{"enabled":true}"#))
+                .method("GET")
+                .uri("/api/v1/harvest/control")
+                .body(Body::empty())
                 .expect("request"),
         )
         .await
         .expect("route response");
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
 
-    // 采集器轮询端点（明文 ingest 监听）看到的是同一个值。
-    let poll = |token: Option<&'static str>| {
-        let mut request = Request::builder()
-            .method("GET")
-            .uri("/api/v1/harvest/control");
-        if let Some(token) = token {
-            request = request.header("authorization", format!("Bearer {token}"));
-        }
-        super::ingest_router(super::build_state(
-            state.config.clone(),
-            Arc::clone(&state.store),
-        ))
-        .oneshot(request.body(Body::empty()).expect("request"))
-    };
-    let response = poll(Some(TEST_ADMIN_API_TOKEN)).await.expect("poll");
+fn harvest_identity(
+    worker_id: &str,
+    source_code: &str,
+    tenant: &str,
+    env: &str,
+) -> crate::infra::VerifiedHarvestIdentity {
+    crate::infra::VerifiedHarvestIdentity {
+        worker_id: worker_id.to_string(),
+        source_code: source_code.to_string(),
+        tenant_id: tenant.to_string(),
+        environment_id: env.to_string(),
+        fingerprint_sha256: "00".to_string(),
+        not_before: "2026-11-14T00:00:00Z".to_string(),
+        not_after: "2027-11-14T00:00:00Z".to_string(),
+    }
+}
+
+async fn harvest_poll_request(
+    state: &super::ApiState,
+    identity: crate::infra::VerifiedHarvestIdentity,
+) -> axum::http::Response<Body> {
+    let worker_id = identity.worker_id.clone();
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/harvest/work:poll")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"api_version":"v1","kind":"poll_harvest_work",
+                 "worker_id":"{worker_id}","instance_id":"hinst-1",
+                 "last_seen_sequence":0,"wait_ms":0,"requested_at":"t"}}"#
+        )))
+        .expect("request");
+    request.extensions_mut().insert(identity);
+    super::router_with_state(state.clone())
+        .oneshot(request)
+        .await
+        .expect("route response")
+}
+
+#[tokio::test]
+async fn harvest_revoked_worker_is_cut_off() {
+    let state = test_state().await;
+    let worker_id = "harvest:demo";
+    state
+        .store
+        .upsert_harvest_worker(&crate::infra::HarvestWorker {
+            worker_id: worker_id.to_string(),
+            source_code: "demo".to_string(),
+            instance_id: "hinst-1".to_string(),
+            status: "revoked".to_string(),
+            enrolled_at: "2026-11-14T00:00:00Z".to_string(),
+            last_seen_at: None,
+            revoked_at: Some("2026-11-14T02:00:00Z".to_string()),
+            revoked_by: "admin:test".to_string(),
+        })
+        .await
+        .expect("seed revoked worker");
+    let response = harvest_poll_request(
+        &state,
+        harvest_identity(
+            worker_id,
+            "demo",
+            &state.config.tenant_id,
+            &state.config.environment_id,
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn harvest_certificate_from_another_site_is_rejected() {
+    let state = test_state().await;
+    let worker_id = "harvest:demo";
+    state
+        .store
+        .upsert_harvest_worker(&crate::infra::HarvestWorker {
+            worker_id: worker_id.to_string(),
+            source_code: "demo".to_string(),
+            instance_id: "hinst-1".to_string(),
+            status: "active".to_string(),
+            enrolled_at: "2026-11-14T00:00:00Z".to_string(),
+            last_seen_at: None,
+            revoked_at: None,
+            revoked_by: String::new(),
+        })
+        .await
+        .expect("seed worker");
+    // 同一把 CA 克隆出来的站点证书：链验得过，但不属于本网关。
+    let response = harvest_poll_request(
+        &state,
+        harvest_identity(worker_id, "demo", "tenant-other", "env-other"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn harvest_admin_endpoints_require_admin_bearer() {
+    let state = test_state().await;
+    for (method, uri) in [
+        ("GET", "/api/v1/admin/harvest/workers"),
+        ("GET", "/api/v1/admin/harvest/works"),
+    ] {
+        let response = super::router_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn harvest_poll_without_client_certificate_is_unauthorized() {
+    let state = test_state().await;
+    let response = super::router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/harvest/work:poll")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"api_version":"v1","kind":"poll_harvest_work",
+                        "worker_id":"harvest:demo","instance_id":"i",
+                        "last_seen_sequence":0,"wait_ms":0,"requested_at":"t"}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn harvest_poll_returns_grant_for_enrolled_worker() {
+    let state = test_state().await;
+    let worker_id = "harvest:tencent-cloud-prod".to_string();
+    state
+        .store
+        .upsert_harvest_worker(&crate::infra::HarvestWorker {
+            worker_id: worker_id.clone(),
+            source_code: "tencent-cloud-prod".to_string(),
+            instance_id: "hinst-1".to_string(),
+            status: "active".to_string(),
+            enrolled_at: "2026-11-14T00:00:00Z".to_string(),
+            last_seen_at: None,
+            revoked_at: None,
+            revoked_by: String::new(),
+        })
+        .await
+        .expect("seed worker");
+    state
+        .store
+        .upsert_harvest_standing(&crate::infra::StoredHarvestStanding {
+            work_id: format!("hsw:{worker_id}:inventory"),
+            worker_id: worker_id.clone(),
+            family: "inventory".to_string(),
+            spec: wist_api::harvest_work::HarvestSpec {
+                credential_ref: "tcloud:prod".to_string(),
+                vendor: "TENCENT_CLOUD".to_string(),
+                assets: vec!["vpc".to_string()],
+                regions: wist_api::harvest_work::HarvestRegions::Auto("auto".to_string()),
+                cadence: wist_api::harvest_work::HarvestCadence::on_demand(),
+                rate: None,
+            },
+            catalog_version: 0,
+            proposal_id: None,
+            plan_version: 1,
+            effective_from: "2026-11-14T00:00:00Z".to_string(),
+            status: "active".to_string(),
+            updated_by: "admin".to_string(),
+            updated_at: "2026-11-14T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("seed standing");
+    state
+        .store
+        .bump_harvest_sequence(&worker_id, "2026-11-14T00:00:00Z")
+        .await
+        .expect("sequence");
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/harvest/work:poll")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"api_version":"v1","kind":"poll_harvest_work",
+                 "worker_id":"{worker_id}","instance_id":"hinst-1",
+                 "last_seen_sequence":0,"wait_ms":0,"requested_at":"t"}}"#
+        )))
+        .expect("request");
+    // mTLS 身份由 TLS 层注入；单元测试直接放扩展（生产只有本进程能写入）。
+    request
+        .extensions_mut()
+        .insert(crate::infra::VerifiedHarvestIdentity {
+            worker_id: worker_id.clone(),
+            source_code: "tencent-cloud-prod".to_string(),
+            tenant_id: "tenant-default".to_string(),
+            environment_id: "env-default".to_string(),
+            fingerprint_sha256: "00".to_string(),
+            not_before: "2026-11-14T00:00:00Z".to_string(),
+            not_after: "2027-11-14T00:00:00Z".to_string(),
+        });
+    let response = super::router_with_state(state)
+        .oneshot(request)
+        .await
+        .expect("route response");
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = decode_json_response(response).await;
-    assert_eq!(payload["enabled"], true, "{payload}");
+    assert_eq!(payload["worker_id"], worker_id);
+    assert_eq!(payload["sequence"], 1);
+    assert_eq!(payload["standing"]["plan_version"], 1);
+    assert_eq!(payload["standing"]["spec"]["cadence"]["mode"], "on_demand");
+    assert_eq!(payload["one_shot"].as_array().expect("array").len(), 0);
+}
 
-    // 没有令牌：401（harvest 配错 token 时必须能看出来，而不是拿到一个 false）。
-    let response = poll(None).await.expect("poll without token");
+// ── 采集器（harvest）接入 / 续期 / 授权顺序（docs/design/harvest-work-grant.md）──
+
+/// 带（可选的）mTLS 身份 POST 一个 harvest worker 面端点。
+async fn harvest_worker_post(
+    state: &super::ApiState,
+    uri: &str,
+    identity: Option<crate::infra::VerifiedHarvestIdentity>,
+    body: &serde_json::Value,
+) -> axum::http::Response<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(body).expect("body")))
+        .expect("request");
+    if let Some(identity) = identity {
+        request.extensions_mut().insert(identity);
+    }
+    super::router_with_state(state.clone())
+        .oneshot(request)
+        .await
+        .expect("route response")
+}
+
+/// 给 `harvest:demo` 备一张可消费的接入券。
+async fn seed_harvest_ticket(state: &super::ApiState, ticket: &str) {
+    state
+        .store
+        .create_harvest_ticket(&crate::infra::StoredHarvestTicket {
+            ticket_hash: sha256_hex(ticket),
+            worker_id: "harvest:demo".to_string(),
+            source_code: "demo".to_string(),
+            created_at: "2026-11-14T00:00:00Z".to_string(),
+            expires_at: "2099-11-14T00:00:00Z".to_string(),
+            consumed_at: None,
+            created_by: "admin".to_string(),
+        })
+        .await
+        .expect("seed ticket");
+}
+
+fn harvest_enroll_body(worker_id: &str, source_code: &str, ticket: &str) -> serde_json::Value {
+    serde_json::json!({
+        "api_version": "v1",
+        "kind": "submit_harvest_enrollment",
+        "ticket": ticket,
+        "worker_id": worker_id,
+        "source_code": source_code,
+        "instance_id": "hinst-1",
+        "certificate_signing_request": certificate_signing_request(),
+        "requested_at": "2026-11-14T00:00:00Z",
+    })
+}
+
+fn harvest_renew_body(worker_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "api_version": "v1",
+        "kind": "renew_harvest_certificate",
+        "worker_id": worker_id,
+        "instance_id": "hinst-1",
+        "certificate_signing_request": certificate_signing_request(),
+        "requested_at": "2026-11-14T00:00:00Z",
+    })
+}
+
+fn harvest_standing_body(worker_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "worker_id": worker_id,
+        "spec": {
+            "credential_ref": "tcloud:prod",
+            "vendor": "TENCENT_CLOUD",
+            "assets": ["vpc"],
+            "regions": "auto",
+            "cadence": {"mode": "daily", "at": "00:30", "jitter_seconds": 300},
+        },
+    })
+}
+
+/// 从接入响应里取出证书并还原成身份 —— 同时证明**主体由网关按 worker_id 填**，
+/// 而不是采信 CSR 里自带的内容。
+fn harvest_identity_from_issued_certificate(
+    payload: &serde_json::Value,
+) -> crate::infra::VerifiedHarvestIdentity {
+    let certificate = payload["result"]["certificate_pem"]
+        .as_str()
+        .expect("certificate_pem");
+    let (_, pem) = x509_parser::pem::parse_x509_pem(certificate.as_bytes()).expect("pem");
+    crate::infra::VerifiedHarvestIdentity::from_certificate_der(&pem.contents).expect("identity")
+}
+
+#[tokio::test]
+async fn harvest_enrollment_burns_the_ticket_and_registers_the_worker() {
+    let state = test_state().await;
+    let ticket = "hwt-single-use-ticket";
+    seed_harvest_ticket(&state, ticket).await;
+
+    let first = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/enroll",
+        None,
+        &harvest_enroll_body("harvest:demo", "demo", ticket),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_no_store(&first);
+    let payload: serde_json::Value = decode_json_response(first).await;
+    assert_eq!(payload["result"]["status"], "accepted");
+
+    // 证书主体来自站点配置 + source_code，不是 CSR。
+    let identity = harvest_identity_from_issued_certificate(&payload);
+    assert_eq!(identity.worker_id, "harvest:demo");
+    assert_eq!(identity.source_code, "demo");
+    assert_eq!(identity.tenant_id, "tenant-default");
+    assert_eq!(identity.environment_id, "env-default");
+
+    // worker 行是接入时建立的（bootstrap 的 standing 顺序依赖这一点）。
+    let worker = state
+        .store
+        .get_harvest_worker("harvest:demo")
+        .await
+        .expect("read worker")
+        .expect("worker registered");
+    assert_eq!(worker.source_code, "demo");
+    assert_eq!(worker.status, "pending");
+
+    // 券只能消费一次：重放同一张必须被拒，且不能再签出证书。
+    let replay = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/enroll",
+        None,
+        &harvest_enroll_body("harvest:demo", "demo", ticket),
+    )
+    .await;
+    let replay: serde_json::Value = decode_json_response(replay).await;
+    assert_eq!(replay["result"]["status"], "rejected");
+    assert_eq!(replay["result"]["reason_code"], "invalid_or_expired_ticket");
+    assert!(replay["result"]["certificate_pem"].is_null());
+}
+
+#[tokio::test]
+async fn harvest_enrollment_rejects_a_self_declared_identity() {
+    // 接入方不能自封 worker：worker_id 必须恰好是 `harvest:<source_code>`。
+    let state = test_state().await;
+    let ticket = "hwt-demo-ticket";
+    seed_harvest_ticket(&state, ticket).await;
+
+    let response = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/enroll",
+        None,
+        &harvest_enroll_body("harvest:someone-else", "demo", ticket),
+    )
+    .await;
+    let payload: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(payload["result"]["status"], "rejected");
+    assert_eq!(
+        payload["result"]["reason_code"],
+        "worker_id_must_match_source_code"
+    );
+}
+
+/// bootstrap 的顺序约束：standing 只能发给**已接入**的 worker。
+/// 先建 standing 会 404 —— 这正是同栈自动接入里最容易写反的一步。
+#[tokio::test]
+async fn harvest_standing_requires_an_enrolled_worker() {
+    let state = test_state().await;
+
+    let before = put_json_to_router(
+        &state.config,
+        &state.store,
+        "/api/v1/admin/harvest/standing",
+        Some(TEST_ADMIN_API_TOKEN),
+        &harvest_standing_body("harvest:demo"),
+    )
+    .await;
+    assert_eq!(before.status(), StatusCode::NOT_FOUND, "未接入不该能授权");
+
+    let ticket = "hwt-demo-ticket";
+    seed_harvest_ticket(&state, ticket).await;
+    let enrolled = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/enroll",
+        None,
+        &harvest_enroll_body("harvest:demo", "demo", ticket),
+    )
+    .await;
+    assert_eq!(enrolled.status(), StatusCode::OK);
+
+    let after = put_json_to_router(
+        &state.config,
+        &state.store,
+        "/api/v1/admin/harvest/standing",
+        Some(TEST_ADMIN_API_TOKEN),
+        &harvest_standing_body("harvest:demo"),
+    )
+    .await;
+    assert_eq!(after.status(), StatusCode::OK, "接入后授权必须成功");
+    let body: serde_json::Value = decode_json_response(after).await;
+    assert_eq!(body["plan_version"], 1);
+}
+
+#[tokio::test]
+async fn harvest_renewal_issues_a_new_certificate_for_the_same_worker() {
+    let state = test_state().await;
+    let worker_id = "harvest:tencent-cloud-prod";
+    state
+        .store
+        .upsert_harvest_worker(&crate::infra::HarvestWorker {
+            worker_id: worker_id.to_string(),
+            source_code: "tencent-cloud-prod".to_string(),
+            instance_id: "hinst-1".to_string(),
+            status: "active".to_string(),
+            enrolled_at: "2026-11-14T00:00:00Z".to_string(),
+            last_seen_at: None,
+            revoked_at: None,
+            revoked_by: String::new(),
+        })
+        .await
+        .expect("seed worker");
+
+    let response = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/credentials:renew",
+        Some(harvest_identity(
+            worker_id,
+            "tencent-cloud-prod",
+            "tenant-default",
+            "env-default",
+        )),
+        &harvest_renew_body(worker_id),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // 续期响应带证书，同样不能进任何缓存。
+    assert_no_store(&response);
+    let payload: serde_json::Value = decode_json_response(response).await;
+    let certificate = payload["certificate_pem"]
+        .as_str()
+        .expect("certificate_pem");
+    let (_, pem) = x509_parser::pem::parse_x509_pem(certificate.as_bytes()).expect("pem");
+    let identity = crate::infra::VerifiedHarvestIdentity::from_certificate_der(&pem.contents)
+        .expect("identity");
+    assert_eq!(identity.worker_id, worker_id);
+    assert_eq!(identity.source_code, "tencent-cloud-prod");
+    assert!(
+        payload["not_after"]
+            .as_str()
+            .is_some_and(|at| !at.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn harvest_renewal_is_refused_for_a_revoked_worker() {
+    let state = test_state().await;
+    let worker_id = "harvest:tencent-cloud-prod";
+    state
+        .store
+        .upsert_harvest_worker(&crate::infra::HarvestWorker {
+            worker_id: worker_id.to_string(),
+            source_code: "tencent-cloud-prod".to_string(),
+            instance_id: "hinst-1".to_string(),
+            status: "active".to_string(),
+            enrolled_at: "2026-11-14T00:00:00Z".to_string(),
+            last_seen_at: None,
+            revoked_at: None,
+            revoked_by: String::new(),
+        })
+        .await
+        .expect("seed worker");
+    state
+        .store
+        .revoke_harvest_worker(worker_id, "admin", "2026-11-14T01:00:00Z")
+        .await
+        .expect("revoke");
+
+    let response = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/credentials:renew",
+        Some(harvest_identity(
+            worker_id,
+            "tencent-cloud-prod",
+            "tenant-default",
+            "env-default",
+        )),
+        &harvest_renew_body(worker_id),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn harvest_renewal_without_a_client_certificate_is_unauthorized() {
+    let state = test_state().await;
+    let response = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/credentials:renew",
+        None,
+        &harvest_renew_body("harvest:demo"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── 一次性工作（P2）：派发 → 下发 → 结果 → 回收 ──
+
+async fn seed_harvest_worker(state: &super::ApiState, worker_id: &str, source_code: &str) {
+    state
+        .store
+        .upsert_harvest_worker(&crate::infra::HarvestWorker {
+            worker_id: worker_id.to_string(),
+            source_code: source_code.to_string(),
+            instance_id: "hinst-1".to_string(),
+            status: "active".to_string(),
+            enrolled_at: "2026-11-14T00:00:00Z".to_string(),
+            last_seen_at: None,
+            revoked_at: None,
+            revoked_by: String::new(),
+        })
+        .await
+        .expect("seed worker");
+}
+
+fn dispatch_body(worker_id: &str, action: &str) -> serde_json::Value {
+    serde_json::json!({ "worker_id": worker_id, "action": action })
+}
+
+fn result_body(worker_id: &str, work_id: &str, status: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "api_version": "v1",
+        "kind": "report_harvest_work_result",
+        "worker_id": worker_id,
+        "instance_id": "hinst-1",
+        "work_id": work_id,
+        "status": status,
+        "detail": detail,
+        "reported_at": "2026-11-14T08:34:17Z",
+    })
+}
+
+async fn grant_one_shot(state: &super::ApiState, worker_id: &str) -> Vec<serde_json::Value> {
+    let response = harvest_poll_request(
+        state,
+        harvest_identity(
+            worker_id,
+            "tencent-cloud-prod",
+            "tenant-default",
+            "env-default",
+        ),
+    )
+    .await;
+    let payload: serde_json::Value = decode_json_response(response).await;
+    payload["one_shot"]
+        .as_array()
+        .expect("one_shot array")
+        .clone()
+}
+
+#[tokio::test]
+async fn harvest_one_shot_is_dispatched_and_delivered_in_the_next_grant() {
+    let state = test_state().await;
+    let worker_id = "harvest:tencent-cloud-prod";
+    seed_harvest_worker(&state, worker_id, "tencent-cloud-prod").await;
+
+    let before = state
+        .store
+        .harvest_sequence(worker_id)
+        .await
+        .expect("sequence");
+    let response = post_json_to_router(
+        &state.config,
+        &state.store,
+        "/api/v1/admin/harvest/one-shot",
+        Some(TEST_ADMIN_API_TOKEN),
+        &dispatch_body(worker_id, "inventory.run"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let dispatched: serde_json::Value = decode_json_response(response).await;
+    let work_id = dispatched["work_id"].as_str().expect("work_id").to_string();
+    assert_eq!(dispatched["status"], "dispatched");
+    assert!(work_id.starts_with(&format!("hos:{worker_id}:inventory.run:")));
+
+    // 派发要 bump 序号：客户端下一拍就能看见（不依赖它逐条比对）。
+    let after = state
+        .store
+        .harvest_sequence(worker_id)
+        .await
+        .expect("sequence");
+    assert_eq!(after, before + 1);
+
+    let one_shot = grant_one_shot(&state, worker_id).await;
+    assert_eq!(one_shot.len(), 1);
+    assert_eq!(one_shot[0]["work_id"], work_id);
+    assert_eq!(one_shot[0]["action"], "inventory.run");
+    assert_eq!(one_shot[0]["status"], "dispatched");
+    assert!(
+        one_shot[0]["deadline_at"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+
+    // 页面只读视图同时带着这件活与序号。
+    let view: serde_json::Value = decode_json_response(
+        get_to_router(
+            &state.config,
+            &state.store,
+            "/api/v1/admin/harvest/works",
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(view["one_shot"][0]["work_id"], work_id);
+    assert_eq!(view["one_shot"][0]["outstanding"], true);
+    assert!(view["one_shot"][0]["result"].is_null());
+}
+
+#[tokio::test]
+async fn harvest_rescan_always_forces_a_fresh_snapshot() {
+    let state = test_state().await;
+    let worker_id = "harvest:tencent-cloud-prod";
+    seed_harvest_worker(&state, worker_id, "tencent-cloud-prod").await;
+
+    let response = post_json_to_router(
+        &state.config,
+        &state.store,
+        "/api/v1/admin/harvest/one-shot",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "worker_id": worker_id,
+            "action": "inventory.rescan",
+            "spec": { "fresh": false },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let one_shot = grant_one_shot(&state, worker_id).await;
+    assert_eq!(one_shot[0]["action"], "inventory.rescan");
+    // 重扫的语义就是忽略缓存：调用方写 false 也不能把它变成增量。
+    assert_eq!(one_shot[0]["spec"]["fresh"], true);
+}
+
+#[tokio::test]
+async fn harvest_result_advances_the_work_and_late_reports_are_stale() {
+    let state = test_state().await;
+    let worker_id = "harvest:tencent-cloud-prod";
+    seed_harvest_worker(&state, worker_id, "tencent-cloud-prod").await;
+    let dispatched: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &state.config,
+            &state.store,
+            "/api/v1/admin/harvest/one-shot",
+            Some(TEST_ADMIN_API_TOKEN),
+            &dispatch_body(worker_id, "inventory.run"),
+        )
+        .await,
+    )
+    .await;
+    let work_id = dispatched["work_id"].as_str().expect("work_id").to_string();
+    let identity = harvest_identity(
+        worker_id,
+        "tencent-cloud-prod",
+        "tenant-default",
+        "env-default",
+    );
+
+    // running：结果落库，但工作仍未了结 → 下一拍还在快照里。
+    let response = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/work:result",
+        Some(identity.clone()),
+        &result_body(worker_id, &work_id, "running", "采集中"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(accepted["status"], "accepted");
+    assert_eq!(grant_one_shot(&state, worker_id).await.len(), 1);
+
+    // succeeded：工作进终态，快照里不再出现。
+    let response = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/work:result",
+        Some(identity.clone()),
+        &result_body(worker_id, &work_id, "succeeded", "3 regions / 128 vpc"),
+    )
+    .await;
+    let accepted: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(accepted["status"], "accepted");
+    assert!(grant_one_shot(&state, worker_id).await.is_empty());
+
+    // 迟到的失败不能把已成功的结果盖掉。
+    let response = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/work:result",
+        Some(identity),
+        &result_body(worker_id, &work_id, "failed", "迟到的失败"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let late: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(late["status"], "stale");
+
+    let view: serde_json::Value = decode_json_response(
+        get_to_router(
+            &state.config,
+            &state.store,
+            "/api/v1/admin/harvest/works",
+            Some(TEST_ADMIN_API_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(view["one_shot"][0]["status"], "succeeded");
+    assert_eq!(
+        view["one_shot"][0]["result"]["detail"],
+        "3 regions / 128 vpc"
+    );
+}
+
+#[tokio::test]
+async fn harvest_result_for_someone_elses_work_is_unknown() {
+    let state = test_state().await;
+    let owner = "harvest:tencent-cloud-prod";
+    let intruder = "harvest:demo";
+    seed_harvest_worker(&state, owner, "tencent-cloud-prod").await;
+    seed_harvest_worker(&state, intruder, "demo").await;
+    let dispatched: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &state.config,
+            &state.store,
+            "/api/v1/admin/harvest/one-shot",
+            Some(TEST_ADMIN_API_TOKEN),
+            &dispatch_body(owner, "inventory.run"),
+        )
+        .await,
+    )
+    .await;
+    let work_id = dispatched["work_id"].as_str().expect("work_id").to_string();
+
+    let response = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/work:result",
+        Some(harvest_identity(
+            intruder,
+            "demo",
+            "tenant-default",
+            "env-default",
+        )),
+        &result_body(intruder, &work_id, "succeeded", "冒名上报"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = decode_json_response(response).await;
+    // 不泄漏「这件活到底存不存在」：统一 unknown。
+    assert_eq!(payload["status"], "unknown");
+    // 别人的成功上报绝不能把 owner 的活变成终态。
+    assert_eq!(grant_one_shot(&state, owner).await.len(), 1);
+}
+
+#[tokio::test]
+async fn harvest_canceled_one_shot_leaves_the_grant() {
+    let state = test_state().await;
+    let worker_id = "harvest:tencent-cloud-prod";
+    seed_harvest_worker(&state, worker_id, "tencent-cloud-prod").await;
+    let dispatched: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &state.config,
+            &state.store,
+            "/api/v1/admin/harvest/one-shot",
+            Some(TEST_ADMIN_API_TOKEN),
+            &dispatch_body(worker_id, "inventory.run"),
+        )
+        .await,
+    )
+    .await;
+    let work_id = dispatched["work_id"].as_str().expect("work_id").to_string();
+
+    let cancel_uri = format!("/api/v1/admin/harvest/one-shot/{work_id}/cancel");
+    let response = post_json_to_router(
+        &state.config,
+        &state.store,
+        &cancel_uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    let canceled: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(canceled["changed"], true);
+    assert!(grant_one_shot(&state, worker_id).await.is_empty());
+
+    // 再取消一次是无操作（幂等），不能谎报 changed。
+    let again: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &state.config,
+            &state.store,
+            &cancel_uri,
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(again["changed"], false);
+}
+
+#[tokio::test]
+async fn harvest_one_shot_dispatch_rejects_bad_input() {
+    let state = test_state().await;
+    let worker_id = "harvest:tencent-cloud-prod";
+    seed_harvest_worker(&state, worker_id, "tencent-cloud-prod").await;
+
+    // 未知动作
+    let response = post_json_to_router(
+        &state.config,
+        &state.store,
+        "/api/v1/admin/harvest/one-shot",
+        Some(TEST_ADMIN_API_TOKEN),
+        &dispatch_body(worker_id, "cost.pull"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 未知采集面
+    let response = post_json_to_router(
+        &state.config,
+        &state.store,
+        "/api/v1/admin/harvest/one-shot",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "worker_id": worker_id,
+            "action": "inventory.run",
+            "spec": { "assets": ["billing"] },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 已经过去的 deadline 等于一派出就过期
+    let response = post_json_to_router(
+        &state.config,
+        &state.store,
+        "/api/v1/admin/harvest/one-shot",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "worker_id": worker_id,
+            "action": "inventory.run",
+            "deadline_at": "2020-01-01T00:00:00Z",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 不存在的 worker
+    let response = post_json_to_router(
+        &state.config,
+        &state.store,
+        "/api/v1/admin/harvest/one-shot",
+        Some(TEST_ADMIN_API_TOKEN),
+        &dispatch_body("harvest:nobody", "inventory.run"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // 管理面仍然要 admin bearer
+    let response = post_json_to_router(
+        &state.config,
+        &state.store,
+        "/api/v1/admin/harvest/one-shot",
+        None,
+        &dispatch_body(worker_id, "inventory.run"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn harvest_result_rejects_a_status_the_client_may_not_claim() {
+    let state = test_state().await;
+    let worker_id = "harvest:tencent-cloud-prod";
+    seed_harvest_worker(&state, worker_id, "tencent-cloud-prod").await;
+    let dispatched: serde_json::Value = decode_json_response(
+        post_json_to_router(
+            &state.config,
+            &state.store,
+            "/api/v1/admin/harvest/one-shot",
+            Some(TEST_ADMIN_API_TOKEN),
+            &dispatch_body(worker_id, "inventory.run"),
+        )
+        .await,
+    )
+    .await;
+    let work_id = dispatched["work_id"].as_str().expect("work_id").to_string();
+    // `timed_out` / `canceled` 是**网关侧**的判定，客户端不能自己宣布。
+    let response = harvest_worker_post(
+        &state,
+        "/api/v1/harvest/work:result",
+        Some(harvest_identity(
+            worker_id,
+            "tencent-cloud-prod",
+            "tenant-default",
+            "env-default",
+        )),
+        &result_body(worker_id, &work_id, "timed_out", ""),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

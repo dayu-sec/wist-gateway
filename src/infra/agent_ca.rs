@@ -30,6 +30,8 @@ pub const CLIENT_CERT_NOT_BEFORE_SKEW_SECONDS: i64 = 300;
 const AGENT_URI_PREFIX: &str = "spiffe://";
 /// URI SAN 里身份段前的固定标记。
 const AGENT_URI_MARKER: &str = "/agent/";
+/// harvest worker 的 URI 标记（与 agent 的 `/agent/` 区分，两者不能互相冒充）。
+const HARVEST_URI_MARKER: &str = "/harvest/";
 /// 证书序列号长度（字节）：128 位随机。
 const SERIAL_NUMBER_BYTES: usize = 16;
 
@@ -169,15 +171,30 @@ impl AgentCa {
         &self.ca_certificate_pem
     }
 
-    /// 用 CSR 里的公钥签一张客户端证书。
+    /// 用 CSR 里的公钥签一张 harvest worker 的客户端证书。
     ///
-    /// **CSR 只贡献公钥**：CSR 的 subject 与请求的扩展一律忽略，主体由网关按
-    /// `identity`（稳定哈希 `agent_id`）填。约束：`CA:FALSE`、`keyUsage=digitalSignature`、
-    /// `EKU=clientAuth`、URI SAN、`notBefore-5min`、`notAfter=now+ttl`。
-    pub fn issue_client_certificate(
+    /// 与 agent 同一条纪律：CSR 只贡献公钥，主体（URI SAN）由网关按
+    /// `identity` 填（`spiffe://<tenant>/<env>/harvest/<source_code>`）。
+    pub fn issue_harvest_certificate(
         &self,
         csr_pem: &str,
-        identity: &AgentCertificateIdentity,
+        identity: &HarvestCertificateIdentity,
+        ttl_seconds: i64,
+    ) -> Result<IssuedAgentCertificate, String> {
+        self.issue_client_certificate_with_uri(
+            csr_pem,
+            &identity.worker_id(),
+            &harvest_uri(identity),
+            ttl_seconds,
+        )
+    }
+
+    /// 签发共用体：只有 CN 与 URI SAN 不同（agent / harvest）。
+    fn issue_client_certificate_with_uri(
+        &self,
+        csr_pem: &str,
+        common_name: &str,
+        uri: &str,
         ttl_seconds: i64,
     ) -> Result<IssuedAgentCertificate, String> {
         if ttl_seconds <= 0 {
@@ -188,17 +205,16 @@ impl AgentCa {
         let csr = CertificateSigningRequestParams::from_pem(csr_pem)
             .map_err(|err| format!("failed to parse certificate signing request: {err}"))?;
 
-        let agent_uri = agent_uri(identity);
         let mut distinguished_name = DistinguishedName::new();
         // CN 只作人类可读标签，权威身份在 URI SAN（§4.2）。
-        distinguished_name.push(DnType::CommonName, identity.agent_id.clone());
+        distinguished_name.push(DnType::CommonName, common_name.to_string());
 
         let mut params = CertificateParams::default();
         params.distinguished_name = distinguished_name;
         params.subject_alt_names =
-            vec![SanType::URI(agent_uri.clone().try_into().map_err(
-                |_| format!("agent URI is not a valid IA5 string: {agent_uri}"),
-            )?)];
+            vec![SanType::URI(uri.to_string().try_into().map_err(|_| {
+                format!("client URI is not a valid IA5 string: {uri}")
+            })?)];
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
@@ -210,7 +226,7 @@ impl AgentCa {
 
         let certificate = params
             .signed_by(&csr.public_key, &self.issuer, &self.issuer_key)
-            .map_err(|err| format!("failed to sign agent client certificate: {err}"))?;
+            .map_err(|err| format!("failed to sign client certificate: {err}"))?;
         let certificate_der = certificate.der().to_vec();
         let serial_bytes = certificate
             .params()
@@ -226,9 +242,143 @@ impl AgentCa {
             serial_hex: hex_lower(&serial_bytes),
             not_before: to_rfc3339(params_not_before(certificate.params())),
             not_after: to_rfc3339(params_not_after(certificate.params())),
-            agent_uri,
+            agent_uri: uri.to_string(),
         })
     }
+
+    /// 用 CSR 里的公钥签一张客户端证书（agent）。
+    ///
+    /// **CSR 只贡献公钥**：CSR 的 subject 与请求的扩展一律忽略，主体由网关按
+    /// `identity`（稳定哈希 `agent_id`）填。约束：`CA:FALSE`、`keyUsage=digitalSignature`、
+    /// `EKU=clientAuth`、URI SAN、`notBefore-5min`、`notAfter=now+ttl`。
+    pub fn issue_client_certificate(
+        &self,
+        csr_pem: &str,
+        identity: &AgentCertificateIdentity,
+        ttl_seconds: i64,
+    ) -> Result<IssuedAgentCertificate, String> {
+        self.issue_client_certificate_with_uri(
+            csr_pem,
+            &identity.agent_id,
+            &agent_uri(identity),
+            ttl_seconds,
+        )
+    }
+}
+
+// ─────────────────────────── harvest worker 身份 ───────────────────────────
+
+/// 证书 URI SAN 里承载的 harvest worker 身份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarvestCertificateIdentity {
+    pub tenant_id: String,
+    pub environment_id: String,
+    pub source_code: String,
+}
+
+impl HarvestCertificateIdentity {
+    pub fn new(
+        tenant_id: impl Into<String>,
+        environment_id: impl Into<String>,
+        source_code: impl Into<String>,
+    ) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            environment_id: environment_id.into(),
+            source_code: source_code.into(),
+        }
+    }
+
+    /// `harvest:<source_code>` —— 与 worker 登记表的主键同源。
+    pub fn worker_id(&self) -> String {
+        format!("harvest:{}", self.source_code)
+    }
+}
+
+/// 拼出 harvest 的证书 URI SAN（与 agent 的 `/agent/` 段区分）。
+pub fn harvest_uri(identity: &HarvestCertificateIdentity) -> String {
+    format!(
+        "{AGENT_URI_PREFIX}{}/{}{HARVEST_URI_MARKER}{}",
+        identity.tenant_id, identity.environment_id, identity.source_code
+    )
+}
+
+/// 从 URI SAN 还原 harvest 身份；不是本系统的 harvest URI 即报错。
+pub fn parse_harvest_uri(uri: &str) -> Result<HarvestCertificateIdentity, String> {
+    let rest = uri
+        .strip_prefix(AGENT_URI_PREFIX)
+        .ok_or_else(|| format!("harvest URI must start with `{AGENT_URI_PREFIX}`: {uri}"))?;
+    let (tenant_id, rest) = rest
+        .split_once('/')
+        .ok_or_else(|| format!("harvest URI missing tenant segment: {uri}"))?;
+    let (environment_id, source_code) = rest
+        .split_once(HARVEST_URI_MARKER)
+        .ok_or_else(|| format!("harvest URI missing `{HARVEST_URI_MARKER}` segment: {uri}"))?;
+    if tenant_id.is_empty()
+        || environment_id.is_empty()
+        || source_code.is_empty()
+        || source_code.contains('/')
+    {
+        return Err(format!(
+            "harvest URI has an empty or malformed segment: {uri}"
+        ));
+    }
+    Ok(HarvestCertificateIdentity::new(
+        tenant_id,
+        environment_id,
+        source_code,
+    ))
+}
+
+/// 由 mTLS 握手带进来、并**已由同一把 agent CA 验链通过**的 harvest 身份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedHarvestIdentity {
+    pub worker_id: String,
+    pub source_code: String,
+    pub tenant_id: String,
+    pub environment_id: String,
+    /// 证书 DER 的 SHA-256（小写 hex）。
+    pub fingerprint_sha256: String,
+    /// 证书生效时刻（RFC3339）。
+    pub not_before: String,
+    /// 证书到期时刻（RFC3339）。
+    pub not_after: String,
+}
+
+impl VerifiedHarvestIdentity {
+    /// 从**已验证**的客户端叶证书 DER 解出身份与有效期。
+    pub fn from_certificate_der(certificate_der: &[u8]) -> Result<Self, String> {
+        let (_, certificate) = X509Certificate::from_der(certificate_der)
+            .map_err(|err| format!("failed to parse client certificate: {err}"))?;
+        let identity = harvest_identity_from_parsed(&certificate)?;
+        let validity = certificate.validity();
+        Ok(Self {
+            worker_id: identity.worker_id(),
+            source_code: identity.source_code,
+            tenant_id: identity.tenant_id,
+            environment_id: identity.environment_id,
+            fingerprint_sha256: hex_lower(digest(&SHA256, certificate_der).as_ref()),
+            not_before: rfc3339_from_unix(validity.not_before.timestamp()),
+            not_after: rfc3339_from_unix(validity.not_after.timestamp()),
+        })
+    }
+}
+
+fn harvest_identity_from_parsed(
+    certificate: &X509Certificate<'_>,
+) -> Result<HarvestCertificateIdentity, String> {
+    let san = certificate
+        .subject_alternative_name()
+        .map_err(|err| format!("failed to read client certificate SAN: {err}"))?
+        .ok_or_else(|| "client certificate has no subject alternative name".to_string())?;
+    for name in &san.value.general_names {
+        if let GeneralName::URI(uri) = name
+            && let Ok(identity) = parse_harvest_uri(uri)
+        {
+            return Ok(identity);
+        }
+    }
+    Err("client certificate has no harvest URI SAN".to_string())
 }
 
 /// 从 DER 证书里读 URI SAN，还原 agent 身份。
