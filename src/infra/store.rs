@@ -263,6 +263,14 @@ pub const DISCOVERY_SNAPSHOT_SCOPE_APPLIED: &str = "applied";
 /// 一块全量快照（百 KB 级）不能因手滑配置打到秒级。两边都夹，是因为任一侧都可能被单独改。
 pub const DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS: u64 = 60;
 
+/// 云资产采集（harvest）的中心侧开关：单行，网关级（一个网关只服务一个客户）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoredHarvestSetting {
+    pub enabled: bool,
+    pub updated_by: String,
+    pub updated_at: String,
+}
+
 /// 原文快照上送的设置 / 生效值。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredDiscoverySnapshotSetting {
@@ -1279,6 +1287,16 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 写入/覆盖 Agent 数据面上送地址设置。
     async fn upsert_agent_uplink(&self, setting: &StoredAgentUplinkAddress) -> StoreResult<()>;
+
+    /// 读云资产采集开关（harvest 轮询用）。
+    async fn harvest_setting(&self) -> StoreResult<StoredHarvestSetting>;
+
+    /// 写云资产采集开关，返回写入后的行（`updated_at` 由库给出）。
+    async fn set_harvest_setting(
+        &self,
+        enabled: bool,
+        updated_by: &str,
+    ) -> StoreResult<StoredHarvestSetting>;
 
     /// 列出原文快照上送的全部行（global / 单机覆盖 / applied 各一份来源）。
     ///

@@ -16,6 +16,7 @@ use crate::infra::{AdminConfig, AgentCa, LocalPeers, Store};
 mod admin_auth;
 mod admin_ops;
 mod agent_ops;
+mod harvest;
 // NOTE(hand-added): 管理面错误码的稳定词表（`code` 的唯一来源）。重新生成控制面代码时需回补本模块。
 pub mod codes;
 mod enrollment;
@@ -346,6 +347,8 @@ pub fn ingest_router(state: ApiState) -> Router {
             post(ingest_agent_facts).layer(DefaultBodyLimit::max(MAX_INGEST_BODY_BYTES)),
         )
         // NOTE(hand-added): 采集日志的落盘（同一张内部监听，见 api/logs.rs）。
+        // 云资产采集开关（harvest 自己轮询；明文内网 + admin token，见 api/harvest.rs）。
+        .route("/api/v1/harvest/control", get(harvest::harvest_control))
         .route(
             "/api/v1/ingest/agent-logs",
             post(ingest_agent_logs).layer(DefaultBodyLimit::max(MAX_LOG_INGEST_BODY_BYTES)),
@@ -419,6 +422,11 @@ pub fn router_with_state(state: ApiState) -> Router {
         )
         // agent 面（edge seam B：gateway ↔ agentd）路由集中在 `api/agent_api/`：按 API 版本分表，
         // 由 `agent_api::mount` 统一挂上（版本并存约定见 api-seam-inventory.md §7）。
+        // 云资产采集开关：管理面读写（harvest 的轮询端点在 ingest_router）。
+        .route(
+            "/api/v1/admin/harvest",
+            get(harvest::view_harvest_setting).put(harvest::set_harvest_setting),
+        )
         .route("/api/v1/admin/agents/overview", get(get_agent_overview))
         .route(
             "/api/v1/admin/agents/host-metrics",

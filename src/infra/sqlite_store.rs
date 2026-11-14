@@ -626,6 +626,14 @@ fn agent_install_package_address_from_row(
     })
 }
 
+fn harvest_setting_from_row(row: &SqliteRow) -> StoreResult<StoredHarvestSetting> {
+    Ok(StoredHarvestSetting {
+        enabled: row.get::<i64, _>("enabled") != 0,
+        updated_by: row.get::<String, _>("updated_by"),
+        updated_at: row.get::<String, _>("updated_at"),
+    })
+}
+
 fn discovery_snapshot_from_row(row: &SqliteRow) -> StoreResult<StoredDiscoverySnapshotSetting> {
     // `enabled` 显式按 `i64` 读再判零：不依赖驱动对 bool ⇄ INTEGER 的隐式映射
     // （与 `get_agent_uplink` 同一口径）。
@@ -1241,6 +1249,35 @@ impl Store for SqliteStore {
         .await
         .map_err(|err| sql_error(err, "upsert agent uplink"))?;
         Ok(())
+    }
+
+    async fn harvest_setting(&self) -> StoreResult<StoredHarvestSetting> {
+        let row =
+            sqlx::query("SELECT enabled, updated_by, updated_at FROM harvest_setting WHERE id = 1")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|err| sql_error(err, "read harvest setting"))?;
+        harvest_setting_from_row(&row)
+    }
+
+    async fn set_harvest_setting(
+        &self,
+        enabled: bool,
+        updated_by: &str,
+    ) -> StoreResult<StoredHarvestSetting> {
+        let row = sqlx::query(
+            "INSERT INTO harvest_setting (id, enabled, updated_by, updated_at)
+             VALUES (1, ?1, ?2, datetime('now'))
+             ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled,
+               updated_by = excluded.updated_by, updated_at = excluded.updated_at
+             RETURNING enabled, updated_by, updated_at",
+        )
+        .bind(i64::from(enabled))
+        .bind(updated_by)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "write harvest setting"))?;
+        harvest_setting_from_row(&row)
     }
 
     async fn list_discovery_snapshot_settings(

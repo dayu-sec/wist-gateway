@@ -3,6 +3,17 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.47.0-alpha] - 2026-11-13
+
+### 新增（云资产采集开关：中心持有，采集器自拉）
+
+- 新表 `harvest_setting`（单行）+ 两个接口：
+  - `GET /api/v1/harvest/control`：挂在**明文 ingest 监听**上，给 `wist-harvest` 轮询
+    （同栈内网，不必为它准备 TLS 信任锚）；沿用管理面 admin token。
+  - `GET` / `PUT /api/v1/admin/harvest`：管理面读写，写入时记 `updated_by`（admin token 指纹）。
+- **默认关闭**：装上去不等于开始采。采集器对读接口的 5xx 处理是 fail-closed，
+  所以「读不到」和「明确关闭」在接口层必须区分（库不可用时回 5xx，不回落成 `false`）。
+
 ## [0.46.0-alpha] - 2026-11-12
 
 ### 新增（调查授权 / 能力上报）

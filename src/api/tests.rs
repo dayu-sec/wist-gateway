@@ -18694,3 +18694,50 @@ async fn metrics_labels_reject_a_wrong_kind_and_an_over_cap_request() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn harvest_control_defaults_off_and_follows_admin_writes() {
+    let state = test_state().await;
+
+    // 装上去不等于开始采：默认关闭。
+    let view = get_view(&state, "/api/v1/admin/harvest").await;
+    assert_eq!(view["enabled"], false, "{view}");
+
+    // 管理面打开。
+    let response = super::router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/admin/harvest")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::from(r#"{"enabled":true}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 采集器轮询端点（明文 ingest 监听）看到的是同一个值。
+    let poll = |token: Option<&'static str>| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/harvest/control");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        super::ingest_router(super::build_state(
+            state.config.clone(),
+            Arc::clone(&state.store),
+        ))
+        .oneshot(request.body(Body::empty()).expect("request"))
+    };
+    let response = poll(Some(TEST_ADMIN_API_TOKEN)).await.expect("poll");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(payload["enabled"], true, "{payload}");
+
+    // 没有令牌：401（harvest 配错 token 时必须能看出来，而不是拿到一个 false）。
+    let response = poll(None).await.expect("poll without token");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
