@@ -2954,22 +2954,78 @@ target = "/var/log/x.log"
             vec!["linux-auth-session"]
         );
         // 容器单元现在在**基线包**里（LinuxHost 也有 ContainerWorkload 面）：
-        // 这台机的两条容器根都不存在 → 两个单元被事实门排除，面本身不展开。
+        // 这台机没探过这两条容器根 → `fact_not_collected`，面本身不展开。
         // `linux-ids` 同理：没探到 `/opt/suricata/logs/eve.json` 就不派 `TrafficInspection`
         // —— 包在模板里不等于可以派，真正的闸门是单元的 `match`。
+        //
+        // 关键进程单元（`linux-process-metrics`，0.12.0 起挂进 `linux-host`）：
+        // 本夹具没上报 agentd 版本 → 先在 `min_agentd_version` 被派下之前裁掉
+        // （`agent_too_old`，与能力协商同一姿态）；够版本且没装这些服务的机器
+        // 则会以 `match_unsatisfied` 排除 —— 两种都不该让 `ProcessMetrics` 面空转。
         assert_eq!(
             expansion
                 .excluded_units
                 .iter()
-                .map(|unit| unit.unit_id.as_str())
+                .map(|unit| (unit.unit_id.as_str(), unit.reason_code.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                "linux-container-stdout",
-                "linux-docker-container-stdout",
-                "linux-suricata-eve"
+                ("linux-container-stdout", "fact_not_collected"),
+                ("linux-docker-container-stdout", "fact_not_collected"),
+                ("linux-keyproc-kafka", "agent_too_old"),
+                ("linux-keyproc-nginx", "agent_too_old"),
+                ("linux-keyproc-postgres", "agent_too_old"),
+                ("linux-keyproc-redis", "agent_too_old"),
+                ("linux-suricata-eve", "fact_not_collected"),
             ],
-            "LinuxHost 只应排除事实门不成立的单元（容器根 / Suricata 输出）"
+            "LinuxHost 只应排除事实门不成立的单元（容器根 / 关键进程 / Suricata 输出）"
         );
+    }
+
+    /// `linux-host` 挂上关键进程包之后的**正例**：机器真的装了那个服务就派。
+    ///
+    /// 这是 0.12.0 那次策展改动的直接后果 —— 以前关键进程只随 `linux-compute` /
+    /// `linux-data` 展开，于是「授权了 linux-host 的主机一台都不采」，面看着正常、数据永远是空的。
+    #[test]
+    fn linux_host_expands_key_process_metrics_when_the_service_is_there() {
+        let set = load_content(
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
+        )
+        .expect("load checked-in content");
+        let mut host_facts = facts("linux", &[]);
+        // 装了 nginx（`path_exists:/etc/nginx` 成立了）
+        host_facts.probed_paths = vec!["/etc/nginx".to_string()];
+        host_facts.present_paths = host_facts.probed_paths.clone();
+        let roots: Vec<String> = Vec::new();
+        // 报过 0.36.0 才会过 `min_agentd_version`（没上报 = 保守不派）。
+        let expansion = set
+            .expand("linux-host", &host_facts, context(&roots, Some("0.36.0")))
+            .expect("expand");
+
+        let process = expansion
+            .works
+            .iter()
+            .find(|work| work.family == "ProcessMetrics")
+            .expect("装了 nginx 的主机应该拿到 ProcessMetrics 面");
+        assert_eq!(process.selected_units, vec!["linux-keyproc-nginx"]);
+        assert_eq!(process.capability, "collect_metrics");
+        // 没装的三个服务仍然不派（`match` 是本机事实，不是模板意愿）。
+        let excluded: Vec<&str> = expansion
+            .excluded_units
+            .iter()
+            .map(|unit| unit.unit_id.as_str())
+            .collect();
+        for absent in [
+            "linux-keyproc-kafka",
+            "linux-keyproc-redis",
+            "linux-keyproc-postgres",
+        ] {
+            assert!(
+                excluded.contains(&absent),
+                "{absent} 没装不该派：{excluded:?}"
+            );
+        }
     }
 
     #[test]
