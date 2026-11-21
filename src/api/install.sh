@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # wist-agentd 安装脚本（由 wist-gateway 渲染签名后下发，本文件已被签名校验过）。
 #
-# 顺序：装包并校验摘要 → 装二进制 → 写初始配置 → 注册常驻服务（交给 launchd / systemd）。
+# 顺序：装包并校验摘要 → 装二进制 → 写初始配置 → 注册常驻服务（交给 launchd / systemd / upstart）。
 # 幂等：重跑等价于升级（覆盖二进制 + 重建服务进程）；任何一步失败都会明确说明停在哪。
 #
 # 两种模式（WIST_AGENTD_REINSTALL 选）：
@@ -79,7 +79,6 @@ fi
 
 case "$OS_NAME" in
   Darwin) SERVICE_MANAGER="launchd" ;;
-  Linux) SERVICE_MANAGER="systemd" ;;
   *) SERVICE_MANAGER="服务管理器" ;;
 esac
 
@@ -93,8 +92,14 @@ esac
 #
 # 系统级由脚本自己提权，而不是要求使用者手工加 sudo：手工加 sudo 会清掉 token 所在的
 # 环境变量，token 静默丢失、脚本退到交互提示。重新执行自己时把 token 与重装标记作为参数带过去。
+#
+# `[ -r /dev/tty ]` **不能**用来判「有没有控制终端」：设备文件通常可读，但 CM/CI、
+# `ssh host 'sh install.sh'` 这类非交互运行根本没有终端，打开时返回 ENXIO —— 配上 `set -e`
+# 会静默退出，连本该打印的“缺 token”提示都没有。真正的判据是能不能打开它。
+have_tty() { ( : </dev/tty ) 2>/dev/null; }
+
 if [ "$(id -u)" != "0" ]; then
-  if [ ! -f "$0" ] || { [ ! -t 0 ] && [ ! -r /dev/tty ]; }; then
+  if [ ! -f "$0" ] || { [ ! -t 0 ] && ! have_tty; }; then
     printf '%s\n' "系统级安装需要 root：请用 sudo 重跑本脚本。" >&2
     exit 2
   fi
@@ -103,11 +108,49 @@ if [ "$(id -u)" != "0" ]; then
   fi
   exec sudo -p '系统级安装需要管理员权限: ' sh "$0" --enrollment-token "$WIST_ENROLLMENT_TOKEN" "$@"
 fi
+
+# 服务管理器**在提权之后**再判：`command -v` 看的是当前进程的 PATH，普通用户与
+# root（sudo secure_path）可能不同；提前判会与第 4 步的实际选择不一致，告警也会重打一遍。
+# 判定与 `wist-agentd service install` 同源（systemd 优先、否则 upstart）：CentOS 6 / RHEL 6
+# 没有 systemctl，PID 1 是 upstart 0.6.5。这里只用于**提示文案**，真正的选择在第 4 步由 agentd 做，
+# 两边判得不一样也不会装错（最多提示语不准）。
+if [ "$OS_NAME" = "Linux" ]; then
+  if command -v systemctl >/dev/null 2>&1; then
+    SERVICE_MANAGER="systemd"
+  elif [ -d /etc/init ] && command -v initctl >/dev/null 2>&1; then
+    SERVICE_MANAGER="upstart"
+  elif [ "$EXPECT_OS" = "Linux" ]; then
+    printf '%s\n' "本机既没有 systemctl 也没有 initctl（upstart）：第 4 步的常驻托管会失败。" >&2
+    printf '%s\n' "  可先用 WIST_AGENTD_SERVICE=0 跳过托管（只装二进制与配置），由你自己的机制拉起。" >&2
+  fi
+fi
 # 二进制放标准 bin 目录，与配置目录解耦；配置目录只放 config + tasks。
 # （系统级下 state/run/spool 落 /var/lib/wist-agentd、日志落 /var/log/wist-agentd。）
 WIST_AGENTD_HOME="${WIST_AGENTD_HOME:-/etc/wist-agentd}"
 BIN_DIR="${WIST_AGENTD_BIN_DIR:-/usr/local/bin}"
 CONFIG_DIR="$WIST_AGENTD_HOME"
+
+# 完成后的自查入口：每个服务管理器的「看状态 / 看日志」命令不同，
+# 给错命令在 CentOS 6 上就是 `systemctl: command not found`，比不给更误导。
+# （放在 BIN_DIR 定下来之后：未知管理器的兑底提示要用到它。）
+case "$SERVICE_MANAGER" in
+  systemd)
+    SERVICE_STATUS_CMD="systemctl status wist-agentd"
+    SERVICE_LOG_CMD="journalctl -u wist-agentd -f"
+    ;;
+  upstart)
+    SERVICE_STATUS_CMD="initctl status wist-agentd"
+    SERVICE_LOG_CMD="tail -f /var/log/wist-agentd/agentd.err"
+    ;;
+  launchd)
+    SERVICE_STATUS_CMD="launchctl print system/com.dayu-sec.wist-agentd"
+    SERVICE_LOG_CMD="tail -f /var/log/wist-agentd/agentd.err"
+    ;;
+  *)
+    SERVICE_STATUS_CMD="$BIN_DIR/wist-agentd service status"
+    SERVICE_LOG_CMD="$BIN_DIR/wist-agentd service status"
+    ;;
+esac
 
 # 输出约定：`==> ` 是脚本自己推进的步骤，缩进的是外部工具（wist-agentd / curl）的输出，
 # 这样一行是哪来的、停在哪一步都一眼可辨。只在交互终端上色，重定向到文件或 CM 时退化为纯文本。
@@ -145,6 +188,8 @@ show_tool_output() {
 
 printf '%swist-agentd 安装程序%s\n' "$BOLD" "$RESET"
 printf '  主机    %s %s\n' "$OS_NAME" "$HOST_ARCH"
+# 托管方式写出来：CentOS 6 上它是 `upstart`（没有 systemd），第 4 步也会按这个名字走。
+printf '  托管    %s\n' "$SERVICE_MANAGER"
 if [ "${REINSTALL}" = "1" ]; then
   printf '  模式    %s\n' "重装（替换本机客户端证书）"
 else
@@ -154,7 +199,7 @@ printf '  二进制  %s\n' "$(short "$BIN_DIR/wist-agentd")"
 printf '  配置    %s\n' "$(short "$CONFIG_DIR/agentd.toml")"
 
 if [ -z "${WIST_ENROLLMENT_TOKEN:-}" ]; then
-  if [ -r /dev/tty ]; then
+  if have_tty; then
     printf "Enrollment token: " >/dev/tty
     stty -echo </dev/tty 2>/dev/null || true
     IFS= read -r WIST_ENROLLMENT_TOKEN </dev/tty
@@ -345,6 +390,8 @@ fi
 show_tool_output "$TOOL_OUT"
 
 printf '\n%s安装完成：wist-agentd 已交给 %s 托管，当前在后台持续运行%s\n' "$GREEN" "$SERVICE_MANAGER" "$RESET"
+note "看状态：$SERVICE_STATUS_CMD"
+note "看日志：$SERVICE_LOG_CMD"
 if [ "${REINSTALL}" = "1" ]; then
   note "重装模式：本机客户端证书已替换；agent_id 是机器标识的稳定哈希，保持不变。"
 fi

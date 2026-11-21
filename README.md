@@ -135,22 +135,25 @@ sha256 **embedded in the command itself**, and only then runs it. All three publ
 (Linux x86_64/ARM64, macOS ARM) share that shape, so the command needs nothing beyond a POSIX
 `sh`, `curl` and `sha256sum`/`shasum` — **no OpenSSL, no certificate pinning**. The previous
 `openssl pkeyutl -verify -rawin` path required OpenSSL ≥ 3.0, which was stricter than every other
-link in the install chain (the script and agentd only ever needed systemd + curl).
+link in the install chain (the script and agentd only ever needed curl + an init system).
 
 Baseline a target host must provide:
 
 - a POSIX `sh` (dash/ash are fine), `curl`, `tar` with gzip, `awk`, and `sha256sum`
   (`shasum` is accepted as a fallback — same order as `install.sh`);
 - root — the script re-executes itself under `sudo` when not already root;
-- Linux: **systemd as PID 1** (the only Linux service backend `wist-agentd` implements);
-  macOS: launchd.
+- an init system: Linux → **systemd as PID 1**, or **upstart** (CentOS / RHEL 6) where systemd is
+  absent; macOS → launchd. The script and `wist-agentd` pick the backend the same way
+  (`systemctl` present → systemd, else `/etc/init` + `initctl` → upstart).
 
-Equivalent distributions: Ubuntu 20.04+, Debian 11+, RHEL/CentOS 8+, macOS 11+ (ARM).
-Out of scope: systems without systemd (EL6, Ubuntu 14.04 and older), and trimmed images that ship
-neither `curl` nor `awk` — install those first, the floor does not assume them.
+Equivalent distributions: Ubuntu 20.04+, Debian 11+, RHEL/CentOS 8+, CentOS/RHEL 6.10 (upstart;
+**static musl artifact required** — those hosts are glibc 2.12 / kernel 2.6.32), macOS 11+ (ARM).
+Out of scope: trimmed images that ship neither `curl` nor `awk` — install those first, the floor
+does not assume them; and Linux hosts with **neither** systemd nor upstart (Alpine, most container
+bases) — use `WIST_AGENTD_SERVICE=0` and supervise the daemon yourself.
 
-`WIST_AGENTD_SERVICE=0` runs the agent in the foreground and drops the systemd requirement, at the
-cost of no supervised restart — for containers and other self-managed setups.
+`WIST_AGENTD_SERVICE=0` runs the agent in the foreground and drops the service-manager requirement,
+at the cost of no supervised restart — for containers and other self-managed setups.
 
 Earlier builds gave macOS a `curl --pinnedpubkey` variant instead, because macOS ships LibreSSL
 (no Ed25519 raw verification either). It has been dropped: pinning the gateway's own serving

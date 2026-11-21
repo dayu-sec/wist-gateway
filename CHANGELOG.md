@@ -3,6 +3,33 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.49.0-alpha] - 2026-11-21
+
+### 新增（关键进程指标的派活支持）
+
+- 新采集面 `ProcessMetrics` + 新来源 `KeyProcessMetrics` 验收：`is_collectable_source` 认得
+  签名列表（`unit:kafka|port:9092|exe:kafka`），目标约束统一走契约的 `accepts_target` ——
+  未知前缀 / 空值 / 值带空白 / `exe` 写路径 / `port` 越界一律拒，不会静默无数据。
+- 面词表同步到模型（23 个面）：`FAMILIES` / `LINUX_ONLY_FAMILIES` 加 `ProcessMetrics`，
+  与 `families.mju`、`catalog.toml` 的一致性由测试钉住。
+- 依赖：`wist-api 0.12 → 0.13`、`wist-metrics 0.19 → 0.20`（整条链随 `wist-contracts 0.12` 一起升）。
+
+### 新增（安装脚本支持 CentOS / RHEL 6：upstart）
+
+- `install.sh` 不再把 Linux 无条件当成 systemd：提权后按 `systemctl` / `/etc/init` + `initctl`
+  判定，步骤标题、完成语与「看状态 / 看日志」命令都按实际管理器给出（CentOS 6 上正确显示
+  `upstart` + `initctl status`，而不是让人去敲不存在的 `systemctl`）。
+- 既无 systemd 也无 upstart 的精简镜像上提前告警，并指向 `WIST_AGENTD_SERVICE=0` 逃生口，
+  而不是等到第 4 步才失败。
+- 真正的托管选型仍在 `wist-agentd service install`（本轮已支持 upstart）；脚本侧只做提示，
+  两边判定同源，极端环境下不一致也不会装错。
+
+### 修复（非交互运行静默退出）
+
+- `[ -r /dev/tty ]` 只判权限，不是「有控制终端」：CM/CI、`ssh host 'sh install.sh'` 下为真但
+  打开返回 ENXIO，配上 `set -e` 会**静默退出**（连“缺 token”提示都不打）。改为 `have_tty()`
+  （试开一次），非交互时正常走到「missing WIST_ENROLLMENT_TOKEN」并给出取得命令的说明。
+
 ## [0.48.0-alpha] - 2026-11-14
 
 ### 新增（云资产采集：工作授权代替开关）

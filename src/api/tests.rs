@@ -953,6 +953,64 @@ async fn install_script_handles_tarball_and_bare_package() {
 }
 
 #[tokio::test]
+async fn install_script_detects_the_real_service_manager() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    // CentOS 6 / RHEL 6 的 PID 1 是 upstart、没有 systemctl：脚本不能再写死 systemd，
+    // 否则步骤标题与完成语都在骗人（第 4 步实际交给 upstart）。
+    assert!(script.contains("command -v systemctl"), "{script}");
+    assert!(script.contains("SERVICE_MANAGER=\"upstart\""), "{script}");
+    assert!(script.contains("initctl"), "{script}");
+    assert!(
+        !script.contains("Linux) SERVICE_MANAGER=\"systemd\""),
+        "不得把 Linux 无条件当成 systemd"
+    );
+
+    // 判定要发生在提权之后（PATH 可能不一样，告警也不该重复打）。
+    let elevate = script
+        .find("if [ \"$(id -u)\" != \"0\" ]; then")
+        .expect("elevation block");
+    let detect = script
+        .find("command -v systemctl")
+        .expect("manager detection");
+    assert!(elevate < detect, "服务管理器判定必须在提权之后");
+
+    // 完成后的自查命令必须与选定管理器一致；给错命令在 CentOS 6 上就是 command not found。
+    assert!(script.contains("SERVICE_STATUS_CMD=\"initctl status wist-agentd\""));
+    assert!(script.contains("SERVICE_LOG_CMD=\"journalctl -u wist-agentd -f\""));
+    assert!(script.contains("tail -f /var/log/wist-agentd/agentd.err"));
+    assert!(script.contains("wist-agentd service status"));
+}
+
+#[tokio::test]
+async fn install_script_warns_when_no_service_manager_is_available() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    // 精简镜像（Alpine / 容器）既无 systemd 也无 upstart：与其让第 4 步失败，不如提前说清楚，
+    // 并给出 `WIST_AGENTD_SERVICE=0` 这个已被支持的逃生口。
+    assert!(
+        script.contains("既没有 systemctl 也没有 initctl"),
+        "{script}"
+    );
+    assert!(script.contains("WIST_AGENTD_SERVICE=0"), "{script}");
+}
+
+#[tokio::test]
+async fn install_script_does_not_assume_a_controlling_tty() {
+    let env = TestEnv::new().await;
+    let script = rendered_install_script(&env);
+
+    // `[ -r /dev/tty ]` 只判权限：CM/CI、`ssh host 'sh install.sh'` 下为真，但打开返回 ENXIO，
+    // 配上 `set -e` 会静默退出（连“缺 token”提示都不打）。判据必须是“能不能打开”。
+    assert!(script.contains("have_tty() {"), "{script}");
+    // 注释里可以提到这个错误写法，但代码里不能再出现。
+    assert!(!script.contains("if [ -r /dev/tty ]; then"), "{script}");
+    assert!(!script.contains("&& [ ! -r /dev/tty ]"), "{script}");
+}
+
+#[tokio::test]
 async fn install_script_scopes_initial_config_to_token() {
     let env = TestEnv::new().await;
     let script = rendered_install_script(&env);

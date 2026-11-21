@@ -83,8 +83,10 @@
 照抄 `docs/design/agent-identity-mtls.md` 的形态，不发明第二套：
 
 ```
-① admin 在管理面签发一次性接入券（ttl 短、可吊销；与 agent 安装码同一张表/同一套语义）
-② 现场把券写进 .wist/sec-value.yml（不进配置文件、不进页面、不进备份）
+① admin 在管理面签发一次性接入券（ttl 短、一次性、可吊销；与 agent 安装码同一套语义）
+② 券怎么到采集器：**不进长期密钥库**（`.wist/sec-value.yml` 里只放要轮换 / 要备份的东西）
+   —— 同栈：`harvest-bootstrap` 现签现用（只在内存里活几秒）；
+   跨机：投放 `<state_dir>/enroll.ticket`（0600，成功接入即删）或一次性环境变量 `HARVEST_ENROLL_TICKET`
 ③ harvest 首启：本地生成密钥对（私钥不出这台机器）→ 生成 CSR
 ④ POST /api/v1/harvest/enroll {ticket, worker_id, instance_id, csr}   ← TLS 监听
 ⑤ 网关按 worker_id 填 subject / URI SAN，用 agent-ca 签客户端证书（37 天）
@@ -101,6 +103,9 @@
   `spiffe://<tenant>/<env>/agent/<agent_id>` 同一条解析规则，靠 `/harvest/` 与 `/agent/` 段区分）。
 - **没有 bearer 轨道**：P1 就是 mTLS（agentd 已经把 bearer 删干净了，harvest 不要重新引入）。
 - 凭据**不进** `harvest.toml`（配置文件会进包、进备份）。
+- **接入券也不进 `sec-value.yml`**：它是一次性的（默认 24h），而密钥库里是 admin token、
+  云 SecretId/Key 这种要长期维护的凭据 —— 混在一起会让运维以为券需要轮换，它还会被 `:ro`
+  挂进用不到它的容器。长期身份是**证书**（37 天，自动续期），不是券。
 - `enroll` 成功 = worker 行建立（`status=pending`），第一次 `work:poll` 后转 `active`。
 - 吊销：管理面 `POST /admin/harvest/workers/{worker_id}/revoke` 把 worker 置 `revoked`、
   证书记录标吊销。**执行点在应用层**（三个 worker 入口都回 403），**不是 mTLS 握手拒绝** ——

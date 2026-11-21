@@ -64,6 +64,8 @@ pub const FAMILIES: &[&str] = &[
     // 粒度是**领域**（要看见什么），产品差异在单元与 `CollectionSourceKind`。
     "DatabaseMetrics",
     "MessageQueueMetrics",
+    // 关键进程指标（按策展签名选代表进程；平台 linux）。
+    "ProcessMetrics",
 ];
 /// 只在 macOS 出现的面（照 `families.mju` 的分类）。**仅用于旧包回落**：
 /// 带 `[[families]]` 的包按词表里的 `platforms` 判，不看这里。
@@ -81,6 +83,7 @@ const LINUX_ONLY_FAMILIES: &[&str] = &[
     // 外部系统指标：自探读 /proc（macOS 已支持，见 `platforms` 词表；
     // 这个常量只用于**旧包回落**，带 `[[families]]` 的包不看它）。
     "MessageQueueMetrics",
+    "ProcessMetrics",
 ];
 /// 能力闭集。
 pub const CAPABILITIES: &[&str] = &["collect_logs", "collect_metrics"];
@@ -98,8 +101,12 @@ pub fn is_known_source_kind(kind: &str) -> bool {
 ///
 /// 日志与指标的可执行词表不同：
 /// - `collect_logs`：契约的 [`is_executable_source`]（FileGlob / MetricInterval / Exporter…）；
-/// - `collect_metrics`：在上面基础上再认**外部系统**（Kafka / MySQL / PG / Doris），
-///   后四者的 `target` **只认 `auto`**（端点由 agentd 自探，不接受显式地址）。
+/// - `collect_metrics`：在上面基础上再认**只属于指标域**的来源——
+///   四个自探域（Kafka / MySQL / PG / Doris，`target` 只认 `auto`）与**关键进程指标**
+///   （`target` 是签名列表 `unit:` / `exe:` / `port:` / `cmdline:`）。
+///
+/// 两类来源的目标约束**统一交给 `accepts_target`**，不要在这里另拼一份条件：
+/// `auto_target_only()` 只覆盖前者，再单写一个 `matches!` 很容易漏掉后加的 kind。
 ///
 /// 为什么不直接改契约的 `is_executable_source`：agentd 用它判断「这条来源能不能变成
 /// 一个日志输入」，把指标 kind 塞进去会让它把 Kafka/DB 当成文件去 tail。
@@ -110,8 +117,15 @@ pub fn is_collectable_source(capability: &str, kind: &str, target: &str) -> bool
     if capability != wist_contracts::work::capability::COLLECT_METRICS {
         return false;
     }
-    wist_contracts::work::CollectionSourceKind::parse(kind)
-        .is_some_and(|kind| kind.auto_target_only() && kind.accepts_target(target))
+    let Some(kind) = wist_contracts::work::CollectionSourceKind::parse(kind) else {
+        return false;
+    };
+    let metrics_only = kind.auto_target_only()
+        || matches!(
+            kind,
+            wist_contracts::work::CollectionSourceKind::KeyProcessMetrics
+        );
+    metrics_only && kind.accepts_target(target)
 }
 
 /// 可执行的来源 kind（用于报错文案）：与 [`is_known_source_kind`] 同一个词表。
@@ -1080,7 +1094,8 @@ fn validate_unit(unit: &UnitRow, families: &BTreeMap<String, FamilyMeta>) -> Con
             "unit {id}: status = active but no source agentd can collect \
              (collect_logs：kind 要去 {EXECUTABLE_SOURCE_KINDS:?}，FileGlob 的 target 要是绝对路径、\
              Exporter 的 ID 要在 EXPORTER_IDS 里；collect_metrics 额外接受 MetricInterval 与\
-             KafkaCluster / MysqlInstance / PostgresInstance / DorisCluster，后四者 target 只认 auto)"
+             KafkaCluster / MysqlInstance / PostgresInstance / DorisCluster（target 只认 auto）、\
+             以及 KeyProcessMetrics（target 是 unit:/exe:/port:/cmdline: 签名列表）"
         )));
     }
     Ok(())
@@ -1679,7 +1694,8 @@ pub struct ExpandedWork {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExcludedUnit {
     pub unit_id: String,
-    /// `collect_not_ready` | `match_unsatisfied` | `fact_not_collected`。
+    /// `collect_not_ready` | `agent_too_old` | `match_unsatisfied` | `fact_not_collected` |
+    /// `source_not_resolved`。
     pub reason_code: String,
     /// 不满足/无法判定的那条条件（如 `installed:postgresql`）。
     pub condition: Option<String>,
@@ -2044,6 +2060,112 @@ template_version = 1
 status = "active"
 "#;
 
+    /// 只有指标来源的单元（无 `FileGlob`）：用来验证“按最低 agentd 版本裁单元”
+    /// 与“日志源解析不得误删指标单元”两件事。
+    const PROCESS_CATALOG: &str = r#"
+catalog_version = 1
+origin = "Gateway"
+published_at = "2026-11-21T00:00:00Z"
+
+[[families]]
+id = "ProcessMetrics"
+platforms = ["linux"]
+name_zh = "关键进程指标"
+name_en = "Key process metrics"
+summary_zh = "按策展签名选出的关键进程运行指标。"
+summary_en = "Runtime metrics of key processes selected by curated signatures."
+
+[[families]]
+id = "HostMetrics"
+
+[[units]]
+unit_id = "mac-metrics"
+family = "HostMetrics"
+capability = "collect_metrics"
+platform = "macos"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "none"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+
+[[units]]
+unit_id = "linux-metrics"
+family = "HostMetrics"
+capability = "collect_metrics"
+platform = "linux"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "root"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+
+[[units]]
+unit_id = "linux-keyproc-kafka"
+family = "ProcessMetrics"
+capability = "collect_metrics"
+platform = "linux"
+match = ""
+rule_ref = "agent_uplink"
+requires_privilege = "root"
+min_agentd_version = "0.36.0"
+status = "active"
+
+[[units.sources]]
+kind = "MetricInterval"
+target = "15s"
+
+[[units.sources]]
+kind = "KeyProcessMetrics"
+target = "unit:kafka|port:9092"
+"#;
+
+    const PROCESS_PACKS: &str = r#"
+[[pack]]
+pack_id = "macos-process-base"
+platform = "macos"
+kind = "Baseline"
+families = ["HostMetrics"]
+unit_refs = ["mac-metrics"]
+catalog_version = 1
+status = "active"
+
+[[pack]]
+pack_id = "linux-process-base"
+platform = "linux"
+kind = "Baseline"
+families = ["HostMetrics"]
+unit_refs = ["linux-metrics"]
+catalog_version = 1
+status = "active"
+
+[[pack]]
+pack_id = "linux-process-metrics"
+platform = "linux"
+kind = "Feature"
+families = ["ProcessMetrics"]
+unit_refs = ["linux-keyproc-kafka"]
+catalog_version = 1
+status = "active"
+"#;
+
+    const PROCESS_TEMPLATES: &str = r#"
+[[template]]
+template_id = "linux-proc"
+machine_class = "LinuxCompute"
+platform = "linux"
+pack_refs = ["linux-process-base", "linux-process-metrics"]
+catalog_version = 1
+template_version = 1
+status = "active"
+"#;
+
     fn minimal() -> ContentSet {
         parse_content(CATALOG, PACKS, TEMPLATES).expect("minimal content parses")
     }
@@ -2096,6 +2218,64 @@ status = "active"
         );
         // 够版本 → 正常选中。
         assert_eq!(excluded_by(Some("0.10.0")), None);
+    }
+
+    /// 指标单元的 `min_agentd_version`：旧 agent **前置排除**（理由能直接指出升级），
+    /// 够版本时**真的派下去** —— 这条同时钉住一个容易漏的边界：
+    /// `KeyProcessMetrics` 单元没有 `FileGlob` 来源，不能被「日志源解析」判成
+    /// `source_not_resolved` 而悄悄丢掉。
+    #[test]
+    fn a_key_process_unit_is_dispatched_only_to_a_new_enough_agent() {
+        let content = parse_content(PROCESS_CATALOG, PROCESS_PACKS, PROCESS_TEMPLATES)
+            .expect("process content parses");
+        let facts = facts("linux", &[]);
+        let roots: Vec<String> = Vec::new();
+
+        let expand = |version: Option<&str>| {
+            content
+                .expand("linux-proc", &facts, context(&roots, version))
+                .expect("expand")
+        };
+        // 模板固带平台基线包（加载器强制），所以断言只看 `ProcessMetrics` 面。
+        let keyproc_works = |expansion: &Expansion| {
+            expansion
+                .works
+                .iter()
+                .filter(|work| work.family == "ProcessMetrics")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        // 0.35：按知识库声明的最低版本排除。
+        let old = expand(Some("0.35.1"));
+        assert_eq!(keyproc_works(&old).len(), 0, "旧 agent 不该拿到关键进程面");
+        assert_eq!(old.excluded_units.len(), 1);
+        assert_eq!(old.excluded_units[0].unit_id, "linux-keyproc-kafka");
+        assert_eq!(old.excluded_units[0].reason_code, "agent_too_old");
+        assert_eq!(
+            old.excluded_units[0].condition.as_deref(),
+            Some("agentd_min_version:0.36.0")
+        );
+
+        // 没报过版本 → 保守不派（与能力协商同一姿态）。
+        let unknown = expand(None);
+        assert_eq!(keyproc_works(&unknown).len(), 0);
+        assert_eq!(unknown.excluded_units[0].reason_code, "agent_too_old");
+
+        // 0.36：真的派下去，且**不**被日志源解析挡掉。
+        let fresh = expand(Some("0.36.0"));
+        assert!(
+            fresh.excluded_units.is_empty(),
+            "指标单元没有 FileGlob 来源，不该被 source_not_resolved 丢掉：{:?}",
+            fresh.excluded_units
+        );
+        let works = keyproc_works(&fresh);
+        assert_eq!(works.len(), 1);
+        assert_eq!(works[0].capability, "collect_metrics");
+        assert_eq!(
+            works[0].selected_units,
+            vec!["linux-keyproc-kafka".to_string()]
+        );
     }
 
     /// 包级下限与单元级取**高者**：升级门槛不能被某个单元“覆盖变低”。
@@ -4340,5 +4520,34 @@ target = "/var/log/x.log"
         assert_eq!(eval_match("port:40000", &facts), Truth::Unknown);
         // 一组里既有命中、又有没采的区间 → 命中优先。
         assert_eq!(eval_match("port:40000|8080", &facts), Truth::Yes);
+    }
+
+    /// 关键进程指标：只有 `collect_metrics` 认，且 `target` 必须是可解析的签名列表。
+    ///
+    /// 这条同时钉住“`auto_target_only()` 不是判断指标来源的唯一谓词”——
+    /// `KeyProcessMetrics` 不在那组里，但它同样受限。
+    #[test]
+    fn key_process_metrics_is_collectable_only_with_a_signature_list() {
+        use wist_contracts::work::capability::{COLLECT_LOGS, COLLECT_METRICS};
+
+        for target in ["unit:kafka", "port:9092|exe:kafka", "cmdline:app.jar"] {
+            assert!(
+                is_collectable_source(COLLECT_METRICS, "KeyProcessMetrics", target),
+                "{target}"
+            );
+        }
+        // `auto` 是自探域的词：它只说“自己找”，没说采什么进程。
+        for target in ["", "auto", "bogus:kafka", "kafka", "exe:/usr/bin/nginx"] {
+            assert!(
+                !is_collectable_source(COLLECT_METRICS, "KeyProcessMetrics", target),
+                "{target}"
+            );
+        }
+        // 日志单元不能挂指标来源。
+        assert!(!is_collectable_source(
+            COLLECT_LOGS,
+            "KeyProcessMetrics",
+            "unit:kafka"
+        ));
     }
 }
