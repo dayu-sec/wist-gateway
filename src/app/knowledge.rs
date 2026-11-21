@@ -479,7 +479,21 @@ pub async fn record_package(
     })?;
     let unpacked = unpack_into(&bytes, &staging);
     let result = match unpacked {
-        Ok(()) => validate_package(&staging, &package_id),
+        // 兼容性**先于内容校验**：新知识包往往引用新的枚举值（如 `KeyProcessMetrics`），
+        // 旧网关会先把它判成 `package_content_invalid`，于是运维去查内容 —— 而真正的动作是升网关。
+        // 内容再对，这个节点也认不出来，所以先把“这个节点装不了”说出来。
+        Ok(()) => {
+            let declared = staged_compat_manifest(&staging);
+            let version = declared
+                .as_ref()
+                .map(|m| m.version.clone())
+                .unwrap_or_default();
+            // 不用 `?`：这一路也要把暂存目录清掉（下面统一处理）。
+            match ensure_upstream_compatible(&staging, &version) {
+                Ok(()) => validate_package(&staging, &package_id),
+                Err(err) => Err(err),
+            }
+        }
         Err(err) => Err(err),
     };
     let validated = match result {
@@ -508,23 +522,10 @@ pub async fn record_package(
         )));
     }
 
-    // 兼容性：包内 `compat.json` 的 `requires`（上游，如 `wist-gateway`）不满足当前节点时，
-    // 默认拒绝录入，并明确提示“先升级当前节点”。没有声明 → 不阻止（页面显示 unknown）。
-    let compat = wist_release::compat::read_manifest_from_tar(&bytes);
-    let current = std::collections::BTreeMap::from([(
-        "wist-gateway".to_string(),
-        env!("CARGO_PKG_VERSION").to_string(),
-    )]);
-    let compatibility = wist_release::compat::check(
-        compat.as_ref(),
-        PACKAGE_NAME,
-        &validated.manifest.version,
-        &current,
-        &chrono::Utc::now().to_rfc3339(),
-    );
-    if compatibility.is_blocking() {
+    // 兼容性（全量报告）：内容已验完，这里再算一次 — 这次能带上**真实包版本**做身份比对。
+    if let Err(err) = ensure_upstream_compatible(&staging, &validated.manifest.version) {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(KnowledgeRecordError::Compatibility(compatibility.summary()));
+        return Err(err);
     }
 
     // 原子换入 `<state>/knowledge/<package_id>/`。
@@ -607,6 +608,38 @@ pub fn load_recorded_package(
         package_id: package_id.to_string(),
     };
     Ok(loaded)
+}
+
+/// 暂存副本里声明的兼容性清单（`compat.json`；没有就回落 `manifest.json`）。
+fn staged_compat_manifest(dir: &Path) -> Option<wist_release::compat::CompatManifest> {
+    wist_release::compat::read_manifest_from_dir(dir)
+}
+
+/// 上游版本闸门：`requires`（如 `wist-gateway >= 0.49.0`）不满足当前节点就 **409**。
+///
+/// 为什么录音前就叫停：新知识包往往引用新的枚举值（如采集来源 `KeyProcessMetrics`），
+/// 旧网关会先把它判成 `package_content_invalid`（422），于是运维去查**内容** —— 而真正要做的是
+/// 升网关。内容再对，这个节点也认不出来。没有 `requires` 声明不阻挠（页面显示 unknown）。
+fn ensure_upstream_compatible(
+    dir: &Path,
+    package_version: &str,
+) -> Result<(), KnowledgeRecordError> {
+    let manifest = staged_compat_manifest(dir);
+    let current = std::collections::BTreeMap::from([(
+        "wist-gateway".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    )]);
+    let compatibility = wist_release::compat::check(
+        manifest.as_ref(),
+        PACKAGE_NAME,
+        package_version,
+        &current,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    if compatibility.is_blocking() {
+        return Err(KnowledgeRecordError::Compatibility(compatibility.summary()));
+    }
+    Ok(())
 }
 
 struct ValidatedPackage {

@@ -14795,6 +14795,48 @@ async fn knowledge_record_rejects_a_package_that_requires_a_newer_gateway() {
     );
 }
 
+/// 新知识包引用旧网关还不认识的枚举值时，**先说“升网关”**而不是“内容不合法”。
+///
+/// 现场真实经历：`KeyProcessMetrics`（采集来源）在 gateway 0.48 上会先撞到内容校验，
+/// 回 422 `package_content_invalid`，于是人去查知识库内容 —— 而内容是对的，该升的是网关。
+#[tokio::test]
+async fn an_old_gateway_is_reported_before_the_content_complaint() {
+    let env = TestEnv::new().await;
+    let state = super::build_state(env.config.clone(), Arc::clone(&env.store_handle));
+    let root = crate::test_support::unique_temp_dir("wist-knowledge-incompatible-before-content");
+    // 两个毛病同时存在：内容被改过（内容校验会报错）+ 要求一个不存在的网关版本。
+    let tarball = crate::test_support::knowledge_package_tarball_with_compat(
+        &root,
+        true,
+        Some(r#"{"requires":{"wist-gateway":">=99.0.0"}}"#),
+    );
+    let response = post_to_state(
+        &state,
+        "/api/v1/admin/knowledge/packages",
+        &serde_json::json!({
+            "source": tarball.to_string_lossy(),
+            "sha256": crate::infra::bytes_sha256_hex(
+                &std::fs::read(&tarball).expect("read tarball")
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "版本不够比内容毛病更前置：结果是 409 而不是 422"
+    );
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "package_incompatible", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("99.0.0"),
+        "要指出要求哪个版本：{body}"
+    );
+}
+
 #[tokio::test]
 async fn knowledge_record_reports_a_compatible_package() {
     let env = TestEnv::new().await;

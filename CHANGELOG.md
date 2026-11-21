@@ -3,6 +3,16 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.49.1-alpha] - 2026-11-21
+
+**旧网关收不下的新知识包，现在会说「先升网关」而不是「内容不合法」。**
+
+- 录入知识包时，**上游版本闸门先于内容校验**：包内 `compat.json` 的 `requires` 不满足当前网关时，
+  直接回 `409 package_incompatible`（带要求的版本号），不再先报 `422 package_content_invalid`。
+  现场表现：新包里的采集来源（如 `KeyProcessMetrics`）旧网关不认识，原来的报错会把人引去查知识库内容，
+  而实际动作是升网关。
+- 失败时仍会清掉 `.staging-*` 副本，不在 `state/knowledge/` 留半成品。
+
 ## [0.49.0-alpha] - 2026-11-21
 
 ### 新增（关键进程指标的派活支持）
