@@ -104,11 +104,13 @@ async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
 
 # 本地联调：与 `wist-contracts` / `wist-api` 同期改动时启用（`[patch]` 让 api/control/shared 也解析到本地版本，
-# 否则会同时存在两份 contracts、类型互不认识）。**发布态不要留**：
-[patch.crates-io]
-# E0/E1：contracts 0.13 / api 0.13.1 尚未发布，本地联调走 path。发布后注释回来。
-wist-contracts = { path = "../wist-contracts" }
-wist-api = { path = "../wist-api" }
-wist-metrics = { path = "../wist-metrics" }
-wist-validate = { path = "../wist-validate" }
+# 否则会同时存在两份 contracts、类型互不认识）。**发布态不要留** ——
+# 留着的后果不是编译失败，而是 CI 上 `patch location ... does not contain packages`（v0.52.0-alpha 首次发布就这样红过）。
+# 四个 crate 已于 2026-11-22 全部上 crates.io（contracts 0.14.0 / api 0.13.2 / metrics 0.20.2 / validate 0.12.0），
+# 所以默认注释掉；本地联调需要时再取消注释。
+# [patch.crates-io]
+# wist-contracts = { path = "../wist-contracts" }
+# wist-api = { path = "../wist-api" }
+# wist-metrics = { path = "../wist-metrics" }
+# wist-validate = { path = "../wist-validate" }
 
