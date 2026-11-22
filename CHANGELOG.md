@@ -3,6 +3,109 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.52.0-alpha] - 2026-11-22
+
+### 新增（B 线：审批 → 签发 → 下发）
+
+控制面闭环。审批绑的是**内容摘要**，不是 `action_id`：
+
+- `POST /api/v1/admin/agents/{agent_id}/approvals`：提交**未签发**的计划。
+  网关铸 `approval_id` 并**写回** `constraints.approval_ref`（客户端自填的一律被覆盖），
+  然后算 `plan_digest` 存库。id 形如 `apv_{agent}_{micros}_{rand4}`：4 字节随机后缀
+  + 3 次有界重试，让「同一微秒两次提交」不会变成 500（撞主键是极端情况，
+  但不能成为正常路径的失败模式）。
+- `POST /api/v1/admin/approvals/{id}/votes`：投票。审批人身份来自 **bearer token 指纹**
+  （`admin:<sha256 前 12 位>`），客户端不能自填。
+- `GET /api/v1/admin/approvals/{id}` / `GET /api/v1/admin/approvals?agent_id=…`：查状态。
+- `POST /api/v1/admin/approvals/{id}/issue`：满足人数后签发。签发时**重算 digest** 并与
+  审批时比对，不一致回 `409 plan_changed_since_approval`（重走审批，而不是重签一份新的）。
+  默认签发后**直接入队**（`?dispatch=false` 可只签发）。
+
+新表（`migrations/sqlite/0044_action_approval.sql`）：`action_approval` + `action_approval_vote`。
+投票主键 `(approval_id, approver)`：同一个人改主意是**覆盖**，不是加一票。
+
+新配置段：
+
+```toml
+[plan_signing]
+key_file = "/etc/wist-gateway/plan-signing.key"  # Ed25519 PKCS#8 PEM
+key_id = "gw-plan-k1"
+issued_by = "gateway:wist-gateway-1"
+ttl_seconds = 3600
+approval_ttl_seconds = 86400
+```
+
+- **没配私钥就不签发**：`issue` 回 `503 plan_signing_unavailable`，不做「跳过签名」的降级。
+- 签发私钥支持 **OpenSSL 的 PKCS#8 v1 布局**（`openssl genpkey -algorithm ed25519`）：
+  ring 的 `from_pkcs8` 对这种嵌套 OCTET STRING 回 `VersionNotSupported`，现在加了回退解析。
+  运维照文档生成密钥就能启动 —— 这条只靠真机自检才能发现（单测一直用的是 ring 生成的密钥）。
+- `init-config` 模板补 `[plan_signing]` 注释块（含 openssl 生成与 `chmod` 命令）。
+- 启动日志新增 `event=PlanSigning configured=… key_id=…`：配置是否生效不必等到第一次审批。
+- `POST /agents/{id}/plans` 加了一道**摘要一致性**检查：带 attestation 但内容对不上 →
+  `400 plan_digest_mismatch`（网关不验签，但能在投递前拆穿「批完又改」）。
+- 一份已签发的计划只能被签发一次（`issued_plan_json IS NULL` 做 CAS），重复签发回 `409`。
+
+### 已知边界（本轮刻意）
+
+- **私钥在网关**是临时状态：审批与签发同在控制面才能先把闭环跑通。代价是「网关被控 = 可自签」；
+  center 接手签发后这条限制才消失。
+- **R3 在单 admin token 下不支持**：同一个指纹只能投一票，凑不出两个审批人。
+  `create` 时就回 `409 approval_policy_unsupported` 并说明原因，而不是等到 `issue` 说人数不够。
+
+新错误码：`approval_not_found`、`approval_not_required`、`approval_incomplete`、
+`approval_expired`、`approval_closed`、`approval_already_issued`、
+`approval_policy_unsupported`、`approval_load_failed`、`approval_store_failed`、
+`plan_changed_since_approval`、`plan_digest_mismatch`、`plan_signing_unavailable`。
+
+审批单的落库 / 读取有自己的码（`approval_store_failed` / `approval_load_failed`），
+**不复用** `agent_command_*`：看到 `agent_command_store_failed` 的人会去查命令队列，
+而实际是审批表写失败。
+
+### 依赖
+
+- 新增 `wist-validate` 直依赖（审批前先过契约形状校验）。
+
+## [0.51.0-alpha] - 2026-11-22
+
+### 新增（E2：执行能力落库 + 入队前能力闸）
+
+- `agent_instances` 新增 `exec_capabilities`（JSON）：agentd 状态上报的「本机能跑哪些 opcode /
+  支持哪个执行 profile」现在**落库**。`NULL` = 还没报过（E2 之前的 agentd）；
+  一次没带（旧心跳）**不会**把最后一次可信的清单擦掉（与 `logs_capabilities` 同口径）。
+- `POST /api/v1/admin/agents/{agent_id}/plans` 在**入队前**做能力闸：
+  - 还没报过能力 → `409 action_plan_capability_unknown`（提示升级 agentd），
+    而不是排一条注定被回 `capability_missing` 的计划；
+  - 计划要的 op（`required_capabilities` ∪ `program.steps[].op`）不在上报清单里 →
+    `409 action_plan_capability_missing`，message 同时写「要什么 / 报了什么」；
+  - `constraints.execution_profile` 不在上报的 profile 里 → 同样是 `409 ..._missing`。
+- 为什么要并上 `program.steps[].op`：`required_capabilities` 是计划作者的**声明**，
+  它可以漏写；真正会跑的是步骤里的 op —— 两边取并集，漏写的计划也拦得住。
+- 能力闸只是**前置拦截**：agentd 仍按自己的 opcode 注册表再判一遍（两边口径不同，不互相替代）。
+
+### 变更（依赖）
+
+- 无契约变更：`AgentStatusReport.exec_capabilities` 自 `wist-api 0.13.1` 已在报文里，
+  本版只是把它写进库并在下发前使用。
+
+## [0.50.0-alpha] - 2026-11-22
+
+### 新增（下发 ActionPlan：`kind = action_plan`）
+
+- 新增 `POST /api/v1/admin/agents/{agent_id}/plans`：请求体是一份完整的 `ActionPlan`，
+  网关原样写进命令队列（`kind = action_plan`），由 agent 的下一次状态上报取走。
+- 只做**投递**：不做审批、不做能力预检（`exec_capabilities` 还没落库）、不做签名。
+  本地终审在 agentd（结构 / 过期 / 目标 / 能力 / 审批），失败时 ack 带
+  `plan_rejected:<code>`。
+- 投递前只校验两件事：计划能按契约解析；`plan.target.agent_id` 与路径一致
+  （不一致回 `400 action_plan_target_mismatch`，且不入队）。
+- 与其它命令的差别：**不覆盖**同 kind 的待执行命令（两份计划是两件事）；
+  重复由 agentd 的 `action_id + plan_digest` 去重。
+
+### 变更（依赖）
+
+- 对齐 `wist-contracts 0.13.0` / `wist-api 0.13.1` / `wist-metrics 0.20.1`。
+  `AgentStatusReport.exec_capabilities` 已随 api 一起进来，本版**只解析不落库**。
+
 ## [0.49.1-alpha] - 2026-11-21
 
 **旧网关收不下的新知识包，现在会说「先升网关」而不是「内容不合法」。**

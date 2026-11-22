@@ -2011,6 +2011,7 @@ async fn agent_status_route_requires_a_client_certificate() {
         "/api/v1/agent/status",
         Some(&agent_id),
         &AgentStatusReport {
+            exec_capabilities: None,
             logs_capabilities: None,
             investigation_capabilities: None,
             machine_profile: None,
@@ -2038,6 +2039,7 @@ async fn agent_status_route_requires_a_client_certificate() {
         "/api/v1/agent/status",
         None,
         &AgentStatusReport {
+            exec_capabilities: None,
             logs_capabilities: None,
             investigation_capabilities: None,
             machine_profile: None,
@@ -2071,6 +2073,7 @@ async fn agent_status_route_persists_reported_metrics() {
         "/api/v1/agent/status",
         Some(&agent_id),
         &AgentStatusReport {
+            exec_capabilities: None,
             logs_capabilities: None,
             investigation_capabilities: None,
             machine_profile: None,
@@ -2117,6 +2120,7 @@ async fn post_agent_status_cpu(
         "/api/v1/agent/status",
         Some(agent_id),
         &AgentStatusReport {
+            exec_capabilities: None,
             logs_capabilities: None,
             investigation_capabilities: None,
             machine_profile: None,
@@ -3913,6 +3917,7 @@ async fn post_agent_status(
     let agent_id = format!("agent-{instance_id}");
     let body = match policy_version {
         Some(version) => serde_json::to_value(AgentStatusReport {
+            exec_capabilities: None,
             logs_capabilities: None,
             investigation_capabilities: None,
             agent_id,
@@ -4700,6 +4705,7 @@ async fn agent_status_route_persists_work_state_changes() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            exec_capabilities: None,
             logs_capabilities: None,
             investigation_capabilities: None,
             machine_profile: None,
@@ -4791,6 +4797,7 @@ async fn the_work_view_exposes_the_agents_local_work_report() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            exec_capabilities: None,
             logs_capabilities: None,
             investigation_capabilities: None,
             machine_profile: None,
@@ -4856,6 +4863,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            exec_capabilities: None,
             logs_capabilities: None,
             investigation_capabilities: None,
             machine_profile: None,
@@ -4897,6 +4905,7 @@ async fn the_runtime_status_view_exposes_the_agents_uplink_state() {
         "/api/v1/agent/status",
         Some(&credential),
         &AgentStatusReport {
+            exec_capabilities: None,
             logs_capabilities: None,
             investigation_capabilities: None,
             machine_profile: None,
@@ -4932,6 +4941,7 @@ async fn a_status_report_with_a_machine_profile_backfills_the_registry() {
     let credential = enroll_agent_credential(&env).await;
 
     let report = |profile: Option<wist_contracts::enrollment::HostProfile>| AgentStatusReport {
+        exec_capabilities: None,
         logs_capabilities: None,
         investigation_capabilities: None,
         machine_profile: profile,
@@ -4998,6 +5008,7 @@ async fn a_status_report_with_a_machine_profile_backfills_the_registry() {
 async fn enroll_agent_with_machine_profile(env: &TestEnv, ip_addresses: Vec<String>) {
     let credential = enroll_agent_credential(env).await;
     let report = AgentStatusReport {
+        exec_capabilities: None,
         logs_capabilities: None,
         investigation_capabilities: None,
         machine_profile: Some(wist_contracts::enrollment::HostProfile {
@@ -6099,6 +6110,7 @@ async fn admin_agent_list_marks_stale_agents_offline() {
         .record_agent_status(&AgentStatusUpdate {
             logs_capabilities: None,
             investigation_capabilities: None,
+            exec_capabilities: None,
             agent_id: "agent-node-a",
             instance_id: "node-a",
             boot_id: "",
@@ -6126,6 +6138,7 @@ async fn admin_agent_list_marks_stale_agents_offline() {
         .record_agent_status(&AgentStatusUpdate {
             logs_capabilities: None,
             investigation_capabilities: None,
+            exec_capabilities: None,
             agent_id: "agent-node-a",
             instance_id: "node-a",
             boot_id: "",
@@ -6162,6 +6175,7 @@ async fn admin_agent_runtime_status_shares_the_online_verdict_with_the_list() {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-node-a",
                 instance_id: "node-a",
                 boot_id: "",
@@ -6191,6 +6205,7 @@ async fn admin_agent_runtime_status_shares_the_online_verdict_with_the_list() {
         .record_agent_status(&AgentStatusUpdate {
             logs_capabilities: None,
             investigation_capabilities: None,
+            exec_capabilities: None,
             agent_id: "agent-node-a",
             instance_id: "node-a",
             boot_id: "",
@@ -6225,6 +6240,7 @@ async fn delete_agent_refuses_an_online_agent() {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-node-a",
                 instance_id: "node-a",
                 boot_id: "",
@@ -6272,6 +6288,7 @@ async fn delete_agent_removes_an_offline_agent_and_its_credential() {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-node-a",
                 instance_id: "node-a",
                 boot_id: "",
@@ -9859,6 +9876,7 @@ async fn report_investigation_capabilities(
         "/api/v1/agent/status",
         Some(agent_id),
         &AgentStatusReport {
+            exec_capabilities: None,
             agent_id: agent_id.to_string(),
             instance_id: "node-a".to_string(),
             version: "0.11.0".to_string(),
@@ -10463,6 +10481,13 @@ impl TestEnv {
             log_keep_files: crate::infra::LogRetention::default().keep_files,
             log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
             log: Default::default(),
+            // 审批/签发默认不配私钥（要测审批链路的用例自己挂密钥）。
+            plan_signing_key_file: None,
+            plan_signing_key_id: "gw-plan-k1".to_string(),
+            plan_signing_issued_by: "gateway".to_string(),
+            plan_signing_ttl_seconds: crate::infra::DEFAULT_ATTESTATION_TTL_SECONDS,
+            plan_approval_ttl_seconds: 86_400,
+            plan_signer: None,
         };
         // A temp-file DB (not `:memory:`) because the router may use several
         // pooled connections; `SqliteStore` is `Clone` and shares the same pool.
@@ -19743,4 +19768,1096 @@ async fn harvest_result_rejects_a_status_the_client_may_not_claim() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// E2：动作计划的投递（`kind = action_plan`）
+// ---------------------------------------------------------------------------
+
+fn sample_action_plan(agent_id: &str) -> wist_contracts::action_plan::ActionPlan {
+    use wist_contracts::action_plan::{
+        ActionPlan, ActionPlanConstraints, ActionPlanMeta, ActionPlanProgram, ActionPlanStep,
+        ActionPlanTarget, ApprovalMode, RiskLevel,
+    };
+    ActionPlan::new(
+        ActionPlanMeta {
+            action_id: "act_gw_plan_1".to_string(),
+            request_id: "req_gw_plan_1".to_string(),
+            template_id: None,
+            tenant_id: "tenant-default".to_string(),
+            environment_id: "env-default".to_string(),
+            plan_version: 1,
+            compiled_at: "2026-01-01T00:00:00Z".to_string(),
+            expires_at: "2031-01-01T00:00:00Z".to_string(),
+        },
+        ActionPlanTarget {
+            agent_id: agent_id.to_string(),
+            instance_id: None,
+            node_id: "node-a".to_string(),
+            host_name: None,
+            platform: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            selectors: Default::default(),
+        },
+        ActionPlanConstraints {
+            risk_level: RiskLevel::R0,
+            approval_ref: None,
+            approval_mode: ApprovalMode::NotRequired,
+            requested_by: "tester".to_string(),
+            reason: None,
+            max_total_duration_ms: 30_000,
+            step_timeout_default_ms: 10_000,
+            execution_profile: "agent_exec_v1".to_string(),
+            required_capabilities: vec!["disk.cleanup.preview".to_string()],
+            allow: None,
+        },
+        ActionPlanProgram {
+            entry: "s1".to_string(),
+            steps: vec![ActionPlanStep {
+                id: "s1".to_string(),
+                kind: "invoke".to_string(),
+                op: Some("disk.cleanup.preview".to_string()),
+                args: Some(serde_json::json!({ "target": "tmp" })),
+            }],
+        },
+    )
+}
+
+/// 造一份带执行能力的 `AgentStatusReport`（与 agentd 的实际上报同一形状）。
+async fn report_exec_capabilities(
+    env: &TestEnv,
+    agent_id: &str,
+    opcodes: &[&str],
+    profiles: &[&str],
+) {
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(agent_id),
+        &serde_json::json!({
+            "agent_id": agent_id,
+            "instance_id": "node-a",
+            "version": "v0.37.0",
+            "exec_capabilities": {
+                "opcodes": opcodes,
+                "execution_profiles": profiles,
+            },
+            "command_acks": [],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+async fn dispatch_plan(
+    env: &TestEnv,
+    agent_id: &str,
+    plan: &wist_contracts::action_plan::ActionPlan,
+) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/agents/{agent_id}/plans"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::to_value(plan).expect("encode plan"),
+    )
+    .await
+}
+
+/// 下发计划：排一条 `kind = action_plan` 的命令，`params` 必须与计划 JSON 逐字一致
+/// （agentd 直接按 `ActionPlan` 解析它）。
+#[tokio::test]
+async fn admin_plan_dispatches_an_action_plan_command_verbatim() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.preview"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let plan = sample_action_plan("agent-node-a");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/plans",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::to_value(&plan).expect("encode plan"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["agent_id"], "agent-node-a");
+    assert_eq!(body["kind"], "action_plan");
+    let command_id = body["command_id"].as_str().expect("command id").to_string();
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.37.0",
+            "command_acks": [],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert_eq!(ack.commands.len(), 1);
+    assert_eq!(ack.commands[0].command_id, command_id);
+    assert_eq!(ack.commands[0].kind, "action_plan");
+    let delivered: wist_contracts::action_plan::ActionPlan =
+        serde_json::from_str(&ack.commands[0].params).expect("delivered plan parses");
+    assert_eq!(delivered.meta.action_id, plan.meta.action_id);
+    assert_eq!(delivered.target.agent_id, "agent-node-a");
+}
+
+/// 计划投错机器：400，且队列里不留任何命令。
+#[tokio::test]
+async fn admin_plan_rejects_a_mismatched_target_without_queueing() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    let plan = sample_action_plan("agent-somewhere-else");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/plans",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::to_value(&plan).expect("encode plan"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_target_mismatch");
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.37.0",
+            "command_acks": [],
+        }),
+    )
+    .await;
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    assert!(ack.commands.is_empty(), "rejected plan must not be queued");
+}
+
+/// 没报过执行能力（E2 之前的 agentd）：入队前就回 409，而不是排一条注定失败的计划。
+#[tokio::test]
+async fn admin_plan_requires_reported_exec_capabilities() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let plan = sample_action_plan("agent-node-a");
+
+    let response = dispatch_plan(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_capability_unknown");
+}
+
+/// 报了能力但不包含计划要的 op：409，并把「要什么 / 有什么」写进 message。
+#[tokio::test]
+async fn admin_plan_rejects_an_op_the_agent_did_not_report() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(&env, &credential, &["process.list"], &["agent_exec_v1"]).await;
+    let plan = sample_action_plan("agent-node-a");
+
+    let response = dispatch_plan(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_capability_missing");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("disk.cleanup.preview"), "{message}");
+    assert!(
+        message.contains("process.list"),
+        "报了什么也要写清楚：{message}"
+    );
+}
+
+/// 想靠「required_capabilities 空着」绕过能力闸：不行 —— 真正要跑的 op 也算在内。
+#[tokio::test]
+async fn admin_plan_gate_covers_ops_the_plan_forgot_to_declare() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.preview"],
+        &["agent_exec_v1"],
+    )
+    .await;
+
+    let mut plan = sample_action_plan("agent-node-a");
+    plan.constraints.required_capabilities.clear();
+    plan.program.steps[0].op = Some("file.hash".to_string());
+
+    let response = dispatch_plan(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_capability_missing");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("file.hash"), "{message}");
+}
+
+/// 执行 profile 不匹配也不能下发（agent 只会 v1，计划是 v2）。
+#[tokio::test]
+async fn admin_plan_rejects_an_unsupported_execution_profile() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.preview"],
+        &["agent_exec_v1"],
+    )
+    .await;
+
+    let mut plan = sample_action_plan("agent-node-a");
+    plan.constraints.execution_profile = "agent_exec_v2".to_string();
+
+    let response = dispatch_plan(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_capability_missing");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("agent_exec_v2"), "{message}");
+}
+
+// ---------------------------------------------------------------------------
+// E3 / B 线：审批 → 签发 → 下发
+// ---------------------------------------------------------------------------
+
+/// 测试用 PKCS#8 PEM（`ring` 生成 → base64 折行）。
+fn pkcs8_pem_for_tests(der: &[u8]) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let encoded = STANDARD.encode(der);
+    let mut wrapped = String::new();
+    for chunk in encoded.as_bytes().chunks(64) {
+        wrapped.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        wrapped.push('\n');
+    }
+    format!("-----BEGIN PRIVATE KEY-----\n{wrapped}-----END PRIVATE KEY-----\n")
+}
+
+/// 造一对签发密钥：返回（签发器, 裸公钥）。公钥用来在测试里**独立验签**。
+fn plan_signer_pair() -> (Arc<crate::infra::PlanSigner>, Vec<u8>) {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate");
+    let der = pkcs8.as_ref().to_vec();
+    let key_pair = Ed25519KeyPair::from_pkcs8(&der).expect("parse");
+    let public = key_pair.public_key().as_ref().to_vec();
+    let signer = crate::infra::PlanSigner::from_pkcs8_pem(
+        &pkcs8_pem_for_tests(&der),
+        "gw-plan-k1",
+        "gateway:test",
+        3600,
+    )
+    .expect("signer");
+    (Arc::new(signer), public)
+}
+
+fn hex_to_bytes(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        let hi = (bytes[index] as char).to_digit(16).expect("hex");
+        let lo = (bytes[index + 1] as char).to_digit(16).expect("hex");
+        out.push(((hi << 4) | lo) as u8);
+        index += 2;
+    }
+    out
+}
+
+fn sample_r2_plan(agent_id: &str) -> wist_contracts::action_plan::ActionPlan {
+    let mut plan = sample_action_plan(agent_id);
+    plan.constraints.risk_level = wist_contracts::action_plan::RiskLevel::R2;
+    plan.constraints.required_capabilities = vec!["disk.cleanup.apply".to_string()];
+    plan.program.steps[0].op = Some("disk.cleanup.apply".to_string());
+    plan
+}
+
+async fn create_approval(
+    env: &TestEnv,
+    agent_id: &str,
+    plan: &wist_contracts::action_plan::ActionPlan,
+) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/agents/{agent_id}/approvals"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "plan": plan, "reason": "clear /tmp" }),
+    )
+    .await
+}
+
+/// 完整闭环：提交 → 1 人赞成 → 签发 → 下发。签发出的计划必须**独立验签通过**。
+#[tokio::test]
+async fn approval_flow_signs_and_dispatches_a_plan_that_verifies() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let (signer, public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["status"], "pending");
+    assert_eq!(body["required_approvers"], 1);
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    // 网关把审批单号写回了计划：客户端自填的 approval_ref 一律被覆盖。
+    assert_eq!(
+        body["plan"]["constraints"]["approval_ref"],
+        serde_json::Value::String(approval_id.clone())
+    );
+    assert_eq!(body["plan"]["constraints"]["approval_mode"], "required");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "decision": "approve", "comment": "ok" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["status"], "approved");
+    assert_eq!(body["votes"][0]["decision"], "approve");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/issue"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let command_id = body["dispatched_command_id"]
+        .as_str()
+        .expect("dispatched command id")
+        .to_string();
+    assert!(!command_id.is_empty());
+
+    let issued_plan = &body["issued_plan"];
+    assert!(issued_plan["attestation"].is_object(), "{issued_plan}");
+    let attestation: wist_contracts::action_plan::ActionPlanAttestation =
+        serde_json::from_value(issued_plan["attestation"].clone()).expect("attestation");
+    let signature = hex_to_bytes(&attestation.signature);
+    assert!(
+        crate::infra::verify_ed25519(&public, &attestation.signing_payload(), &signature),
+        "issued attestation must verify with the gateway public key"
+    );
+    let delivered: wist_contracts::action_plan::ActionPlan =
+        serde_json::from_value(issued_plan.clone()).expect("issued plan");
+    assert_eq!(
+        attestation.plan_digest,
+        wist_contracts::action_plan::plan_digest(&delivered)
+    );
+    assert_eq!(attestation.approval.approvers.len(), 1);
+    assert_eq!(attestation.approval.approval_id, approval_id);
+    assert_eq!(
+        attestation.risk_level,
+        wist_contracts::action_plan::RiskLevel::R2
+    );
+
+    // 下发的就是签发后的那份（带 attestation），agentd 会再验一遍。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.40.0",
+            "command_acks": [],
+        }),
+    )
+    .await;
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    let command = ack
+        .commands
+        .iter()
+        .find(|command| command.command_id == command_id)
+        .expect("dispatched command is delivered");
+    let delivered_plan: wist_contracts::action_plan::ActionPlan =
+        serde_json::from_str(&command.params).expect("delivered plan parses");
+    assert!(delivered_plan.attestation.is_some());
+}
+
+/// R0/R1 不需要审批：直接下发即可，提交到审批队列只会多一条无意义的记录。
+#[tokio::test]
+async fn approvals_refuse_a_plan_that_does_not_need_approval() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let plan = sample_action_plan("agent-node-a"); // R0
+
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_not_required");
+}
+
+/// 单 admin token 下 R3 凑不出两个审批人：提交时就拒绝，而不是等到 issue 才说人数不够。
+#[tokio::test]
+async fn approvals_refuse_r3_under_a_single_admin_token() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let mut plan = sample_action_plan("agent-node-a");
+    plan.constraints.risk_level = wist_contracts::action_plan::RiskLevel::R3;
+
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_policy_unsupported");
+}
+
+/// 还没批就签发：409，且库里不会出现 `issued_plan_json`。
+#[tokio::test]
+async fn issuing_an_unapproved_plan_is_refused() {
+    let mut env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/issue"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_incomplete");
+}
+
+/// 没配私钥就不签发：503，而不是「跳过签名」把一份匿名计划送出去。
+#[tokio::test]
+async fn issuing_without_a_signing_key_is_unavailable() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "decision": "approve" }),
+    )
+    .await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/issue"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "plan_signing_unavailable");
+}
+
+/// 带 attestation 但内容被改过：网关在投递前就回 400（不必等 agentd 几秒后回一条失败 ack）。
+#[tokio::test]
+async fn dispatching_a_tampered_attested_plan_is_refused_early() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "decision": "approve" }),
+    )
+    .await;
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/issue"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    let mut issued: wist_contracts::action_plan::ActionPlan =
+        serde_json::from_value(body["issued_plan"].clone()).expect("issued plan");
+
+    // 改参数但保留签名。
+    issued.program.steps[0].args = Some(serde_json::json!({ "target": "var_log" }));
+    let response = dispatch_plan(&env, "agent-node-a", &issued).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "plan_digest_mismatch");
+}
+
+/// 投票人来自 token 指纹：同一个人重复投是**覆盖**，不会变成两票。
+#[tokio::test]
+async fn repeated_votes_do_not_count_twice() {
+    let mut env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+    // 把门槛抬到 2，模拟「需要两个人」——但单 token 只会有同一个 approver。
+    env.config.plan_approval_ttl_seconds = 86_400;
+
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+
+    for _ in 0..2 {
+        post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({ "decision": "approve" }),
+        )
+        .await;
+    }
+    let votes = env
+        .store_handle
+        .list_action_approval_votes(&approval_id)
+        .await
+        .expect("votes");
+    assert_eq!(votes.len(), 1, "同一个 approver 只能有一票");
+}
+
+/// 能力闸在**签发之前**：机器没报过能力就不签，否则签名只能攒着等升级。
+#[tokio::test]
+async fn issuing_refuses_when_the_agent_cannot_run_the_plan() {
+    let mut env = TestEnv::new().await;
+    // 刻意不调 report_exec_capabilities：能力未知。
+    let _credential = enroll_agent_credential(&env).await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "decision": "approve" }),
+    )
+    .await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/issue"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_capability_unknown");
+
+    // 没签发也没入队。
+    let stored = env
+        .store_handle
+        .get_action_approval(&approval_id)
+        .await
+        .expect("approval")
+        .expect("row exists");
+    assert!(stored.issued_plan_json.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 审批链路的边界与失败路径（负向用例）
+// ---------------------------------------------------------------------------
+
+/// 手工种一行审批单：用来构造正常流程到不了的库内状态（被否决 / 摘要不符 / 票数不足）。
+#[allow(clippy::too_many_arguments)]
+async fn seed_approval(
+    env: &TestEnv,
+    approval_id: &str,
+    agent_id: &str,
+    plan_json: &str,
+    plan_digest: &str,
+    status: &str,
+    required_approvers: i64,
+) {
+    env.store_handle
+        .insert_action_approval(&crate::infra::StoredActionApproval {
+            approval_id: approval_id.to_string(),
+            agent_id: agent_id.to_string(),
+            plan_digest: plan_digest.to_string(),
+            risk_level: "R2".to_string(),
+            requested_by: "admin:test".to_string(),
+            reason: None,
+            requested_at: "2026-06-01T00:00:00Z".to_string(),
+            plan_json: plan_json.to_string(),
+            required_approvers,
+            status: status.to_string(),
+            approved_at: Some("2026-06-01T00:00:00Z".to_string()),
+            expires_at: "2031-01-01T00:00:00Z".to_string(),
+            issued_plan_json: None,
+        })
+        .await
+        .expect("seed approval");
+}
+
+/// R2 计划 + 已填好的审批引用（手工 seed 时用，不经过 `create`）。
+fn r2_plan_with_ref(agent_id: &str, approval_id: &str) -> wist_contracts::action_plan::ActionPlan {
+    let mut plan = sample_r2_plan(agent_id);
+    plan.constraints.approval_ref = Some(approval_id.to_string());
+    plan.constraints.approval_mode = wist_contracts::action_plan::ApprovalMode::Required;
+    plan
+}
+
+async fn issue_to_router(env: &TestEnv, approval_id: &str) -> Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/issue"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await
+}
+
+/// 被否决的审批单不能再签发：回 `approval_closed`，而不是笼统的 `approval_incomplete`。
+#[tokio::test]
+async fn issuing_a_rejected_approval_is_closed() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+
+    let plan = r2_plan_with_ref("agent-node-a", "apv-rej");
+    seed_approval(
+        &env,
+        "apv-rej",
+        "agent-node-a",
+        &serde_json::to_string(&plan).expect("plan json"),
+        &wist_contracts::action_plan::plan_digest(&plan),
+        "rejected",
+        1,
+    )
+    .await;
+
+    let response = issue_to_router(&env, "apv-rej").await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_closed");
+}
+
+/// 库里的 `status` 说 approved、但票不够：签发前必须再看一眼真实票数。
+#[tokio::test]
+async fn issuing_with_fewer_votes_than_the_quorum_is_refused() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+
+    let plan = r2_plan_with_ref("agent-node-a", "apv-short");
+    seed_approval(
+        &env,
+        "apv-short",
+        "agent-node-a",
+        &serde_json::to_string(&plan).expect("plan json"),
+        &wist_contracts::action_plan::plan_digest(&plan),
+        "approved",
+        2,
+    )
+    .await;
+    env.store_handle
+        .upsert_action_approval_vote(&crate::infra::StoredActionApprovalVote {
+            approval_id: "apv-short".to_string(),
+            approver: "admin:one".to_string(),
+            decision: "approve".to_string(),
+            comment: None,
+            voted_at: "2026-06-01T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("seed vote");
+
+    let response = issue_to_router(&env, "apv-short").await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_incomplete");
+}
+
+/// 审批之后计划被改过（摘要对不上）：409 `plan_changed_since_approval`，不重签。
+#[tokio::test]
+async fn issuing_a_plan_changed_since_approval_is_refused() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+
+    let plan = r2_plan_with_ref("agent-node-a", "apv-changed");
+    seed_approval(
+        &env,
+        "apv-changed",
+        "agent-node-a",
+        &serde_json::to_string(&plan).expect("plan json"),
+        // 审批时记录的摘要与当前计划内容不一致（模拟审批后被改）。
+        &format!("plan-v1:sha256:{}", "0".repeat(64)),
+        "approved",
+        1,
+    )
+    .await;
+    env.store_handle
+        .upsert_action_approval_vote(&crate::infra::StoredActionApprovalVote {
+            approval_id: "apv-changed".to_string(),
+            approver: "admin:one".to_string(),
+            decision: "approve".to_string(),
+            comment: None,
+            voted_at: "2026-06-01T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("seed vote");
+
+    let response = issue_to_router(&env, "apv-changed").await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "plan_changed_since_approval");
+
+    let stored = env
+        .store_handle
+        .get_action_approval("apv-changed")
+        .await
+        .expect("approval")
+        .expect("row");
+    assert!(stored.issued_plan_json.is_none(), "拒签不能留下已签发计划");
+}
+
+/// 重复签发：第二次回 409，绝不悄悄换一份已签出的计划。
+#[tokio::test]
+async fn issuing_twice_is_refused() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "decision": "approve" }),
+    )
+    .await;
+
+    let first = issue_to_router(&env, &approval_id).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = issue_to_router(&env, &approval_id).await;
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(second).await;
+    assert_eq!(body["error"]["code"], "approval_already_issued");
+}
+
+/// 列表不带计划原文，单条详情才带：一页几十条时响应不该被计划体撑大。
+#[tokio::test]
+async fn listing_approvals_omits_plan_bodies_but_detail_includes_them() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let plan = sample_r2_plan("agent-node-a");
+
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(body["plan"].is_object(), "create 应返回计划原文");
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/approvals",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let list: serde_json::Value = decode_json_response(response).await;
+    let row = list
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|row| row["approval_id"] == approval_id)
+        .expect("approval in list");
+    assert!(row["plan"].is_null(), "list 不应带计划原文");
+    assert_eq!(row["status"], "pending");
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}"),
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let detail: serde_json::Value = decode_json_response(response).await;
+    assert!(detail["plan"].is_object(), "单条详情应带计划原文");
+}
+
+#[tokio::test]
+async fn an_unknown_approval_is_not_found() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/approvals/apv_missing",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_not_found");
+}
+
+#[tokio::test]
+async fn creating_an_approval_with_an_attestation_is_refused() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let mut plan = sample_r2_plan("agent-node-a");
+    plan.attestation = Some(wist_contracts::action_plan::ActionPlanAttestation {
+        api_version: "v1".to_string(),
+        plan_digest: format!("plan-v1:sha256:{}", "0".repeat(64)),
+        approval: wist_contracts::action_plan::ActionPlanApproval {
+            approval_id: "apv-x".to_string(),
+            approvers: vec!["user:alice".to_string()],
+            required_approvers: 1,
+            approved_at: "2026-06-01T00:00:00Z".to_string(),
+        },
+        risk_level: wist_contracts::action_plan::RiskLevel::R2,
+        issued_by: "gateway:test".to_string(),
+        key_id: "gw-plan-k1".to_string(),
+        algorithm: "ed25519".to_string(),
+        signed_at: "2026-06-01T00:00:00Z".to_string(),
+        expires_at: "2031-01-01T00:00:00Z".to_string(),
+        signature: "0".repeat(128),
+    });
+
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_invalid");
+}
+
+#[tokio::test]
+async fn creating_an_approval_for_another_agent_is_refused() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let plan = sample_r2_plan("agent-elsewhere");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_target_mismatch");
+}
+
+#[tokio::test]
+async fn an_invalid_vote_decision_is_refused() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "decision": "maybe" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_invalid");
+}
+
+/// 反对票是终态：关闭审批单，之后既不能再投也不能签发。
+#[tokio::test]
+async fn voting_reject_closes_the_approval_and_blocks_issue() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "decision": "reject", "comment": "not today" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["status"], "rejected");
+    assert_eq!(body["votes"][0]["comment"], "not today");
+
+    // 已关闭的单子不能再改票。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "decision": "approve" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_closed");
+
+    let response = issue_to_router(&env, &approval_id).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_closed");
+}
+
+/// 连续提交（很可能落在同一微秒）必须全部成功，且 id 互不相同 ——
+/// 主键冲突不能成为正常路径里的 500。
+#[tokio::test]
+async fn repeated_submissions_never_collide_on_the_approval_id() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let plan = sample_r2_plan("agent-node-a");
+
+    let mut ids = std::collections::BTreeSet::new();
+    for _ in 0..10 {
+        let response = create_approval(&env, "agent-node-a", &plan).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = decode_json_response(response).await;
+        let id = body["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_string();
+        assert!(ids.insert(id), "approval_id 重复了");
+    }
+    assert_eq!(ids.len(), 10);
 }

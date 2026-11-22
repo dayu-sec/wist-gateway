@@ -27,6 +27,8 @@ mod ingest;
 // NOTE(hand-added): 一次性调查（`investigate`）的下发与报告读取。报告本体由数据面
 // （wparse）写入 `<data-plane>/data/ivsrep/`，网关只读 —— 与 data_plane 同一模型。
 // 不在 jumo 静态模型 binding.mju 的声明里，重新生成控制面代码时需回补本模块与下方路由。
+mod action_approvals;
+mod action_plans;
 mod install;
 mod investigations;
 /// 命令队列（只读）：agentd 待执行 / 执行中 / 已回执，含来源（中心下发 / 页面发起）。
@@ -528,6 +530,34 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agents/{agent_id}/investigations/grant",
             put(set_agent_investigation_grant).delete(reset_agent_investigation_grant),
+        )
+        // NOTE(hand-added): 下发一条 ActionPlan（`kind = action_plan`）。只投递不审批；
+        // 本地终审在 agentd（结构 / 过期 / 目标 / 能力 / 审批）——见 api/action_plans.rs。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/plans",
+            post(action_plans::dispatch_agent_plan),
+        )
+        // NOTE(hand-added): 执行计划的审批 → 签发（B 线）。投票人来自 token 指纹，
+        // 签发后默认直接下发。见 api/action_approvals.rs。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/approvals",
+            post(action_approvals::create_approval),
+        )
+        .route(
+            "/api/v1/admin/approvals",
+            get(action_approvals::list_approvals),
+        )
+        .route(
+            "/api/v1/admin/approvals/{approval_id}",
+            get(action_approvals::get_approval),
+        )
+        .route(
+            "/api/v1/admin/approvals/{approval_id}/votes",
+            post(action_approvals::vote_approval),
+        )
+        .route(
+            "/api/v1/admin/approvals/{approval_id}/issue",
+            post(action_approvals::issue_approval),
         )
         .route(
             "/api/v1/admin/agents/{agent_id}/work",

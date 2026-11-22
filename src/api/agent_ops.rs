@@ -103,6 +103,9 @@ pub async fn submit_agent_status(
                     // 调查能力（G2）：同样“没带就不清”。`None` 在**入队前**被当作「不可用」
                     // （见 `api::investigations`），而不是「什么都会」。
                     investigation_capabilities: input.investigation_capabilities.clone(),
+                    // 执行能力（E2）：同样“没带就不清”。`None` 在**入队前**被当作「不可用」
+                    // （见 `api::action_plans`），而不是「什么计划都接」。
+                    exec_capabilities: input.exec_capabilities.clone(),
                 })
                 .await;
             match status_result {

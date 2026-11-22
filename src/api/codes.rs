@@ -21,6 +21,22 @@ macro_rules! codes {
 }
 
 codes! {
+    ACTION_PLAN_CAPABILITY_MISSING => "action_plan_capability_missing",
+    ACTION_PLAN_CAPABILITY_UNKNOWN => "action_plan_capability_unknown",
+    ACTION_PLAN_INVALID => "action_plan_invalid",
+    ACTION_PLAN_TARGET_MISMATCH => "action_plan_target_mismatch",
+    APPROVAL_ALREADY_ISSUED => "approval_already_issued",
+    APPROVAL_CLOSED => "approval_closed",
+    APPROVAL_EXPIRED => "approval_expired",
+    APPROVAL_INCOMPLETE => "approval_incomplete",
+    APPROVAL_LOAD_FAILED => "approval_load_failed",
+    APPROVAL_NOT_FOUND => "approval_not_found",
+    APPROVAL_NOT_REQUIRED => "approval_not_required",
+    APPROVAL_POLICY_UNSUPPORTED => "approval_policy_unsupported",
+    APPROVAL_STORE_FAILED => "approval_store_failed",
+    PLAN_CHANGED_SINCE_APPROVAL => "plan_changed_since_approval",
+    PLAN_DIGEST_MISMATCH => "plan_digest_mismatch",
+    PLAN_SIGNING_UNAVAILABLE => "plan_signing_unavailable",
     ADVERTISE_URL_INVALID => "advertise_url_invalid",
     ADVERTISE_URL_STORE_FAILED => "advertise_url_store_failed",
     ADVERTISE_URL_UNAVAILABLE => "advertise_url_unavailable",

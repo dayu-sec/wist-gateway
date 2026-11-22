@@ -56,6 +56,13 @@ async fn run_main() -> Result<(), wist_gateway::AppError> {
         &config.log_section(),
         &wist_log::Identity::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
     );
+    // NOTE(hand-added): 签发器是否加载成功，是运维最常问的一个问题（“我配了私钥，它生效了吗”）。
+    // 只打 key_id 与是否就绪，不输出任何私钥内容。
+    log::info!(
+        "event=PlanSigning configured={} key_id={}",
+        config.plan_signer.is_some(),
+        config.plan_signing_key_id
+    );
 
     // 单实例闸门：**一个操作系统上只允许一个网关**。放在打开库之前 —— 真正的破坏是两个实例
     // 同时写一份 SQLite，而不是端口被占（端口可以配成不同的）。

@@ -186,6 +186,11 @@ pub struct StoredAgentRegistration {
     /// **不可用**处理：调查是一次性只读操作，发一条注定被回 `unsupported` 的命令没有价值。
     pub investigation_capabilities:
         Option<wist_contracts::capability_report::InvestigationCapabilities>,
+    /// 最近一次上报的**执行能力**（能跑哪些 opcode、支持哪些执行 profile）。
+    ///
+    /// 与 `investigation_capabilities` 同口径：`None` = 还没报过（E2 之前的 agentd），
+    /// **入队前**按「不可用」处理 —— 发一份注定被回 `capability_missing` 的计划没有价值。
+    pub exec_capabilities: Option<wist_contracts::capability_report::ExecCapabilities>,
 }
 
 /// Agent 的**机器身份**读投影：只含「这是哪台机器」需要的列，不读 `local_work` / `uplink_state`
@@ -886,6 +891,51 @@ pub struct StoredAgentCommand {
     pub requested_by: String,
 }
 
+/// 一张执行计划的**审批单**（见 `migrations/sqlite/0044_action_approval.sql`）。
+///
+/// 与 [`StoredAgentCommand`] 分开：命令回答「送给这台机器的一条东西」，审批回答
+/// 「人同意了这个变更」。后者必须在投递**之前**完成，且绑的是**内容摘要**而不是 action_id。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredActionApproval {
+    pub approval_id: String,
+    pub agent_id: String,
+    /// 提交审批时算出的内容摘要（`plan-v1:sha256:<hex>`）。
+    pub plan_digest: String,
+    /// 契约的 wire 名：`R0` / `R1` / `R2` / `R3`。
+    pub risk_level: String,
+    pub requested_by: String,
+    pub reason: Option<String>,
+    pub requested_at: String,
+    /// 提交审批时的计划原文（防「审批后改内容再签发」）。
+    pub plan_json: String,
+    /// 这张单需要几个人批；提交时按风险等级定下，之后不可改。
+    pub required_approvers: i64,
+    /// `pending` | `approved` | `rejected` | `expired`。
+    pub status: String,
+    pub approved_at: Option<String>,
+    /// 审批单自身的过期时刻；过了不能再投票 / 签发。
+    pub expires_at: String,
+    /// 签发后的完整计划（含 attestation）。`None` = 还没签发。
+    pub issued_plan_json: Option<String>,
+}
+
+/// 一次审批投票。`(approval_id, approver)` 唯一：同一个人改主意是**覆盖**，不是加一票。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredActionApprovalVote {
+    pub approval_id: String,
+    pub approver: String,
+    /// `approve` | `reject`
+    pub decision: String,
+    pub comment: Option<String>,
+    pub voted_at: String,
+}
+
+impl StoredActionApprovalVote {
+    pub fn is_approve(&self) -> bool {
+        self.decision == "approve"
+    }
+}
+
 /// Agent 的工作确认回执（网关侧留痕，模型里没有对应元素）。
 ///
 /// 为什么单独一张表：确认是 **Agent 侧的事实**（我手上是这个版本），与工作自身的
@@ -1254,6 +1304,9 @@ pub struct AgentStatusUpdate<'a> {
     /// 落库后保持上一次的值（与 `logs_capabilities` / `uplink_state` 同口径）。
     pub investigation_capabilities:
         Option<wist_contracts::capability_report::InvestigationCapabilities>,
+    /// 本机**执行能力**（能跑哪些 opcode、支持哪些执行 profile）：`None` = 这次没带
+    /// （E2 之前的 agentd）—— 落库后保持上一次的值。
+    pub exec_capabilities: Option<wist_contracts::capability_report::ExecCapabilities>,
 }
 
 /// 机器画像回填（agentd 状态上报携带的 `HostProfile`）。
@@ -2012,6 +2065,60 @@ pub trait Store: Send + Sync + fmt::Debug {
         agent_id: Option<&str>,
         state: Option<&str>,
     ) -> StoreResult<u64>;
+
+    // ── 执行计划的审批与签发（E3 / 响应能力 B 线）──
+
+    /// 新建一张审批单（`approval_id` 唯一），已存在时**报错**。
+    ///
+    /// 业务路径不要用它判重 —— 用 [`Self::try_insert_action_approval`]，
+    /// 否则「id 撞了」会变成 500。本方法只给“必须插入”的场合（测试种子）用。
+    async fn insert_action_approval(&self, approval: &StoredActionApproval) -> StoreResult<()>;
+
+    /// 新建一张审批单；`approval_id` 已存在时返回 `Ok(false)` 而不是报错。
+    ///
+    /// 为什么要这个方法：审批单 id 带时间戳，极端情况下（同一微秒内两次提交）
+    /// 会撞主键。撞了应当**换一个 id 重试**，而不是给调用方一个 500。
+    async fn try_insert_action_approval(
+        &self,
+        approval: &StoredActionApproval,
+    ) -> StoreResult<bool>;
+
+    /// 按 id 读审批单；不存在返回 `None`。
+    async fn get_action_approval(
+        &self,
+        approval_id: &str,
+    ) -> StoreResult<Option<StoredActionApproval>>;
+
+    /// 审批单列表：`agent_id = None` = 全机队，按新 → 旧。
+    async fn list_action_approvals(
+        &self,
+        agent_id: Option<&str>,
+    ) -> StoreResult<Vec<StoredActionApproval>>;
+
+    /// 写/改一票（`(approval_id, approver)` 冲突时覆盖：改主意不是多一票）。
+    async fn upsert_action_approval_vote(&self, vote: &StoredActionApprovalVote)
+    -> StoreResult<()>;
+
+    /// 某张审批单的全部投票（按人排序）。
+    async fn list_action_approval_votes(
+        &self,
+        approval_id: &str,
+    ) -> StoreResult<Vec<StoredActionApprovalVote>>;
+
+    /// 推进审批单状态；只写 `status` / `approved_at`。返回是否命中。
+    async fn set_action_approval_status(
+        &self,
+        approval_id: &str,
+        status: &str,
+        approved_at: Option<&str>,
+    ) -> StoreResult<bool>;
+
+    /// 写入签发后的完整计划（含 attestation）。返回是否命中（且此前未签发）。
+    async fn set_action_approval_issued(
+        &self,
+        approval_id: &str,
+        issued_plan_json: &str,
+    ) -> StoreResult<bool>;
 
     /// 某台 agent 在 `since_ms` 之后**入门过**多少条某种 kind 的命令（含已被覆盖/已确认）。
     ///

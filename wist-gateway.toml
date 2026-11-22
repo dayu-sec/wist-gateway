@@ -94,3 +94,22 @@ listen_addr = "127.0.0.1:3001"
 # 私钥在发布 CI、公钥在网关配置里）。
 # [knowledge]
 # signing_public_key_file = "state/knowledge-signing.pub.pem"
+#
+# ── 执行计划的审批与签发（响应能力 B 线）──
+# 网关用这把 **Ed25519 私钥**给审批通过的计划签 attestation；被管端用对应公钥本地验签
+# （agentd 的 `[attestation] trusted_keys`）。**不配 = 不签发**：审批端点回 503
+# `plan_signing_unavailable`，不做“跳过签名”的降级（一份没签名的计划在 enforced 机器上会被拒）。
+#
+# 生成（私钥只留在控制面，**不要**拷到被管机）：
+#   openssl genpkey -algorithm ed25519 -out state/plan-signing.key
+#   chmod 600 state/plan-signing.key
+# 权限要求：其他用户不得有任何权限（0600 推荐；0640 需 group 可信）。0644 会在启动期被拒。
+#
+# `key_id` 必须与 agentd `[attestation] trusted_keys[].key_id` 对应；换钥匙时新旧两把可并存。
+# 设计（规范化、信任锚轮换、root 被控的边界）：docs/design/plan-attestation.md。
+# [plan_signing]
+# key_file = "state/plan-signing.key"   # PKCS#8 PEM（相对配置目录）
+# key_id = "gw-plan-k1"
+# issued_by = "gateway:wist-gateway-1"  # 审计：这份证明是哪台控制面签的
+# ttl_seconds = 3600                    # 一份证明的有效期；且不晚于计划自身 expires_at
+# approval_ttl_seconds = 86400          # 一张审批单从创建到过期

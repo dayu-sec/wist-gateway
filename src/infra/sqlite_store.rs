@@ -43,7 +43,7 @@ const AGENT_PROJECTION: &str = "SELECT a.agent_id, a.tenant_id, a.environment_id
      COALESCE(i.started_at, '') AS started_at, \
      i.memory_bytes, i.cpu_percent, i.cpu_cores, i.admin_latency_ms, i.work_state_changes, \
      i.discovery_policy_version, i.local_work, i.uplink_state, i.logs_capabilities, \
-     i.investigation_capabilities, \
+     i.investigation_capabilities, i.exec_capabilities, \
      COALESCE(a.current_credential_id, '') AS credential_id, \
      COALESCE(c.token_hash, '') AS credential_token_hash, \
      COALESCE(c.issued_at, '') AS credential_issued_at, \
@@ -456,6 +456,28 @@ fn deserialize_investigation_capabilities(
     }
 }
 
+/// 执行能力同样整块存 JSON（opcode 会随演进加），只留最近一份。
+fn serialize_exec_capabilities(
+    value: Option<wist_contracts::capability_report::ExecCapabilities>,
+) -> StoreResult<Option<String>> {
+    match value {
+        Some(value) => serde_json::to_string(&value)
+            .map(Some)
+            .source_err(StoreReason::Json, "serialize agent exec capabilities"),
+        None => Ok(None),
+    }
+}
+
+/// 坏 JSON 当「没报过」（`None`）= 网关侧按「不可用」处理（入队前回 409）。
+fn deserialize_exec_capabilities(
+    raw: Option<String>,
+) -> Option<wist_contracts::capability_report::ExecCapabilities> {
+    match raw.as_deref() {
+        Some(value) if !value.is_empty() => serde_json::from_str(value).ok(),
+        _ => None,
+    }
+}
+
 /// 网卡地址列表：存的是 JSON 数组文本；空串 / 解析失败都当空表 —— 这是展示信息，坏值不该影响整行读取。
 fn deserialize_ip_addresses(raw: Option<String>) -> Vec<String> {
     match raw.as_deref() {
@@ -526,6 +548,24 @@ macro_rules! column {
     };
 }
 
+fn action_approval_from_row(row: &SqliteRow) -> StoreResult<StoredActionApproval> {
+    Ok(StoredActionApproval {
+        approval_id: column!(row, "approval_id"),
+        agent_id: column!(row, "agent_id"),
+        plan_digest: column!(row, "plan_digest"),
+        risk_level: column!(row, "risk_level"),
+        requested_by: column!(row, "requested_by"),
+        reason: column!(row, "reason"),
+        requested_at: column!(row, "requested_at"),
+        plan_json: column!(row, "plan_json"),
+        required_approvers: column!(row, "required_approvers"),
+        status: column!(row, "status"),
+        approved_at: column!(row, "approved_at"),
+        expires_at: column!(row, "expires_at"),
+        issued_plan_json: column!(row, "issued_plan_json"),
+    })
+}
+
 fn token_from_row(row: &SqliteRow) -> StoreResult<StoredEnrollmentToken> {
     let status: String = column!(row, "status");
     Ok(StoredEnrollmentToken {
@@ -580,6 +620,7 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
     let uplink_state: Option<String> = column!(row, "uplink_state");
     let logs_capabilities: Option<String> = column!(row, "logs_capabilities");
     let investigation_capabilities: Option<String> = column!(row, "investigation_capabilities");
+    let exec_capabilities: Option<String> = column!(row, "exec_capabilities");
     let ip_addresses: Option<String> = column!(row, "ip_addresses");
     Ok(StoredAgentRegistration {
         agent_id: column!(row, "agent_id"),
@@ -611,6 +652,7 @@ fn agent_from_row(row: &SqliteRow) -> StoreResult<StoredAgentRegistration> {
         investigation_capabilities: deserialize_investigation_capabilities(
             investigation_capabilities,
         ),
+        exec_capabilities: deserialize_exec_capabilities(exec_capabilities),
     })
 }
 
@@ -2523,13 +2565,14 @@ impl Store for SqliteStore {
             let logs_capabilities = serialize_logs_capabilities(update.logs_capabilities.clone())?;
             let investigation_capabilities =
                 serialize_investigation_capabilities(update.investigation_capabilities.clone())?;
+            let exec_capabilities = serialize_exec_capabilities(update.exec_capabilities.clone())?;
             // 实例行不存在则新建（Agentd 重启换 boot_id / instance_id 时保留历史）。
             sqlx::query(
                 "INSERT INTO agent_instances (instance_id, agent_id, boot_id, version, \
                  started_at, last_seen_at, memory_bytes, cpu_percent, cpu_cores, admin_latency_ms, \
                  work_state_changes, discovery_policy_version, local_work, uplink_state, \
-                 logs_capabilities, investigation_capabilities) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+                 logs_capabilities, investigation_capabilities, exec_capabilities) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
                  ON CONFLICT (instance_id) DO UPDATE SET version = excluded.version, \
                  boot_id = CASE WHEN excluded.boot_id = '' THEN agent_instances.boot_id \
                  ELSE excluded.boot_id END, \
@@ -2547,7 +2590,10 @@ impl Store for SqliteStore {
                  THEN agent_instances.logs_capabilities ELSE excluded.logs_capabilities END, \
                  investigation_capabilities = CASE WHEN excluded.investigation_capabilities IS NULL \
                  THEN agent_instances.investigation_capabilities \
-                 ELSE excluded.investigation_capabilities END",
+                 ELSE excluded.investigation_capabilities END, \
+                 exec_capabilities = CASE WHEN excluded.exec_capabilities IS NULL \
+                 THEN agent_instances.exec_capabilities \
+                 ELSE excluded.exec_capabilities END",
             )
             .bind(&instance_id)
             .bind(update.agent_id)
@@ -2564,6 +2610,7 @@ impl Store for SqliteStore {
             .bind(uplink_state)
             .bind(logs_capabilities)
             .bind(investigation_capabilities)
+            .bind(exec_capabilities)
             .execute(&mut *tx)
             .await
             .map_err(|err| sql_error(err, "upsert agent instance"))?;
@@ -2734,6 +2781,20 @@ impl Store for SqliteStore {
             .await
             .map_err(|err| sql_error(err, detail))?;
         }
+        // 审批票没有 `agent_id` 列（它挂在审批单上），单独按审批单删。
+        sqlx::query(
+            "DELETE FROM action_approval_vote WHERE approval_id IN \
+             (SELECT approval_id FROM action_approval WHERE agent_id = ?1)",
+        )
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| sql_error(err, "delete action approval votes"))?;
+        sqlx::query("DELETE FROM action_approval WHERE agent_id = ?1")
+            .bind(agent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| sql_error(err, "delete action approvals"))?;
         let deleted = sqlx::query("DELETE FROM agents WHERE agent_id = ?1")
             .bind(agent_id)
             .execute(&mut *tx)
@@ -2743,6 +2804,177 @@ impl Store for SqliteStore {
             .await
             .map_err(|err| sql_error(err, "commit delete agent"))?;
         Ok(deleted.rows_affected() > 0)
+    }
+
+    // ── 执行计划的审批与签发 ──
+
+    async fn insert_action_approval(&self, approval: &StoredActionApproval) -> StoreResult<()> {
+        if self.try_insert_action_approval(approval).await? {
+            return Ok(());
+        }
+        Err(StoreReason::Sql
+            .to_err()
+            .with_detail("action approval already exists".to_string()))
+    }
+
+    async fn try_insert_action_approval(
+        &self,
+        approval: &StoredActionApproval,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "INSERT INTO action_approval (approval_id, agent_id, plan_digest, risk_level, \
+             requested_by, reason, requested_at, plan_json, required_approvers, status, \
+             approved_at, expires_at, issued_plan_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT (approval_id) DO NOTHING",
+        )
+        .bind(&approval.approval_id)
+        .bind(&approval.agent_id)
+        .bind(&approval.plan_digest)
+        .bind(&approval.risk_level)
+        .bind(&approval.requested_by)
+        .bind(&approval.reason)
+        .bind(&approval.requested_at)
+        .bind(&approval.plan_json)
+        .bind(approval.required_approvers)
+        .bind(&approval.status)
+        .bind(&approval.approved_at)
+        .bind(&approval.expires_at)
+        .bind(&approval.issued_plan_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "insert action approval"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn get_action_approval(
+        &self,
+        approval_id: &str,
+    ) -> StoreResult<Option<StoredActionApproval>> {
+        let row = sqlx::query(
+            "SELECT approval_id, agent_id, plan_digest, risk_level, requested_by, reason, \
+             requested_at, plan_json, required_approvers, status, approved_at, expires_at, \
+             issued_plan_json FROM action_approval WHERE approval_id = ?1",
+        )
+        .bind(approval_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "load action approval"))?;
+        row.map(|row| action_approval_from_row(&row)).transpose()
+    }
+
+    async fn list_action_approvals(
+        &self,
+        agent_id: Option<&str>,
+    ) -> StoreResult<Vec<StoredActionApproval>> {
+        const COLUMNS: &str = "approval_id, agent_id, plan_digest, risk_level, requested_by, \
+                               reason, requested_at, plan_json, required_approvers, status, \
+                               approved_at, expires_at, issued_plan_json";
+        let rows = match agent_id {
+            Some(agent_id) => {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SELECT {COLUMNS} FROM action_approval WHERE agent_id = ?1 \
+                     ORDER BY requested_at DESC, approval_id DESC"
+                )))
+                .bind(agent_id)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SELECT {COLUMNS} FROM action_approval \
+                     ORDER BY requested_at DESC, approval_id DESC"
+                )))
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|err| sql_error(err, "list action approvals"))?;
+        rows.iter().map(action_approval_from_row).collect()
+    }
+
+    async fn upsert_action_approval_vote(
+        &self,
+        vote: &StoredActionApprovalVote,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO action_approval_vote (approval_id, approver, decision, comment, voted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (approval_id, approver) DO UPDATE SET decision = excluded.decision, \
+             comment = excluded.comment, voted_at = excluded.voted_at",
+        )
+        .bind(&vote.approval_id)
+        .bind(&vote.approver)
+        .bind(&vote.decision)
+        .bind(&vote.comment)
+        .bind(&vote.voted_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert action approval vote"))?;
+        Ok(())
+    }
+
+    async fn list_action_approval_votes(
+        &self,
+        approval_id: &str,
+    ) -> StoreResult<Vec<StoredActionApprovalVote>> {
+        let rows = sqlx::query(
+            "SELECT approval_id, approver, decision, comment, voted_at \
+             FROM action_approval_vote WHERE approval_id = ?1 ORDER BY approver ASC",
+        )
+        .bind(approval_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list action approval votes"))?;
+        rows.iter()
+            .map(|row| {
+                Ok(StoredActionApprovalVote {
+                    approval_id: column!(row, "approval_id"),
+                    approver: column!(row, "approver"),
+                    decision: column!(row, "decision"),
+                    comment: column!(row, "comment"),
+                    voted_at: column!(row, "voted_at"),
+                })
+            })
+            .collect()
+    }
+
+    async fn set_action_approval_status(
+        &self,
+        approval_id: &str,
+        status: &str,
+        approved_at: Option<&str>,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE action_approval SET status = ?2, approved_at = COALESCE(?3, approved_at) \
+             WHERE approval_id = ?1",
+        )
+        .bind(approval_id)
+        .bind(status)
+        .bind(approved_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "set action approval status"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn set_action_approval_issued(
+        &self,
+        approval_id: &str,
+        issued_plan_json: &str,
+    ) -> StoreResult<bool> {
+        // `issued_plan_json IS NULL` 让重复签发变成幂等的 no-op（返回 false），
+        // 而不是把一份已经签好的计划悄悄换成另一份。
+        let result = sqlx::query(
+            "UPDATE action_approval SET issued_plan_json = ?2 \
+             WHERE approval_id = ?1 AND issued_plan_json IS NULL",
+        )
+        .bind(approval_id)
+        .bind(issued_plan_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "set action approval issued"))?;
+        Ok(result.rows_affected() > 0)
     }
 
     // ── Agent 事实摘要与用途推断 ──
@@ -5188,6 +5420,7 @@ mod tests {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-unknown",
                 instance_id: "inst-x",
                 boot_id: "",
@@ -5215,6 +5448,7 @@ mod tests {
                 .record_agent_status(&AgentStatusUpdate {
                     logs_capabilities: None,
                     investigation_capabilities: None,
+                    exec_capabilities: None,
                     agent_id: "agent-1",
                     instance_id,
                     boot_id: "boot-1",
@@ -5554,6 +5788,7 @@ mod tests {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -5578,6 +5813,7 @@ mod tests {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -5604,6 +5840,7 @@ mod tests {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -5654,6 +5891,7 @@ mod tests {
             uplink_state: None,
             logs_capabilities: capabilities,
             investigation_capabilities: None,
+            exec_capabilities: None,
         };
 
         // 旧 agentd（不报）：读出 None —— 网关据此退回契约判据（不做能力裁剪）。
@@ -5712,6 +5950,7 @@ mod tests {
             uplink_state: None,
             logs_capabilities: None,
             investigation_capabilities: capabilities,
+            exec_capabilities: None,
         };
 
         // 旧 agentd（不报）：读出 None —— 网关据此把调查面当作「不可用」。
@@ -5740,6 +5979,54 @@ mod tests {
         assert_eq!(agent.investigation_capabilities, Some(reported));
     }
 
+    #[tokio::test]
+    async fn stores_exec_capabilities_and_keeps_them_when_the_next_report_omits_them() {
+        let store = store().await;
+        register(&store, "hash-e", "agent-1", "inst-1").await;
+
+        let update = |capabilities| AgentStatusUpdate {
+            agent_id: "agent-1",
+            instance_id: "inst-1",
+            boot_id: "boot-1",
+            version: "0.37.0",
+            last_seen_at: "2026-11-22T00:00:00+00:00",
+            memory_bytes: None,
+            cpu_percent: None,
+            cpu_cores: None,
+            admin_latency_ms: None,
+            discovery_policy_version: None,
+            work_state_changes: None,
+            local_work: None,
+            uplink_state: None,
+            logs_capabilities: None,
+            investigation_capabilities: None,
+            exec_capabilities: capabilities,
+        };
+
+        store.record_agent_status(&update(None)).await.unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert!(
+            agent.exec_capabilities.is_none(),
+            "E2 之前的 agentd 不报 → 读出来是 None"
+        );
+
+        let reported = wist_contracts::capability_report::ExecCapabilities {
+            opcodes: vec!["file.hash".to_string(), "socket.list".to_string()],
+            execution_profiles: vec!["agent_exec_v1".to_string()],
+        };
+        store
+            .record_agent_status(&update(Some(reported.clone())))
+            .await
+            .unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.exec_capabilities, Some(reported.clone()));
+
+        // 一次老心跳（没带）不该把最后一次可信的执行能力清单擦掉。
+        store.record_agent_status(&update(None)).await.unwrap();
+        let agent = store.get_agent("agent-1").await.unwrap().expect("agent");
+        assert_eq!(agent.exec_capabilities, Some(reported));
+    }
+
     fn uplink_state(
         kind: &str,
         target: Option<&str>,
@@ -5765,6 +6052,7 @@ mod tests {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -5789,6 +6077,7 @@ mod tests {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -5817,6 +6106,7 @@ mod tests {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -5850,6 +6140,7 @@ mod tests {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -5875,6 +6166,7 @@ mod tests {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -5900,6 +6192,7 @@ mod tests {
             .record_agent_status(&AgentStatusUpdate {
                 logs_capabilities: None,
                 investigation_capabilities: None,
+                exec_capabilities: None,
                 agent_id: "agent-1",
                 instance_id: "inst-1",
                 boot_id: "boot-1",
@@ -6857,6 +7150,37 @@ mod tests {
     ///
     /// 两者在下发行为上都是“一个面都没开”（与采集面一致），存储上仍分开：
     /// 一个回答“没配过”，一个回答“配成了空”。
+    /// `try_insert` 把「id 已存在」当成 `Ok(false)`，而不是把冲突变成错误：
+    /// 审批单 id 带时间戳，撞了应当换一个 id 重试。
+    #[tokio::test]
+    async fn try_insert_action_approval_reports_duplicates_instead_of_failing() {
+        let store = store().await;
+        let approval = StoredActionApproval {
+            approval_id: "apv-dup".to_string(),
+            agent_id: "agent-1".to_string(),
+            plan_digest: format!("plan-v1:sha256:{}", "a".repeat(64)),
+            risk_level: "R2".to_string(),
+            requested_by: "admin:test".to_string(),
+            reason: None,
+            requested_at: "2026-06-01T00:00:00Z".to_string(),
+            plan_json: "{}".to_string(),
+            required_approvers: 1,
+            status: "pending".to_string(),
+            approved_at: None,
+            expires_at: "2026-06-02T00:00:00Z".to_string(),
+            issued_plan_json: None,
+        };
+
+        assert!(store.try_insert_action_approval(&approval).await.unwrap());
+        assert!(!store.try_insert_action_approval(&approval).await.unwrap());
+        // “必须插入”的旧语义仍然会报错。
+        assert!(store.insert_action_approval(&approval).await.is_err());
+
+        let mut other = approval.clone();
+        other.approval_id = "apv-dup-2".to_string();
+        assert!(store.try_insert_action_approval(&other).await.unwrap());
+    }
+
     #[tokio::test]
     async fn investigation_grant_round_trips_and_distinguishes_empty_from_missing() {
         let store = store().await;

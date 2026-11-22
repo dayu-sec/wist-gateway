@@ -197,6 +197,21 @@ pub struct AdminConfig {
     pub log_max_age_seconds: i64,
     /// `[log]` 段：本进程运行日志（级别 / 格式 / 落点 / 轮转）。与 `[logs]`（被采集 agent 日志）不同。
     pub log: wist_log::LogSection,
+    /// 计划签发私钥（Ed25519 PKCS#8 PEM，0600）。`None` = 不签发（审批端点回 503）。
+    ///
+    /// **本轮私钥在网关**是刻意的临时状态：审批与签发同在控制面才能先把闭环跑通。
+    /// 代价是「网关被控 = 可自签」——这条限制写进了 `docs/design/plan-attestation.md`。
+    pub plan_signing_key_file: Option<PathBuf>,
+    /// 与 agentd 端 `[attestation] trusted_keys[].key_id` 对应。
+    pub plan_signing_key_id: String,
+    /// 写进 attestation 的 `issued_by`（审计：这份证明是哪台控制面签的）。
+    pub plan_signing_issued_by: String,
+    /// 一份证明的有效期（秒）。
+    pub plan_signing_ttl_seconds: i64,
+    /// 一张审批单从创建到过期的时长（秒）。到期后不能再投票 / 签发。
+    pub plan_approval_ttl_seconds: i64,
+    /// 已加载的签发器。`None` = 没配私钥 —— 端点必须回 503，**不**做“跳过签名”的降级。
+    pub plan_signer: Option<std::sync::Arc<crate::infra::PlanSigner>>,
 }
 
 pub use wist_error::ConfigError;
@@ -211,6 +226,38 @@ fn config_io(message: impl Into<String>) -> ConfigError {
 
 fn config_parse(message: impl Into<String>) -> ConfigError {
     ConfigReason::Parse.to_err().with_detail(message)
+}
+
+/// 签发私钥不能被「其他用户」访问。
+///
+/// 允许 `0600`（推荐）与 `0640`（容器里常见的服务组挂载）：真正的事故是 `0644` ——
+/// 同一台宿主机上的任何进程都能拷走签发权，而它正是“审批”这一层唯一的根。
+/// 宁可拒启，也不静默接受一个可以被抄走的私钥。
+#[cfg(unix)]
+fn require_private_key_permissions(path: &Path) -> Result<(), ConfigError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::metadata(path).map_err(|err| {
+        config_validation(format!(
+            "failed to stat plan signing key {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mode = metadata.permissions().mode();
+    if mode & 0o007 != 0 {
+        return Err(config_validation(format!(
+            "plan signing key {} is accessible by other users (mode {:o}); \
+             chmod 600 (or 640 with a trusted group)",
+            path.display(),
+            mode & 0o777
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_private_key_permissions(_path: &Path) -> Result<(), ConfigError> {
+    // Windows / 其他平台没有 POSIX mode；信任由文件 ACL 决定，这里不替它做判断。
+    Ok(())
 }
 
 // 接口层（`wist-gateway-pub.toml`）的**路径解析**与**无重复叶子合并**不再在本文件手写：
@@ -250,6 +297,32 @@ struct RawAdminConfig {
     /// `[log]` 段：**本网关进程自己**的运行日志（与上面 `[logs]` 的“被采集 agent 日志落盘保留”不同）。
     #[serde(default)]
     log: RawLogConfig,
+    /// `[plan_signing]` 段：执行计划的**审批与签发**（私钥、key_id、有效期）。
+    #[serde(default)]
+    plan_signing: RawPlanSigningConfig,
+}
+
+/// `[plan_signing]` 段：执行计划的审批与签发。
+///
+/// 缺省 = 不配私钥：所有审批/签发端点回 503，E2 的直发路径不受影响
+/// （除非 agentd 端开了 `[attestation] enforced`）。
+#[derive(Debug, Default, Deserialize)]
+struct RawPlanSigningConfig {
+    /// Ed25519 PKCS#8 PEM 私钥文件（相对配置目录）。私钥**只在控制面**。
+    #[serde(default)]
+    key_file: Option<String>,
+    /// 与 agentd 端信任锚的 `key_id` 对应。缺省 `gw-plan-k1`。
+    #[serde(default)]
+    key_id: Option<String>,
+    /// 写进 attestation 的 `issued_by`。缺省 `gateway`。
+    #[serde(default)]
+    issued_by: Option<String>,
+    /// 一份证明的有效期（秒）。缺省 [`crate::infra::DEFAULT_ATTESTATION_TTL_SECONDS`]。
+    #[serde(default)]
+    ttl_seconds: Option<i64>,
+    /// 一张审批单从创建到过期的时长（秒）。缺省 86400（24 小时）。
+    #[serde(default)]
+    approval_ttl_seconds: Option<i64>,
 }
 
 /// `[metrics]` 段：选择类 label 的推断注册表。
@@ -614,7 +687,7 @@ impl AdminConfig {
             None => None,
         };
         // 启动期知识源（出厂初始包）：归一化 + 相对配置目录化；**不做存在性校验** ——
-        // 它是「尽量可用」的回落来源，配了却读不到只告警（见 `LoadedKnowledge::resolve`）。
+        // 它是「尽量可用」的回落来源，配了却读不到只告警（见 [`LoadedKnowledge::resolve`]）。
         let knowledge_source_dir = normalize_optional(
             raw.knowledge
                 .source_dir
@@ -628,6 +701,63 @@ impl AdminConfig {
                 .allowed_maturity
                 .unwrap_or_else(default_knowledge_allowed_maturity),
         )?;
+        let plan_signing_key_file = normalize_optional(
+            raw.plan_signing
+                .key_file
+                .as_deref()
+                .map(|value| expand(&env, value))
+                .transpose()?,
+        )
+        .map(|value| absolutize_path(config_dir, Path::new(&value)));
+        let plan_signing_key_id = normalize_optional(
+            raw.plan_signing
+                .key_id
+                .as_deref()
+                .map(|value| expand(&env, value))
+                .transpose()?,
+        )
+        .unwrap_or_else(|| "gw-plan-k1".to_string());
+        let plan_signing_issued_by = normalize_optional(
+            raw.plan_signing
+                .issued_by
+                .as_deref()
+                .map(|value| expand(&env, value))
+                .transpose()?,
+        )
+        .unwrap_or_else(|| "gateway".to_string());
+        let plan_signing_ttl_seconds = raw
+            .plan_signing
+            .ttl_seconds
+            .unwrap_or(crate::infra::DEFAULT_ATTESTATION_TTL_SECONDS);
+        let plan_approval_ttl_seconds = raw.plan_signing.approval_ttl_seconds.unwrap_or(86_400);
+        // 私钥格式错就地拒绝启动：它是信任链的起点，含糊地接受比验不了更糟。
+        let plan_signer = match plan_signing_key_file.as_deref() {
+            Some(path) => {
+                // 权限先于内容：一份 world-readable 的私钥，格式再对也是事故。
+                require_private_key_permissions(path)?;
+                let pem = fs::read_to_string(path).map_err(|err| {
+                    config_validation(format!(
+                        "failed to read plan signing key {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                Some(std::sync::Arc::new(
+                    crate::infra::PlanSigner::from_pkcs8_pem(
+                        &pem,
+                        plan_signing_key_id.clone(),
+                        plan_signing_issued_by.clone(),
+                        plan_signing_ttl_seconds,
+                    )
+                    .map_err(|err| {
+                        config_validation(format!(
+                            "invalid plan signing key {}: {err}",
+                            path.display()
+                        ))
+                    })?,
+                ))
+            }
+            None => None,
+        };
         require_non_empty("server.admin_api_token", &admin_api_token)?;
         require_min_secret_length(
             "server.admin_api_token",
@@ -818,6 +948,12 @@ impl AdminConfig {
                 keep_files: raw.log.keep_files,
                 max_seconds: raw.log.max_seconds,
             },
+            plan_signing_key_file,
+            plan_signing_key_id,
+            plan_signing_issued_by,
+            plan_signing_ttl_seconds,
+            plan_approval_ttl_seconds,
+            plan_signer,
         })
     }
 
@@ -834,6 +970,15 @@ impl AdminConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        require_positive_seconds("plan_signing.ttl_seconds", self.plan_signing_ttl_seconds)?;
+        require_positive_seconds(
+            "plan_signing.approval_ttl_seconds",
+            self.plan_approval_ttl_seconds,
+        )?;
+        if self.plan_signing_key_file.is_some() {
+            require_non_empty("plan_signing.key_id", &self.plan_signing_key_id)?;
+            require_non_empty("plan_signing.issued_by", &self.plan_signing_issued_by)?;
+        }
         require_non_empty("server.listen_addr", &self.listen_addr)?;
         require_https_url("server.public_base_url", &self.public_base_url)?;
         require_existing_file("server.tls_cert_file", &self.tls_cert_file)?;
@@ -1487,6 +1632,12 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         log_keep_files: crate::infra::LogRetention::default().keep_files,
         log_max_age_seconds: crate::infra::LogRetention::default().max_age_seconds,
         log: wist_log::LogSection::default(),
+        plan_signing_key_file: None,
+        plan_signing_key_id: "gw-plan-k1".to_string(),
+        plan_signing_issued_by: "gateway".to_string(),
+        plan_signing_ttl_seconds: crate::infra::DEFAULT_ATTESTATION_TTL_SECONDS,
+        plan_approval_ttl_seconds: 86_400,
+        plan_signer: None,
     }
 }
 
@@ -1503,6 +1654,38 @@ mod tests {
     #[test]
     fn rejects_short_admin_token() {
         assert!(require_non_weak_admin_token("1234567").is_err()); // 7 chars < minimum
+    }
+
+    /// 私钥不能被「其他用户」访问；group 读（0640）在容器里常见，允许。
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_plan_signing_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "wist-gw-plan-key-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("plan.key");
+        std::fs::write(&path, b"placeholder").expect("write");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(
+            require_private_key_permissions(&path).is_err(),
+            "0644 必须拒"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        require_private_key_permissions(&path).expect("0640 允许");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        require_private_key_permissions(&path).expect("0600 允许");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
