@@ -548,6 +548,17 @@ macro_rules! column {
     };
 }
 
+/// 可空列：`NULL` → `None`（不要把 `NULL` 当读取失败 —— 那是两件事）。
+macro_rules! column_opt {
+    ($row:expr, $name:literal) => {
+        $row.try_get::<Option<_>, _>($name).map_err(|err| {
+            StoreReason::Sql
+                .to_err()
+                .with_detail(format!("read column {}: {err}", $name))
+        })?
+    };
+}
+
 fn action_approval_from_row(row: &SqliteRow) -> StoreResult<StoredActionApproval> {
     Ok(StoredActionApproval {
         approval_id: column!(row, "approval_id"),
@@ -3098,6 +3109,83 @@ impl Store for SqliteStore {
             .await
             .map_err(|err| sql_error(err, "delete investigation grant"))?;
         Ok(())
+    }
+
+    async fn get_response_grant(&self, agent_id: &str) -> StoreResult<Option<StoredResponseGrant>> {
+        let row = sqlx::query(
+            "SELECT agent_id, grant_id, max_risk, opcodes_json, not_before, not_after, \
+             reason, granted_by, granted_at, revoked_at FROM response_grant WHERE agent_id = ?1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "load response grant"))?;
+        let Some(row) = row else { return Ok(None) };
+        let opcodes_raw: Option<String> = column!(row, "opcodes_json");
+        Ok(Some(StoredResponseGrant {
+            agent_id: column!(row, "agent_id"),
+            grant_id: column!(row, "grant_id"),
+            max_risk: column!(row, "max_risk"),
+            opcodes: match opcodes_raw {
+                Some(raw) => Some(deserialize_json_array(
+                    &raw,
+                    "parse response grant opcodes",
+                )?),
+                None => None,
+            },
+            not_before: column!(row, "not_before"),
+            not_after: column!(row, "not_after"),
+            reason: column_opt!(row, "reason"),
+            granted_by: column!(row, "granted_by"),
+            granted_at: column!(row, "granted_at"),
+            revoked_at: column_opt!(row, "revoked_at"),
+        }))
+    }
+
+    async fn upsert_response_grant(&self, grant: &StoredResponseGrant) -> StoreResult<()> {
+        let opcodes = match grant.opcodes.as_ref() {
+            Some(opcodes) => Some(serialize_json_array(
+                opcodes,
+                "serialize response grant opcodes",
+            )?),
+            None => None,
+        };
+        // 重新签发要把 `revoked_at` 清空：新单子就是新的，不能带着旧单的撤销标记。
+        sqlx::query(
+            "INSERT INTO response_grant (agent_id, grant_id, max_risk, opcodes_json, \
+             not_before, not_after, reason, granted_by, granted_at, revoked_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL) \
+             ON CONFLICT (agent_id) DO UPDATE SET grant_id = excluded.grant_id, \
+             max_risk = excluded.max_risk, opcodes_json = excluded.opcodes_json, \
+             not_before = excluded.not_before, not_after = excluded.not_after, \
+             reason = excluded.reason, granted_by = excluded.granted_by, \
+             granted_at = excluded.granted_at, revoked_at = NULL",
+        )
+        .bind(&grant.agent_id)
+        .bind(&grant.grant_id)
+        .bind(&grant.max_risk)
+        .bind(opcodes)
+        .bind(&grant.not_before)
+        .bind(&grant.not_after)
+        .bind(&grant.reason)
+        .bind(&grant.granted_by)
+        .bind(&grant.granted_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert response grant"))?;
+        Ok(())
+    }
+
+    async fn revoke_response_grant(&self, agent_id: &str, revoked_at: &str) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE response_grant SET revoked_at = ?2 WHERE agent_id = ?1 AND revoked_at IS NULL",
+        )
+        .bind(agent_id)
+        .bind(revoked_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "revoke response grant"))?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn list_agent_log_sources(&self, agent_id: &str) -> StoreResult<Vec<StoredLogSource>> {
@@ -7179,6 +7267,69 @@ mod tests {
         let mut other = approval.clone();
         other.approval_id = "apv-dup-2".to_string();
         assert!(store.try_insert_action_approval(&other).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn response_grant_round_trips_and_revoke_is_soft() {
+        let store = store().await;
+        assert!(
+            store.get_response_grant("agent-a").await.unwrap().is_none(),
+            "从未签发过必须是 None"
+        );
+
+        let grant = StoredResponseGrant {
+            agent_id: "agent-a".to_string(),
+            grant_id: "grn_agent-a_1_aaaa".to_string(),
+            max_risk: "R2".to_string(),
+            opcodes: Some(vec!["log.rotate".to_string()]),
+            not_before: "2026-11-22T00:00:00Z".to_string(),
+            not_after: "2026-11-23T00:00:00Z".to_string(),
+            reason: Some("排障".to_string()),
+            granted_by: "admin:9f2c1a7b3d40".to_string(),
+            granted_at: "2026-11-22T00:00:00Z".to_string(),
+            revoked_at: None,
+        };
+        store.upsert_response_grant(&grant).await.unwrap();
+        assert_eq!(
+            store.get_response_grant("agent-a").await.unwrap(),
+            Some(grant.clone())
+        );
+
+        // 撤销是软删：行还在，`revoked_at` 非空（审计要能回答“谁什么时候撤的”）。
+        assert!(
+            store
+                .revoke_response_grant("agent-a", "2026-11-22T01:00:00Z")
+                .await
+                .unwrap()
+        );
+        let revoked = store
+            .get_response_grant("agent-a")
+            .await
+            .unwrap()
+            .expect("row is kept after revoke");
+        assert_eq!(revoked.revoked_at.as_deref(), Some("2026-11-22T01:00:00Z"));
+        // 幂等：再撤一次不报错，只是没改到行。
+        assert!(
+            !store
+                .revoke_response_grant("agent-a", "2026-11-22T02:00:00Z")
+                .await
+                .unwrap()
+        );
+
+        // 重新签发会把撤销标记清掉，并换新的 grant_id。
+        let reissued = StoredResponseGrant {
+            grant_id: "grn_agent-a_2_bbbb".to_string(),
+            granted_at: "2026-11-22T03:00:00Z".to_string(),
+            ..grant
+        };
+        store.upsert_response_grant(&reissued).await.unwrap();
+        let stored = store
+            .get_response_grant("agent-a")
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(stored.grant_id, "grn_agent-a_2_bbbb");
+        assert!(stored.revoked_at.is_none(), "重新签发要清掉 revoked_at");
     }
 
     #[tokio::test]

@@ -1,7 +1,9 @@
 //! 下发执行计划：`POST /api/v1/admin/agents/{agent_id}/plans`。
 //!
-//! 只做**投递**，不做审批：本端点把一份 `ActionPlan` 写进命令队列，`kind = action_plan`，
-//! `params` 就是计划 JSON 原文。真正的本地终审在 agentd（结构 / 过期 / 目标 / 能力 / 审批），
+//! 本端点把一份 `ActionPlan` 写进命令队列（`kind = action_plan`，`params` 就是计划 JSON 原文）。
+//! 它**不做审批**，但**必须有授权来源**：只处理「靠时间窗授权单放行」这一条路
+//! （见 `api/response_grants.rs`）。另一条路是审批 —— 那条由 `issue_approval` 直接入队，
+//! 不经过本函数。真正的本地终审在 agentd（结构 / 过期 / 目标 / 能力 / 审批），
 //! 因为「这台机器认不认识这个 op」只有它自己知道。
 //!
 //! 三条刻意的取舍：
@@ -13,9 +15,11 @@
 //!    **没报过 = 不可用**（`action_plan_capability_unknown`），而不是「什么都会」——
 //!    否则管理面上看到的是「命令已下发」，几秒后才变成一条看不懂的失败 ack。
 //!    能力闸只是**前置拦截**，agentd 仍会自己再判一遍（两边口径不同：它看真正的注册表）。
-//! 3. **不验签**：网关没有 agentd 的信任锚，验签只发生在执行侧。但带 attestation 的计划
-//!    会在这里**重算摘要并比对**（`plan_digest_mismatch`）—— 那能拆穿「批完又改」，
-//!    而且比让 agentd 几秒后回一条失败 ack 早得多。
+//! 3. **不接受客户端自带的 attestation**：网关没有 agentd 的信任锚，无法验证一份证明的真假；
+//!    照单全收等于任何人自己造一个证明就能绕过授权。已签发的计划只由网关自己入队
+//!    （审批流 `issue_approval` / 授权单放行），不走这个端点。
+//! 4. **必须有授权来源**：本端点只处理「靠时间窗授权单放行」这一条路（见 `api/response_grants.rs`）；
+//!    没有有效授权单就拒（`response_grant_missing` / `expired` / `insufficient`）。
 
 use std::collections::BTreeSet;
 
@@ -35,6 +39,7 @@ use crate::api::admin_ops::{agent_command_response, agent_not_found_response};
 use crate::api::codes;
 use crate::api::error::ApiError;
 use crate::api::rate_limit;
+use crate::api::response_grants;
 use crate::infra::StoredAgentCommand;
 
 /// `POST /api/v1/admin/agents/{agent_id}/plans`
@@ -80,24 +85,64 @@ pub async fn dispatch_agent_plan(
         .into_response();
     }
 
+    // 形状校验放在**签发之前**：现在出口会盖一个签名，不能给一份形状非法的计划盖章
+    // （签名会把它固化成一份「看起来已授权」的东西）。agentd 仍会再验一遍，两边口径不同。
+    if let Err(err) = wist_validate::action_plan::validate_action_plan(&plan) {
+        return ApiError::bad_request(
+            codes::ACTION_PLAN_INVALID,
+            format!("invalid action plan: {}", err.code),
+        )
+        .into_response();
+    }
+
     // 能力闸：只在计划真的要求了东西时才查（空集 = 没有可拦的）。
     if let Err(response) = ensure_plan_capable(&state, &agent_id, &plan).await {
         return response;
     }
 
-    // 带签发证明：先确认「签的是这一份」。网关不验签（那是 agentd 的事，它才有信任锚），
-    // 但摘要不一致意味着审批后被改过 —— 现在回 400 比几秒后一条看不懂的失败 ack 好。
-    if let Some(attestation) = plan.attestation.as_ref() {
-        let expected = wist_contracts::action_plan::plan_digest(&plan);
-        if attestation.plan_digest != expected {
-            return ApiError::bad_request(
-                codes::PLAN_DIGEST_MISMATCH,
-                format!(
-                    "plan digest does not match its attestation (attested {}, computed {expected})",
-                    attestation.plan_digest
-                ),
+    // 带签发证明的计划只能由**网关自己**签发后下发（审批流 / 授权单），不能接受客户端自带。
+    //
+    // 为什么：网关没有信任锚（那是 agentd 的），所以它无法验证一份证明的真假 —— 如果这里
+    // 照单全收，任何人都能自己造一个 `attestation` 绕过授权，然后靠 `enforced = false` 的
+    // 机器放行。真正「已签发」的计划走 `enqueue_plan`（`issue_approval` / 授权单放行），
+    // 不经过这个端点。
+    if plan.attestation.is_some() {
+        return ApiError::bad_request(
+            codes::ACTION_PLAN_INVALID,
+            "plan already carries an attestation; attested plans are dispatched by the approval \
+             flow or under a response grant, not through this endpoint",
+        )
+        .into_response();
+    }
+
+    // 授权闸（见 `response_grants`）：没有有效的授权单就不允许直发。
+    //
+    // 注意这是**两条并列路径**里的一条：另一条是审批（`issue_approval` 直接入队，
+    // 不经过本函数）。所以到这里的计划只有「靠授权单放行」这一条出路。
+    let mut plan = plan;
+    let now = chrono::Utc::now();
+    let grant = match state.store.get_response_grant(&agent_id).await {
+        Ok(grant) => grant,
+        Err(err) => {
+            return ApiError::internal(
+                codes::RESPONSE_GRANT_STORE_FAILED,
+                "failed to load response grant",
+                err,
             )
             .into_response();
+        }
+    };
+    let ops = response_grants::plan_opcodes(&plan);
+    match response_grants::evaluate_grant(grant.as_ref(), plan.constraints.risk_level, &ops, now) {
+        response_grants::GrantDecision::Allowed(grant) => {
+            if let Err(response) =
+                response_grants::authorize_under_grant(&state, &mut plan, grant, now)
+            {
+                return response;
+            }
+        }
+        response_grants::GrantDecision::Denied { code, detail } => {
+            return ApiError::forbidden(code, detail).into_response();
         }
     }
 
@@ -182,7 +227,7 @@ pub(crate) async fn ensure_plan_capable(
 ///
 /// 为什么要带上后者：`required_capabilities` 是计划作者的**声明**，它可以漏写；
 /// 真正会跑的却是 `steps[].op`。两边取并集，漏写的计划也拦得住。
-fn required_opcodes(plan: &ActionPlan) -> BTreeSet<String> {
+pub(crate) fn required_opcodes(plan: &ActionPlan) -> BTreeSet<String> {
     let mut required: BTreeSet<String> = plan
         .constraints
         .required_capabilities

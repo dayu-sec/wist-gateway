@@ -22,8 +22,8 @@ use crate::infra::{
     KnowledgeActivation, LocalPeers, SqliteStore, Store, StoredAgentCommand,
     StoredAgentInstallPackage, StoredAgentInstallPackageAddress, StoredAgentRevocation,
     StoredAgentUplinkAddress, StoredCredentialStatus, StoredEnrollmentTokenStatus,
-    StoredInvestigationGrant, StoredKnowledgePackage, VerifiedAgentIdentity, bytes_sha256_hex,
-    sha256_hex,
+    StoredInvestigationGrant, StoredKnowledgePackage, StoredResponseGrant, VerifiedAgentIdentity,
+    bytes_sha256_hex, sha256_hex,
 };
 use wist_api::action_result::{ReportActionResult, ResultAttestation};
 use wist_api::discovery_policies::{
@@ -19865,6 +19865,61 @@ async fn dispatch_plan(
     .await
 }
 
+// ── 响应授权单（时间窗授权）───────────────────────────────────────────────
+
+fn r0_grant_body() -> serde_json::Value {
+    serde_json::json!({ "max_risk": "R0", "duration_minutes": 60 })
+}
+
+fn r2_grant_body() -> serde_json::Value {
+    serde_json::json!({ "max_risk": "R2", "duration_minutes": 60 })
+}
+
+async fn put_response_grant(env: &TestEnv, agent_id: &str, body: serde_json::Value) -> Response {
+    put_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/agents/{agent_id}/response-grant"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &body,
+    )
+    .await
+}
+
+/// 无 body 的管理面请求（GET / DELETE）。
+async fn admin_request(env: &TestEnv, method: &str, uri: &str) -> Response {
+    router(env.config.clone(), Arc::clone(&env.store_handle))
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {TEST_ADMIN_API_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+}
+
+/// 造一张**已过期**的授权单（HTTP 接口只能签未来的，造不出过去）。
+async fn store_expired_grant(env: &TestEnv, agent_id: &str) {
+    env.store_handle
+        .upsert_response_grant(&StoredResponseGrant {
+            agent_id: agent_id.to_string(),
+            grant_id: "grn_test_expired".to_string(),
+            max_risk: "R0".to_string(),
+            opcodes: None,
+            not_before: "2020-01-01T00:00:00Z".to_string(),
+            not_after: "2020-01-02T00:00:00Z".to_string(),
+            reason: None,
+            granted_by: "admin:test".to_string(),
+            granted_at: "2020-01-01T00:00:00Z".to_string(),
+            revoked_at: None,
+        })
+        .await
+        .expect("store expired grant");
+}
+
 /// 下发计划：排一条 `kind = action_plan` 的命令，`params` 必须与计划 JSON 逐字一致
 /// （agentd 直接按 `ActionPlan` 解析它）。
 #[tokio::test]
@@ -19878,6 +19933,9 @@ async fn admin_plan_dispatches_an_action_plan_command_verbatim() {
         &["agent_exec_v1"],
     )
     .await;
+    // 直发必须有授权来源：先签一张覆盖 R0 的授权单（见 `api/response_grants.rs`）。
+    let response = put_response_grant(&env, "agent-node-a", r0_grant_body()).await;
+    assert_eq!(response.status(), StatusCode::OK);
     let plan = sample_action_plan("agent-node-a");
 
     let response = post_json_to_router(
@@ -20227,18 +20285,19 @@ async fn approvals_refuse_a_plan_that_does_not_need_approval() {
     assert_eq!(body["error"]["code"], "approval_not_required");
 }
 
-/// 单 admin token 下 R3 凑不出两个审批人：提交时就拒绝，而不是等到 issue 才说人数不够。
+/// R3 也是**一票就够**：单票制下 `required_approvers` 恒为 1（R3 不再要求两人）。
 #[tokio::test]
-async fn approvals_refuse_r3_under_a_single_admin_token() {
+async fn approvals_accept_r3_under_the_single_approval_policy() {
     let env = TestEnv::new().await;
     let _credential = enroll_agent_credential(&env).await;
     let mut plan = sample_action_plan("agent-node-a");
     plan.constraints.risk_level = wist_contracts::action_plan::RiskLevel::R3;
 
     let response = create_approval(&env, "agent-node-a", &plan).await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = decode_json_response(response).await;
-    assert_eq!(body["error"]["code"], "approval_policy_unsupported");
+    assert_eq!(body["required_approvers"], 1);
+    assert_eq!(body["status"], "pending");
 }
 
 /// 还没批就签发：409，且库里不会出现 `issued_plan_json`。
@@ -20306,9 +20365,11 @@ async fn issuing_without_a_signing_key_is_unavailable() {
     assert_eq!(body["error"]["code"], "plan_signing_unavailable");
 }
 
-/// 带 attestation 但内容被改过：网关在投递前就回 400（不必等 agentd 几秒后回一条失败 ack）。
+/// 已签发的计划**不能**从直发端点下发：网关没有信任锚（那是 agentd 的），无法判断证明真假。
+/// 如果这里照单全收，任何人自造一份 `attestation` 就能绕过授权
+/// （再加上 `[attestation] enforced = false` 的默认值，动作会真的执行）。
 #[tokio::test]
-async fn dispatching_a_tampered_attested_plan_is_refused_early() {
+async fn an_attested_plan_cannot_be_dispatched_directly() {
     let mut env = TestEnv::new().await;
     let credential = enroll_agent_credential(&env).await;
     report_exec_capabilities(
@@ -20353,7 +20414,295 @@ async fn dispatching_a_tampered_attested_plan_is_refused_early() {
     let response = dispatch_plan(&env, "agent-node-a", &issued).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: serde_json::Value = decode_json_response(response).await;
-    assert_eq!(body["error"]["code"], "plan_digest_mismatch");
+    assert_eq!(body["error"]["code"], "action_plan_invalid");
+}
+
+// ── 授权闸：没有有效授权单就不允许直发 ─────────────────────────────
+
+/// 没有任何授权来源：直发必被拒。
+///
+/// 这是本次改动最核心的一条：以前 R0/R1 是「免费直发」，token 在就能无限次下发。
+#[tokio::test]
+async fn dispatching_without_any_authorization_is_refused() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.preview"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let response = dispatch_plan(&env, "agent-node-a", &sample_action_plan("agent-node-a")).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "response_grant_missing");
+}
+
+/// 窗口内、风险对上：放行。
+#[tokio::test]
+async fn a_grant_lets_matching_plans_through() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.preview"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let response = put_response_grant(&env, "agent-node-a", r0_grant_body()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["grant"]["state"], "active");
+    assert_eq!(body["grant"]["max_risk"], "R0");
+    assert!(
+        body["grant"]["remaining_seconds"].as_i64().unwrap_or(0) > 0,
+        "an active grant must report remaining time"
+    );
+
+    let response = dispatch_plan(&env, "agent-node-a", &sample_action_plan("agent-node-a")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// 授权单是**上限**：R1 的单子放不过 R2 计划。
+#[tokio::test]
+async fn a_grant_caps_the_risk_level() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let response = put_response_grant(
+        &env,
+        "agent-node-a",
+        serde_json::json!({ "max_risk": "R1", "duration_minutes": 60 }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = dispatch_plan(&env, "agent-node-a", &sample_r2_plan("agent-node-a")).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "response_grant_insufficient");
+}
+
+/// opcode 白名单：范围外的 op 一律拒。
+#[tokio::test]
+async fn a_grant_can_narrow_to_opcodes() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let response = put_response_grant(
+        &env,
+        "agent-node-a",
+        serde_json::json!({
+            "max_risk": "R2",
+            "duration_minutes": 60,
+            "opcodes": ["process.list"]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = dispatch_plan(&env, "agent-node-a", &sample_r2_plan("agent-node-a")).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "response_grant_insufficient");
+}
+
+/// 撤销立即生效（软删，行还在，审计可查）。
+#[tokio::test]
+async fn a_revoked_grant_is_refused() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.preview"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let response = put_response_grant(&env, "agent-node-a", r0_grant_body()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = admin_request(
+        &env,
+        "DELETE",
+        "/api/v1/admin/agents/agent-node-a/response-grant",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["grant"]["state"], "revoked");
+    assert!(body["grant"]["revoked_at"].is_string());
+
+    let response = dispatch_plan(&env, "agent-node-a", &sample_action_plan("agent-node-a")).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "response_grant_revoked");
+}
+
+/// 过期的授权单不再生效（判定时比时间，不靠定时清理）。
+#[tokio::test]
+async fn an_expired_grant_is_refused() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.preview"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    store_expired_grant(&env, "agent-node-a").await;
+
+    let response = dispatch_plan(&env, "agent-node-a", &sample_action_plan("agent-node-a")).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "response_grant_expired");
+}
+
+/// 参数边界：期限两头、R3 不得被授权单覆盖、空白名单不是「全部允许」。
+#[tokio::test]
+async fn grant_parameters_are_bounded() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    for body in [
+        serde_json::json!({ "max_risk": "R0", "duration_minutes": 5 }),
+        serde_json::json!({ "max_risk": "R0", "duration_minutes": 20_000 }),
+        serde_json::json!({ "max_risk": "R3", "duration_minutes": 60 }),
+        serde_json::json!({ "max_risk": "R9", "duration_minutes": 60 }),
+        serde_json::json!({ "max_risk": "R0", "duration_minutes": 60, "opcodes": [] }),
+        serde_json::json!({ "max_risk": "R0", "duration_minutes": 60, "opcodes": ["  "] }),
+    ] {
+        let label = body.to_string();
+        let response = put_response_grant(&env, "agent-node-a", body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "must reject {label}"
+        );
+        let payload: serde_json::Value = decode_json_response(response).await;
+        assert_eq!(payload["error"]["code"], "response_grant_invalid");
+    }
+
+    // 省略 duration 仍然落一个有限窗口（默认 24h），不是「无限期」。
+    let response = put_response_grant(
+        &env,
+        "agent-node-a",
+        serde_json::json!({ "max_risk": "R0" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let remaining = body["grant"]["remaining_seconds"].as_i64().unwrap_or(0);
+    assert!(
+        (23 * 3600..=24 * 3600).contains(&remaining),
+        "default window must be about 24h, got {remaining}s"
+    );
+}
+
+/// R2 在授权单下放行时由网关**即时签发**证明：`approval_id` / `approval_ref` 都是 grant_id。
+#[tokio::test]
+async fn r2_under_a_grant_is_signed_with_the_grant_id() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+
+    let response = put_response_grant(&env, "agent-node-a", r2_grant_body()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let grant_id = body["grant"]["grant_id"]
+        .as_str()
+        .expect("grant id")
+        .to_string();
+    assert!(
+        grant_id.starts_with("grn_"),
+        "unexpected grant id {grant_id}"
+    );
+
+    let response = dispatch_plan(&env, "agent-node-a", &sample_r2_plan("agent-node-a")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let command_id = body["command_id"].as_str().expect("command id").to_string();
+
+    // 取回真正要下发的计划：必须是「带证明 + approval_ref 指向这张授权单」。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.41.0",
+            "command_acks": [],
+        }),
+    )
+    .await;
+    let ack: AgentStatusAck = decode_json_response(response).await;
+    let command = ack
+        .commands
+        .iter()
+        .find(|command| command.command_id == command_id)
+        .expect("dispatched command is delivered");
+    let delivered: wist_contracts::action_plan::ActionPlan =
+        serde_json::from_str(&command.params).expect("delivered plan parses");
+    let attestation = delivered
+        .attestation
+        .as_ref()
+        .expect("grant dispatch is signed");
+    assert_eq!(attestation.approval.approval_id, grant_id);
+    assert_eq!(
+        delivered.constraints.approval_ref.as_deref(),
+        Some(grant_id.as_str())
+    );
+    assert_eq!(
+        delivered.constraints.approval_mode,
+        wist_contracts::action_plan::ApprovalMode::Required
+    );
+    assert_eq!(attestation.approval.required_approvers, 1);
+}
+
+/// 没配签发私钥时，写动作不能靠授权单溜过去（不降级）。
+#[tokio::test]
+async fn r2_under_a_grant_without_a_signer_is_refused() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let response = put_response_grant(&env, "agent-node-a", r2_grant_body()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = dispatch_plan(&env, "agent-node-a", &sample_r2_plan("agent-node-a")).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "plan_signing_unavailable");
 }
 
 /// 投票人来自 token 指纹：同一个人重复投是**覆盖**，不会变成两票。

@@ -729,6 +729,31 @@ pub struct StoredInvestigationGrant {
     pub updated_by: String,
 }
 
+/// 执行计划的**响应授权单**（时间窗授权）：一台一条，重新签发即覆盖。
+///
+/// 它是与 `action_approval` **并列**的授权来源：审批是「批了这一份」，授权单是
+/// 「这段窗口里、这个风险上限以内都可以发」。两者都没有就不允许下发（见
+/// `migrations/sqlite/0045_response_grant.sql`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredResponseGrant {
+    pub agent_id: String,
+    /// 每张授权单实例的号（`grn_<agent>_<micros>_<rand4>`），进 `approval_ref` 与签名。
+    pub grant_id: String,
+    /// 风险上限（wire 名 `R0`..`R3`）。
+    pub max_risk: String,
+    /// 可选 opcode 白名单；`None` = 不按 op 收窄。
+    pub opcodes: Option<Vec<String>>,
+    pub not_before: String,
+    /// **必有**：不允许无限期授权。
+    pub not_after: String,
+    pub reason: Option<String>,
+    pub granted_by: String,
+    pub granted_at: String,
+    /// 非空 = 已撤销（软删，保留审计）。
+    pub revoked_at: Option<String>,
+}
+
 /// 一条探不了的路径 + 原始错误（`permission denied` 之类）。
 ///
 /// 原始错误必须带上来：预检要回答「该去改权限还是该换机器」，只有错误文本能区分。
@@ -1752,6 +1777,19 @@ pub trait Store: Send + Sync + fmt::Debug {
 
     /// 删掉某台机器的允许集 = **回到默认（全关）**（页面上的“恢复默认”）。
     async fn delete_investigation_grant(&self, agent_id: &str) -> StoreResult<()>;
+
+    /// 读取某台机器的响应授权单；`None` = 从未签发过。
+    ///
+    /// 撤销是软删（`revoked_at` 非空），所以调用方必须自己判：只有
+    /// `revoked_at.is_none()` 且时间在窗口内才算生效。
+    async fn get_response_grant(&self, agent_id: &str) -> StoreResult<Option<StoredResponseGrant>>;
+
+    /// 写入/覆盖某台机器的授权单（重新签发 = 覆盖并把 `revoked_at` 清空）。
+    async fn upsert_response_grant(&self, grant: &StoredResponseGrant) -> StoreResult<()>;
+
+    /// 撤销：打上 `revoked_at`，不删行（审计要能回答“谁什么时候撤的”）。
+    /// 返回是否真的改到了行。
+    async fn revoke_response_grant(&self, agent_id: &str, revoked_at: &str) -> StoreResult<bool>;
 
     /// 读这台机器全部日志源候选（**含**人工覆盖）。
     ///

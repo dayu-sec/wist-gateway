@@ -9,11 +9,12 @@
 //! 三条刻意的取舍：
 //!
 //! * **投票人来自鉴权身份**（`admin:<token 指纹>`），不接受客户端自填 —— 否则
-//!   「两个人批了」可以由一个人伪造。
+//!   「另一个人批了」可以由一个人伪造。
 //! * **签发的有效期不晚于计划本身**，且审批单自己有过期时刻。一份审批单不该永远有效。
-//! * **单 admin token 下 R3 显式不支持**：同一个指纹只能投一票，凑不出两个审批人。
-//!   与其让用户在 `issue` 时看到「人数不够」，不如在 `create` 时说清楚要等用户体系。
-//!   这是**本轮网关临时承载审批**的已知边界，center 接手后会随身份体系一起消失。
+//! * **单次审批**：R2 / R3 都是**一票就够**。多票机制（R3 要两名审批人）已去掉 ——
+//!   单 admin token 下所有票共享同一指纹，凑不出第二个身份，留着只会让 R3 变成
+//!   「永远批不了」。`required_approvers` 字段仍在（它进签名覆盖），将来 center 接手
+//!   身份体系后想恢复多票，改策略与两端下限即可，不用动契约。
 
 use axum::{
     Json,
@@ -57,13 +58,15 @@ fn new_approval_id(agent_id: &str, now: DateTime<Utc>) -> String {
 
 /// 风险等级要求的最少审批人数。
 ///
+/// **策略只有两档**：`0`（R0/R1 只读，免审）/ `1`（R2/R3 写，单次审批）。
+/// R3 保留为枚举值（契约里有、审计可辨），但**不再要求两名审批人**：多票机制已去掉。
+///
 /// 与 agentd 的 `plan_review::policy_min_approvers` **各写一份**，不是疏忽：
-/// 两端各自硬编码下限，一方被改不会让另一方自动放宽。想收紧就两边都改。
+/// 两端各自硬编码下限，一方被改不会让另一方自动放宽。想改策略就两边都改。
 fn required_approvers_for(risk: RiskLevel) -> u8 {
     match risk {
         RiskLevel::R0 | RiskLevel::R1 => 0,
-        RiskLevel::R2 => 1,
-        RiskLevel::R3 => 2,
+        RiskLevel::R2 | RiskLevel::R3 => 1,
     }
 }
 
@@ -317,15 +320,14 @@ pub async fn create_approval(
         )
         .into_response();
     }
+    // 单票制下这个分支不可达（见 `required_approvers_for`）。仍然保留：将来若有人
+    // 把 R3 改回 2 票，网关会明确拒绝而不是静默地「等第二个人永远等不到」。
     if required > 1 {
-        // 本轮网关只有单一 admin token，`admin_actor` 对所有请求给出同一个指纹，
-        // 因此凑不出第二个审批人。早失败比在 `issue` 时说「人数不够」更清楚。
         return ApiError::conflict(
             codes::APPROVAL_POLICY_UNSUPPORTED,
             format!(
                 "risk level {} requires {required} distinct approvers, but this gateway \
-                 has a single admin token (all votes share one identity); \
-                 multi-approver policy needs the center user directory",
+                 enforces single-approval policy",
                 risk_level_wire(risk)
             ),
         )
@@ -833,7 +835,7 @@ mod tests {
         assert_eq!(required_approvers_for(RiskLevel::R0), 0);
         assert_eq!(required_approvers_for(RiskLevel::R1), 0);
         assert_eq!(required_approvers_for(RiskLevel::R2), 1);
-        assert_eq!(required_approvers_for(RiskLevel::R3), 2);
+        assert_eq!(required_approvers_for(RiskLevel::R3), 1);
     }
 
     #[test]

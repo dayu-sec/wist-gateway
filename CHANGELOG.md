@@ -3,6 +3,51 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.53.0-alpha] - 2026-11-22
+
+### 新增（响应授权单：**时间窗授权**）
+
+授权从「只有单次审批」变成**两条并列的授权来源**：
+
+| 来源 | 粒度 | 用什么换 |
+|---|---|---|
+| `action_approval` | 一份计划（绑 `plan_digest`） | 一次审批 |
+| **`response_grant`（新）** | 一台机器 + 风险上限 + 时间窗 | 一次「批发」授权 |
+
+- 新表 `response_grant`（`migrations/sqlite/0045_response_grant.sql`），**启动时自动迁移**。
+- 新端点：`GET / PUT / DELETE /api/v1/admin/agents/{agent_id}/response-grant`
+  - `PUT` 请求只收 `max_risk` / `opcodes?` / `duration_minutes?` / `reason?`；
+    **期限由服务端算**（客户端不发绝对时刻），默认 24h、范围 15min～7d；
+  - 一期风险上限封在 **R2**（R3 必须一次一议）；
+  - `DELETE` 是**软删**（打 `revoked_at`），撤销后仍能读到 `state = revoked`。
+- 下发闸门（`POST /agents/{id}/plans`）：
+  - 有有效授权单且 `风险 ≤ 上限`（可选 opcode 白名单）→ 放行；
+  - 否则回 `403 response_grant_missing` / `_revoked` / `_expired` / `_not_yet_valid` / `_insufficient`。
+- **放行时由网关即时签发证明**：`approval_id` / `approval_ref` 都是 `grn_…`，
+  用同一把 `[plan_signing]` 私钥。**契约零改动** —— agentd 看到的仍是一份
+  「摘要对得上、签名验得过」的计划，本地终审逻辑一行不用改。
+- 审计可区分来源：`apv_…` = 人批的，`grn_…` = 窗口内授权的（审批页与命令队列都看得到）。
+
+### 变更（安全收紧，升级注意）
+
+- **直发端点不再接受客户端自带的 `attestation`**（回 `400 action_plan_invalid`）。
+  网关没有信任锚（那是 agentd 的），无法判断一份证明的真假；照单全收等于任何人
+  自造一个证明就能绕过授权。已签发的计划只由网关自己入队（审批流 / 授权单）。
+- **R0/R1 不再「免费直发」**：必须先给机器签发授权单，否则回 `403 response_grant_missing`。
+  升级后如果只读响应发不出去，先到「采集授权 → 响应授权」页给机器签一张。
+- **R2 靠授权单放行时需要 `[plan_signing]`**：没配私钥回 `503 plan_signing_unavailable`，
+  不做「跳过签名」的降级。
+
+### 变更（审批策略：多票 → **单次审批**）
+
+- `required_approvers_for`：R3 从 2 降到 **1**。`POST /agents/{id}/approvals` 不再因为
+  「R3 需要两名审批人」回 `409 approval_policy_unsupported` —— R3 现在和 R2 一样，
+  一人批一次即可签发。
+- `approval_policy_unsupported` 仍在词表里（对外契约，删除属破坏性变更），但**本版不再产生**。
+- **升级顺序**：被管机的 **agentd 必须 ≥ 0.41.0**。agentd 0.40.0 把 R3 下限硬编码成 2，
+  会拒绝本版签发的「1 人 R3」证明（`approval_insufficient`）。仍然是「读者先发」。
+- 契约不变：`ActionPlanApproval.required_approvers` 字段保留（在签名覆盖范围内）。
+
 ## [0.52.0-alpha] - 2026-11-22
 
 ### 新增（B 线：审批 → 签发 → 下发）

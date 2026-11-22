@@ -29,10 +29,13 @@ mod ingest;
 // 不在 jumo 静态模型 binding.mju 的声明里，重新生成控制面代码时需回补本模块与下方路由。
 mod action_approvals;
 mod action_plans;
+// NOTE(hand-added): 响应授权单（时间窗授权）。与 `action_approval` 并列的第二条授权来源：
+// 窗口内满足风险上限的动作可免逐次审批。见 api/response_grants.rs。
 mod install;
 mod investigations;
 /// 命令队列（只读）：agentd 待执行 / 执行中 / 已回执，含来源（中心下发 / 页面发起）。
 mod queue;
+mod response_grants;
 // NOTE(hand-added): 安装包的拉取/本地缓存（管理面设置来源地址后网关先拉到本地，
 // 之后统一从网关分发）。对应 jumo 模型 WistGatewayManagementInterface 的
 // AdminSetAgentInstallPackageAddress 与 AgentInstallPackageAddress；新路由未变，
@@ -558,6 +561,14 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/approvals/{approval_id}/issue",
             post(action_approvals::issue_approval),
+        )
+        // NOTE(hand-added): 响应授权单（时间窗授权）：签发 / 查 / 撤销。
+        // 一台机器同时只有一张生效单；重新 PUT = 覆盖并换新的 grant_id。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/response-grant",
+            get(response_grants::get_response_grant)
+                .put(response_grants::put_response_grant)
+                .delete(response_grants::delete_response_grant),
         )
         .route(
             "/api/v1/admin/agents/{agent_id}/work",
