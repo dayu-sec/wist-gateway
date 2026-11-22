@@ -29,6 +29,8 @@ mod ingest;
 // 不在 jumo 静态模型 binding.mju 的声明里，重新生成控制面代码时需回补本模块与下方路由。
 mod action_approvals;
 mod action_plans;
+// NOTE(hand-added): 执行结果的管理面读取（agentd 上报的 `ReportActionResult` 落库后从这里取）。
+mod action_results;
 // NOTE(hand-added): 响应授权单（时间窗授权）。与 `action_approval` 并列的第二条授权来源：
 // 窗口内满足风险上限的动作可免逐次审批。见 api/response_grants.rs。
 mod install;
@@ -540,6 +542,11 @@ pub fn router_with_state(state: ApiState) -> Router {
             "/api/v1/admin/agents/{agent_id}/plans",
             post(action_plans::dispatch_agent_plan),
         )
+        // NOTE(hand-added): 发起页用的目标画像（platform / arch 来自事实摘要）。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/plan-target",
+            get(action_plans::get_plan_target),
+        )
         // NOTE(hand-added): 执行计划的审批 → 签发（B 线）。投票人来自 token 指纹，
         // 签发后默认直接下发。见 api/action_approvals.rs。
         .route(
@@ -569,6 +576,11 @@ pub fn router_with_state(state: ApiState) -> Router {
             get(response_grants::get_response_grant)
                 .put(response_grants::put_response_grant)
                 .delete(response_grants::delete_response_grant),
+        )
+        // NOTE(hand-added): 执行结果读取（发起页的预览 / 执行结果都靠它）。
+        .route(
+            "/api/v1/admin/agents/{agent_id}/action-results/{action_id}",
+            get(action_results::get_action_result),
         )
         .route(
             "/api/v1/admin/agents/{agent_id}/work",

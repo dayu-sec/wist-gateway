@@ -754,6 +754,27 @@ pub struct StoredResponseGrant {
     pub revoked_at: Option<String>,
 }
 
+/// 执行结果（agentd 上报的 `ReportActionResult`）落库行。
+///
+/// **整份报文原样存**（`report_json`）：结果形状由 `wist-api` 契约演进，网关不镜像它的结构 ——
+/// 镜像一份就会在加字段时静默丢数据。读端直接把这串 JSON 给前端。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredActionResult {
+    pub agent_id: String,
+    pub action_id: String,
+    pub execution_id: String,
+    pub plan_digest: String,
+    /// `FinalStatus` 的 wire 值（`succeeded` / `failed` …）。
+    pub final_status: String,
+    /// 整份 `ReportActionResult` 的 JSON 原文。
+    pub report_json: String,
+    /// agentd 声称的上报时刻。
+    pub reported_at: String,
+    /// 网关收到的时刻（网关墙钟）。
+    pub received_at: String,
+}
+
 /// 一条探不了的路径 + 原始错误（`permission denied` 之类）。
 ///
 /// 原始错误必须带上来：预检要回答「该去改权限还是该换机器」，只有错误文本能区分。
@@ -1790,6 +1811,16 @@ pub trait Store: Send + Sync + fmt::Debug {
     /// 撤销：打上 `revoked_at`，不删行（审计要能回答“谁什么时候撤的”）。
     /// 返回是否真的改到了行。
     async fn revoke_response_grant(&self, agent_id: &str, revoked_at: &str) -> StoreResult<bool>;
+
+    /// 读一份执行结果；`None` = 还没收到（或这台机器没跑过这份计划）。
+    async fn get_action_result(
+        &self,
+        agent_id: &str,
+        action_id: &str,
+    ) -> StoreResult<Option<StoredActionResult>>;
+
+    /// 写入/覆盖一份执行结果（按 `(agent_id, action_id)` 幂等：重试不产生第二行）。
+    async fn upsert_action_result(&self, result: &StoredActionResult) -> StoreResult<()>;
 
     /// 读这台机器全部日志源候选（**含**人工覆盖）。
     ///

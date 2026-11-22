@@ -944,17 +944,66 @@ pub async fn report_action_result(
     )
     .await
     {
-        Ok(_) => (
-            StatusCode::ACCEPTED,
-            Json(ActionResultAck {
-                agent_id: input.agent_id,
-                report_id: input.report_id,
-                acknowledged_at: chrono::Utc::now().to_rfc3339(),
-            }),
-        )
-            .into_response(),
+        Ok(_) => {
+            // 结果要**落库**：命令队列只有 `outcome` 与一行 `detail`，看不到真正的产出。
+            // 清理类动作的价值全在产出里（预览扫出了哪些文件、共多少字节），不存的话人只能盲批。
+            if let Err(response) = store_action_result(&state, &input).await {
+                return response;
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(ActionResultAck {
+                    agent_id: input.agent_id,
+                    report_id: input.report_id,
+                    acknowledged_at: chrono::Utc::now().to_rfc3339(),
+                }),
+            )
+                .into_response()
+        }
         Err(response) => response,
     }
+}
+
+/// 把上报结果原样落库（按 `(agent_id, action_id)` 幂等）。
+///
+/// **不镜像报文结构**：`report_json` 存原文，形状的演进交给 `wist-api` 契约。
+/// 落库失败回 500：agentd 带 `report_attempt` 重试，结果不该静默丢掉。
+async fn store_action_result(state: &ApiState, input: &ReportActionResult) -> Result<(), Response> {
+    let report_json = serde_json::to_string(input).map_err(|err| {
+        ApiError::internal(
+            codes::ACTION_RESULT_STORE_FAILED,
+            "failed to encode action result",
+            err,
+        )
+        .into_response()
+    })?;
+    // `FinalStatus` 的 wire 值：用 serde 序列化的结果，不另写一份映射（两份映射一定会漂）。
+    let final_status = serde_json::to_value(input.final_status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    let stored = crate::infra::StoredActionResult {
+        agent_id: input.agent_id.clone(),
+        action_id: input.action_id.clone(),
+        execution_id: input.execution_id.clone(),
+        plan_digest: input.plan_digest.clone(),
+        final_status,
+        report_json,
+        reported_at: input.reported_at.clone(),
+        received_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state
+        .store
+        .upsert_action_result(&stored)
+        .await
+        .map_err(|err| {
+            ApiError::internal(
+                codes::ACTION_RESULT_STORE_FAILED,
+                "failed to store action result",
+                err,
+            )
+            .into_response()
+        })
 }
 
 /// 接收 agentd 上报的事实**摘要**（对应模型 `ReportAgentFactSummary` / `IngestAgentFactSummary`）。

@@ -5402,6 +5402,69 @@ async fn agent_routes_accept_a_client_certificate() {
     assert_eq!(report.status(), StatusCode::ACCEPTED);
 }
 
+/// 执行结果会被**落库**，并能从管理面读回 —— 发起页的预览与执行结果都靠这条读口。
+#[tokio::test]
+async fn action_results_are_stored_and_readable_from_the_admin_api() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let report = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/action-results",
+        Some(&credential),
+        &ReportActionResult::new(
+            "rep-act-launch-1".to_string(),
+            "act-launch-1".to_string(),
+            1,
+            FinalStatus::Succeeded,
+            "exec-launch-1".to_string(),
+            "sha256:plan".to_string(),
+            "agent-node-a".to_string(),
+            "node-a".to_string(),
+            ResultAttestation {
+                result_digest: "sha256:test".to_string(),
+                signature: "test-signature".to_string(),
+                issued_by: "agent-node-a".to_string(),
+                attested_at: DateTime::now().to_chrono().to_rfc3339(),
+            },
+            DateTime::now().to_chrono().to_rfc3339(),
+            ActionResult::new(
+                "act-launch-1".to_string(),
+                "exec-launch-1".to_string(),
+                FinalStatus::Succeeded,
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(report.status(), StatusCode::ACCEPTED);
+
+    let response = admin_request(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/action-results/act-launch-1",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["action_id"], "act-launch-1");
+    assert_eq!(body["execution_id"], "exec-launch-1");
+    assert_eq!(body["final_status"], "succeeded");
+    // 原始报文原样透出（网关不镜像结构）。
+    assert_eq!(body["report"]["action_id"], "act-launch-1");
+
+    // 还没上报过的 action → 404（不伪造空结果）。
+    let response = admin_request(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/action-results/act-never-ran",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_result_not_found");
+}
+
 #[tokio::test]
 async fn enrollment_route_rejects_invalid_token() {
     let env = TestEnv::new().await;
@@ -20418,6 +20481,36 @@ async fn an_attested_plan_cannot_be_dispatched_directly() {
 }
 
 // ── 授权闸：没有有效授权单就不允许直发 ─────────────────────────────
+
+/// 发起页要的 `target` 形状：`platform` / `arch` 只能来自 agent 上报的事实。
+///
+/// 没报过就**明确拒绝**，不编默认值 —— 瞎写 linux/x86_64 会把错误的系统信息
+/// 写进一份会被签名的计划里。
+#[tokio::test]
+async fn plan_target_comes_from_reported_facts_and_is_refused_without_them() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    let response =
+        admin_request(&env, "GET", "/api/v1/admin/agents/agent-node-a/plan-target").await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_target_unknown");
+
+    env.store_handle
+        .upsert_agent_fact_summary(&facts_with_evidence("agent-node-a", &[], &[]))
+        .await
+        .expect("store facts");
+
+    let response =
+        admin_request(&env, "GET", "/api/v1/admin/agents/agent-node-a/plan-target").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["agent_id"], "agent-node-a");
+    assert_eq!(body["node_id"], "node-a");
+    assert_eq!(body["platform"], "linux");
+    assert_eq!(body["arch"], "x86_64");
+}
 
 /// 没有任何授权来源：直发必被拒。
 ///

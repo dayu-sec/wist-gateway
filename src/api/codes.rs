@@ -22,9 +22,12 @@ macro_rules! codes {
 
 codes! {
     ACTION_PLAN_CAPABILITY_MISSING => "action_plan_capability_missing",
+    ACTION_RESULT_NOT_FOUND => "action_result_not_found",
+    ACTION_RESULT_STORE_FAILED => "action_result_store_failed",
     ACTION_PLAN_CAPABILITY_UNKNOWN => "action_plan_capability_unknown",
     ACTION_PLAN_INVALID => "action_plan_invalid",
     ACTION_PLAN_TARGET_MISMATCH => "action_plan_target_mismatch",
+    ACTION_PLAN_TARGET_UNKNOWN => "action_plan_target_unknown",
     APPROVAL_ALREADY_ISSUED => "approval_already_issued",
     APPROVAL_CLOSED => "approval_closed",
     APPROVAL_EXPIRED => "approval_expired",

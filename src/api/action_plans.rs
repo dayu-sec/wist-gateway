@@ -29,6 +29,7 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
+use serde::Serialize;
 use wist_api::status::command_kind;
 use wist_contracts::action_plan::{ActionPlan, STEP_KIND_INVOKE};
 use wist_contracts::capability_report::ExecCapabilities;
@@ -244,6 +245,90 @@ pub(crate) fn required_opcodes(plan: &ActionPlan) -> BTreeSet<String> {
         }
     }
     required
+}
+
+/// 发起页用的**目标画像**：把注册表 + 事实摘要拼成一份 `ActionPlan.target` 的形状。
+///
+/// 为什么单独给一个读口：前端列表视图里没有 `platform` / `arch`，而计划契约要求它们
+/// 非空（`missing_target_platform` / `missing_target_arch`）。让前端瞎猜（写死 linux/x86_64）
+/// 会把错误的系统信息写进一份**会被签名**的计划里，后面对账时没法分辨谁写错的。
+///
+/// 来源：`os` / `arch` 来自 agent 上报的事实摘要（`std::env::consts::OS/ARCH`，与 opcode
+/// 的平台词表同源）；没报过就明确拒绝，而不是编一个默认值。
+#[derive(Debug, Serialize)]
+struct PlanTargetView {
+    agent_id: String,
+    instance_id: Option<String>,
+    node_id: String,
+    host_name: Option<String>,
+    platform: String,
+    arch: String,
+}
+
+/// `GET /api/v1/admin/agents/{agent_id}/plan-target`
+pub async fn get_plan_target(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let agent = match state.store.get_agent(&agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
+            return ApiError::not_found(
+                codes::AGENT_NOT_FOUND,
+                format!("unknown agent {agent_id}"),
+            )
+            .into_response();
+        }
+        Err(err) => {
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent store",
+                err,
+            )
+            .into_response();
+        }
+    };
+    let facts = match state.store.get_agent_fact_summary(&agent_id).await {
+        Ok(facts) => facts,
+        Err(err) => {
+            return ApiError::internal(
+                codes::AGENT_STORE_UNAVAILABLE,
+                "failed to load agent facts",
+                err,
+            )
+            .into_response();
+        }
+    };
+    let (platform, arch) = match facts.as_ref() {
+        Some(facts) if !facts.os.trim().is_empty() && !facts.arch.trim().is_empty() => {
+            (facts.os.clone(), facts.arch.clone())
+        }
+        // 没报过事实（或报了空值）：不编默认值。发起页据此提示"先刷新事实"。
+        _ => {
+            return ApiError::conflict(
+                codes::ACTION_PLAN_TARGET_UNKNOWN,
+                format!(
+                    "agent {agent_id} has not reported os/arch yet; refresh facts first                      (the plan target needs a real platform and arch)"
+                ),
+            )
+            .into_response();
+        }
+    };
+    Json(PlanTargetView {
+        agent_id: agent.agent_id,
+        instance_id: Some(agent.instance_id).filter(|value| !value.trim().is_empty()),
+        node_id: agent.node_id,
+        host_name: Some(agent.hostname).filter(|value| !value.trim().is_empty()),
+        platform,
+        arch,
+    })
+    .into_response()
 }
 
 /// 这台 agent 自报的执行能力；`None` = 还没报过（E2 之前的 agentd）。

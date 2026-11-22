@@ -3,6 +3,28 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.54.0-alpha] - 2026-11-22
+
+### 新增（发起响应：执行结果落库 + 目标画像）
+
+两项都是为了让「发起响应」能在页面上真正走通：
+
+- **执行结果落库**：`POST /api/v1/agent/action-results` 过去**只回 ack、结果直接丢弃**
+  （命令队列只有 `outcome` 与一行 `detail`）。现在把整份 `ReportActionResult` 写进新表
+  `action_result`（migration `0046_action_result.sql`，启动自动迁移），
+  **按 `(agent_id, action_id)` 幂等**（重试不产生第二行），报文**原样存**（`report_json`），
+  网关不镜像它的结构 —— 镜像一份就会在契约加字段时静默丢数据。
+- **读回结果**：`GET /api/v1/admin/agents/{agent_id}/action-results/{action_id}`
+  - 200：元信息 + `report`（整份报文，JSON 对象）；
+  - 404 `action_result_not_found`：还没收到（发起页据此继续轮询）。
+- **目标画像**：`GET /api/v1/admin/agents/{agent_id}/plan-target`
+  - 返回一份 `ActionPlan.target` 的形状（`agent_id` / `instance_id` / `node_id` / `host_name`
+    / `platform` / `arch`）。
+  - `platform` / `arch` **只来自 agent 上报的事实摘要**（`std::env::consts::OS/ARCH`，
+    与 opcode 的平台词表同源）；没报过就回 `409 action_plan_target_unknown`，
+    **不编默认值** —— 一份会被签名的计划里写错系统信息，事后没法分辨是谁写错的。
+- 落库失败回 500（agentd 带 `report_attempt` 重试），结果不该静默丢掉。
+
 ## [0.53.0-alpha] - 2026-11-22
 
 ### 新增（响应授权单：**时间窗授权**）

@@ -3188,6 +3188,58 @@ impl Store for SqliteStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn get_action_result(
+        &self,
+        agent_id: &str,
+        action_id: &str,
+    ) -> StoreResult<Option<StoredActionResult>> {
+        let row = sqlx::query(
+            "SELECT agent_id, action_id, execution_id, plan_digest, final_status, \
+             report_json, reported_at, received_at FROM action_result \
+             WHERE agent_id = ?1 AND action_id = ?2",
+        )
+        .bind(agent_id)
+        .bind(action_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "load action result"))?;
+        let Some(row) = row else { return Ok(None) };
+        Ok(Some(StoredActionResult {
+            agent_id: column!(row, "agent_id"),
+            action_id: column!(row, "action_id"),
+            execution_id: column!(row, "execution_id"),
+            plan_digest: column!(row, "plan_digest"),
+            final_status: column!(row, "final_status"),
+            report_json: column!(row, "report_json"),
+            reported_at: column!(row, "reported_at"),
+            received_at: column!(row, "received_at"),
+        }))
+    }
+
+    async fn upsert_action_result(&self, result: &StoredActionResult) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO action_result (agent_id, action_id, execution_id, plan_digest, \
+             final_status, report_json, reported_at, received_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT (agent_id, action_id) DO UPDATE SET \
+             execution_id = excluded.execution_id, plan_digest = excluded.plan_digest, \
+             final_status = excluded.final_status, report_json = excluded.report_json, \
+             reported_at = excluded.reported_at, received_at = excluded.received_at",
+        )
+        .bind(&result.agent_id)
+        .bind(&result.action_id)
+        .bind(&result.execution_id)
+        .bind(&result.plan_digest)
+        .bind(&result.final_status)
+        .bind(&result.report_json)
+        .bind(&result.reported_at)
+        .bind(&result.received_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert action result"))?;
+        Ok(())
+    }
+
     async fn list_agent_log_sources(&self, agent_id: &str) -> StoreResult<Vec<StoredLogSource>> {
         // 稳定排序交给 SQL：覆盖在前（人显式指定），其余按**证据档的信任顺序**、再按置信度。
         // 为什么不能直接 `ORDER BY evidence`：那是字母序（`config_file` 会排在
