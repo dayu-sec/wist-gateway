@@ -6,10 +6,11 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 use wist_approve::render_summary;
 use wist_approve::{ApproverKey, GatewayClient, SigningPayload};
 use wist_contracts::action_plan::{
@@ -28,14 +29,21 @@ use wist_contracts::action_plan::{
 )]
 struct Cli {
     /// 网关地址，例如 `https://127.0.0.1`。
+    ///
+    /// 不传时依次回落：`WIST_GATEWAY` 环境变量 → `~/.wist/config.toml` 的 `gateway`
+    /// （安装脚本会把“这个 CLI 是从哪台网关装的”写进去，所以装完基本不需要再给）。
     #[arg(long, global = true, env = "WIST_GATEWAY")]
     gateway: Option<String>,
     /// approver token 文件（默认 `~/.wist/approver.token`）。
     #[arg(long, global = true)]
     token_file: Option<PathBuf>,
     /// 私有 CA 证书（PEM）。网关用自签证书时必须给。
+    /// 不传时用 `~/.wist/config.toml` 里的 `ca_file`（安装脚本已写好）。
     #[arg(long, global = true)]
     ca_file: Option<PathBuf>,
+    /// 配置文件（默认 `~/.wist/config.toml`；不存在就当没配置）。
+    #[arg(long, global = true, env = "WIST_CONFIG")]
+    config: Option<PathBuf>,
     /// **不要**在生产用：跳过 TLS 校验（仅本机联调）。
     #[arg(long, global = true)]
     insecure: bool,
@@ -461,11 +469,70 @@ fn confirm(prompt: &str) -> Result<bool, String> {
     Ok(matches!(line.trim(), "yes" | "y" | "Y"))
 }
 
+/// `~/.wist/config.toml`：**由网关的 `install.sh` 写入**。
+///
+/// 写它的理由：`install.sh` 本来就知道「这个 CLI 是从哪台网关装的」（它自己就是从那里下的），
+/// 让用户装完再手敲 `--gateway https://... --ca-file ...` 是把已知信息再问一遍。
+/// 里面**只有公开信息**（地址 + CA 路径）；token 是凭据，仍由管理员单独下发。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliConfig {
+    gateway: Option<String>,
+    ca_file: Option<PathBuf>,
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// 默认配置路径。没有 `HOME`（极少见）就当没配置。
+fn default_config_path() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".wist/config.toml"))
+}
+
+/// 读配置。区分两种情形：
+/// * **显式给 `--config`**：文件必须存在且能解析（说错了就要报错，不能静默忽略）；
+/// * **用默认位置**：不存在是正常状态（没跑过安装脚本），返回空配置。
+fn load_config(explicit: Option<&Path>) -> Result<CliConfig, String> {
+    let path = match explicit {
+        Some(path) => path.to_path_buf(),
+        None => match default_config_path() {
+            Some(path) => path,
+            None => return Ok(CliConfig::default()),
+        },
+    };
+    if !path.exists() {
+        if explicit.is_some() {
+            return Err(format!("config file not found: {}", path.display()));
+        }
+        return Ok(CliConfig::default());
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read config {}: {err}", path.display()))?;
+    toml::from_str(&text).map_err(|err| format!("failed to parse config {}: {err}", path.display()))
+}
+
+/// 连接参数：**命令行 > 环境变量（clap 已合进 flag）> 配置文件**。
+fn resolve_connection(
+    flag_gateway: Option<String>,
+    flag_ca: Option<PathBuf>,
+    config: CliConfig,
+) -> Result<(String, Option<PathBuf>), String> {
+    let gateway = flag_gateway
+        .or(config.gateway)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "--gateway <url> is required (or WIST_GATEWAY, or `gateway` in ~/.wist/config.toml \
+             — the install script writes it for you)"
+                .to_string()
+        })?;
+    Ok((gateway, flag_ca.or(config.ca_file)))
+}
+
 fn build_client(cli: &Cli) -> Result<GatewayClient, String> {
-    let gateway = cli
-        .gateway
-        .clone()
-        .ok_or_else(|| "--gateway <url> (or WIST_GATEWAY) is required".to_string())?;
+    let config = load_config(cli.config.as_deref())?;
+    let (gateway, ca_file) = resolve_connection(cli.gateway.clone(), cli.ca_file.clone(), config)?;
     let token_path = cli
         .token_file
         .clone()
@@ -478,7 +545,7 @@ fn build_client(cli: &Cli) -> Result<GatewayClient, String> {
     if token.is_empty() {
         return Err(format!("token file {} is empty", token_path.display()));
     }
-    GatewayClient::new(&gateway, &token, cli.ca_file.as_deref(), cli.insecure)
+    GatewayClient::new(&gateway, &token, ca_file.as_deref(), cli.insecure)
         .map_err(|err| err.to_string())
 }
 
@@ -496,6 +563,91 @@ fn with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
 mod tests {
     use super::*;
     use wist_approve::SigningPayload;
+
+    /// 写一临时配置文件，返回路径（目录不存在就建）。名字用自增序号，不靠时间戳（会撞）。
+    fn temp_config(text: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("wist-approve-cfg-{}-{seq}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.toml");
+        fs::write(&path, text).expect("write config");
+        path
+    }
+
+    /// 安装脚本写的那份配置必须能被解析（两边字段名漂了 → 装完就是「要 --gateway」）。
+    #[test]
+    fn parses_the_config_the_install_script_writes() {
+        let path = temp_config(
+            "# 由网关安装脚本生成\ngateway = \"https://c-dev01.test.gw.jingang.cloud\"\nca_file = \"/home/a/.wist/gateway-ca.crt.pem\"\n",
+        );
+        let config = load_config(Some(&path)).expect("parse");
+        assert_eq!(
+            config.gateway.as_deref(),
+            Some("https://c-dev01.test.gw.jingang.cloud")
+        );
+        assert_eq!(
+            config.ca_file.as_deref(),
+            Some(Path::new("/home/a/.wist/gateway-ca.crt.pem"))
+        );
+        let _ = fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn config_supplies_the_gateway_when_no_flag_is_given() {
+        let config = CliConfig {
+            gateway: Some("https://gw.example".to_string()),
+            ca_file: Some(PathBuf::from("/tmp/ca.pem")),
+        };
+        let (gateway, ca) = resolve_connection(None, None, config).expect("resolve");
+        assert_eq!(gateway, "https://gw.example");
+        assert_eq!(ca.as_deref(), Some(Path::new("/tmp/ca.pem")));
+    }
+
+    #[test]
+    fn flags_win_over_the_config() {
+        let config = CliConfig {
+            gateway: Some("https://from-config".to_string()),
+            ca_file: Some(PathBuf::from("/tmp/config-ca.pem")),
+        };
+        let (gateway, ca) = resolve_connection(
+            Some("https://from-flag".to_string()),
+            Some(PathBuf::from("/tmp/flag-ca.pem")),
+            config,
+        )
+        .expect("resolve");
+        assert_eq!(gateway, "https://from-flag");
+        assert_eq!(ca.as_deref(), Some(Path::new("/tmp/flag-ca.pem")));
+    }
+
+    /// 什么都没给时，错误必须把「配置在哪」说出来 —— 否则用户不知道有这条路。
+    #[test]
+    fn missing_gateway_points_at_the_config_file() {
+        let err = resolve_connection(None, None, CliConfig::default()).expect_err("must fail");
+        assert!(err.contains("--gateway"), "{err}");
+        assert!(err.contains("config.toml"), "{err}");
+    }
+
+    /// 显式 `--config` 指错了就要报错，不能静默当没配（否则 “我明明写了配置” 无解释失败）。
+    #[test]
+    fn an_explicit_config_must_exist() {
+        let missing = std::env::temp_dir().join("wist-approve-cfg-does-not-exist.toml");
+        let _ = fs::remove_file(&missing);
+        let err = load_config(Some(&missing)).expect_err("must fail");
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    /// 未知键直接拒：写错一个字母（如 `gatewaay`）不应该静默失效。
+    #[test]
+    fn unknown_config_keys_are_rejected() {
+        let path = temp_config("gatewaay = \"https://gw\"\n");
+        let err = load_config(Some(&path)).expect_err("must fail");
+        assert!(err.contains("failed to parse"), "{err}");
+        let _ = fs::remove_dir_all(path.parent().expect("parent"));
+    }
 
     fn plan_json(expires_at: &str) -> serde_json::Value {
         serde_json::json!({

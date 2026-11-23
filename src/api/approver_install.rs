@@ -340,5 +340,18 @@ mod tests {
             !rendered.contains("$PREFIX"),
             "旧的 $PREFIX 变量必须清干净（残留会让路径与提示文案不一致）"
         );
+        // 安装即带来源：脚本写得进 gateway + ca_file，装完不靠用户手敲参数。
+        assert!(
+            rendered.contains("gateway = \"https://gw\""),
+            "install.sh 必须把网关地址写进 config.toml"
+        );
+        assert!(
+            rendered.contains("ca_file = "),
+            "install.sh 必须把 CA 路径写进 config.toml"
+        );
+        assert!(
+            rendered.contains("approver.token"),
+            "要告诉用户 token 放哪里（凭据不随包）"
+        );
     }
 }

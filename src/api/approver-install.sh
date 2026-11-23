@@ -80,6 +80,21 @@ cat > "$CONF_DIR/gateway-ca.crt.pem" <<'CA_EOF'
 CA_EOF
 chmod 0644 "$CONF_DIR/gateway-ca.crt.pem"
 
+# **安装即带来源**：把「这个 CLI 是从哪台网关装的」写进配置 —— 安装脚本本来就知道这两件事。
+# 不写的话，用户装完还要手敲 `--gateway https://… --ca-file …`，等于把已知信息再问一遍。
+# 里面**只有公开信息**（地址 + CA 路径）；token 是凭据，仍由管理员单独下发。
+cat > "$CONF_DIR/config.toml" <<CFG_EOF
+# 由网关安装脚本生成；wist-approve 的默认连接参数（命令行参数 / 环境变量优先）。
+gateway = "{{BASE_URL}}"
+ca_file = "$CONF_DIR/gateway-ca.crt.pem"
+CFG_EOF
+chmod 0644 "$CONF_DIR/config.toml"
+
+# CLI 默认只读 `~/.wist/config.toml`；自定义了 CONF_DIR 就要告诉它。
+if [ "$CONF_DIR" != "$HOME/.wist" ]; then
+  note "注意：配置写在 $CONF_DIR/config.toml；CLI 默认只看 ~/.wist/config.toml —— 请用 --config 或 WIST_CONFIG 指过去。"
+fi
+
 # 旧版装到 `$HOME/.wist/bin`；留着这份陈旧副本只会让 `which` 指到旧二进制。
 STALE="$HOME/.wist/bin/wist-approve"
 if [ "$STALE" != "$BIN_DIR/wist-approve" ] && [ -f "$STALE" ]; then
@@ -89,8 +104,9 @@ fi
 echo
 echo "已安装：$BIN_DIR/wist-approve"
 echo "网关 CA：$CONF_DIR/gateway-ca.crt.pem"
+echo "连接配置：$CONF_DIR/config.toml（gateway = {{BASE_URL}}）"
 echo
-echo "下一步（三步都在审批人自己的机器上）："
+echo "下一步（前三步都在审批人自己的机器上）："
 case ":${PATH}:" in
   *":${BIN_DIR}:"*) note "1) $BIN_DIR 已在 PATH 上，直接敲 wist-approve 即可" ;;
   *) note "1) 把 $BIN_DIR 加进 PATH：export PATH=\"$BIN_DIR:\$PATH\"" ;;
@@ -98,8 +114,8 @@ esac
 note "2) 生成审批钥匙（私钥只留在这台机器）：wist-approve key generate --out $CONF_DIR/approver.key"
 note "3) 打印 key_id 与指纹，交给管理员登记到网关：wist-approve key show --key $CONF_DIR/approver.key"
 echo
-echo "调用示例："
-note "wist-approve --gateway {{BASE_URL}} --ca-file $CONF_DIR/gateway-ca.crt.pem \\"
-note "             --token-file <approver token 文件> list"
+echo "token 是凭据（**不**在本安装包里）：管理员单独签发后放到 $CONF_DIR/approver.token，"
+echo "之后直接跑，不需要任何参数："
+note "wist-approve list"
 echo
 echo "注意：这份安装包是公开的，**不含任何凭据**。审批用的 token 必须由管理员单独签发。"

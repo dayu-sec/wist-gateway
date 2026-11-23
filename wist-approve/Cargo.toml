@@ -19,6 +19,8 @@ path = "src/lib.rs"
 wist-contracts = { version = "0.14" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `~/.wist/config.toml`（install.sh 生成）的解析：只用来读两三个键，不手写解析器。
+toml = "1"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
 ring = "0.17"

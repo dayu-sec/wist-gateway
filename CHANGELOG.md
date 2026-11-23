@@ -5,18 +5,30 @@
 
 ## [0.57.2-alpha] - 2026-11-23
 
-### 修复（审批终端装完不在 PATH 上）
+### 修复（审批终端装完不在 PATH 上、且还得手敲参数）
 
-**症状**：安装脚本把 `wist-approve` 装到 `$HOME/.wist/bin`，而绝大多数机器的 PATH 里是
+**症状一**：安装脚本把 `wist-approve` 装到 `$HOME/.wist/bin`，而绝大多数机器的 PATH 里是
 `$HOME/bin` —— 装完敲 `wist-approve` 直接 `command not found`，用户以为没装上。
+
+**症状二**：装上了也跑不起来，还要自己凑参数：
+`wist-approve list` → `--gateway <url> (or WIST_GATEWAY) is required`。
+而这些信息安装脚本**本来就知道**（它就是从那台网关下载的）。
 
 - 二进制默认装到 **`$HOME/bin`**（与 `gx` 的 `_pub_local` 同一约定）；`WIST_BIN_DIR` 可直指目录，
   `WIST_PREFIX=/usr/local` 保留为旧用法。
+- **安装即带来源**：install.sh 把 `gateway` 与 `ca_file` 写进 `~/.wist/config.toml`，
+  CLI 新增 `--config`（默认就是这个文件）并默认读取 —— 装完直接 `wist-approve list`，
+  **不需要任何参数**；命令行参数 / 环境变量（`WIST_GATEWAY` / `WIST_CONFIG`）优先于配置。
+  配置里**只有公开信息**；token 是凭据，仍由管理员单独下发到 `~/.wist/approver.token`。
+- 配置写错要报错：显式 `--config` 指向不存在的文件、或文件里有未知键（如 `gatewaay`），
+  都直接失败，不静默降级成「要 --gateway」。
 - 网关 CA / 私钥 / token 仍在 `$HOME/.wist`（`WIST_CONF_DIR` 可改）—— CLI 的默认 token 路径不变，
   已有安装不会因为这次改动而找不到 CA。
-- 安装提示分情况：目录已在 PATH 就直说，不在才给 `export PATH=...`。
-- 检测到旧位置的副本（`$HOME/.wist/bin/wist-approve`）时明确提示可删 —— 否则 `which` 可能指到旧二进制。
-- 测试：渲染后的脚本断言默认目录是 `$HOME/bin`、CA 目录是 `$HOME/.wist`、`$PREFIX` 无残留。
+- 安装提示分情况：目录已在 PATH 就直说，不在才给 `export PATH=...`；
+  检测到旧位置的副本（`$HOME/.wist/bin/wist-approve`）时提示可删 —— 否则 `which` 可能指到旧二进制。
+- 测试：渲染后的脚本断言默认目录 / CA 目录 / 写入的 `gateway`、`ca_file`、token 路径；
+  CLI 侧 6 条：配置能解析、配置供 gateway、flag 覆盖配置、什么都没给的报错指向配置文件、
+  显式配置必须存在、未知键拒绝。
 
 ## [0.57.1-alpha] - 2026-11-23
 
