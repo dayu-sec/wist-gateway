@@ -3,6 +3,21 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.57.2-alpha] - 2026-11-23
+
+### 修复（审批终端装完不在 PATH 上）
+
+**症状**：安装脚本把 `wist-approve` 装到 `$HOME/.wist/bin`，而绝大多数机器的 PATH 里是
+`$HOME/bin` —— 装完敲 `wist-approve` 直接 `command not found`，用户以为没装上。
+
+- 二进制默认装到 **`$HOME/bin`**（与 `gx` 的 `_pub_local` 同一约定）；`WIST_BIN_DIR` 可直指目录，
+  `WIST_PREFIX=/usr/local` 保留为旧用法。
+- 网关 CA / 私钥 / token 仍在 `$HOME/.wist`（`WIST_CONF_DIR` 可改）—— CLI 的默认 token 路径不变，
+  已有安装不会因为这次改动而找不到 CA。
+- 安装提示分情况：目录已在 PATH 就直说，不在才给 `export PATH=...`。
+- 检测到旧位置的副本（`$HOME/.wist/bin/wist-approve`）时明确提示可删 —— 否则 `which` 可能指到旧二进制。
+- 测试：渲染后的脚本断言默认目录是 `$HOME/bin`、CA 目录是 `$HOME/.wist`、`$PREFIX` 无残留。
+
 ## [0.57.1-alpha] - 2026-11-23
 
 ### 修复（审批终端装不上：制品内置进镜像，现场不再需要手工投放）

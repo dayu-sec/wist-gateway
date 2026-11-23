@@ -326,5 +326,19 @@ mod tests {
             rendered.contains("gateway-ca.crt.pem"),
             "must drop the gateway CA for --ca-file"
         );
+        // 二进制装 `$HOME/bin`（`~/bin` 通常已在 PATH 上）；`$HOME/.wist` 只放 CA / token / 私钥。
+        // 早先默认装 `$HOME/.wist/bin`，装完直接 `wist-approve` 就是 command not found。
+        assert!(
+            rendered.contains("BIN_DIR=\"$HOME/bin\""),
+            "默认安装目录必须是 $HOME/bin"
+        );
+        assert!(
+            rendered.contains("CONF_DIR=\"${WIST_CONF_DIR:-$HOME/.wist}\""),
+            "CA / 私钥目录必须是 $HOME/.wist"
+        );
+        assert!(
+            !rendered.contains("$PREFIX"),
+            "旧的 $PREFIX 变量必须清干净（残留会让路径与提示文案不一致）"
+        );
     }
 }

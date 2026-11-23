@@ -336,7 +336,7 @@ pending ──approve/reject──▶ approved ──（待签）──▶ issue
 ### 7.5 CLI 怎么到审批人手里：**网关分发（主推）**
 
 ```
-客户机器 ──curl -k──▶ 网关 /api/v1/approver/install/<triple>/install.sh | sh ──▶ $HOME/.wist/bin
+客户机器 ──curl -k──▶ 网关 /api/v1/approver/install/<triple>/install.sh | sh ──▶ $HOME/bin
                        └── /api/v1/approver/packages/<triple>（二进制本体）
 ```
 
