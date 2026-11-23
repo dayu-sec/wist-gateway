@@ -42,6 +42,62 @@ struct ActionResultView {
     report: Value,
 }
 
+#[derive(Debug, Serialize)]
+struct ActionResultListView {
+    agent_id: String,
+    /// 时间倒序（最新在前）。
+    results: Vec<ActionResultView>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ActionResultListQuery {
+    limit: Option<usize>,
+}
+
+/// 列表上限：每条 `report` 都是几 KB 的完整报文，别一次拉几百条。
+const MAX_RESULT_LIST_LIMIT: usize = 50;
+const DEFAULT_RESULT_LIST_LIMIT: usize = 10;
+
+/// `GET /api/v1/admin/agents/{agent_id}/action-results?limit=N`
+///
+/// 为什么要有列表：结果只在**发起页当次会话**里可见的话，刷新一次就再也找不回来 ——
+/// 而结果恰恰是复核与审计要反复看的东西。
+pub async fn list_action_results(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ActionResultListQuery>,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = agent_not_found_response(&state, &agent_id).await {
+        return response;
+    }
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_RESULT_LIST_LIMIT)
+        .clamp(1, MAX_RESULT_LIST_LIMIT);
+    let stored = match state.store.list_action_results(&agent_id, limit).await {
+        Ok(results) => results,
+        Err(err) => {
+            return ApiError::internal(
+                codes::ACTION_RESULT_STORE_FAILED,
+                "failed to list action results",
+                err,
+            )
+            .into_response();
+        }
+    };
+    Json(ActionResultListView {
+        agent_id,
+        results: stored.iter().map(action_result_view).collect(),
+    })
+    .into_response()
+}
+
 /// `GET /api/v1/admin/agents/{agent_id}/action-results/{action_id}`
 pub async fn get_action_result(
     State(state): State<ApiState>,
@@ -74,16 +130,19 @@ pub async fn get_action_result(
         )
         .into_response();
     };
-    let report: Value = serde_json::from_str(&stored.report_json).unwrap_or(Value::Null);
-    Json(ActionResultView {
-        agent_id: stored.agent_id,
-        action_id: stored.action_id,
-        execution_id: stored.execution_id,
-        plan_digest: stored.plan_digest,
-        final_status: stored.final_status,
-        reported_at: stored.reported_at,
-        received_at: stored.received_at,
-        report,
-    })
-    .into_response()
+    Json(action_result_view(&stored)).into_response()
+}
+
+fn action_result_view(stored: &crate::infra::StoredActionResult) -> ActionResultView {
+    ActionResultView {
+        agent_id: stored.agent_id.clone(),
+        action_id: stored.action_id.clone(),
+        execution_id: stored.execution_id.clone(),
+        plan_digest: stored.plan_digest.clone(),
+        final_status: stored.final_status.clone(),
+        reported_at: stored.reported_at.clone(),
+        received_at: stored.received_at.clone(),
+        // 报文坏掉时给 `null` 而不是整条失败：元信息（状态 / 时间）仍然有审计价值。
+        report: serde_json::from_str(&stored.report_json).unwrap_or(Value::Null),
+    }
 }

@@ -3,6 +3,24 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.56.0-alpha] - 2026-11-23
+
+### 新增（执行结果列表：刷新页面后还能找回历史）
+
+**症状**：响应命令执行成功了，网关也收到了结果、`action_result` 表里也有数据，
+但用户刷新页面后**再也没有入口**看到这条结果 —— 发起页的预览只活在当次会话里，
+`actionId` 一刷新就丢。用户体感是「执行了但没有任何反馈」。
+
+- 新增 `GET /api/v1/admin/agents/{agent_id}/action-results?limit=N`：
+  按 `received_at` **时间倒序**返回这台机器最近的执行结果（默认 10 条，上限 50 条）。
+- 每条结果原样透出 `report` 报文（网关不镜像结构）+ 元信息
+  （`action_id` / `execution_id` / `plan_digest` / `final_status` / `reported_at` / `received_at`），
+  前端可据此展开 `candidates` 与逐项明细。
+- 未注册的 agent → 404；`limit` 越界夹到 `1..=50`（不报错、不返回空列表）。
+- 抽出 `action_result_view`，单条与列表共用同一份字段映射，避免两边漂移。
+- 新 store 方法 `list_action_results`（`ORDER BY received_at DESC LIMIT ?`）；
+  为它补了 store 往返/排序/agent 隔离测试与 API 列表测试。
+
 ## [0.55.0-alpha] - 2026-11-22
 
 ### 修复（`action_plan` 命令永远显示「执行中」）

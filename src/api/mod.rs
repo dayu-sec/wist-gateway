@@ -583,6 +583,10 @@ pub fn router_with_state(state: ApiState) -> Router {
             get(action_results::get_action_result),
         )
         .route(
+            "/api/v1/admin/agents/{agent_id}/action-results",
+            get(action_results::list_action_results),
+        )
+        .route(
             "/api/v1/admin/agents/{agent_id}/work",
             get(view_agent_work).post(grant_work),
         )

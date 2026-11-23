@@ -5465,6 +5465,111 @@ async fn action_results_are_stored_and_readable_from_the_admin_api() {
     assert_eq!(body["error"]["code"], "action_result_not_found");
 }
 
+/// 构造一份上报报文（结果内容与 `action_id` 对齐，方便断言“原样透出”）。
+fn action_result_report(action_id: &str) -> ReportActionResult {
+    ReportActionResult::new(
+        format!("rep-{action_id}"),
+        action_id.to_string(),
+        1,
+        FinalStatus::Succeeded,
+        format!("exec-{action_id}"),
+        "sha256:plan".to_string(),
+        "agent-node-a".to_string(),
+        "node-a".to_string(),
+        ResultAttestation {
+            result_digest: "sha256:test".to_string(),
+            signature: "test-signature".to_string(),
+            issued_by: "agent-node-a".to_string(),
+            attested_at: DateTime::now().to_chrono().to_rfc3339(),
+        },
+        DateTime::now().to_chrono().to_rfc3339(),
+        ActionResult::new(
+            action_id.to_string(),
+            format!("exec-{action_id}"),
+            FinalStatus::Succeeded,
+        ),
+    )
+}
+
+/// 结果列表：刷新页面后要能找回历史结果（最新在前），并受 `limit` 约束。
+///
+/// 回归点：结果之前只存在发起页当次会话里，`actionId` 一刷新就丢，用户“看不到反馈”。
+#[tokio::test]
+async fn action_result_list_returns_recent_results_newest_first() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    for action_id in ["act-oldest", "act-middle", "act-newest"] {
+        let report = post_agent_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/agent/action-results",
+            Some(&credential),
+            &action_result_report(action_id),
+        )
+        .await;
+        assert_eq!(report.status(), StatusCode::ACCEPTED);
+    }
+
+    let response = admin_request(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/action-results",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["agent_id"], "agent-node-a");
+    let ids: Vec<&str> = body["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|item| item["action_id"].as_str().expect("action_id"))
+        .collect();
+    assert_eq!(ids, vec!["act-newest", "act-middle", "act-oldest"]);
+    // 报文原样透出（网关不镜像结构）。
+    assert_eq!(body["results"][0]["report"]["action_id"], "act-newest");
+    assert_eq!(body["results"][0]["execution_id"], "exec-act-newest");
+    assert_eq!(body["results"][0]["final_status"], "succeeded");
+
+    // limit 生效：只要最近 2 条。
+    let response = admin_request(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/action-results?limit=2",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let ids: Vec<&str> = body["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|item| item["action_id"].as_str().expect("action_id"))
+        .collect();
+    assert_eq!(ids, vec!["act-newest", "act-middle"]);
+
+    // limit=0 被夹到 1（不返回空列表，也不报错）。
+    let response = admin_request(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/action-results?limit=0",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["results"].as_array().expect("results array").len(), 1);
+
+    // 未注册的 agent → 404（不伪造空列表）。
+    let response = admin_request(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-unknown/action-results",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn enrollment_route_rejects_invalid_token() {
     let env = TestEnv::new().await;

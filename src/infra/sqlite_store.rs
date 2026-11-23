@@ -3240,6 +3240,37 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn list_action_results(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredActionResult>> {
+        let rows = sqlx::query(
+            "SELECT agent_id, action_id, execution_id, plan_digest, final_status, \
+             report_json, reported_at, received_at FROM action_result \
+             WHERE agent_id = ?1 ORDER BY received_at DESC LIMIT ?2",
+        )
+        .bind(agent_id)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list action results"))?;
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            results.push(StoredActionResult {
+                agent_id: column!(row, "agent_id"),
+                action_id: column!(row, "action_id"),
+                execution_id: column!(row, "execution_id"),
+                plan_digest: column!(row, "plan_digest"),
+                final_status: column!(row, "final_status"),
+                report_json: column!(row, "report_json"),
+                reported_at: column!(row, "reported_at"),
+                received_at: column!(row, "received_at"),
+            });
+        }
+        Ok(results)
+    }
+
     async fn settle_action_plan_command(
         &self,
         agent_id: &str,
@@ -8870,6 +8901,70 @@ mod tests {
         assert!(log[0].0.is_none());
         assert_eq!(log[0].1.as_str(), "kbp-a");
         assert_eq!((log[2].3.as_str(), log[2].2), ("rollback", 3));
+    }
+
+    /// 执行结果列表：**时间倒序**、`limit` 生效、按 agent 隔离。
+    ///
+    /// 结果列表是刷新页面后唯一还能找回历史的地方，排序错了就会「看到旧的那条」。
+    #[tokio::test]
+    async fn action_result_list_is_newest_first_and_scoped_per_agent() {
+        let store = store().await;
+        let result = |agent_id: &str, action_id: &str, received_at: &str| StoredActionResult {
+            agent_id: agent_id.to_string(),
+            action_id: action_id.to_string(),
+            execution_id: format!("exec-{action_id}"),
+            plan_digest: "sha256:plan".to_string(),
+            final_status: "succeeded".to_string(),
+            report_json: format!(r#"{{"action_id":"{action_id}"}}"#),
+            reported_at: received_at.to_string(),
+            received_at: received_at.to_string(),
+        };
+
+        for (action_id, received_at) in [
+            ("act-oldest", "2026-11-23T00:00:01+00:00"),
+            ("act-middle", "2026-11-23T00:00:02+00:00"),
+            ("act-newest", "2026-11-23T00:00:03+00:00"),
+        ] {
+            store
+                .upsert_action_result(&result("agent-node-a", action_id, received_at))
+                .await
+                .expect("upsert action result");
+        }
+        // 另一台机器的结果不能串进来。
+        store
+            .upsert_action_result(&result(
+                "agent-node-b",
+                "act-other",
+                "2026-11-23T00:00:09+00:00",
+            ))
+            .await
+            .expect("upsert other agent");
+
+        let all = store
+            .list_action_results("agent-node-a", 10)
+            .await
+            .expect("list");
+        let ids: Vec<&str> = all.iter().map(|item| item.action_id.as_str()).collect();
+        assert_eq!(ids, vec!["act-newest", "act-middle", "act-oldest"]);
+
+        let limited = store
+            .list_action_results("agent-node-a", 2)
+            .await
+            .expect("list limited");
+        let ids: Vec<&str> = limited.iter().map(|item| item.action_id.as_str()).collect();
+        assert_eq!(ids, vec!["act-newest", "act-middle"], "limit 取最近的 N 条");
+
+        // 报文原样带出（网关不镜像结构）。
+        assert_eq!(limited[0].report_json, r#"{"action_id":"act-newest"}"#);
+        assert_eq!(limited[0].execution_id, "exec-act-newest");
+
+        assert!(
+            store
+                .list_action_results("agent-node-c", 10)
+                .await
+                .expect("list unknown")
+                .is_empty()
+        );
     }
 }
 

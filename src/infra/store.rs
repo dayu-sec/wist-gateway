@@ -1822,6 +1822,16 @@ pub trait Store: Send + Sync + fmt::Debug {
     /// 写入/覆盖一份执行结果（按 `(agent_id, action_id)` 幂等：重试不产生第二行）。
     async fn upsert_action_result(&self, result: &StoredActionResult) -> StoreResult<()>;
 
+    /// 最近的执行结果（时间倒序）。
+    ///
+    /// 为什么需要列表：结果只在「发起页当次会话」里可见的话，刷新一次就再也找不回来了 ——
+    /// 而结果恰恰是审计与复核要反复看的东西。上限由调用方夹紧，避免一次拉几百条大报文。
+    async fn list_action_results(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredActionResult>>;
+
     /// 把某条 `action_plan` 命令按执行结果**结单**，返回改了几行。
     ///
     /// 为什么要有：agent 只在「取走」时回报 `accepted`，执行完**不会**再有终态 ack
