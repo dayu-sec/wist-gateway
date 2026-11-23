@@ -6,16 +6,6 @@ version = "0.58.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
-# 审批终端（V1 CLI）与网关同仓：它只依赖 `wist-contracts`，不共享网关的运行期依赖。
-# 将来拆成独立仓/服务时，把 `wist-approve` 目录整体搬走即可（核心已在 lib 里）。
-[workspace]
-members = ["wist-approve"]
-# 默认成员只有网关本身：发布流水线里的 `cargo build --release --target …` 不该顺手
-# 把客户用的 CLI（clap + reqwest）也交叉编一遍 —— 它有自己的制品通道（V1.1）。
-# 显式要 CLI 时用 `-p wist-approve`；跑全部测试仍用 `--all`。
-default-members = ["."]
-resolver = "2"
-
 [dependencies]
 jumo-derive = "0.1"
 axum = "0.8"

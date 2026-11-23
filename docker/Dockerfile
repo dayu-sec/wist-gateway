@@ -36,16 +36,6 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 # 预编译二进制（build context 按架构提供：amd64/wist-gateway、arm64/wist-gateway）
 COPY --chown=999:999 ${TARGETARCH}/wist-gateway /usr/local/bin/wist-gateway
 
-# 审批终端制品（`/api/v1/approver/...` 分发的东西）。
-#
-# 三个平台的都进镜像，**与网关自己是什么架构无关**：网关只负责分发，客户的审批机可能是
-# 任意三者之一。内置是刻意的 —— 多站点 / 四十台起步的现场不能指望有人登录网关主机
-# 手工投放一次（落一次地就忘一次，症状是审批人装不上 CLI：503），且隔离站点没有外网，
-# 只能从网关拿。
-#
-# 站点仍可用 `<state>/approver-package/` 覆盖（换 CLI 不必等网关发版），优先级高于这里。
-COPY --chown=999:999 approver-package /usr/share/wist/approver-package
-
 WORKDIR /wist-gateway
 
 # 运行期以固定的 999 身份跑（与 wist-gateway-stack 的 compose `user: "999:999"` 同值）。

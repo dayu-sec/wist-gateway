@@ -5,6 +5,16 @@
 
 ## [0.58.0-alpha] - 2026-11-23
 
+### 变更（审批终端拆为独立仓 `wist-approve`）
+
+`wist-approve` 从本仓的 workspace 成员拆成**独立制品仓**（`dayu-sec/wist-approve`），
+CI 对齐 `wist-agentd`（三平台构建 + 静态 musl 自证 + 包命名），版本与网关同一发车。
+
+- 本仓不再构建、也不再烘制审批终端：`build-approver-cli` job、镜像内的
+  `/usr/share/wist/approver-package` 一并移除；`Cargo.lock` 随之少了 CLI 的依赖树。
+- 分发面（`/api/v1/approver/…`）改为从**包管理**里取制品（与 agent 安装包同一套：
+  录入来源 → 网关拉取并缓存 → 分发地址与摘要同源）。
+
 ### 新增（`wist-approve` 变成字符界面：键盘就能完成审批）
 
 以前审批人得背一串子命令（`list` → `show` → `approve --sign`）。现在**不带参数直接跑**就进

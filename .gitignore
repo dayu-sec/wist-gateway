@@ -2,7 +2,5 @@
 .report
 .run*
 
-# 镜像构建时从 CI 制品暂存的审批终端（不进仓库）
-/docker/approver-package/
 /docker/amd64/
 /docker/arm64/
