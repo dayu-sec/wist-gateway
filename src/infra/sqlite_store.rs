@@ -691,6 +691,18 @@ fn agent_install_package_address_from_row(
     })
 }
 
+fn approver_install_package_from_row(row: &SqliteRow) -> StoreResult<StoredApproverInstallPackage> {
+    Ok(StoredApproverInstallPackage {
+        platform: column!(row, "platform"),
+        source: column!(row, "source"),
+        package_sha256: column!(row, "package_sha256"),
+        cached_path: column!(row, "cached_path"),
+        version: column!(row, "version"),
+        updated_by: column!(row, "updated_by"),
+        updated_at: column!(row, "updated_at"),
+    })
+}
+
 fn harvest_worker_from_row(row: &SqliteRow) -> StoreResult<HarvestWorker> {
     Ok(HarvestWorker {
         worker_id: column!(row, "worker_id"),
@@ -1347,6 +1359,70 @@ impl Store for SqliteStore {
         .await
         .map_err(|err| sql_error(err, "upsert agent install package"))?;
         Ok(())
+    }
+
+    async fn get_approver_install_package(
+        &self,
+        platform: &str,
+    ) -> StoreResult<Option<StoredApproverInstallPackage>> {
+        let row = sqlx::query(
+            "SELECT platform, source, package_sha256, cached_path, version, updated_by, updated_at \
+             FROM approver_install_package WHERE platform = ?1",
+        )
+        .bind(platform)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select approver install package"))?;
+        row.as_ref()
+            .map(approver_install_package_from_row)
+            .transpose()
+    }
+
+    async fn list_approver_install_packages(
+        &self,
+    ) -> StoreResult<Vec<StoredApproverInstallPackage>> {
+        let rows = sqlx::query(
+            "SELECT platform, source, package_sha256, cached_path, version, updated_by, updated_at \
+             FROM approver_install_package ORDER BY platform",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list approver install packages"))?;
+        rows.iter().map(approver_install_package_from_row).collect()
+    }
+
+    async fn upsert_approver_install_package(
+        &self,
+        package: &StoredApproverInstallPackage,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO approver_install_package (platform, source, package_sha256, cached_path, \
+             version, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT (platform) DO UPDATE SET source = excluded.source, \
+             package_sha256 = excluded.package_sha256, cached_path = excluded.cached_path, \
+             version = excluded.version, updated_by = excluded.updated_by, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(&package.platform)
+        .bind(&package.source)
+        .bind(&package.package_sha256)
+        .bind(&package.cached_path)
+        .bind(&package.version)
+        .bind(&package.updated_by)
+        .bind(&package.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert approver install package"))?;
+        Ok(())
+    }
+
+    async fn delete_approver_install_package(&self, platform: &str) -> StoreResult<bool> {
+        let result = sqlx::query("DELETE FROM approver_install_package WHERE platform = ?1")
+            .bind(platform)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| sql_error(err, "delete approver install package"))?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn get_agent_uplink(&self) -> StoreResult<Option<StoredAgentUplinkAddress>> {

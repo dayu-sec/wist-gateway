@@ -210,7 +210,7 @@ pub fn cache_verified_package(
     })
 }
 
-fn write_cache_to(path: &Path, bytes: &[u8]) -> Result<(), PackageFetchError> {
+pub(crate) fn write_cache_to(path: &Path, bytes: &[u8]) -> Result<(), PackageFetchError> {
     let dir = path.parent().ok_or_else(|| {
         PackageFetchError::SourceUnavailable(format!(
             "invalid package cache path {}",

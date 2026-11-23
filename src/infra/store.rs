@@ -557,6 +557,27 @@ pub struct StoredAgentInstallPackage {
     pub created_at: String,
 }
 
+/// wist-approve（审批终端）安装包来源：一行一个平台。
+///
+/// 与 [`StoredAgentInstallPackageAddress`] 同一套语义（录入来源 → 网关拉取并缓存 → 分发只读缓存），
+/// 但**没有历史表**：审批终端不需要按条目回滚，换版本 = 重新录入（按 platform 幂等覆盖）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredApproverInstallPackage {
+    /// 目标三元组（与分发白名单同一组）。
+    pub platform: String,
+    /// 原始录入（`/abs/path` 或 `https://…`），只留痕。
+    pub source: String,
+    /// 网关据自己缓存的那份字节算出的摘要，统一 `sha256:<64 hex>`。
+    pub package_sha256: String,
+    /// 网关自己存的那份副本（分发端点读它）。
+    pub cached_path: String,
+    /// 从包名 / 包内目录名读到的版本；读不到为空串。
+    pub version: String,
+    pub updated_by: String,
+    pub updated_at: String,
+}
+
 /// 知识库**内容包**：管理面录入的策展数据，内容寻址，一行一个包。
 ///
 /// 设计见 `docs/design/knowledge-content-management.md` §6.1。与安装包历史表
@@ -1510,6 +1531,29 @@ pub trait Store: Send + Sync + fmt::Debug {
         &self,
         setting: &StoredAgentInstallPackageAddress,
     ) -> StoreResult<()>;
+
+    /// 读取某平台的 **wist-approve 安装包**来源；未录入返回 `None`。
+    async fn get_approver_install_package(
+        &self,
+        platform: &str,
+    ) -> StoreResult<Option<StoredApproverInstallPackage>>;
+
+    /// 列出已录入的全部平台（审批终端安装包）。
+    async fn list_approver_install_packages(
+        &self,
+    ) -> StoreResult<Vec<StoredApproverInstallPackage>>;
+
+    /// 写入/覆盖某平台的审批终端安装包来源（按 `platform` 幂等）。
+    async fn upsert_approver_install_package(
+        &self,
+        package: &StoredApproverInstallPackage,
+    ) -> StoreResult<()>;
+
+    /// 删掉某平台的审批终端安装包来源（`true` = 确实删掉了一行）。
+    ///
+    /// 只删记录，**不删缓存副本** —— 与 agent 包同一取舍：删记录就不再生效，
+    /// 但盘上那份还留着，现场回滚时不必重新拉取。
+    async fn delete_approver_install_package(&self, platform: &str) -> StoreResult<bool>;
 
     /// 列出安装包录入历史，按 `created_at` 倒序（最近录入的在前）。
     async fn list_agent_install_packages(&self) -> StoreResult<Vec<StoredAgentInstallPackage>>;

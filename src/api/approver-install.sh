@@ -57,22 +57,34 @@ sha256_of() {
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 
-echo "==> 下载 wist-approve（${PLATFORM}）"
-if ! curl -fsSLk "$PACKAGE_URL" -o "$TMP_DIR/wist-approve"; then
+echo "==> 下载 wist-approve 安装包（${PLATFORM}）"
+if ! curl -fsSLk "$PACKAGE_URL" -o "$TMP_DIR/package.tar.gz"; then
   echo "下载失败：${PACKAGE_URL}" >&2
   exit 1
 fi
 
 echo "==> 校验摘要"
-ACTUAL="$(sha256_of "$TMP_DIR/wist-approve")"
+ACTUAL="$(sha256_of "$TMP_DIR/package.tar.gz")"
 if [ "$ACTUAL" != "$PACKAGE_SHA256" ]; then
   echo "摘要不匹配：期望 ${PACKAGE_SHA256}，实际 ${ACTUAL} —— 已中止，未安装" >&2
   exit 1
 fi
 
-mkdir -p "$BIN_DIR" "$CONF_DIR"
-cp "$TMP_DIR/wist-approve" "$BIN_DIR/wist-approve"
+# 网关分发的是**原包**（tar.gz，与 agent 安装包同一形态）：解包后取顶层里的 wist-approve。
+mkdir -p "$TMP_DIR/x" "$BIN_DIR"
+if ! tar -xzf "$TMP_DIR/package.tar.gz" -C "$TMP_DIR/x"; then
+  echo "解包失败：安装包不是合法的 tar.gz" >&2
+  exit 1
+fi
+BIN="$(find "$TMP_DIR/x" -name wist-approve -type f -print -quit)"
+if [ -z "$BIN" ] || [ ! -s "$BIN" ]; then
+  echo "安装包里没有 wist-approve —— 已中止，未安装" >&2
+  exit 1
+fi
+cp "$BIN" "$BIN_DIR/wist-approve"
 chmod 0755 "$BIN_DIR/wist-approve"
+
+mkdir -p "$CONF_DIR"
 
 # 网关 CA（公开信息）：CLI 用 `--ca-file` 校验管理面 TLS。
 cat > "$CONF_DIR/gateway-ca.crt.pem" <<'CA_EOF'

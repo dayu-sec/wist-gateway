@@ -14,8 +14,6 @@
 //! 3. **每次现算摘要**。脚本里内嵌的 sha256 必须和当前这份文件一致 —— 否则装机时校验失败，
 //!    而不是装上一个来路不明的东西。
 
-use std::path::PathBuf;
-
 use axum::{
     extract::{Path, State},
     http::header,
@@ -29,23 +27,7 @@ use crate::api::install::{effective_advertise_base, supported_agent_platform};
 use crate::infra::{AdminConfig, bytes_sha256_hex};
 
 const INSTALL_SCRIPT_TEMPLATE: &str = include_str!("approver-install.sh");
-const BINARY_NAME: &str = "wist-approve";
 const NO_STORE: &str = "no-store";
-
-/// 审批终端制品在磁盘上的落点：`<state>/approver-package/<platform>/wist-approve`。
-///
-/// 与 agent 安装包同一性质：网关自己分发的东西，放 `state/`（容器里唯一可写且随容器持久）。
-/// 投放方式见 `wist-gateway-stack` 的 `scripts/install-approver-package.sh`。
-pub(crate) fn approver_package_path(config: &AdminConfig, platform: &str) -> PathBuf {
-    let state_dir = config
-        .sqlite_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    state_dir
-        .join("approver-package")
-        .join(platform)
-        .join(BINARY_NAME)
-}
 
 fn unknown_platform_response() -> Response {
     ApiError::not_found(
@@ -65,18 +47,26 @@ fn package_unavailable(platform: &str) -> Response {
     .into_response()
 }
 
-/// 读制品。
+/// 读安装包（**原包 tar.gz**）：只有「管理面录入过 + 缓存副本还在」才算有包。
 ///
 /// `Err` 包一层 `Box`：`axum::http::Response` 有 128 字节，直接当 `Err` 会踩
 /// `clippy::result_large_err`，而这个函数在热路径上并不会真失败到需要优化 ——
 /// 只是把错误路径的开销挪到堆上，`Ok` 路径不受影响。
-fn read_package(config: &AdminConfig, platform: &str) -> Result<(PathBuf, Vec<u8>), Box<Response>> {
-    let path = approver_package_path(config, platform);
+async fn read_package(state: &ApiState, platform: &str) -> Result<Vec<u8>, Box<Response>> {
+    let Some(path) =
+        super::approver_package::effective_package_path(&state.config, &state.store, platform)
+            .await
+    else {
+        log::warn!(
+            "approver install package for {platform} is not recorded or its cached copy is gone"
+        );
+        return Err(Box::new(package_unavailable(platform)));
+    };
     match std::fs::read(&path) {
-        Ok(bytes) => Ok((path, bytes)),
+        Ok(bytes) => Ok(bytes),
         Err(err) => {
             log::warn!(
-                "approver package missing for platform {platform} at {}: {err}",
+                "approver install package unreadable for {platform} at {}: {err}",
                 path.display()
             );
             Err(Box::new(package_unavailable(platform)))
@@ -84,7 +74,7 @@ fn read_package(config: &AdminConfig, platform: &str) -> Result<(PathBuf, Vec<u8
     }
 }
 
-/// `GET /api/v1/approver/packages/{platform}` —— 二进制本体。
+/// `GET /api/v1/approver/packages/{platform}` —— 安装包本体（tar.gz，由 install.sh 解包）。
 pub async fn download_approver_package(
     State(state): State<ApiState>,
     Path(platform): Path<String>,
@@ -92,18 +82,18 @@ pub async fn download_approver_package(
     let Ok(platform) = supported_agent_platform(&platform) else {
         return unknown_platform_response();
     };
-    let (_, bytes) = match read_package(&state.config, platform) {
+    let bytes = match read_package(&state, platform).await {
         Ok(package) => package,
         Err(response) => return *response,
     };
     (
         [
-            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CONTENT_TYPE, "application/gzip"),
             (
                 header::CONTENT_DISPOSITION,
-                "attachment; filename=\"wist-approve\"",
+                "attachment; filename=\"wist-approve-package.tar.gz\"",
             ),
-            // 同一个 tag 下制品不会变；缓存几分钟能省掉重复下载，又不会把新制品挡在缓存后面。
+            // 同一个包不常变；缓存几分钟能省掉重复下载，又不会把新包挡在缓存后面。
             (header::CACHE_CONTROL, "public, max-age=300"),
         ],
         bytes,
@@ -129,7 +119,7 @@ pub async fn get_approver_digests(
     let Ok(platform) = supported_agent_platform(&platform) else {
         return unknown_platform_response();
     };
-    let (_, bytes) = match read_package(&state.config, platform) {
+    let bytes = match read_package(&state, platform).await {
         Ok(package) => package,
         Err(response) => return *response,
     };
@@ -151,7 +141,7 @@ pub async fn get_approver_install_script(
     let Ok(platform) = supported_agent_platform(&platform) else {
         return unknown_platform_response();
     };
-    let (_, bytes) = match read_package(&state.config, platform) {
+    let bytes = match read_package(&state, platform).await {
         Ok(package) => package,
         Err(response) => return *response,
     };

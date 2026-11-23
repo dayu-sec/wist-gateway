@@ -1188,6 +1188,17 @@ impl AdminConfig {
     /// 与单例 [`Self::install_package_cache_path`] 是两回事：那个 `agent-package` 是
     /// 「当前生效来源」的单文件缓存（安装仍用它），这里 `history/<package_id>` 是历史里
     /// 每个包各自的副本。调用方写入前会确保 parent 目录存在（见 `install_package::write_cache_to`）。
+    /// wist-approve 安装包的按平台缓存（分发端点读它）。
+    ///
+    /// 存**原包**（tar.gz），由安装脚本解包 —— 网关不做解包，也就不需要多归档依赖。
+    pub fn approver_package_cache_path(&self, platform: &str) -> PathBuf {
+        let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
+        state_dir
+            .join("approver-package")
+            .join(platform)
+            .join("package.tar.gz")
+    }
+
     pub fn install_package_history_path(&self, package_id: &str) -> PathBuf {
         let state_dir = self.sqlite_path.parent().unwrap_or(Path::new("."));
         state_dir

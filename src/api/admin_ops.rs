@@ -3263,10 +3263,19 @@ fn validate_advertise_url(value: &str) -> Result<&str, String> {
 /// 安装包是 Agent 的启动来源，因此地址只接受 https URL 或本机绝对路径：
 /// 不允许明文 http 分发（与 `server.public_base_url` 必须 https 的口径一致）。
 /// 摘要**必填**（64 hex，可带 `sha256:` 前缀）；空 / 形态不对一律 400。
-fn validate_package_address<'a>(
+pub(crate) fn validate_package_address<'a>(
     package_url: &'a str,
     package_sha256: &str,
 ) -> Result<(&'a str, String), String> {
+    Ok((
+        validate_package_url(package_url)?,
+        normalize_sha256(package_sha256.trim())?,
+    ))
+}
+
+/// 只校验**来源地址**（不含摘要）：审批终端安装包的摘要是可选的，
+/// 所以把这个分支单独抽出来 —— 地址的校验规则仍只有这一份。
+pub(crate) fn validate_package_url(package_url: &str) -> Result<&str, String> {
     if package_url.is_empty() {
         return Err("package_url must not be empty".to_string());
     }
@@ -3281,10 +3290,10 @@ fn validate_package_address<'a>(
     if !package_url.starts_with("https://") && !package_url.starts_with('/') {
         return Err("package_url must be an https:// URL or an absolute path".to_string());
     }
-    Ok((package_url, normalize_sha256(package_sha256.trim())?))
+    Ok(package_url)
 }
 
-fn normalize_sha256(value: &str) -> Result<String, String> {
+pub(crate) fn normalize_sha256(value: &str) -> Result<String, String> {
     let hex = value.strip_prefix("sha256:").unwrap_or(value);
     if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(

@@ -22303,10 +22303,163 @@ async fn repeated_submissions_never_collide_on_the_approval_id() {
 
 // ── wist-approve 分发面（公开、无鉴权）────────────────────────────────────────
 
-fn place_approver_package(env: &TestEnv, platform: &str, bytes: &[u8]) {
-    let path = crate::api::approver_install::approver_package_path(&env.config, platform);
+async fn place_approver_package(env: &TestEnv, platform: &str, bytes: &[u8]) {
+    // 包管理：**先落文件、再登记** —— 分发面按「记录 + 缓存副本都在」才发。
+    let path = crate::api::approver_package::cached_package_path(&env.config, platform);
     std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
     std::fs::write(&path, bytes).expect("write package");
+    let record = crate::infra::StoredApproverInstallPackage {
+        platform: platform.to_string(),
+        source: "/tmp/wist-approve-package.tar.gz".to_string(),
+        package_sha256: format!("sha256:{}", crate::infra::bytes_sha256_hex(bytes)),
+        cached_path: path.display().to_string(),
+        version: "0.58.0".to_string(),
+        updated_by: "test".to_string(),
+        updated_at: "2026-11-23T00:00:00Z".to_string(),
+    };
+    env.store_handle
+        .upsert_approver_install_package(&record)
+        .await
+        .expect("record package");
+}
+
+/// 包管理（与 agent 安装包同一套）：录入本地路径 → 分发读缓存 → 删除后回到 503。
+///
+/// 用**普通文件**当源：`read_verified_source` 对绝对路径就是整读字节，
+/// `read_package_identity` 读不出 tar 目录时返回空 arch（不拦），所以不必在测试里造 tar。
+#[tokio::test]
+async fn approver_package_recording_serves_and_removes() {
+    let env = TestEnv::new().await;
+    let platform = "aarch64-apple-darwin";
+
+    // 没录入 → 分发 503。
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/approver/packages/{platform}"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let root = crate::test_support::unique_temp_dir("approver-package-source");
+    let source = root.join("wist-approve.tar.gz");
+    let bytes = b"fake-approver-package-bytes".to_vec();
+    std::fs::write(&source, &bytes).expect("write source");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/approver/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "platform": platform,
+            "source": source.display().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["platform"], platform);
+    assert_eq!(
+        body["package_sha256"],
+        format!("sha256:{}", crate::infra::bytes_sha256_hex(&bytes))
+    );
+    assert_eq!(body["available"], true);
+
+    // 分发端点读的就是缓存那份（字节与源一致）。
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/approver/packages/{platform}"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.to_vec(), bytes);
+
+    // 列表看得到录入记录。
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/approver/install-package",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["packages"][0]["platform"], platform);
+
+    // 删除记录 → 不再分发（缓存副本仍留在盘上，不删）。
+    let response = delete_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approver/install-package/{platform}"),
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["removed"], true);
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/approver/packages/{platform}"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// 录入入口的校验：平台不在白名单 / 来源地址非法 → 400；没带 admin token → 401。
+#[tokio::test]
+async fn approver_package_recording_validates_its_input() {
+    let env = TestEnv::new().await;
+
+    for (platform, source, expected_code) in [
+        (
+            "windows-x86_64",
+            "/tmp/x.tar.gz",
+            "install_package_platform_required",
+        ),
+        (
+            "aarch64-apple-darwin",
+            "relative/path.tar.gz",
+            "install_package_address_invalid",
+        ),
+        (
+            "aarch64-apple-darwin",
+            "http://insecure/x.tar.gz",
+            "install_package_address_invalid",
+        ),
+    ] {
+        let response = post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/approver/install-package",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({ "platform": platform, "source": source }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "platform={platform} source={source}"
+        );
+        let body: serde_json::Value = decode_json_response(response).await;
+        assert_eq!(body["error"]["code"], expected_code);
+    }
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/approver/install-package",
+        None,
+        &serde_json::json!({ "platform": "aarch64-apple-darwin", "source": "/tmp/x.tar.gz" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// 三个端点（脚本 / 摘要 / 二进制）要互相自洽，且都**不需要**鉴权。
@@ -22315,7 +22468,7 @@ async fn approver_install_script_and_digests_are_consistent() {
     let env = TestEnv::new().await;
     let platform = "aarch64-apple-darwin";
     let bytes = b"#!fake-wist-approve-binary".to_vec();
-    place_approver_package(&env, platform, &bytes);
+    place_approver_package(&env, platform, &bytes).await;
 
     let response = get_to_router(
         &env.config,

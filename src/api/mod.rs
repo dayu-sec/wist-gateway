@@ -32,8 +32,11 @@ mod action_plans;
 // NOTE(hand-added): 审批公钥登记（**外部签发**模式：私钥在审批人手上，网关只收签名）。
 // 只有「挡垃圾 + 展示指纹」两个作用；真正的授权在执行侧 agentd 的锚。
 mod approver_keys;
-// NOTE(hand-added): `wist-approve` 的分发面（公开、无鉴权）：安装脚本 + 二进制 + 摘要。
+// NOTE(hand-added): `wist-approve` 的分发面（公开、无鉴权）：安装脚本 + 安装包 + 摘要。
 mod approver_install;
+// NOTE(hand-added): 审批终端安装包的来源管理（录入 → 网关拉取并缓存 → 分发只读缓存），
+// 与 agent 安装包同一套逻辑。
+mod approver_package;
 // NOTE(hand-added): 执行结果的管理面读取（agentd 上报的 `ReportActionResult` 落库后从这里取）。
 mod action_results;
 // NOTE(hand-added): 响应授权单（时间窗授权）。与 `action_approval` 并列的第二条授权来源：
@@ -600,6 +603,18 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/approver/install/{platform}/digests",
             get(approver_install::get_approver_digests),
+        )
+        // NOTE(hand-added): 管理面——审批终端安装包来源（录入 / 查看 / 撤销）。
+        // 与 agent 安装包同一条链：录入来源→网关拉取并缓存→分发只读缓存，
+        // 因此 install.sh 内嵌的摘要与真正发出去的字节同源。
+        .route(
+            "/api/v1/admin/approver/install-package",
+            get(approver_package::view_approver_install_package)
+                .post(approver_package::set_approver_install_package),
+        )
+        .route(
+            "/api/v1/admin/approver/install-package/{platform}",
+            delete(approver_package::delete_approver_install_package),
         )
         // NOTE(hand-added): 响应授权单（时间窗授权）：签发 / 查 / 撤销。
         // 一台机器同时只有一张生效单；重新 PUT = 覆盖并换新的 grant_id。
