@@ -20482,6 +20482,107 @@ async fn an_attested_plan_cannot_be_dispatched_directly() {
 
 // ── 授权闸：没有有效授权单就不允许直发 ─────────────────────────────
 
+/// 结果上报到达后，对应的 `action_plan` 命令必须**结单** ——
+/// 否则命令队列会永远显示「执行中」（agent 只在取走时回报 `accepted`，执行完没有终态 ack）。
+#[tokio::test]
+async fn reporting_an_action_result_settles_the_action_plan_command() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.preview"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let response = put_response_grant(&env, "agent-node-a", r0_grant_body()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let plan = sample_action_plan("agent-node-a");
+    let action_id = plan.meta.action_id.clone();
+    let response = dispatch_plan(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let command_id = body["command_id"].as_str().expect("command id").to_string();
+
+    // agent 取走（阶段回报 `accepted`）→ 队列里这条变 `claimed`。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/status",
+        Some(&credential),
+        &serde_json::json!({
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "version": "v0.42.0",
+            "command_acks": [{ "command_id": command_id, "outcome": "accepted" }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let response = admin_request(&env, "GET", "/api/v1/admin/agents/agent-node-a/commands").await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    let claimed = body["commands"]
+        .as_array()
+        .expect("commands")
+        .iter()
+        .find(|command| command["command_id"] == command_id.as_str())
+        .expect("command is listed");
+    assert_eq!(claimed["state"], "claimed", "accepted 只算取走，不结单");
+
+    // 结果上报 → 命令结单。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/action-results",
+        Some(&credential),
+        &ReportActionResult::new(
+            "rep-settle-1".to_string(),
+            action_id.clone(),
+            1,
+            FinalStatus::Succeeded,
+            "exec-settle-1".to_string(),
+            "sha256:plan".to_string(),
+            "agent-node-a".to_string(),
+            "node-a".to_string(),
+            ResultAttestation {
+                result_digest: "sha256:test".to_string(),
+                signature: "test-signature".to_string(),
+                issued_by: "agent-node-a".to_string(),
+                attested_at: DateTime::now().to_chrono().to_rfc3339(),
+            },
+            DateTime::now().to_chrono().to_rfc3339(),
+            ActionResult::new(
+                action_id.clone(),
+                "exec-settle-1".to_string(),
+                FinalStatus::Succeeded,
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let response = admin_request(&env, "GET", "/api/v1/admin/agents/agent-node-a/commands").await;
+    let body: serde_json::Value = decode_json_response(response).await;
+    let settled = body["commands"]
+        .as_array()
+        .expect("commands")
+        .iter()
+        .find(|command| command["command_id"] == command_id.as_str())
+        .expect("command is listed");
+    assert_eq!(settled["state"], "acked", "结果到了命令就该有终态");
+    assert_eq!(settled["outcome"], "succeeded");
+    assert!(
+        settled["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("执行完成"),
+        "detail should explain the settlement: {:?}",
+        settled["detail"]
+    );
+}
+
 /// 发起页要的 `target` 形状：`platform` / `arch` 只能来自 agent 上报的事实。
 ///
 /// 没报过就**明确拒绝**，不编默认值 —— 瞎写 linux/x86_64 会把错误的系统信息

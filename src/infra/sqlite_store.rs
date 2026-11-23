@@ -3240,6 +3240,33 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn settle_action_plan_command(
+        &self,
+        agent_id: &str,
+        action_id: &str,
+        outcome: &str,
+        detail: &str,
+        acked_at: &str,
+    ) -> StoreResult<u64> {
+        // `json_valid` 先挡住非 JSON 的 params：`json_extract` 遇到坏 JSON 会让**整条语句**报错，
+        // 而不只是跳过那一行。
+        let result = sqlx::query(
+            "UPDATE agent_commands SET acked_at = ?3, outcome = ?4, detail = ?5 \
+             WHERE agent_id = ?1 AND kind = ?2 AND acked_at IS NULL \
+             AND json_valid(params) AND json_extract(params, '$.meta.action_id') = ?6",
+        )
+        .bind(agent_id)
+        .bind(wist_api::status::command_kind::ACTION_PLAN)
+        .bind(acked_at)
+        .bind(outcome)
+        .bind(detail)
+        .bind(action_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "settle action plan command"))?;
+        Ok(result.rows_affected())
+    }
+
     async fn list_agent_log_sources(&self, agent_id: &str) -> StoreResult<Vec<StoredLogSource>> {
         // 稳定排序交给 SQL：覆盖在前（人显式指定），其余按**证据档的信任顺序**、再按置信度。
         // 为什么不能直接 `ORDER BY evidence`：那是字母序（`config_file` 会排在
@@ -7382,6 +7409,82 @@ mod tests {
             .expect("row exists");
         assert_eq!(stored.grant_id, "grn_agent-a_2_bbbb");
         assert!(stored.revoked_at.is_none(), "重新签发要清掉 revoked_at");
+    }
+
+    #[tokio::test]
+    async fn settle_action_plan_command_only_closes_the_matching_live_one() {
+        let store = store().await;
+        let plan_command = |command_id: &str, agent_id: &str, action_id: &str| StoredAgentCommand {
+            command_id: command_id.to_string(),
+            agent_id: agent_id.to_string(),
+            kind: wist_api::status::command_kind::ACTION_PLAN.to_string(),
+            params: format!(
+                r#"{{"api_version":"v1","kind":"action_plan","meta":{{"action_id":"{action_id}"}}}}"#
+            ),
+            requested_at_ms: 1_700_000_000_000,
+            acked_at: None,
+            claimed_at: Some("2026-11-22T00:00:01Z".to_string()),
+            outcome: None,
+            detail: None,
+            requested_by: "admin:test".to_string(),
+        };
+        store
+            .enqueue_agent_command(&plan_command("cmd-a", "agent-a", "act-a"), false)
+            .await
+            .unwrap();
+        store
+            .enqueue_agent_command(&plan_command("cmd-b", "agent-a", "act-b"), false)
+            .await
+            .unwrap();
+        // 另一台机器上**同名** action 不能被牵连。
+        store
+            .enqueue_agent_command(&plan_command("cmd-c", "agent-b", "act-a"), false)
+            .await
+            .unwrap();
+
+        let affected = store
+            .settle_action_plan_command(
+                "agent-a",
+                "act-a",
+                command_outcome::SUCCEEDED,
+                "done",
+                "2026-11-22T00:00:05Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(affected, 1, "只结单匹配的那一条");
+
+        let pending = store
+            .list_pending_agent_commands("agent-a", 8)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "同机器的另一条计划不该被结单");
+        assert_eq!(pending[0].command_id, "cmd-b");
+
+        // 重复上报（agentd 会重试）：已经终态的不再改写。
+        assert_eq!(
+            store
+                .settle_action_plan_command(
+                    "agent-a",
+                    "act-a",
+                    command_outcome::FAILED,
+                    "late",
+                    "2026-11-22T00:00:09Z",
+                )
+                .await
+                .unwrap(),
+            0
+        );
+
+        // 另一台机器的同名 action 仍在待下发。
+        assert_eq!(
+            store
+                .list_pending_agent_commands("agent-b", 8)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

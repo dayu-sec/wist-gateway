@@ -1822,6 +1822,23 @@ pub trait Store: Send + Sync + fmt::Debug {
     /// 写入/覆盖一份执行结果（按 `(agent_id, action_id)` 幂等：重试不产生第二行）。
     async fn upsert_action_result(&self, result: &StoredActionResult) -> StoreResult<()>;
 
+    /// 把某条 `action_plan` 命令按执行结果**结单**，返回改了几行。
+    ///
+    /// 为什么要有：agent 只在「取走」时回报 `accepted`，执行完**不会**再有终态 ack
+    /// （本地队列条目里没有 `command_id`）。结果上报到达时必须由网关把命令结单，
+    /// 否则命令队列会永远显示「执行中」。
+    ///
+    /// 只改「属于该 agent、kind = action_plan、尚未终态、且 `params.meta.action_id` 匹配」
+    /// 的那一条；已结单的不会被改写（迟到 / 重复的上报幂等）。
+    async fn settle_action_plan_command(
+        &self,
+        agent_id: &str,
+        action_id: &str,
+        outcome: &str,
+        detail: &str,
+        acked_at: &str,
+    ) -> StoreResult<u64>;
+
     /// 读这台机器全部日志源候选（**含**人工覆盖）。
     ///
     /// 不按 origin 分两次查：求值要的就是「覆盖在前、解析在后」的**一份**有序视图，

@@ -36,6 +36,7 @@ use wist_api::work::{
     WorkAccepted, WorkGrant, WorkResultAccepted,
 };
 use wist_contracts::API_VERSION_V1;
+use wist_contracts::action_result::FinalStatus;
 use wist_contracts::fact_summary::FactContent;
 use wist_contracts::work::AGENT_REPORTABLE_WORK_STATUSES;
 use wist_control::types::DateTime;
@@ -1003,7 +1004,54 @@ async fn store_action_result(state: &ApiState, input: &ReportActionResult) -> Re
                 err,
             )
             .into_response()
-        })
+        })?;
+
+    // 结果到了 = 这条命令有终态了。顺手把命令结单：agent 只在「取走」时回报过
+    // `accepted`，执行完不会再有终态 ack（本地队列条目里没有 command_id），
+    // 不结单的话命令队列会永远显示「执行中」。
+    let (outcome, detail) = match input.final_status {
+        FinalStatus::Succeeded => (
+            wist_api::status::command_outcome::SUCCEEDED,
+            format!("执行完成（{}）", outcome_note(input)),
+        ),
+        other => (
+            wist_api::status::command_outcome::FAILED,
+            format!(
+                "执行结束：{}（{}）",
+                other.as_state_name(),
+                outcome_note(input)
+            ),
+        ),
+    };
+    if let Err(err) = state
+        .store
+        .settle_action_plan_command(
+            &input.agent_id,
+            &input.action_id,
+            outcome,
+            &detail,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+    {
+        // 结单失败不影响「结果已存下来」：队列显示滞后一拍，下次上报还会再试。
+        log::warn!(
+            "event=ActionPlanCommandSettleFailed agent_id={} action_id={} detail=\"{err}\"",
+            input.agent_id,
+            input.action_id
+        );
+    }
+    Ok(())
+}
+
+/// 队列 `detail` 里的一行注脚：优先写执行器给的 `exit_reason`，否则写步骤数。
+fn outcome_note(input: &ReportActionResult) -> String {
+    if let Some(reason) = input.result.exit_reason.as_deref()
+        && !reason.trim().is_empty()
+    {
+        return reason.to_string();
+    }
+    format!("{} 个步骤", input.result.step_records.len())
 }
 
 /// 接收 agentd 上报的事实**摘要**（对应模型 `ReportAgentFactSummary` / `IngestAgentFactSummary`）。

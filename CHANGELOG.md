@@ -3,6 +3,24 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.55.0-alpha] - 2026-11-22
+
+### 修复（`action_plan` 命令永远显示「执行中」）
+
+**症状**：命令队列里那些 `action_plan` 一直是 `claimed`，`outcome` 永远为空 ——
+即使机器早就执行完、结果也回来了。
+
+**根因**：agent 只在「取走」时回报 `accepted`，执行完**没有终态 ack**
+（本地队列条目里没有 `command_id`，agent 侧无法按命令结单）。
+网关收到执行结果时也只落库，没有回头把命令结单。
+
+- `report_action_result` 落库后**顺手结单**：按 `(agent_id, kind=action_plan, params.meta.action_id)`
+  把未终态的那条改成 `acked` + `succeeded`/`failed`，`detail` 写「执行完成（N 个步骤）」
+  或执行器给的 `exit_reason`。
+- 只改**尚未终态**的那条：重复上报（agentd 会重试）幂等，已结单的不会被改写。
+- 结单失败只告警、不影响「结果已存下来」：队列显示滞后一拍，不会丢数据。
+- 新 store 方法 `settle_action_plan_command`（条件 UPDATE + `json_valid` 护住非 JSON 的 params）。
+
 ## [0.54.0-alpha] - 2026-11-22
 
 ### 新增（发起响应：执行结果落库 + 目标画像）
