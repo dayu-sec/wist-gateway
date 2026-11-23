@@ -1,6 +1,16 @@
 # 执行计划的签发证明（Plan Attestation）
 
-> 状态：已落地（E3 / 响应能力 B 线第一阶段）。
+> 状态：**协议层已落地**（E3 / 响应能力 B 线第一阶段）。本文只描述**协议本身**：
+> 证明的形状、规范化、摘要、审批绑定、执行侧判定。
+>
+> **文档地图**（避免重复维护）：
+>
+> | 本文不管什么 | 去哪看 |
+> |---|---|
+> | 谁持有私钥、审批在哪做、CLI、将来的服务/钉钉 | [`plan-external-signing.md`](./plan-external-signing.md) |
+> | 信任锚怎么铺到存量机队、怎么轮换 | [`wist-agentd/docs/design/plan-anchor-distribution.md`](../../../wist-agentd/docs/design/plan-anchor-distribution.md) |
+> | 实施顺序与验收 | [`plan-approval-signing-impl.md`](./plan-approval-signing-impl.md) |
+>
 > 适用仓：`wist-contracts`（类型与摘要）、`wist-validate`（形状）、`wist-agentd`（验签）、
 > `wist-gateway`（审批与签发）。
 
@@ -130,30 +140,40 @@ trusted_keys = [{ key_id = "gw-plan-k1", public_key_pem_file = "/etc/wist-agentd
 `enforced=true` + 空 `trusted_keys` ⇒ 所有 R2/R3 都被拒（`unknown_signing_key`）。
 这是 fail-closed：宁可拒绝，也不要「没配就当没这项」。
 
+> 目标形态是把锚改成**目录**（`attestation/keys/<key_id>.pem`，加锚不重启、新旧天然并存），
+> 理由与迁移见 [`plan-anchor-distribution.md`](../../../wist-agentd/docs/design/plan-anchor-distribution.md)。
+> 在目录化落地前，本文的 `trusted_keys` 语义仍然有效。
+
 **升级顺序**：`AgentConfig` 是 `deny_unknown_fields`，旧 agentd 读到 `[attestation]` 会拒启。
 先升 agentd，再加配置段（建议先 `enforced=false` 观察一轮）。
 
-## 7. 信任锚的轮换
+## 7. 信任锚（执行侧）
 
-`trusted_keys` 是**列表**，可以新旧并存：
+执行侧只认两件事：`attestation.key_id` 命中本地锚，且签名验得过。
+锚可以是**列表**（当前实现：`trusted_keys`，绝对路径）或**目录**（目标形态：
+`attestation/keys/<key_id>.pem`）—— 两者语义一致，目录化的理由与迁移见
+[`plan-anchor-distribution.md`](../../../wist-agentd/docs/design/plan-anchor-distribution.md)。
 
-1. 新公钥加入列表（此时签发方仍用旧钥）；
+轮换必须**新旧并存**：
+
+1. 新公钥加入锚（此时签发方仍用旧钥）；
 2. 签发方切到新钥（`key_id` 变了）；
 3. 旧计划自然过期后，移除旧公钥。
 
 为什么必须并存一段时间：已签发未执行的计划还在路上，立刻移除旧钥会让它们全部
-`unknown_signing_key`。轮换窗口应该 ≥ `plan.attestation.ttl_seconds` 与计划的 `expires_at`。
+`unknown_signing_key`。窗口应该 ≥ `plan.attestation.ttl_seconds` 与计划的 `expires_at`。
 
-**公钥只能来自本地绝对路径**。绝不「每次向网关要公钥」：那等于让被控方自己决定信任谁。
+**公钥只能来自本地**。绝不「每次向网关要公钥」：那等于让被控方自己决定信任谁。
+公钥文件每次 `review` 重新读（换锚不需要重启 agentd），限 8 KiB 上限。
 
-公钥文件每次 `review` 重新读（换锚不需要重启 agentd），并限了 8 KiB 上限。
-
-### 7.1 签发私钥的文件权限
+### 7.1 签发私钥的文件权限（当前网关自签形态）
 
 网关启动期会检查 `[plan_signing] key_file` 的 POSIX mode：**「其他用户」有任何权限就拒启**
 （`0644` 是典型事故）。`0600` 推荐，`0640`（容器里的服务组）允许。
 
 理由：私钥是「审批」这一层唯一的根。同一台宿主机上的任何进程能拷走它，审批就只剩形式。
+换成客户侧外部签发（[`plan-external-signing.md`](./plan-external-signing.md)）后，
+这条检查落到**持钥侧**（CLI 本地密钥 / KMS 策略），网关不再持有私钥。
 
 生成：
 
@@ -174,6 +194,15 @@ chmod 600 state/plan-signing.key
 
 启动日志里有一行 `event=PlanSigning configured=true key_id=…`：配置是否生效不必等到第一次审批。
 
+### 7.2 存量机队：公钥怎么下去
+
+本节只定「公钥不能从网关运行时拉」，没回答**已经装好的机器**怎么把公钥钉上去。
+那件事（锚目录化、升级搭车、轮换、40 台滚动顺序）在 agentd 侧的设计稿里：
+
+- `wist-agentd/docs/design/plan-anchor-distribution.md`
+
+一句话口径：**下发是落一次盘，之后只读本地**；首次铺走升级搭车，日常轮换走锚目录。
+
 ## 8. 边界：这些**不**解决
 
 ### 8.1 被控主机的 root
@@ -184,24 +213,28 @@ chmod 600 state/plan-signing.key
 它不是对抗本地 root 的机制。要发现「root 干了什么」，只能靠中心侧的**外部证据**
 （审批单与实际执行结果的比对、机器状态的独立探测）。
 
-### 8.2 网关被控（本轮）
+### 8.2 网关被控
 
-**本轮私钥在网关**，是刻意的临时状态：审批与签发同在控制面才能先把闭环跑通。
+当前**发布形态**是网关自签（`[plan_signing]` 在网关），所以：
 
-代价：网关被控 ⇒ 它可以自签任意计划。这与 E2 相比并没有变差（那时它本来就能发任意计划），
-但**不能**被当成「已经有了不可抵赖的审批」。
+- 网关被控 ⇒ 它可以自签任意计划。这与 E2 相比并没有变差（那时它本来就能发任意计划），
+  但**不能**被当成「已经有了不可抵赖的审批」。
+- 已决策改为**客户侧外部签发**（审批在 CLI、私钥在客户侧），见
+  [`plan-external-signing.md`](./plan-external-signing.md)。切过去后这一段收窄为：
+  网关仍能推二进制（升级通道，见锚下发文档 §2.1），但**签不出审批**。
 
-这一点必须在文档和部署说明里写明，直到 center 接手签发。
-
-### 8.3 R3 在单 admin token 下不可用
+### 8.3 R3 双人：**已决定不做**
 
 审批人 = `admin:<sha256(token) 前 12 位>`。一个网关只有一个 admin token ⇒ 只有一个身份。
 
-所以：
-- R2（1 人）可用；
-- R3（2 人）在 `create` 时直接回 `409 approval_policy_unsupported`，并说明需要 center 的用户体系。
+历史沿革与现状：
 
-早失败好过在 `issue` 时说「人数不够」。
+- 0.53 起改为**单票制**：`R2` / `R3` 都是一人批一次（`required_approvers_for` 返回 1，
+  见 `src/api/action_approvals.rs:66`）；agentd 执行侧下限也是 1（`plan_review.rs:130`）。
+  所以 R3 **不再**回 `409 approval_policy_unsupported`。
+- 短期**不做**双人/多签（决策与理由：
+  [`plan-external-signing.md`](./plan-external-signing.md) §8）。
+- 「一人批」不等于允许自批：默认仍拒绝同一身份既提交又批准（同上 §8.3）。
 
 ### 8.4 风险等级被低报
 
@@ -241,19 +274,22 @@ chmod 600 state/plan-signing.key
 
 为什么不现在改成 16 位（64 位）：那会改变已有审计行里的 owner 值，
 历史记录会与新记录对不上（「这个 `admin:ab12…` 到底是不是同一个人」）。
-它与 `user:<id>` 迁移是同一件事，应该**一起**做（见 §9），而不是单独打一个字号补丁。
+它与 `user:<id>` 迁移是同一件事，应该**一起**做（见
+[`plan-external-signing.md`](./plan-external-signing.md) §11），而不是单独打一个字号补丁。
 
-## 9. center 接手时的迁移路径
+## 9. 签发方是可更换的
 
-本轮网关侧的接口是照着「将来由 center 签发」设计的，迁移时**不需要改 agentd**：
+证明里的 `key_id` + `issued_by` 就是为此设计的：**换签发方不需要改协议，也不需要改执行侧判定**。
 
-1. 网关的 `POST /approvals` / `votes` 变成 center 的转发（或页面直接打 center）；
-2. `plan_signer` 只在 center 配置；网关的 `[plan_signing]` 留空（`issue` 回 503）；
-3. 审批人身份从 `admin:<token 指纹>` 换成 `user:<id>`（`approvers` 字段类型不变）——
-   这同时也是 §8.5 那个 48 位指纹的正解（不是把它改长，而是不再需要它）；
-4. agentd 侧只改一项：`trusted_keys[].public_key_pem_file` 指向 center 的公钥（或并存到切换完成）。
+| 签发方 | 私钥在哪 | 备注 |
+|---|---|---|
+| 网关自签（当前发布形态） | 网关配置文件 | 闭环最快；审批权归运维方 |
+| **客户侧审批 CLI / 签名服务（已决策方向）** | 客户 KMS/HSM 或审批人机器 | 审批权归客户；见 §plan-external-signing.md |
+| center 集中签发（可选） | center | 客户把审批集中到中心时用；不是必经之路 |
 
-`attestation.issued_by` 已经区分了「哪台控制面签的」，所以迁移期两种签发方并存是可观测的。
+agentd 侧的动作永远只有一个：**把锚换成新签发方的公钥**（可新旧并存到切换完成）。
+锚怎么铺、怎么轮换见
+[`wist-agentd/docs/design/plan-anchor-distribution.md`](../../../wist-agentd/docs/design/plan-anchor-distribution.md)。
 
 ## 10. 代码位置
 

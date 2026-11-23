@@ -20440,6 +20440,797 @@ async fn approval_flow_signs_and_dispatches_a_plan_that_verifies() {
     assert!(delivered_plan.attestation.is_some());
 }
 
+// ── 外部签发（私钥在审批人手上）───────────────────────────────────────────────
+
+/// 一把测试用审批钥匙：私钥留在测试里（扮演 `wist-approve`），公钥登记到网关。
+struct ApproverKeyFixture {
+    key_id: String,
+    owner: String,
+    public_pem: String,
+    key_pair: ring::signature::Ed25519KeyPair,
+}
+
+fn approver_key_fixture(key_id: &str, owner: &str) -> ApproverKeyFixture {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate");
+    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse");
+    let public = key_pair.public_key().as_ref().to_vec();
+    ApproverKeyFixture {
+        key_id: key_id.to_string(),
+        owner: owner.to_string(),
+        public_pem: crate::infra::ed25519_public_key_pem_for_tests(&public),
+        key_pair,
+    }
+}
+
+async fn register_approver_key_fixture(
+    env: &TestEnv,
+    fixture: &ApproverKeyFixture,
+) -> axum::response::Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/approver-keys",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "key_id": fixture.key_id,
+            "owner": fixture.owner,
+            "public_key": fixture.public_pem,
+        }),
+    )
+    .await
+}
+
+async fn fetch_signing_payload(env: &TestEnv, approval_id: &str) -> serde_json::Value {
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/signing-payload"),
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    decode_json_response(response).await
+}
+
+/// 已登记过 agent / 能力之后的“提交 + 批准”（同一个 agent 可以反复用）。
+async fn approved_r2_approval_with(env: &TestEnv) -> String {
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "decision": "approve" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    approval_id
+}
+
+/// 提交 + 批准一条 R2，返回 `approval_id`（顺带把 agent 与能力准备好）。
+async fn approved_r2_approval(env: &TestEnv) -> String {
+    let credential = enroll_agent_credential(env).await;
+    report_exec_capabilities(
+        env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    approved_r2_approval_with(env).await
+}
+
+/// 按 `signing-payload` 里的**事实**构造并签一份 attestation（测试扮演审批机）。
+fn external_attestation(
+    payload: &serde_json::Value,
+    fixture: &ApproverKeyFixture,
+) -> wist_contracts::action_plan::ActionPlanAttestation {
+    use wist_contracts::action_plan::{ActionPlanApproval, ActionPlanAttestation, RiskLevel};
+    let approvers: Vec<String> = payload["approvers"]
+        .as_array()
+        .expect("approvers")
+        .iter()
+        .map(|value| value.as_str().expect("approver").to_string())
+        .collect();
+    let mut attestation = ActionPlanAttestation {
+        api_version: "v1".to_string(),
+        plan_digest: payload["plan_digest"].as_str().expect("digest").to_string(),
+        approval: ActionPlanApproval {
+            approval_id: payload["approval_id"]
+                .as_str()
+                .expect("approval id")
+                .to_string(),
+            approvers,
+            required_approvers: u8::try_from(
+                payload["required_approvers"].as_u64().expect("required"),
+            )
+            .expect("u8"),
+            approved_at: payload["approved_at"]
+                .as_str()
+                .expect("approved_at")
+                .to_string(),
+        },
+        risk_level: if payload["risk_level"] == "R3" {
+            RiskLevel::R3
+        } else {
+            RiskLevel::R2
+        },
+        issued_by: fixture.owner.clone(),
+        key_id: fixture.key_id.clone(),
+        algorithm: "ed25519".to_string(),
+        signed_at: DateTime::now().to_chrono().to_rfc3339(),
+        // 计划到期在 2031，直接用计划到期作为证明到期（≤ 计划到期且 > now）。
+        expires_at: payload["plan_expires_at"]
+            .as_str()
+            .expect("plan expires")
+            .to_string(),
+        signature: String::new(),
+    };
+    let signature = fixture.key_pair.sign(&attestation.signing_payload());
+    attestation.signature = signature
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    attestation
+}
+
+async fn issue_with_attestation(
+    env: &TestEnv,
+    approval_id: &str,
+    attestation: &wist_contracts::action_plan::ActionPlanAttestation,
+) -> axum::response::Response {
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/issue"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "attestation": attestation }),
+    )
+    .await
+}
+
+/// 外部签发的完整闭环：登记公钥 → 取待签包 → 独立签名 → 签发下发。
+#[tokio::test]
+async fn external_attestation_is_verified_and_dispatched() {
+    let mut env = TestEnv::new().await;
+    // 网关**没有**自签私钥：这条路必须完全不依赖 `[plan_signing]`。
+    env.config.plan_signer = None;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    let response = register_approver_key_fixture(&env, &fixture).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let registered: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(registered["key_id"], "site-k1");
+    assert_eq!(registered["fingerprint"].as_str().expect("fp").len(), 16);
+
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    assert_eq!(payload["approval_id"], approval_id);
+    assert_eq!(payload["required_approvers"], 1);
+    assert_eq!(payload["approvers"].as_array().expect("approvers").len(), 1);
+
+    let attestation = external_attestation(&payload, &fixture);
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let command_id = body["dispatched_command_id"]
+        .as_str()
+        .expect("dispatched")
+        .to_string();
+    assert!(!command_id.is_empty());
+    let issued = &body["issued_plan"];
+    assert_eq!(issued["attestation"]["key_id"], "site-k1");
+    assert_eq!(issued["attestation"]["issued_by"], "role:approver");
+    assert_eq!(issued["attestation"]["signature"], attestation.signature);
+}
+
+/// 没批准之前不给待签包：待签包里的 `approvers` 必须是服务端事实。
+#[tokio::test]
+async fn signing_payload_is_refused_before_approval() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"].as_str().expect("approval id");
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/signing-payload"),
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_incomplete");
+}
+
+/// 一把没登记过的钥匙，签名再对也不收（已有别的钥匙在生效）。
+#[tokio::test]
+async fn external_issue_rejects_unknown_key() {
+    let env = TestEnv::new().await;
+    // 先登记一把**别的**钥匙，让「一条都没有」的场景不会抢走这条断言。
+    let registered = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &registered)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let fixture = approver_key_fixture("never-registered", "role:approver");
+    let attestation = external_attestation(&payload, &fixture);
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approver_key_unknown");
+}
+
+/// 吊销后同一把钥匙立刻失效（已签发的计划不受影响，这里只看新签发）。
+#[tokio::test]
+async fn external_issue_rejects_revoked_key() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let response = admin_request(&env, "DELETE", "/api/v1/admin/approver-keys/site-k1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let attestation = external_attestation(&payload, &fixture);
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approver_key_revoked");
+}
+
+/// 签名被改过一个字节就不收。
+#[tokio::test]
+async fn external_issue_rejects_bad_signature() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let mut attestation = external_attestation(&payload, &fixture);
+    // 把签名首字符换掉（保持 hex 形状，让失败原因只能是验签）。
+    let first = if attestation.signature.starts_with('0') {
+        "1"
+    } else {
+        "0"
+    };
+    attestation.signature.replace_range(0..1, first);
+
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "attestation_signature_invalid");
+}
+
+/// 签名方不能自己往 `approvers` 里塞人（审批事实必须在服务端）。
+#[tokio::test]
+async fn external_issue_rejects_fabricated_approvers() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let mut attestation = external_attestation(&payload, &fixture);
+    attestation
+        .approval
+        .approvers
+        .push("user:ghost".to_string());
+    // 改了被签内容就要重签，否则会先因为签名失败而掩盖真正的拒绝原因。
+    let signature = fixture.key_pair.sign(&attestation.signing_payload());
+    attestation.signature = signature
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_mismatch");
+}
+
+/// 审批后被改过的计划：证明里的摘要对不上现在重算的。
+#[tokio::test]
+async fn external_issue_rejects_digest_mismatch() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let mut attestation = external_attestation(&payload, &fixture);
+    // 把声称的摘要改成另 sha256（形状仍合法）。
+    attestation.plan_digest = format!("plan-v1:sha256:{}", "ab".repeat(32));
+    let signature = fixture.key_pair.sign(&attestation.signing_payload());
+    attestation.signature = signature
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "plan_digest_mismatch");
+}
+
+/// 不能「批了 R1、跑 R2」：证明里的风险等级必须与计划一致。
+#[tokio::test]
+async fn external_issue_rejects_risk_mismatch() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let mut attestation = external_attestation(&payload, &fixture);
+    attestation.risk_level = wist_contracts::action_plan::RiskLevel::R3;
+    let signature = fixture.key_pair.sign(&attestation.signing_payload());
+    attestation.signature = signature
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_risk_mismatch");
+}
+
+/// 一条公钥都没登记时，错误要说清楚「该去登记公钥」，而不是「没配私钥」。
+#[tokio::test]
+async fn external_issue_reports_unregistered_when_no_key_exists() {
+    let env = TestEnv::new().await;
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    let attestation = external_attestation(&payload, &fixture);
+
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approver_key_unregistered");
+}
+
+/// 改过内容的证明必须重签，否则失败原因会被“签名不对”掩盖。测试里显式重签。
+fn resign(
+    attestation: &mut wist_contracts::action_plan::ActionPlanAttestation,
+    fixture: &ApproverKeyFixture,
+) {
+    let signature = fixture.key_pair.sign(&attestation.signing_payload());
+    attestation.signature = signature
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+}
+
+/// 已经过期的证明不收。
+///
+/// 这里构造的是「签的时候没过期、现在已经过期」的情形（`signed_at` 在 2 小时前、
+/// `expires_at` 在 1 小时前）—— 形状层只要求 `expires_at > signed_at`，所以这条会
+/// 穿过 `wist-validate`，由网关的有效期检查拦住。
+#[tokio::test]
+async fn external_issue_rejects_an_expired_attestation() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let mut attestation = external_attestation(&payload, &fixture);
+    let now = chrono::Utc::now();
+    attestation.signed_at =
+        (now - chrono::Duration::hours(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    attestation.expires_at =
+        (now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    resign(&mut attestation, &fixture);
+
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "attestation_invalid");
+}
+
+/// 证明不能活得比计划长（计划到期之后，一份还“有效”的证明毫无意义）。
+#[tokio::test]
+async fn external_issue_rejects_attestation_outliving_the_plan() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let mut attestation = external_attestation(&payload, &fixture);
+    attestation.expires_at = "2032-01-01T00:00:00Z".to_string();
+    resign(&mut attestation, &fixture);
+
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "attestation_invalid");
+}
+
+/// A 单的签名不能拿去签 B 单。
+///
+/// 这一条被 **`wist-validate` 的形状层**先拦下了：它要求
+/// `attestation.approval.approval_id == plan.constraints.approval_ref`（而计划的
+/// `approval_ref` 由网关写入），所以回 400 `attestation_invalid` 而不是 409
+/// `approval_mismatch` —— 两道闸都成立，先撞哪道不影响结论。
+#[tokio::test]
+async fn external_issue_rejects_an_attestation_for_another_approval() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let mut attestation = external_attestation(&payload, &fixture);
+    attestation.approval.approval_id = "apv_someone_else".to_string();
+    resign(&mut attestation, &fixture);
+
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "attestation_invalid");
+}
+
+/// 吊销过的钥匙不能被一次重试静默复活；要显式 `reactivate`。
+#[tokio::test]
+async fn registering_a_revoked_key_requires_reactivate() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let response = admin_request(&env, "DELETE", "/api/v1/admin/approver-keys/site-k1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 重新导入同一把 → 拒绝。
+    let response = register_approver_key_fixture(&env, &fixture).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approver_key_revoked");
+
+    // 显式 reactivate → 恢复。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/approver-keys",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "key_id": fixture.key_id,
+            "owner": fixture.owner,
+            "public_key": fixture.public_pem,
+            "reactivate": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(body["revoked_at"].is_null(), "{body}");
+}
+
+/// 登记入口的形状校验：名字不能穿越、公钥必须是 Ed25519 SPKI。
+#[tokio::test]
+async fn approver_key_registration_validates_its_input() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+
+    for (key_id, expected_code) in [
+        ("../etc/passwd", "approver_key_invalid"),
+        ("", "approver_key_invalid"),
+    ] {
+        let response = post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            "/api/v1/admin/approver-keys",
+            Some(TEST_ADMIN_API_TOKEN),
+            &serde_json::json!({
+                "key_id": key_id,
+                "owner": "role:approver",
+                "public_key": fixture.public_pem
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "key_id={key_id:?}"
+        );
+        let body: serde_json::Value = decode_json_response(response).await;
+        assert_eq!(body["error"]["code"], expected_code);
+    }
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/approver-keys",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({
+            "key_id": "site-k1",
+            "owner": "role:approver",
+            "public_key": "not a pem"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approver_key_invalid");
+}
+
+/// 签发之后再要待签包 → 409（不允许重复签）。
+#[tokio::test]
+async fn signing_payload_is_refused_after_issue() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let attestation = external_attestation(&payload, &fixture);
+    assert_eq!(
+        issue_with_attestation(&env, &approval_id, &attestation)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/signing-payload"),
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "approval_already_issued");
+}
+
+/// 请求体带 `{"attestation": null}` 必须回到网关自签（老页面/旧客户端就发这种）。
+#[tokio::test]
+async fn issue_with_a_null_attestation_falls_back_to_gateway_signing() {
+    let mut env = TestEnv::new().await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+    // 同时登记了一把审批公钥：证明"外部模式可用"也不会抢走旧路径。
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/issue"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "attestation": null }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["issued_plan"]["attestation"]["key_id"], "gw-plan-k1");
+}
+
+/// 外部签发也支持 `dispatch=false`（只签不发，自己再调 `/plans`）。
+#[tokio::test]
+async fn external_issue_can_skip_dispatch() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let attestation = external_attestation(&payload, &fixture);
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/issue?dispatch=false"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "attestation": attestation }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert!(body["dispatched_command_id"].is_null(), "{body}");
+    assert_eq!(body["issued"], true);
+}
+
+/// 轮换：同名 `key_id` 换成新公钥后，**旧钥匙立刻失效**（新钥匙可用）。
+#[tokio::test]
+async fn rotating_an_approver_key_invalidates_the_old_key() {
+    let env = TestEnv::new().await;
+    // 同一个 agent 反复用：一条凭证 + 一次能力上报，之后只提交/投票。
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.apply"],
+        &["agent_exec_v1"],
+    )
+    .await;
+
+    let old = approver_key_fixture("site-k1", "role:approver");
+    let response = register_approver_key_fixture(&env, &old).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let old_fingerprint = decode_json_response::<serde_json::Value>(response).await["fingerprint"]
+        .as_str()
+        .expect("old fingerprint")
+        .to_string();
+
+    // 先用旧钥匙签一条（此时可用）。
+    let first = approved_r2_approval_with(&env).await;
+    let payload = fetch_signing_payload(&env, &first).await;
+    let attestation = external_attestation(&payload, &old);
+    assert_eq!(
+        issue_with_attestation(&env, &first, &attestation)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // 轮换到新钥匙（同 key_id）。
+    let new = approver_key_fixture("site-k1", "role:approver");
+    let response = register_approver_key_fixture(&env, &new).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let new_fingerprint = decode_json_response::<serde_json::Value>(response).await["fingerprint"]
+        .as_str()
+        .expect("new fingerprint")
+        .to_string();
+    assert_ne!(new_fingerprint, old_fingerprint, "指纹必须跟着公钥变");
+
+    // 新钥匙可用。
+    let second = approved_r2_approval_with(&env).await;
+    let payload = fetch_signing_payload(&env, &second).await;
+    let attestation = external_attestation(&payload, &new);
+    assert_eq!(
+        issue_with_attestation(&env, &second, &attestation)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // 旧钥匙被拒（验签不过）。
+    let third = approved_r2_approval_with(&env).await;
+    let payload = fetch_signing_payload(&env, &third).await;
+    let attestation = external_attestation(&payload, &old);
+    let response = issue_with_attestation(&env, &third, &attestation).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "attestation_signature_invalid");
+}
+
+/// 列表里要能看到已吊销的行（审计要回答"什么时候撤的"）。
+#[tokio::test]
+async fn approver_keys_list_includes_revoked_rows() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let response = admin_request(&env, "DELETE", "/api/v1/admin/approver-keys/site-k1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/approver-keys",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let keys = body["keys"].as_array().expect("keys");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["key_id"], "site-k1");
+    assert!(!keys[0]["revoked_at"].is_null());
+}
+
+/// 审批公钥是管理面资源：没有 admin token 一律 401。
+#[tokio::test]
+async fn approver_keys_require_the_admin_token() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/approver-keys",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/approver-keys",
+        None,
+        &serde_json::json!({
+            "key_id": fixture.key_id,
+            "owner": fixture.owner,
+            "public_key": fixture.public_pem
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 算法字段只认 `ed25519`（形状层拦，不等验签时才失败）。
+#[tokio::test]
+async fn external_issue_rejects_a_non_ed25519_algorithm() {
+    let env = TestEnv::new().await;
+    let fixture = approver_key_fixture("site-k1", "role:approver");
+    assert_eq!(
+        register_approver_key_fixture(&env, &fixture).await.status(),
+        StatusCode::OK
+    );
+    let approval_id = approved_r2_approval(&env).await;
+    let payload = fetch_signing_payload(&env, &approval_id).await;
+    let mut attestation = external_attestation(&payload, &fixture);
+    attestation.algorithm = "rsa".to_string();
+    resign(&mut attestation, &fixture);
+
+    let response = issue_with_attestation(&env, &approval_id, &attestation).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "attestation_invalid");
+}
+
 /// R0/R1 不需要审批：直接下发即可，提交到审批队列只会多一条无意义的记录。
 #[tokio::test]
 async fn approvals_refuse_a_plan_that_does_not_need_approval() {
@@ -21508,4 +22299,109 @@ async fn repeated_submissions_never_collide_on_the_approval_id() {
         assert!(ids.insert(id), "approval_id 重复了");
     }
     assert_eq!(ids.len(), 10);
+}
+
+// ── wist-approve 分发面（公开、无鉴权）────────────────────────────────────────
+
+fn place_approver_package(env: &TestEnv, platform: &str, bytes: &[u8]) {
+    let path = crate::api::approver_install::approver_package_path(&env.config, platform);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+    std::fs::write(&path, bytes).expect("write package");
+}
+
+/// 三个端点（脚本 / 摘要 / 二进制）要互相自洽，且都**不需要**鉴权。
+#[tokio::test]
+async fn approver_install_script_and_digests_are_consistent() {
+    let env = TestEnv::new().await;
+    let platform = "aarch64-apple-darwin";
+    let bytes = b"#!fake-wist-approve-binary".to_vec();
+    place_approver_package(&env, platform, &bytes);
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/approver/install/{platform}/install.sh"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let script = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    let package_sha = crate::infra::bytes_sha256_hex(&bytes);
+    assert!(
+        script.contains(&package_sha),
+        "script must embed the package digest"
+    );
+    assert!(
+        script.contains("wist-approve"),
+        "script must install the binary"
+    );
+    assert!(!script.contains("{{"), "no unrendered placeholders");
+    assert!(
+        script.contains(&format!("/api/v1/approver/packages/{platform}")),
+        "script must point at the package endpoint"
+    );
+
+    // 摘要端点给出的是同一组值（页面用它显示「运行前核对」）。
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/approver/install/{platform}/digests"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let digests: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(digests["platform"], platform);
+    assert_eq!(digests["package_sha256"], package_sha.as_str());
+    assert_eq!(
+        digests["script_sha256"],
+        crate::infra::bytes_sha256_hex(script.as_bytes()).as_str(),
+        "script digest must match the served script byte-for-byte"
+    );
+
+    // 二进制本体。
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/approver/packages/{platform}"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.to_vec(), bytes);
+}
+
+/// 没放制品就 503（而不是 404：平台认识，只是这台网关没有这个包）。
+#[tokio::test]
+async fn approver_install_is_unavailable_without_an_artifact() {
+    let env = TestEnv::new().await;
+    let platform = "aarch64-apple-darwin";
+    for path in [
+        format!("/api/v1/approver/install/{platform}/install.sh"),
+        format!("/api/v1/approver/install/{platform}/digests"),
+        format!("/api/v1/approver/packages/{platform}"),
+    ] {
+        let response = get_to_router(&env.config, &env.store_handle, &path, None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        let body: serde_json::Value = decode_json_response(response).await;
+        assert_eq!(body["error"]["code"], "approver_package_unavailable");
+    }
+}
+
+/// 平台白名单：不认识的一律 404（分发面不接受任意路径）。
+#[tokio::test]
+async fn approver_install_rejects_an_unknown_platform() {
+    let env = TestEnv::new().await;
+    for platform in ["windows-x86_64", "..%2F..%2Fetc", "armv7"] {
+        let response = get_to_router(
+            &env.config,
+            &env.store_handle,
+            &format!("/api/v1/approver/packages/{platform}"),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{platform}");
+        let body: serde_json::Value = decode_json_response(response).await;
+        assert_eq!(body["error"]["code"], "unknown_platform");
+    }
 }

@@ -62,6 +62,35 @@ pub fn public_key_fingerprint(public_key: &[u8]) -> String {
     digest.chars().take(16).collect()
 }
 
+/// 从公钥 PEM 直接取指纹（解析失败就报错，不返回空串）。
+///
+/// 登记审批公钥时这两件事总是一起做：不会解析的 PEM 就不该被存下来，
+/// 否则页面/CLI 会显示一个永远对不上的指纹。
+pub fn public_key_fingerprint_from_pem(pem: &str) -> Result<String, String> {
+    let raw = parse_ed25519_public_key_pem(pem)?;
+    Ok(public_key_fingerprint(&raw))
+}
+
+/// hex → 字节（大小写均可）。
+///
+/// 小写输出是唯一方向（签名、摘要都按小写 hex 存），但输入宽容大小写：
+/// 别的工具可能大写输出，因为这拒绝一份合法签名没有意义。
+pub fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let hi = (bytes[index] as char).to_digit(16)?;
+        let lo = (bytes[index + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        index += 2;
+    }
+    Some(out)
+}
+
 /// 测试专用：把裸公钥包成 SPKI PEM（知识库验签的测试夹具用）。
 #[cfg(test)]
 pub(crate) fn ed25519_public_key_pem_for_tests(public_key: &[u8]) -> String {
@@ -136,5 +165,29 @@ mod tests {
         let mut other = public.clone();
         other[0] ^= 0x01;
         assert!(!verify_ed25519(&other, message, &signature));
+    }
+
+    #[test]
+    fn fingerprint_comes_from_the_pem_and_is_stable() {
+        let raw = [9u8; 32];
+        let pem = ed25519_public_key_pem(&raw);
+        let from_pem = public_key_fingerprint_from_pem(&pem).expect("fingerprint");
+        assert_eq!(from_pem, public_key_fingerprint(&raw));
+        assert_eq!(from_pem.len(), 16);
+        // 换一个字节，指纹必须变（否则核对就失去意义）。
+        let mut changed = raw;
+        changed[31] ^= 0x01;
+        assert_ne!(
+            public_key_fingerprint_from_pem(&ed25519_public_key_pem(&changed)).expect("fp"),
+            from_pem
+        );
+    }
+
+    #[test]
+    fn hex_decode_accepts_both_cases_and_rejects_garbage() {
+        assert_eq!(hex_decode("00ff10"), Some(vec![0x00, 0xff, 0x10]));
+        assert_eq!(hex_decode("00FF10"), Some(vec![0x00, 0xff, 0x10]));
+        assert_eq!(hex_decode("abc"), None, "odd length");
+        assert_eq!(hex_decode("zz"), None, "not hex");
     }
 }

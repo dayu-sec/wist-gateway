@@ -93,7 +93,7 @@ pub async fn get_agent_install_script(
 /// 安装脚本路径里的**平台**（target-triple）：只认 agentd 发布的三个平台。
 /// 其余一律 404（安装面是固定的：macOS-ARM + Linux x86_64/ARM64）；
 /// 具体某个平台是否有包，另由 `resolve_agent_package` 判定（无则 503）。
-fn supported_agent_platform(platform: &str) -> Result<&'static str, ()> {
+pub(crate) fn supported_agent_platform(platform: &str) -> Result<&'static str, ()> {
     match platform.trim() {
         p if p == PLATFORM_LINUX_X86 => Ok(PLATFORM_LINUX_X86),
         p if p == PLATFORM_LINUX_ARM => Ok(PLATFORM_LINUX_ARM),

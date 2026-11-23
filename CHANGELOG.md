@@ -3,6 +3,38 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.57.0-alpha] - 2026-11-23
+
+### 新增（外部签发：审批与签名移到客户侧）
+
+审批权必须在**客户**手上：我们代签不算审批。这一版把签发拆成「网关只收签名」：审批人用自己机器上的
+`wist-approve` 投票 + 用私钥签名，网关只做校验与留痕。**私钥永不进网关**。
+
+- 新增 `GET /api/v1/admin/approvals/{id}/signing-payload`：返回**将要被签的字节**
+  （`plan` 原文 + 服务端事实 `approvers` / `plan_digest`），CLI 据此本地重算摘要并渲染人读摘要。
+- `POST /api/v1/admin/approvals/{id}/issue` 接受可选 `attestation`（`{}` / `null` 回退到原来的
+  网关自签，老客户端不受影响）。外部证明走**七条校验**：形状、算法、摘要与待签字节一致、
+  `approval_ref` 绑定、审批人数与风险相符、有效期不越计划到期、签名对得上已登记公钥。
+- 新增审批公钥登记面 `GET/POST /api/v1/admin/approver-keys`、`DELETE /api/v1/admin/approver-keys/{key_id}`：
+  导入即验 Ed25519 SPKI 并算指纹；**吊销过的钥匙默认不会被一次重导静默复活**（需显式 `reactivate`，
+  判定在 SQL 的 `CASE` 里，不可被并发绕过）。
+- 新增审批终端分发面 `GET /api/v1/approver/packages|install|digests`（**公开无鉴权**）：
+  客户/隔离站点只连得上自己的网关。安装脚本内嵌包 sha256，`/digests` 另外给出脚本摘要供人核对；
+  平台只认三个白名单 triple，文件名固定，不做目录遍历。
+- `wist-approve`（workspace 成员，V1 CLI）：`key generate|show`、`list`、`show`、`approve [--sign]`、
+  `reject`、`sign`、`submit`、`status`。摘要与规范化**复用 `wist-contracts`**（不写第二份，
+  否则「签的东西」和「机器验的东西」会漂）；未知 op / 未知字段直接拒绝；签完本机再验一遍。
+- CLI 制品随 release 出三平台 tarball（`wist-approve-<tag>-<triple>.tar.gz`），Linux 为**静态 musl**
+  （审批人的跳板机常是老系统）；`--version` 打印发布 tag 与目标平台，便于对账。
+
+### 升级注意
+
+- **agentd 不受影响**：外部证明对 agentd 就是一份普通 attestation（形状与网关自签相同）。
+- 现场要另外做两步，否则审批人装不上 CLI / 签了也不生效：把 `wist-approve` 制品投放到网关
+  （`wist-gateway-stack` 的 `scripts/install-approver-package.sh`）、把站点签署公钥钉进 agentd 的
+  `[attestation] trusted_keys` 并先以 `enforced = false` 观察。
+- **临时缺口**：审批接口仍用 admin token（角色分离排在后续版本），发布说明里必须写明。
+
 ## [0.56.0-alpha] - 2026-11-23
 
 ### 新增（执行结果列表：刷新页面后还能找回历史）

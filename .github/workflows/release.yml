@@ -56,6 +56,86 @@ jobs:
   #   · build context 里要同时放两份二进制（~50MB），一次传给 builder；
   #   · 一个架构失败会拖死整条链；拆开 + `fail-fast: false` 时另一份照常产出。
   # manifest list 由下面的 `manifest` job 合并。
+  # 1b. `wist-approve`（审批终端）单独出三平台制品。
+  #     客户通过网关的 `/api/v1/approver/...` 下载，网关只需要有人把制品放进
+  #     `<state>/approver-package/<platform>/wist-approve`（现场由栈脚本投放）。
+  #
+  #     Linux 必须是**静态 musl**，与 agentd 制品同一口径（见 wist-agentd 的
+  #     release.yml）：审批 CLI 跑在客户的工作站/跳板机上，隔离站点的跳板机常是
+  #     CentOS 7/8 这类老系统 —— 绑 glibc 2.39 的 gnu 制品在那边连加载器都过不去。
+  #
+  #     triple **必须**与网关的分发白名单一致（`src/api/install_package.rs` 的
+  #     三个 PLATFORM_* 常量，审批分发面复用它）：白名单里是 musl triple，CI 若出
+  #     gnu 制品，`/api/v1/approver/...` 会按白名单把请求直接挡成 404，且栈脚本把
+  #     文件投到网关根本不读的目录。
+  build-approver-cli:
+    name: Build wist-approve ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cargo build
+        # `default-members` 只包含网关，所以这里必须显式 `-p`。
+        # C 依赖（ring）按 target 取 CC；Rust 侧链接器指向 musl-gcc 才能真静态。
+        # `WIST_APPROVE_VERSION` 把 tag 编进 `--version`：客户报障时能对上是哪个制品。
+        env:
+          WIST_APPROVE_VERSION: ${{ github.ref_name }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          AR_x86_64_unknown_linux_musl: ar
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          AR_aarch64_unknown_linux_musl: ar
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --locked -p wist-approve --bin wist-approve --target ${{ matrix.target }}
+
+      - name: Package tarball
+        env:
+          TARGET_IS_MUSL: ${{ contains(matrix.target, 'musl') }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          BIN="target/${{ matrix.target }}/release/wist-approve"
+          # 静态性必须由 CI 对**当次产物**自证：gnu 制品在这里不报错，只会在客户的
+          # 老跳板机上炸成 "GLIBC_2.39 not found"，事后人工复核既依赖网络也依赖人没忘。
+          # 不用 `file … | grep -q`（命中即退出会关掉管道，配 pipefail 变成误判）。
+          if [ "${TARGET_IS_MUSL}" = "true" ]; then
+            desc="$(file -b "${BIN}")"
+            case "${desc}" in
+              # x86_64-musl 默认开 PIE，file 吐 `static-pie linked`；aarch64 吐
+              # `statically linked`。判据是「没绑动态库」，不是「没有 PIE」。
+              *"statically linked"*|*"static-pie linked"*) echo "静态链接 ✓（${desc}）" ;;
+              *) echo "拒绝发布：wist-approve 不是静态链接 —— ${desc}" >&2; exit 1 ;;
+            esac
+          fi
+          cp "${BIN}" artifacts/wist-approve
+          tar -czf "wist-approve-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C artifacts wist-approve
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wist-approve-${{ matrix.target }}
+          path: wist-approve-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
   docker:
     needs: [build-binaries]
     runs-on: ubuntu-24.04
@@ -182,7 +262,7 @@ jobs:
 
   # 4. 发布 tarball 到 GitHub Release
   release:
-    needs: [build-binaries]
+    needs: [build-binaries, build-approver-cli]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -192,6 +272,12 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           pattern: wist-gateway-*
+          path: artifacts
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wist-approve-*
           path: artifacts
           merge-multiple: true
 

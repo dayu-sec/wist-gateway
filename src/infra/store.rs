@@ -982,6 +982,32 @@ impl StoredActionApprovalVote {
     }
 }
 
+/// 一把**审批公钥**（外部签发模式：私钥在审批人手上，网关只收签名）。
+///
+/// 语义上它只是「挡垃圾 + 展示指纹」：真正的授权在执行侧（agentd 的锚）。
+/// 所以吊销它不会让已签发的计划失效，只会让后续用这把钥匙签的单进不来。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredApproverKey {
+    /// 与 `attestation.key_id` 对应，也是 agentd 锚里的文件名。
+    pub key_id: String,
+    /// 属主（`user:<id>` / `role:approver` …），用于审计与页面展示。
+    pub owner: String,
+    /// Ed25519 **SPKI PEM**（公开信息）。
+    pub public_key: String,
+    /// DER 的 sha256 前 16 位（页面与 CLI 核对用）。
+    pub fingerprint: String,
+    pub added_by: String,
+    pub added_at: String,
+    /// `None` = 生效中。
+    pub revoked_at: Option<String>,
+}
+
+impl StoredApproverKey {
+    pub fn is_active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
+}
+
 /// Agent 的工作确认回执（网关侧留痕，模型里没有对应元素）。
 ///
 /// 为什么单独一张表：确认是 **Agent 侧的事实**（我手上是这个版本），与工作自身的
@@ -2215,6 +2241,28 @@ pub trait Store: Send + Sync + fmt::Debug {
         approval_id: &str,
         issued_plan_json: &str,
     ) -> StoreResult<bool>;
+
+    /// 登记一把审批公钥（外部签发）。同 `key_id` 重复导入 = 覆盖公钥（轮换）。
+    ///
+    /// `reactivate` 语义：**只有它为 true 才会把已吊销的行清回生效**。不用「裸 upsert」是因为
+    /// 吊销往往是一次安全事件 —— 不能因为一次重试/一张旧页面的提交就把撤销掉。
+    /// 它在 SQL 里判定（而不是先读后写），所以「读到的还没吊销、写的瞬间被吊销」
+    /// 这种竞态也不会把吊销撤回去。
+    async fn upsert_approver_key(
+        &self,
+        key: &StoredApproverKey,
+        reactivate: bool,
+    ) -> StoreResult<()>;
+
+    /// 全部审批公钥（含已吊销的，审计要看）。按 `added_at` 排序。
+    async fn list_approver_keys(&self) -> StoreResult<Vec<StoredApproverKey>>;
+
+    /// 按 `key_id` 取一把；`None` = 没登记过。
+    async fn get_approver_key(&self, key_id: &str) -> StoreResult<Option<StoredApproverKey>>;
+
+    /// 吊销：打上 `revoked_at`，不删行（审计要能回答「什么时候被谁撤的」）。
+    /// 返回是否真的改到了行。
+    async fn revoke_approver_key(&self, key_id: &str, revoked_at: &str) -> StoreResult<bool>;
 
     /// 某台 agent 在 `since_ms` 之后**入门过**多少条某种 kind 的命令（含已被覆盖/已确认）。
     ///

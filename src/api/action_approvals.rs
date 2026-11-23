@@ -94,6 +94,19 @@ fn format_ts(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// 客户端可控字符串进日志前的洗白。
+///
+/// `issued_by` / `key_id` 来自请求，直接拼进 `log::info!` 会让攻击者能用 `\n`
+/// 伪造一整行日志（比如伪造成 `event=ApprovalIssuedExternal`）。这里把控制字符
+/// 换成 `?` 并截断，日志始终一行、字段边界不会被撑破。
+fn log_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .take(120)
+        .collect()
+}
+
 fn parse_ts(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -593,7 +606,142 @@ pub async fn vote_approval(
     Json(approval_view(&approval, votes, true)).into_response()
 }
 
+// ── GET /api/v1/admin/approvals/{approval_id}/signing-payload ──
+
+/// 待签包：给审批机（`wist-approve`）的一切它需要、而**不需要相信页面**的东西。
+///
+/// 只给**事实**（审批人名单 / 摘要 / 计划原文 / 计划到期），不替审批机填
+/// `key_id` / `issued_by` / `signed_at` —— 那些属于签名方，网关代填就变成"网关也在决定签名内容"。
+#[derive(Debug, Serialize)]
+struct SigningPayloadView {
+    approval_id: String,
+    agent_id: String,
+    plan_digest: String,
+    risk_level: String,
+    approvers: Vec<String>,
+    required_approvers: u8,
+    approved_at: Option<String>,
+    /// 计划原文（含审批时写入的 `approval_ref`）。CLI 用它本地重算摘要。
+    plan: serde_json::Value,
+    /// 计划自身的到期时刻：证明的 `expires_at` 不能晚于它。
+    plan_expires_at: String,
+}
+
+pub async fn signing_payload(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Path(approval_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let approval = match load_approval(&state, &approval_id).await {
+        Ok(approval) => approval,
+        Err(response) => return response,
+    };
+    if approval.issued_plan_json.is_some() {
+        return ApiError::conflict(
+            codes::APPROVAL_ALREADY_ISSUED,
+            "approval has already been issued",
+        )
+        .into_response();
+    }
+    let now = Utc::now();
+    if let Some(expires) = parse_ts(&approval.expires_at)
+        && now >= expires
+    {
+        return ApiError::conflict(
+            codes::APPROVAL_EXPIRED,
+            format!("approval expired at {}", approval.expires_at),
+        )
+        .into_response();
+    }
+    if approval.status != "approved" {
+        let (code, detail) = match approval.status.as_str() {
+            "rejected" => (codes::APPROVAL_CLOSED, "approval was rejected".to_string()),
+            "expired" => (codes::APPROVAL_EXPIRED, "approval expired".to_string()),
+            other => (
+                codes::APPROVAL_INCOMPLETE,
+                format!(
+                    "approval is {other} (needs {} approver(s))",
+                    approval.required_approvers
+                ),
+            ),
+        };
+        return ApiError::conflict(code, detail).into_response();
+    }
+    let votes = match load_votes(&state, &approval_id).await {
+        Ok(votes) => votes,
+        Err(response) => return response,
+    };
+    let approvers: Vec<String> = votes
+        .iter()
+        .filter(|vote| vote.is_approve())
+        .map(|vote| vote.approver.clone())
+        .collect();
+    let Ok(required) = u8::try_from(approval.required_approvers) else {
+        return ApiError::internal(
+            codes::ACTION_PLAN_INVALID,
+            "stored approval has an invalid required_approvers",
+            approval.required_approvers,
+        )
+        .into_response();
+    };
+    if approvers.len() < usize::from(required) {
+        return ApiError::conflict(
+            codes::APPROVAL_INCOMPLETE,
+            format!(
+                "approval has {} approved vote(s), needs {required}",
+                approvers.len()
+            ),
+        )
+        .into_response();
+    }
+    let plan: ActionPlan = match serde_json::from_str(&approval.plan_json) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return ApiError::internal(
+                codes::ACTION_PLAN_INVALID,
+                "stored approval plan is not a valid action plan",
+                err,
+            )
+            .into_response();
+        }
+    };
+    // 能力闸同样放在**签名之前**：一台不会跑这份计划的机器，不该让人白签一次。
+    if let Err(response) =
+        action_plans::ensure_plan_capable(&state, &approval.agent_id, &plan).await
+    {
+        return response;
+    }
+    Json(SigningPayloadView {
+        approval_id: approval.approval_id.clone(),
+        agent_id: approval.agent_id.clone(),
+        plan_digest: approval.plan_digest.clone(),
+        risk_level: approval.risk_level.clone(),
+        approvers,
+        required_approvers: required,
+        approved_at: approval.approved_at.clone(),
+        plan: serde_json::from_str(&approval.plan_json).unwrap_or(serde_json::Value::Null),
+        plan_expires_at: plan.meta.expires_at.clone(),
+    })
+    .into_response()
+}
+
 // ── POST /api/v1/admin/approvals/{approval_id}/issue ──
+
+/// 签发请求体（可选）：带 `attestation` = **外部签发**（私钥在审批人手上）。
+///
+/// `attestation` 可缺省：老客户端/页面仍会发 `{}`（表示「用网关自己的私钥签」），
+/// 把缺省当成错误会让所有旧调用方一起 422。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueRequest {
+    #[serde(default)]
+    attestation: Option<wist_contracts::action_plan::ActionPlanAttestation>,
+}
 
 /// 满足人数后签发：填 `attestation` 写回库，并（默认）立即下发。
 pub async fn issue_approval(
@@ -602,20 +750,22 @@ pub async fn issue_approval(
     rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
     Path(approval_id): Path<String>,
     Query(query): Query<IssueQuery>,
+    body: Option<Json<IssueRequest>>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    // 没配私钥就不签发：一份「没签名的计划」在 enforced 的机器上会被拒，
-    // 在未 enforced 的机器上会被静默执行 —— 后者才是最坏的，所以不做降级。
-    let Some(signer) = state.config.plan_signer.clone() else {
+    // 两条路径：请求体带 attestation = 外部签发；不带 = 网关自签（需要 `[plan_signing]`）。
+    let external = body.and_then(|Json(request)| request.attestation);
+    let signer = state.config.plan_signer.clone();
+    if external.is_none() && signer.is_none() {
         return ApiError::unavailable(
             codes::PLAN_SIGNING_UNAVAILABLE,
             "plan signing key is not configured ([plan_signing] key_file)",
         )
         .into_response();
-    };
+    }
 
     let mut approval = match load_approval(&state, &approval_id).await {
         Ok(approval) => approval,
@@ -707,32 +857,71 @@ pub async fn issue_approval(
     {
         return response;
     }
-    // 签发时重算摘要：不一致说明审批之后计划被改过（重走审批，而不是重签一份新的）。
-    if let Err(err) = signer.sign(
-        &mut plan,
-        &approval.approval_id,
-        approvers,
-        required,
-        &approval.plan_digest,
-        now,
-    ) {
-        // 按变体映射，不看文案：文案一改就会把 409 静默变成 500。
-        return match err {
-            SignError::PlanChanged { .. } => {
-                ApiError::conflict(codes::PLAN_CHANGED_SINCE_APPROVAL, err.to_string())
-                    .into_response()
+    // 两条路径：外部签发（私钥在审批人手上）不碰 `plan_signer`；
+    // 网关自签保持原样（含「重算摘要不一致 → 重走审批」的判断）。
+    match external {
+        Some(attestation) => {
+            let key_id = attestation.key_id.clone();
+            if let Err(response) = apply_external_attestation(
+                &state,
+                &approval,
+                &approvers,
+                required,
+                &mut plan,
+                attestation,
+                now,
+            )
+            .await
+            {
+                // 拒绝要留痕：外部签发下「为什么这条签名没收」是最常被问的一句。
+                log::warn!(
+                    "event=ExternalAttestationRejected approval_id={} agent_id={} key_id={} status={}",
+                    approval.approval_id,
+                    approval.agent_id,
+                    log_field(&key_id),
+                    response.status().as_u16()
+                );
+                return response;
             }
-            SignError::PlanExpired => {
-                ApiError::conflict(codes::APPROVAL_EXPIRED, err.to_string()).into_response()
+        }
+        None => {
+            let Some(signer) = signer else {
+                // 上面已判过：这里不可达，但不用 `unwrap` 在安全路径上。
+                return ApiError::unavailable(
+                    codes::PLAN_SIGNING_UNAVAILABLE,
+                    "plan signing key is not configured",
+                )
+                .into_response();
+            };
+            // 签发时重算摘要：不一致说明审批之后计划被改过（重走审批，而不是重签一份新的）。
+            if let Err(err) = signer.sign(
+                &mut plan,
+                &approval.approval_id,
+                approvers,
+                required,
+                &approval.plan_digest,
+                now,
+            ) {
+                // 按变体映射，不看文案：文案一改就会把 409 静默变成 500。
+                return match err {
+                    SignError::PlanChanged { .. } => {
+                        ApiError::conflict(codes::PLAN_CHANGED_SINCE_APPROVAL, err.to_string())
+                            .into_response()
+                    }
+                    SignError::PlanExpired => {
+                        ApiError::conflict(codes::APPROVAL_EXPIRED, err.to_string()).into_response()
+                    }
+                    SignError::AlreadyAttested => {
+                        ApiError::conflict(codes::APPROVAL_ALREADY_ISSUED, err.to_string())
+                            .into_response()
+                    }
+                    SignError::Invalid(_) => {
+                        ApiError::internal(codes::APPROVAL_STORE_FAILED, "failed to sign plan", err)
+                            .into_response()
+                    }
+                };
             }
-            SignError::AlreadyAttested => {
-                ApiError::conflict(codes::APPROVAL_ALREADY_ISSUED, err.to_string()).into_response()
-            }
-            SignError::Invalid(_) => {
-                ApiError::internal(codes::APPROVAL_STORE_FAILED, "failed to sign plan", err)
-                    .into_response()
-            }
-        };
+        }
     }
     let issued_json = match serde_json::to_string(&plan) {
         Ok(json) => json,
@@ -791,6 +980,205 @@ pub async fn issue_approval(
         dispatched_command_id,
     })
     .into_response()
+}
+
+/// 校验一份**外部签发**的 attestation，通过后写回 `plan.attestation`。
+///
+/// 这是外部签发模式的安全核心：**七条校验一条都不能省**。它只回答
+/// 「这份签名是不是这把已登记钥匙对**这份已批准的计划**签的」，
+/// 不回答「这台机器该不该执行」—— 后者是 agentd 的锚。
+///
+/// 特别防「confused deputy」：计划原文**只从库里读**，不信任请求体里的任何计划字段；
+/// 请求体里只有一份 `attestation`。
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+async fn apply_external_attestation(
+    state: &ApiState,
+    approval: &StoredActionApproval,
+    approvers: &[String],
+    required: u8,
+    plan: &mut ActionPlan,
+    attestation: wist_contracts::action_plan::ActionPlanAttestation,
+    now: DateTime<Utc>,
+) -> Result<(), Response> {
+    // 1) 形状：只有把证明挂上去才能校验它（`wist-validate` 是「整份计划」的校验）。
+    let mut candidate = plan.clone();
+    candidate.attestation = Some(attestation.clone());
+    if let Err(err) = wist_validate::action_plan::validate_action_plan(&candidate) {
+        return Err(ApiError::bad_request(
+            codes::ATTESTATION_INVALID,
+            format!("attestation shape is invalid: {}", err.code),
+        )
+        .into_response());
+    }
+
+    // 2) 摘要：审批时的、现在重算的、证明里写的，三者必须一致。
+    let recomputed = plan_digest(&candidate);
+    if recomputed != approval.plan_digest || attestation.plan_digest != recomputed {
+        return Err(ApiError::conflict(
+            codes::PLAN_DIGEST_MISMATCH,
+            format!(
+                "plan changed since approval (approved {}, now {recomputed}, attested {})",
+                approval.plan_digest, attestation.plan_digest
+            ),
+        )
+        .into_response());
+    }
+
+    // 3) 审批单：不能拿 A 单的签名去签 B 单。
+    if attestation.approval.approval_id != approval.approval_id {
+        return Err(ApiError::conflict(
+            codes::APPROVAL_MISMATCH,
+            format!(
+                "attestation is for approval {} but issuing {}",
+                attestation.approval.approval_id, approval.approval_id
+            ),
+        )
+        .into_response());
+    }
+
+    // 4) 审批事实：签名方不能自己往里塞“多一个人”或改人数下限。
+    let mut expected: Vec<String> = approvers.to_vec();
+    expected.sort();
+    let mut claimed: Vec<String> = attestation.approval.approvers.clone();
+    claimed.sort();
+    if claimed != expected {
+        return Err(ApiError::conflict(
+            codes::APPROVAL_MISMATCH,
+            format!("attestation approvers {claimed:?} do not match recorded votes {expected:?}"),
+        )
+        .into_response());
+    }
+    if attestation.approval.required_approvers != required {
+        return Err(ApiError::conflict(
+            codes::APPROVAL_MISMATCH,
+            format!(
+                "attestation required_approvers {} != recorded {required}",
+                attestation.approval.required_approvers
+            ),
+        )
+        .into_response());
+    }
+
+    // 5) 风险：不能「批了 R1、跑 R2」。
+    if attestation.risk_level != plan.constraints.risk_level {
+        return Err(ApiError::conflict(
+            codes::APPROVAL_RISK_MISMATCH,
+            format!(
+                "attestation risk {} != plan risk {:?}",
+                risk_level_wire(attestation.risk_level),
+                plan.constraints.risk_level
+            ),
+        )
+        .into_response());
+    }
+
+    // 6) 有效期：证明不能已过期，也不能活得比计划长。
+    let Some(expires) = parse_ts(&attestation.expires_at) else {
+        return Err(ApiError::bad_request(
+            codes::ATTESTATION_INVALID,
+            "attestation expires_at is not RFC3339",
+        )
+        .into_response());
+    };
+    if expires <= now {
+        return Err(ApiError::conflict(
+            codes::ATTESTATION_INVALID,
+            format!("attestation expired at {}", attestation.expires_at),
+        )
+        .into_response());
+    }
+    if let Some(plan_expires) = parse_ts(&plan.meta.expires_at)
+        && expires > plan_expires
+    {
+        return Err(ApiError::bad_request(
+            codes::ATTESTATION_INVALID,
+            format!(
+                "attestation expires_at {} is later than plan expires_at {}",
+                attestation.expires_at, plan.meta.expires_at
+            ),
+        )
+        .into_response());
+    }
+
+    // 7) 钥匙已登记、未吊销，且签名验得过。
+    // 先区分「一条都没登记」与「这把没登记」：前者是还没配外部签发，后者可能是填错 key_id。
+    match state.store.list_approver_keys().await {
+        Ok(keys) if keys.is_empty() => {
+            return Err(ApiError::unavailable(
+                codes::APPROVER_KEY_UNREGISTERED,
+                "no approver key registered; import one before using external signing",
+            )
+            .into_response());
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return Err(ApiError::internal(
+                codes::APPROVER_KEY_STORE_FAILED,
+                "failed to list approver keys",
+                err,
+            )
+            .into_response());
+        }
+    }
+    let key = match state.store.get_approver_key(&attestation.key_id).await {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return Err(ApiError::conflict(
+                codes::APPROVER_KEY_UNKNOWN,
+                format!("approver key {} is not registered", attestation.key_id),
+            )
+            .into_response());
+        }
+        Err(err) => {
+            return Err(ApiError::internal(
+                codes::APPROVER_KEY_STORE_FAILED,
+                "failed to load approver key",
+                err,
+            )
+            .into_response());
+        }
+    };
+    if !key.is_active() {
+        return Err(ApiError::conflict(
+            codes::APPROVER_KEY_REVOKED,
+            format!("approver key {} has been revoked", attestation.key_id),
+        )
+        .into_response());
+    }
+    let fingerprint = match crate::api::approver_keys::verify_attestation_signature(
+        &key.public_key,
+        &attestation.signing_payload(),
+        &attestation.signature,
+    ) {
+        Ok(fingerprint) => fingerprint,
+        Err(code) => {
+            return Err(ApiError::bad_request(
+                code,
+                "attestation signature does not verify against the registered key",
+            )
+            .into_response());
+        }
+    };
+    // `issued_by` 在签名覆盖范围内，改不了；只如实记下并与登记属主比对（审计用）。
+    if attestation.issued_by != key.owner {
+        log::warn!(
+            "event=ApproverKeyOwnerMismatch approval_id={} key_id={} declared_issued_by={} registered_owner={}",
+            approval.approval_id,
+            log_field(&key.key_id),
+            log_field(&attestation.issued_by),
+            log_field(&key.owner)
+        );
+    }
+    log::info!(
+        "event=ApprovalIssuedExternal approval_id={} agent_id={} key_id={} fingerprint={} issued_by={}",
+        approval.approval_id,
+        approval.agent_id,
+        log_field(&key.key_id),
+        fingerprint,
+        log_field(&attestation.issued_by)
+    );
+    plan.attestation = Some(attestation);
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]

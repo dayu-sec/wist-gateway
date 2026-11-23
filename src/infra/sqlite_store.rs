@@ -577,6 +577,18 @@ fn action_approval_from_row(row: &SqliteRow) -> StoreResult<StoredActionApproval
     })
 }
 
+fn approver_key_from_row(row: &SqliteRow) -> StoreResult<StoredApproverKey> {
+    Ok(StoredApproverKey {
+        key_id: column!(row, "key_id"),
+        owner: column!(row, "owner"),
+        public_key: column!(row, "public_key"),
+        fingerprint: column!(row, "fingerprint"),
+        added_by: column!(row, "added_by"),
+        added_at: column!(row, "added_at"),
+        revoked_at: column!(row, "revoked_at"),
+    })
+}
+
 fn token_from_row(row: &SqliteRow) -> StoreResult<StoredEnrollmentToken> {
     let status: String = column!(row, "status");
     Ok(StoredEnrollmentToken {
@@ -2985,6 +2997,71 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(|err| sql_error(err, "set action approval issued"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn upsert_approver_key(
+        &self,
+        key: &StoredApproverKey,
+        reactivate: bool,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO approver_key (key_id, owner, public_key, fingerprint, added_by, added_at, \
+             revoked_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL) \
+             ON CONFLICT (key_id) DO UPDATE SET \
+             owner = excluded.owner, public_key = excluded.public_key, \
+             fingerprint = excluded.fingerprint, added_by = excluded.added_by, \
+             added_at = excluded.added_at, \
+             revoked_at = CASE WHEN ?7 THEN NULL ELSE approver_key.revoked_at END",
+        )
+        .bind(&key.key_id)
+        .bind(&key.owner)
+        .bind(&key.public_key)
+        .bind(&key.fingerprint)
+        .bind(&key.added_by)
+        .bind(&key.added_at)
+        .bind(reactivate)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert approver key"))?;
+        Ok(())
+    }
+
+    async fn list_approver_keys(&self) -> StoreResult<Vec<StoredApproverKey>> {
+        let rows = sqlx::query(
+            "SELECT key_id, owner, public_key, fingerprint, added_by, added_at, revoked_at \
+             FROM approver_key ORDER BY added_at, key_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "list approver keys"))?;
+        Ok(rows
+            .iter()
+            .map(approver_key_from_row)
+            .collect::<StoreResult<Vec<_>>>()?)
+    }
+
+    async fn get_approver_key(&self, key_id: &str) -> StoreResult<Option<StoredApproverKey>> {
+        let row = sqlx::query(
+            "SELECT key_id, owner, public_key, fingerprint, added_by, added_at, revoked_at \
+             FROM approver_key WHERE key_id = ?1",
+        )
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "load approver key"))?;
+        row.as_ref().map(approver_key_from_row).transpose()
+    }
+
+    async fn revoke_approver_key(&self, key_id: &str, revoked_at: &str) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE approver_key SET revoked_at = ?2 WHERE key_id = ?1 AND revoked_at IS NULL",
+        )
+        .bind(key_id)
+        .bind(revoked_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "revoke approver key"))?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -8964,6 +9041,90 @@ mod tests {
                 .await
                 .expect("list unknown")
                 .is_empty()
+        );
+    }
+
+    /// 审批公钥：吊销是软删且幂等；**没有显式 reactivate 就不能把吊销撤回来**。
+    ///
+    /// 这条是安全语义，不是便利性：吊销通常源于“钥匙可能泄露”，不能被一次重试抹掉。
+    #[tokio::test]
+    async fn approver_key_upsert_only_reactivates_when_asked() {
+        let store = store().await;
+        let key = StoredApproverKey {
+            key_id: "site-k1".to_string(),
+            owner: "role:approver".to_string(),
+            public_key: "-----BEGIN PUBLIC KEY-----\nAA==\n-----END PUBLIC KEY-----\n".to_string(),
+            fingerprint: "0123456789abcdef".to_string(),
+            added_by: "admin:test".to_string(),
+            added_at: "2026-11-23T00:00:00Z".to_string(),
+            revoked_at: None,
+        };
+        store
+            .upsert_approver_key(&key, false)
+            .await
+            .expect("insert");
+        assert!(
+            store
+                .get_approver_key("site-k1")
+                .await
+                .expect("get")
+                .expect("exists")
+                .is_active()
+        );
+
+        assert!(
+            store
+                .revoke_approver_key("site-k1", "2026-11-23T01:00:00Z")
+                .await
+                .expect("revoke")
+        );
+        // 重复吊销不改时间（幂等）。
+        assert!(
+            !store
+                .revoke_approver_key("site-k1", "2026-11-23T02:00:00Z")
+                .await
+                .expect("revoke again")
+        );
+        assert_eq!(
+            store
+                .get_approver_key("site-k1")
+                .await
+                .expect("get")
+                .expect("exists")
+                .revoked_at
+                .as_deref(),
+            Some("2026-11-23T01:00:00Z")
+        );
+
+        // 不带 reactivate 的重导：保持吊销（即使公钥/指纹换了）。
+        let rotated = StoredApproverKey {
+            fingerprint: "fedcba9876543210".to_string(),
+            ..key.clone()
+        };
+        store
+            .upsert_approver_key(&rotated, false)
+            .await
+            .expect("re-import");
+        let after = store
+            .get_approver_key("site-k1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(!after.is_active(), "吊销不能被一次重导静默撤掉");
+        assert_eq!(after.fingerprint, "fedcba9876543210", "公钥仍会被轮换");
+
+        // 显式 reactivate：恢复生效。
+        store
+            .upsert_approver_key(&rotated, true)
+            .await
+            .expect("reactivate");
+        assert!(
+            store
+                .get_approver_key("site-k1")
+                .await
+                .expect("get")
+                .expect("exists")
+                .is_active()
         );
     }
 }

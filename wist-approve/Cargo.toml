@@ -1,0 +1,32 @@
+[package]
+name = "wist-approve"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "审批终端：审批人自己的签名机上跑，私钥不出本机（网关只收签名）"
+
+[[bin]]
+name = "wist-approve"
+path = "src/main.rs"
+
+[lib]
+name = "wist_approve"
+path = "src/lib.rs"
+
+[dependencies]
+# 摘要 / 规范化 / 证明形状的**唯一实现**：不要在 CLI 里再写一遍
+#（写两遍一定会漂，而这里漂的后果是「签的东西和机器验的东西不一样」）。
+wist-contracts = { version = "0.14" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+ring = "0.17"
+base64 = "0.23"
+zeroize = "1"
+# 只用 blocking + rustls（与网关同一条 TLS 栈，支持 --ca-file 私有 CA）。
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }

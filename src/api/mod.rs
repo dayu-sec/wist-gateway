@@ -29,6 +29,11 @@ mod ingest;
 // 不在 jumo 静态模型 binding.mju 的声明里，重新生成控制面代码时需回补本模块与下方路由。
 mod action_approvals;
 mod action_plans;
+// NOTE(hand-added): 审批公钥登记（**外部签发**模式：私钥在审批人手上，网关只收签名）。
+// 只有「挡垃圾 + 展示指纹」两个作用；真正的授权在执行侧 agentd 的锚。
+mod approver_keys;
+// NOTE(hand-added): `wist-approve` 的分发面（公开、无鉴权）：安装脚本 + 二进制 + 摘要。
+mod approver_install;
 // NOTE(hand-added): 执行结果的管理面读取（agentd 上报的 `ReportActionResult` 落库后从这里取）。
 mod action_results;
 // NOTE(hand-added): 响应授权单（时间窗授权）。与 `action_approval` 并列的第二条授权来源：
@@ -568,6 +573,33 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/approvals/{approval_id}/issue",
             post(action_approvals::issue_approval),
+        )
+        // NOTE(hand-added): 外部签发：给审批机（`wist-approve`）取待签包。
+        .route(
+            "/api/v1/admin/approvals/{approval_id}/signing-payload",
+            get(action_approvals::signing_payload),
+        )
+        // NOTE(hand-added): 审批公钥登记（外部签发）。`key_id` 与 agentd 锚、attestation 同名。
+        .route(
+            "/api/v1/admin/approver-keys",
+            get(approver_keys::list_approver_keys).post(approver_keys::register_approver_key),
+        )
+        .route(
+            "/api/v1/admin/approver-keys/{key_id}",
+            delete(approver_keys::revoke_approver_key),
+        )
+        // NOTE(hand-added): `wist-approve` 分发面（公开：二进制与脚本不含任何凭据）。
+        .route(
+            "/api/v1/approver/packages/{platform}",
+            get(approver_install::download_approver_package),
+        )
+        .route(
+            "/api/v1/approver/install/{platform}/install.sh",
+            get(approver_install::get_approver_install_script),
+        )
+        .route(
+            "/api/v1/approver/install/{platform}/digests",
+            get(approver_install::get_approver_digests),
         )
         // NOTE(hand-added): 响应授权单（时间窗授权）：签发 / 查 / 撤销。
         // 一台机器同时只有一张生效单；重新 PUT = 覆盖并换新的 grant_id。
