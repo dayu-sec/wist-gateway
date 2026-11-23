@@ -26,6 +26,11 @@ chrono = { version = "0.4", features = ["serde"] }
 ring = "0.17"
 base64 = "0.23"
 zeroize = "1"
+# 字符界面（无子命令时进入）：审批人在终端里用方向键 / 回车完成审阅与签发。
+# 选 ratatui + crossterm：这是 Rust 交互式终端的事实标准（crossterm 负责终端事件与
+# raw/alternate screen，ratatui 只做布局与绘制）。
+ratatui = "0.29"
+crossterm = "0.28"
 # 只用 blocking + rustls（与网关同一条 TLS 栈，支持 --ca-file 私有 CA）。
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",

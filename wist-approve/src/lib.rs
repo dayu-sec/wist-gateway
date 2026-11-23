@@ -9,6 +9,6 @@ pub mod client;
 pub mod render;
 pub mod signing;
 
-pub use client::{GatewayClient, GatewayError, SigningPayload};
+pub use client::{ApprovalSummary, GatewayClient, GatewayError, SigningPayload};
 pub use render::{PlanSummary, render_summary};
 pub use signing::ApproverKey;

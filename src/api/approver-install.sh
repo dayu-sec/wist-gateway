@@ -114,8 +114,10 @@ esac
 note "2) 生成审批钥匙（私钥只留在这台机器）：wist-approve key generate --out $CONF_DIR/approver.key"
 note "3) 打印 key_id 与指纹，交给管理员登记到网关：wist-approve key show --key $CONF_DIR/approver.key"
 echo
-echo "token 是凭据（**不**在本安装包里）：管理员单独签发后放到 $CONF_DIR/approver.token，"
-echo "之后直接跑，不需要任何参数："
-note "wist-approve list"
+echo "token 是凭据（**不**在本安装包里）：管理员单独签发后放到 $CONF_DIR/approver.token。"
+echo "之后直接跑（不带参数就进入字符界面，方向键 + 回车完成审批）："
+note "wist-approve"
+echo "脚本 / 无终端场景用子命令："
+note "wist-approve list  |  show <id>  |  approve <id>  |  sign <id>"
 echo
 echo "注意：这份安装包是公开的，**不含任何凭据**。审批用的 token 必须由管理员单独签发。"

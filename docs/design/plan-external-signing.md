@@ -254,6 +254,27 @@ wist-approve submit        --attestation apv_….json       # air-gap：人工�
 wist-approve status        <approval_id>                  # 下发 / 执行结果
 ```
 
+### 7.0 默认形态：**字符界面（TUI）**
+
+`wist-approve` 不带子命令时进入全屏字符界面，**方向键 + 回车**就能完成审阅与签发。
+子命令全部保留——它们是给脚本 / CI / air-gap 的，那些场景没有终端，也不该需要。
+
+```
+ ↑↓/jk 选择   tab/←→ 切换过滤（待审批/已批准/全部）
+ a 批准   s 签发   A 批准+签发   x 驳回   r 刷新   ? 帮助   q 退出
+```
+
+界面的三条硬约束（与 §7.1 同一套）：
+
+1. **右栏就是将要被签的字节渲染出来的摘要**（`signing-payload` → 本地重算 → 渲染），
+   不是网关给的文案；确认框里再贴一次，避免“顺手回车”盖过没看的细节。
+2. **动作可用性与网关状态机同口径**：pending 才能批/驳，approved 且未签发才能签；
+   没私钥时签发类直接置灰（`can_perform`，与网页 `allowedActions` 互为镜像，两边各有测试）。
+3. **键盘确认而非一次点击**：审批不可撤回，`Enter` 比误触安全（? ? 里写了这一条）。
+
+网络调用是同步的（内网管理接口，延迟远小于多线程引入的复杂度）；空闲 15 秒自动重拉列表。
+非终端环境（管道 / CI）**直接拒绝**并提示改用子命令。
+
 离线 / air-gap 场景下 `list` / `show` / `submit` 换成「文件带进带出」，中间步骤不变。
 
 凭据：**approver scope 的 token**（`approvals:list|read|vote|submit-attestation`），

@@ -3,32 +3,38 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.57.2-alpha] - 2026-11-23
+## [0.58.0-alpha] - 2026-11-23
+
+### 新增（`wist-approve` 变成字符界面：键盘就能完成审批）
+
+以前审批人得背一串子命令（`list` → `show` → `approve --sign`）。现在**不带参数直接跑**就进
+全屏字符界面：左边列表（待审批 / 已批准 / 全部），右边是**将要被签的字节渲染出的摘要**，
+`a` 批准、`s` 签发、`A` 批准+签发、`x` 驳回、`Enter` 确认、`?` 帮助、`q` 退出。
+
+- 子命令**全部保留**：脚本 / CI / air-gap（`submit` 带文件进出）没有终端，也不该需要。
+  非终端环境不带子命令 → 直接拒绝并提示改用子命令。
+- 界面不改变信任边界：签名仍在本机，私钥不出本机；右栏摘要与确认框里的摘要都由
+  `signing-payload` 本地重算后渲染（与签名同一份字节）。
+- 动作可用性与网关状态机同口径：pending 才能批/驳，approved 且未签发才能签；
+  没私钥时签发类直接拒绝并给出生成命令。
+- 空闲 15 秒自动重拉列表；全部状态变化都会在状态行留一行。
+- 新增依赖：`ratatui` + `crossterm`（Rust 交互式终端的事实标准）。仓库里**没有先例**——
+  其它组件都不是给人操作的交互式工具，这次为审批人破例。
+- 测试：纯逻辑（过滤档、选中夹取、动作状态机、状态文案）+ **`TestBackend` 真实渲染断言**
+  （头部网关/钥匙状态、列表过滤、确认框含摘要）；共 7 条新增。
 
 ### 修复（审批终端装完不在 PATH 上、且还得手敲参数）
-
-**症状一**：安装脚本把 `wist-approve` 装到 `$HOME/.wist/bin`，而绝大多数机器的 PATH 里是
-`$HOME/bin` —— 装完敲 `wist-approve` 直接 `command not found`，用户以为没装上。
-
-**症状二**：装上了也跑不起来，还要自己凑参数：
-`wist-approve list` → `--gateway <url> (or WIST_GATEWAY) is required`。
-而这些信息安装脚本**本来就知道**（它就是从那台网关下载的）。
 
 - 二进制默认装到 **`$HOME/bin`**（与 `gx` 的 `_pub_local` 同一约定）；`WIST_BIN_DIR` 可直指目录，
   `WIST_PREFIX=/usr/local` 保留为旧用法。
 - **安装即带来源**：install.sh 把 `gateway` 与 `ca_file` 写进 `~/.wist/config.toml`，
-  CLI 新增 `--config`（默认就是这个文件）并默认读取 —— 装完直接 `wist-approve list`，
-  **不需要任何参数**；命令行参数 / 环境变量（`WIST_GATEWAY` / `WIST_CONFIG`）优先于配置。
+  CLI 新增 `--config`（默认就是这个文件）并默认读取 —— 装完直接跑，**不需要任何参数**；
+  命令行参数 / 环境变量（`WIST_GATEWAY` / `WIST_CONFIG`）优先于配置。
   配置里**只有公开信息**；token 是凭据，仍由管理员单独下发到 `~/.wist/approver.token`。
-- 配置写错要报错：显式 `--config` 指向不存在的文件、或文件里有未知键（如 `gatewaay`），
-  都直接失败，不静默降级成「要 --gateway」。
-- 网关 CA / 私钥 / token 仍在 `$HOME/.wist`（`WIST_CONF_DIR` 可改）—— CLI 的默认 token 路径不变，
-  已有安装不会因为这次改动而找不到 CA。
-- 安装提示分情况：目录已在 PATH 就直说，不在才给 `export PATH=...`；
-  检测到旧位置的副本（`$HOME/.wist/bin/wist-approve`）时提示可删 —— 否则 `which` 可能指到旧二进制。
-- 测试：渲染后的脚本断言默认目录 / CA 目录 / 写入的 `gateway`、`ca_file`、token 路径；
-  CLI 侧 6 条：配置能解析、配置供 gateway、flag 覆盖配置、什么都没给的报错指向配置文件、
-  显式配置必须存在、未知键拒绝。
+- 配置写错要报错：显式 `--config` 指向不存在的文件、或文件里有未知键，都直接失败，
+  不静默降级成「要 --gateway」。
+- 网关 CA / 私钥 / token 仍在 `$HOME/.wist`；安装提示分情况（目录已在 PATH 就直说），
+  并提示旧位置 `$HOME/.wist/bin` 的副本可删。
 
 ## [0.57.1-alpha] - 2026-11-23
 

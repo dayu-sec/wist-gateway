@@ -9,6 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod tui;
+
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use wist_approve::render_summary;
@@ -44,11 +46,16 @@ struct Cli {
     /// 配置文件（默认 `~/.wist/config.toml`；不存在就当没配置）。
     #[arg(long, global = true, env = "WIST_CONFIG")]
     config: Option<PathBuf>,
+    /// 审批私钥（字符界面与签发用；默认 `~/.wist/approver.key`）。
+    #[arg(long, global = true, env = "WIST_APPROVER_KEY")]
+    approver_key: Option<PathBuf>,
     /// **不要**在生产用：跳过 TLS 校验（仅本机联调）。
     #[arg(long, global = true)]
     insecure: bool,
+    /// 不传子命令 = 进入**字符界面**（方向键选择、回车确认）；
+    /// 脚本 / 无终端环境仍用子命令。
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -153,7 +160,11 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<(), String> {
-    match &cli.command {
+    // 没有子命令 = 交互式字符界面（审批人日常路径）。
+    let Some(command) = cli.command.as_ref() else {
+        return tui::run(cli);
+    };
+    match command {
         Command::Key { action } => run_key(action),
         Command::List { agent } => {
             let client = build_client(cli)?;
@@ -467,6 +478,13 @@ fn confirm(prompt: &str) -> Result<bool, String> {
         .read_line(&mut line)
         .map_err(|err| format!("failed to read stdin: {err}"))?;
     Ok(matches!(line.trim(), "yes" | "y" | "Y"))
+}
+
+/// 解析出“当前生效的网关地址”（仅用于展示：字符界面头部要显示它）。
+fn resolved_gateway(cli: &Cli) -> Result<String, String> {
+    let config = load_config(cli.config.as_deref())?;
+    let (gateway, _) = resolve_connection(cli.gateway.clone(), cli.ca_file.clone(), config)?;
+    Ok(gateway)
 }
 
 /// `~/.wist/config.toml`：**由网关的 `install.sh` 写入**。
