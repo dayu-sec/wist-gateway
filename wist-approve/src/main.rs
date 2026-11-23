@@ -546,14 +546,15 @@ mod tests {
     }
 
     fn fresh_key() -> ApproverKey {
-        let dir = std::env::temp_dir().join(format!(
-            "wist-approve-main-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // 目录名必须**确定性唯一**：并行测试在同一时间片里取 `SystemTime::now()`
+        // 可能拿到相同的纳秒值，撞上「目标已存在」→ `generate_to(…, false)` 直接失败。
+        // 发版门禁上真偶发过一次红灯（1/20），所以这里用进程内自增序号 + 先清目录。
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("wist-approve-main-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("k.key");
         let key = ApproverKey::generate_to(&path, false).expect("generate");
         let _ = std::fs::remove_dir_all(&dir);

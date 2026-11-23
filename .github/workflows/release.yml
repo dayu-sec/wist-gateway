@@ -137,7 +137,7 @@ jobs:
           retention-days: 7
 
   docker:
-    needs: [build-binaries]
+    needs: [build-binaries, build-approver-cli]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -165,6 +165,36 @@ jobs:
           mkdir -p "docker/${{ matrix.arch }}"
           tar -xzf "staged/wist-gateway-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C "docker/${{ matrix.arch }}"
           ls -R "docker/${{ matrix.arch }}"
+
+      # 审批终端制品烘进镜像（三个平台都要，与本次构建的架构无关）：
+      # 分发面没东西可发就是 503，而现场不能指望有人登录网关主机手工投放。
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wist-approve-*
+          path: staged-approver
+          merge-multiple: true
+
+      - name: Stage approver CLI packages for docker build
+        run: |
+          set -euo pipefail
+          rm -rf docker/approver-package
+          count=0
+          # triple **从产物文件名推导**，不在这里再维护一份平台清单：
+          # 那份清单已经有三个消费者（网关白名单 / CI 矩阵 / 栈脚本），第四份只会漂。
+          for pkg in staged-approver/wist-approve-*.tar.gz; do
+            base="$(basename "${pkg}" .tar.gz)"
+            triple="${base#wist-approve-${{ github.ref_name }}-}"
+            test "${triple}" != "${base}" || { echo "::error::无法从 ${pkg} 推导 triple"; exit 1; }
+            dir="docker/approver-package/${triple}"
+            mkdir -p "${dir}"
+            tar -xzf "${pkg}" -C "${dir}"
+            test -s "${dir}/wist-approve" || { echo "::error::${triple} 包内没有 wist-approve"; exit 1; }
+            echo "staged ${triple} ($(wc -c < "${dir}/wist-approve") bytes)"
+            count=$((count + 1))
+          done
+          # 三个平台一个都不能少：少一个，那个平台的审批人就装不上。
+          test "${count}" -eq 3 || { echo "::error::审批终端制品应有 3 个，实际 ${count}"; exit 1; }
+          ls -R docker/approver-package
 
       # 不需要 QEMU：Dockerfile 里没有任何 `RUN`（distroless 自带运行时依赖）。
       - uses: docker/setup-buildx-action@v3

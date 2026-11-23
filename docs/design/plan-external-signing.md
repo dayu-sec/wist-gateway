@@ -374,27 +374,34 @@ Linux 必须静态：审批人是客户的人，跳板机常是 CentOS 7/8 这�
 只会表现在「`/api/v1/approver/…` 一直 404」或「文件投了但一直 503」—— 因为网关只在自己
 认得的那三个目录里找文件。
 
-现场的制品投放（`wist-gateway-stack`）：
+**默认零手工**：三个平台的制品烘在**网关镜像**里
+（`/usr/share/wist/approver-package/<triple>/wist-approve`，见 `docker/Dockerfile`）。
+镜像自带 = 与网关版本天然一致，且隔离站点（没有外网）也能分发；这也避开了「要求谁登录
+网关主机手工投放一次」——多站点 / 四十台起步的现场，这一步一定会被漏，症状就是 503。
+
+站点仍可**覆盖**单个平台（换 CLI 不必等网关发版），优先级高于镜像：
 
 ```bash
 scripts/install-approver-package.sh --tag "$GATEWAY_TAG"      # 有外网：从 Release 拉
 scripts/install-approver-package.sh --from ./downloads        # 隔离站点：用离线 tar.gz
-scripts/install-approver-package.sh --check --tag "$GATEWAY_TAG"   # 核对缺口 + 投放自哪个 tag
+scripts/install-approver-package.sh --check --tag "$GATEWAY_TAG"   # 看哪些平台被站点覆盖了
 ```
 
-- 落点 `<栈根>/configs/gateway/state/approver-package/<triple>/wist-approve`，**投完不用重启**
-  容器（网关读的是挂载卷里的 `state/`）。
+- 解析顺序：`<栈根>/configs/gateway/state/approver-package/<triple>/wist-approve` →（没有就）镜像内置。
+  **站点覆盖不需要重启**容器（读的是挂载卷里的 `state/`）；镜像内置随网关版本走。
 - **源基址** = `<仓库 + 发布渠道>`，下载地址 = `<基址>/<tag>/<文件名>`：
   缺省 `https://github.com/dayu-sec/wist-gateway/releases/download`，可换 COS 镜像
   `https://<COS 桶域>/wist-gateway`（对象键与 knowledge 同形）。
   **不要**复用 vars 里的 `ARTIFACT_HOME` —— 那是 wist-knowledge 的基址，仓库名不同。
 - **故意不接进 localize**：隔离站点没外网，挂上去会让 `gops sys localize` 与升级的
-  `regenerate` 阶段直接失败；而且制品文件名固定，`gx.download` 的 `reuse_cache` 不判版本，
-  升 tag 也不会更新。
-- **换 tag 不会自动换制品**。文件名与路径都是固定的，网关无从知道盘上这份是哪版 ——
-  所以投放脚本把 tag 记在 `state/approver-package/VERSION`，`--check` 会把它与当前
-  `GATEWAY_TAG` 对不上这件事说出来。这是 V1 的已知缺口：真正的修法是让 `--version`
-  与网关的 `compat` 声明做版本闸（与 agent 包同一思路），排到 V2。
+  `regenerate` 阶段直接失败；内置之后也**不再需要** localize 帮忙。
+- **覆盖会漂，内置不会**：站点覆盖的文件名固定，网关无从知道盘上那份是哪版 —— 所以投放脚本
+  把 tag 记在 `state/approver-package/VERSION`，`--check` 会报「覆盖自哪个 tag」。
+  覆盖只是少数场景（不等网关发版就换 CLI），日常应当就是「网关什么版本，CLI 就什么版本」。
+
+由此带上的一条工程约束：`BUILTIN_PACKAGE_DIR` 必须与 `docker/Dockerfile` 的 `COPY` 目标
+**逐字一致**，两边漂了就是现场 503 而单测全绿 —— 所以有一条单测直接 `include_str!` 那个 Dockerfile
+并断言路径出现在里面。
 
 ## 8. 单审批人（已决策，短期不做多人）
 

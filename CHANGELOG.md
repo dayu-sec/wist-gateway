@@ -3,6 +3,31 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.57.1-alpha] - 2026-11-23
+
+### 修复（审批终端装不上：制品内置进镜像，现场不再需要手工投放）
+
+**症状**：审批人按页面上的命令装机，`curl … /api/v1/approver/install/<triple>/install.sh`
+回 **503 `approver_package_unavailable`** —— 镜像里根本没有这个文件，需要有人登录网关主机
+手工跑一次投放脚本。多站点 / 四十台起步的现场，这一步一定会被漏。
+
+- 三个平台的 `wist-approve`（Linux x86_64 / arm64 静态 musl + macOS arm64）**烘进网关镜像**：
+  `/usr/share/wist/approver-package/<triple>/wist-approve`，与网关版本天然一致，且隔离站点
+  （没有外网）也能分发。分发面解析顺序：**站点覆盖 → 镜像内置**。
+- 站点目录 `<state>/approver-package/` 保留且**优先级更高**：某个站点要不等网关发版就换 CLI，
+  仍可覆盖（`wist-gateway-stack` 的 `scripts/install-approver-package.sh`）。
+- 非容器部署可用 `WIST_APPROVER_PACKAGE_DIR` 指到自己的制品目录。
+- 加了两条防止静默漂移的测试：路径解析顺序（覆盖优先 / 回落内置 / 都没有 → 503），
+  以及 `BUILTIN_PACKAGE_DIR` 必须与 `docker/Dockerfile` 的 `COPY` 目标逐字一致
+  （两边漂了就是现场 503 而单测全绿）。
+- 代价：镜像增大约 7 MB（三个平台的静态二进制）。宁可镜像大一点，也不要「每次发版都指望有人
+  登录网关主机手工投放」。
+
+### 修复（`wist-approve` 测试偶发红灯）
+
+临时目录名原用 `pid + 纳秒`，并行测试在同一时间片里可能取到相同的值 → `generate_to` 撞
+「目标已存在」偶发失败（发版门禁上 1/20）。改为进程内自增序号 + 先清残留目录。
+
 ## [0.57.0-alpha] - 2026-11-23
 
 ### 新增（外部签发：审批与签名移到客户侧）

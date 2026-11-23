@@ -319,18 +319,10 @@ mod tests {
 
     #[test]
     fn pem_parser_rejects_wrong_labels_and_missing_footers() {
-        let key = ApproverKey::generate_to(
-            &std::env::temp_dir().join(format!(
-                "wist-approve-pem-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("clock")
-                    .as_nanos()
-            )),
-            true,
-        )
-        .expect("generate");
+        // 同上：目录名不用 `SystemTime::now()`（并行下会撞），且先清残留。
+        let dir = std::env::temp_dir().join(format!("wist-approve-pem-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let key = ApproverKey::generate_to(&dir.join("site.key"), true).expect("generate");
         // 公钥 PEM 当私钥解析：必须报错（不然会用错钥匙签）。
         let err = ApproverKey::from_pkcs8_pem(key.public_pem()).expect_err("must refuse");
         assert!(err.contains("PRIVATE KEY"), "{err}");
@@ -339,6 +331,8 @@ mod tests {
         let broken = key.public_pem().replace("-----END PUBLIC KEY-----", "");
         let err = ApproverKey::from_pkcs8_pem(&broken).expect_err("must refuse");
         assert!(err.contains("PRIVATE KEY"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
