@@ -9861,6 +9861,71 @@ async fn command_queue_shows_source_state_and_counts() {
     assert_eq!(error["error"]["code"], "invalid_state");
 }
 
+/// 计划类命令要给出 `action_id`（页面才能跳到执行结果详情）；其它种类没有这个字段。
+#[tokio::test]
+async fn command_queue_exposes_the_action_id_of_plan_commands() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+    let now = chrono::Utc::now().timestamp_millis();
+
+    for (id, kind, params, at) in [
+        (
+            "cmd-plan-1",
+            "action_plan",
+            r#"{"meta":{"action_id":"act_9"}}"#,
+            now - 2_000,
+        ),
+        (
+            "cmd-inv-1",
+            "investigate",
+            r#"{"topic":"disk"}"#,
+            now - 1_000,
+        ),
+    ] {
+        env.store
+            .enqueue_agent_command(
+                &StoredAgentCommand {
+                    command_id: id.to_string(),
+                    agent_id: "agent-node-a".to_string(),
+                    kind: kind.to_string(),
+                    params: params.to_string(),
+                    requested_at_ms: at,
+                    acked_at: None,
+                    claimed_at: None,
+                    outcome: None,
+                    detail: None,
+                    requested_by: "admin:abc123".to_string(),
+                },
+                false,
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    let response = get_admin(&env, "/api/v1/admin/agents/agent-node-a/commands").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value = decode_json_response(response).await;
+    let commands = view["commands"].as_array().expect("commands");
+
+    let plan = commands
+        .iter()
+        .find(|item| item["command_id"] == "cmd-plan-1")
+        .expect("plan row");
+    assert_eq!(
+        plan["action_id"], "act_9",
+        "计划类命令要带 action_id，否则队列页无处查看执行详情"
+    );
+
+    let other = commands
+        .iter()
+        .find(|item| item["command_id"] == "cmd-inv-1")
+        .expect("investigate row");
+    assert!(
+        other["action_id"].is_null(),
+        "非计划命令的 action_id 必须是 null（字段仍要在，不能缺）"
+    );
+}
+
 /// 中心没传 id 时网关自己铸一个（与 admin 同口径）；审计落 `center`。
 #[tokio::test]
 async fn gateway_plane_investigation_without_an_id_mints_one_and_audits_center() {
@@ -20663,6 +20728,53 @@ async fn signing_payload_is_refused_before_approval() {
     assert_eq!(body["error"]["code"], "approval_incomplete");
 }
 
+/// 能力闸覆盖**签发前的待签包**这条路径：审批人手里的私钥不该为一份跑不起来的计划动一次。
+///
+/// 与上一条的区别：上一条测「还没批」，这条测「批了也签不了」。
+#[tokio::test]
+async fn signing_payload_is_refused_when_the_agent_did_not_report_the_op() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    // 只报只读路径：计划要的 `disk.cleanup.apply` 不在名单里。
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.preview"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "decision": "approve" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/signing-payload"),
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_capability_missing");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("disk.cleanup.apply"), "{message}");
+}
+
 /// 一把没登记过的钥匙，签名再对也不收（已有别的钥匙在生效）。
 #[tokio::test]
 async fn external_issue_rejects_unknown_key() {
@@ -21479,6 +21591,64 @@ async fn reporting_an_action_result_settles_the_action_plan_command() {
     );
 }
 
+/// 结果来了但**队列里没有对应命令**（手工 `run-plan`、命令已被清理、action_id 不匹配）：
+/// 结果照样落库、仍然回 2xx。
+///
+/// 这是「结单失败不回 200」那条修复的**反向闸**：`settle` 返回 0 行是**正常**
+/// （没有可结的单），不能当成错误 —— 否则 agent 会永远重发同一份报告、
+/// 再也删不掉本地信封，每一拍刷一条 5xx。
+#[tokio::test]
+async fn an_action_result_without_a_matching_command_is_still_accepted() {
+    let env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/action-results",
+        Some(&credential),
+        &ReportActionResult::new(
+            "rep-orphan-1".to_string(),
+            "act-never-queued".to_string(),
+            1,
+            FinalStatus::Succeeded,
+            "exec-orphan-1".to_string(),
+            "sha256:plan".to_string(),
+            "agent-node-a".to_string(),
+            "node-a".to_string(),
+            ResultAttestation {
+                result_digest: "sha256:test".to_string(),
+                signature: "test-signature".to_string(),
+                issued_by: "agent-node-a".to_string(),
+                attested_at: DateTime::now().to_chrono().to_rfc3339(),
+            },
+            DateTime::now().to_chrono().to_rfc3339(),
+            ActionResult::new(
+                "act-never-queued".to_string(),
+                "exec-orphan-1".to_string(),
+                FinalStatus::Succeeded,
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "没有可结的命令是正常情形，不能回 5xx 让 agent 无限重送"
+    );
+
+    // 结果本身仍然要能读到（管理面的「最近结果」靠它）。
+    let response = admin_request(
+        &env,
+        "GET",
+        "/api/v1/admin/agents/agent-node-a/action-results/act-never-queued",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["final_status"], "succeeded");
+}
+
 /// 发起页要的 `target` 形状：`platform` / `arch` 只能来自 agent 上报的事实。
 ///
 /// 没报过就**明确拒绝**，不编默认值 —— 瞎写 linux/x86_64 会把错误的系统信息
@@ -21876,6 +22046,56 @@ async fn issuing_refuses_when_the_agent_cannot_run_the_plan() {
         .expect("approval")
         .expect("row exists");
     assert!(stored.issued_plan_json.is_none());
+}
+
+/// 同一道闸的「能力已上报、但少了这个 op」变体：
+/// 机器只会跑只读操作时，`disk.cleanup.apply` 既不许签发也不许入队。
+#[tokio::test]
+async fn issuing_refuses_when_the_agent_did_not_report_the_op() {
+    let mut env = TestEnv::new().await;
+    let credential = enroll_agent_credential(&env).await;
+    report_exec_capabilities(
+        &env,
+        &credential,
+        &["disk.cleanup.preview"],
+        &["agent_exec_v1"],
+    )
+    .await;
+    let (signer, _public) = plan_signer_pair();
+    env.config.plan_signer = Some(signer);
+
+    let plan = sample_r2_plan("agent-node-a");
+    let response = create_approval(&env, "agent-node-a", &plan).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    let approval_id = body["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        &format!("/api/v1/admin/approvals/{approval_id}/votes"),
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "decision": "approve" }),
+    )
+    .await;
+
+    let response = issue_to_router(&env, &approval_id).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "action_plan_capability_missing");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("disk.cleanup.apply"), "{message}");
+
+    // 没签发也没入队。
+    let stored = env
+        .store_handle
+        .get_action_approval(&approval_id)
+        .await
+        .expect("approval")
+        .expect("row exists");
+    assert!(stored.issued_plan_json.is_none(), "被能力闸拦下就不能签发");
 }
 
 // ---------------------------------------------------------------------------

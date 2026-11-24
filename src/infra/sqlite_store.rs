@@ -3076,6 +3076,17 @@ impl Store for SqliteStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn clear_action_approval_issued(&self, approval_id: &str) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE action_approval SET issued_plan_json = NULL WHERE approval_id = ?1",
+        )
+        .bind(approval_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "clear action approval issued"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn upsert_approver_key(
         &self,
         key: &StoredApproverKey,
@@ -7530,6 +7541,68 @@ mod tests {
         let mut other = approval.clone();
         other.approval_id = "apv-dup-2".to_string();
         assert!(store.try_insert_action_approval(&other).await.unwrap());
+    }
+
+    /// 入队失败后回滚「已签发」标记。
+    ///
+    /// 关键性质：撤回后**能重新签发**。否则「签发成功、下发失败」这条路就堵死了 ——
+    /// 审批单永久显示已签发，重签又被 `approval_already_issued` 拒。
+    #[tokio::test]
+    async fn clearing_the_issued_marker_makes_the_approval_signable_again() {
+        let store = store().await;
+        store
+            .insert_action_approval(&StoredActionApproval {
+                approval_id: "apv-rollback".to_string(),
+                agent_id: "agent-1".to_string(),
+                plan_digest: format!("plan-v1:sha256:{}", "b".repeat(64)),
+                risk_level: "R2".to_string(),
+                requested_by: "admin:test".to_string(),
+                reason: None,
+                requested_at: "2026-06-01T00:00:00Z".to_string(),
+                plan_json: "{}".to_string(),
+                required_approvers: 1,
+                status: "approved".to_string(),
+                approved_at: Some("2026-06-01T00:00:00Z".to_string()),
+                expires_at: "2026-06-02T00:00:00Z".to_string(),
+                issued_plan_json: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .set_action_approval_issued("apv-rollback", "{\"v\":1}")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_action_approval_issued("apv-rollback", "{\"v\":2}")
+                .await
+                .unwrap(),
+            "已签发之后不允许再写第二份"
+        );
+
+        assert!(
+            store
+                .clear_action_approval_issued("apv-rollback")
+                .await
+                .unwrap()
+        );
+        let row = store
+            .get_action_approval("apv-rollback")
+            .await
+            .unwrap()
+            .expect("approval row");
+        assert!(row.issued_plan_json.is_none(), "标记必须真的被清掉");
+
+        assert!(
+            store
+                .set_action_approval_issued("apv-rollback", "{\"v\":3}")
+                .await
+                .unwrap(),
+            "回滚之后必须能重新签发"
+        );
     }
 
     #[tokio::test]

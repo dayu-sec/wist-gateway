@@ -24,7 +24,7 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use wist_api::status::command_outcome;
+use wist_api::status::{command_kind, command_outcome};
 
 use crate::infra::StoredAgentCommand;
 
@@ -69,6 +69,12 @@ struct QueueItemView {
     acknowledged_at: Option<String>,
     outcome: Option<String>,
     detail: Option<String>,
+    /// `action_plan` 命令才有：计划里的 `action_id`（其它种类恒为 `null`）。
+    ///
+    /// 队列行只带一行回执摘要；「到底删了什么 / 为什么失败」在执行结果里
+    /// （`GET /admin/agents/{id}/action-results/{action_id}`）。页面靠这个字段跳过去，
+    /// 否则用户只能看到一句 `rejected（unsupported_platform）` 而无处可查。
+    action_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -206,7 +212,25 @@ fn queue_item(command: &StoredAgentCommand) -> QueueItemView {
         acknowledged_at: command.acked_at.clone(),
         outcome: command.outcome.clone(),
         detail: command.detail.clone(),
+        action_id: command_action_id(&command.kind, &command.params),
     }
+}
+
+/// 计划类命令的 `action_id`：`params` 存的就是整份计划（见 `enqueue_plan`）。
+///
+/// 解析失败 / 字段缺失一律返回 `None`（不是 `Some("")`）：空 id 拼出来的链接
+/// 会落到一个不存在的详情页，比不显示链接更让人迷惑。
+fn command_action_id(kind: &str, params: &str) -> Option<String> {
+    if kind != command_kind::ACTION_PLAN {
+        return None;
+    }
+    let value: Value = serde_json::from_str(params).ok()?;
+    value
+        .get("meta")?
+        .get("action_id")?
+        .as_str()
+        .map(str::to_string)
+        .filter(|id| !id.trim().is_empty())
 }
 
 /// 队列态：`acked_at` 是终态谓词，具体是哪种终态看 `outcome`。

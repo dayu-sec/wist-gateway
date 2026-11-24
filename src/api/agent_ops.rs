@@ -969,6 +969,8 @@ pub async fn report_action_result(
 ///
 /// **不镜像报文结构**：`report_json` 存原文，形状的演进交给 `wist-api` 契约。
 /// 落库失败回 500：agentd 带 `report_attempt` 重试，结果不该静默丢掉。
+/// **命令没结单也回 500**：结果已落库（幂等），但队列没推进的话，回 200 会让 agent
+/// 删掉本地信封、彻底失去重试机会 —— 队列就永远停在「执行中」。
 async fn store_action_result(state: &ApiState, input: &ReportActionResult) -> Result<(), Response> {
     let report_json = serde_json::to_string(input).map_err(|err| {
         ApiError::internal(
@@ -1034,12 +1036,20 @@ async fn store_action_result(state: &ApiState, input: &ReportActionResult) -> Re
         )
         .await
     {
-        // 结单失败不影响「结果已存下来」：队列显示滞后一拍，下次上报还会再试。
+        // 结果已经落库（幂等），但命令没结单。这里**必须回 5xx**：
+        // agent 只在收到 2xx 后才删本地信封，回 200 会让这条结果彻底失去重试机会 ——
+        // 队列就永远停在「执行中」而结果页却有数据。重发会重走 upsert + settle，两边最终一致。
         log::warn!(
             "event=ActionPlanCommandSettleFailed agent_id={} action_id={} detail=\"{err}\"",
             input.agent_id,
             input.action_id
         );
+        return Err(ApiError::internal(
+            codes::ACTION_RESULT_STORE_FAILED,
+            "result stored but the action command was not settled",
+            err,
+        )
+        .into_response());
     }
     Ok(())
 }

@@ -5,12 +5,34 @@
 
 ## [0.58.1-alpha] - 2026-11-24
 
+### 新增（命令队列带 `action_id`，页面能跳到执行详情）
+
+- `GET /admin/agent-commands`（及单机口）每个 `action_plan` 行多一个 `action_id`
+  （取自计划 `meta.action_id`，其它命令恒为 `null`）。队列行只有一行回执摘要，
+  「删了什么 / 为什么失败」在执行结果里，页面靠它跳过去。
+
+### 修复（两处状态不一致）
+
+- **签发成功但下发失败**：此前先把审批单标为「已签发」再入队，入队失败就直接返回 ——
+  审批单永久显示已签发、队列里却没有命令，重签又被 `approval_already_issued` 拒。
+  现在入队失败会**回滚「已签发」标记**（`clear_action_approval_issued`），这张单可以重签。
+- **结果已入库但命令没结单**：此前只记一条 warn 就回 200，agent 收到 2xx 即删本地信封，
+  队列就永远停在「执行中」而结果页有数据。现在这种情况回 **5xx**，agent 会重发
+  （结果入库与结单都幂等，两边最终一致）。
+
 ### 变更（命令回执带上人读原因）
 
 - 队列 `detail` 现在把 `exit_reason`（**机器码**）与失败步的 `stderr_summary` 拼在一起：
   `执行结束：rejected（unsupported_platform：op disk.cleanup.apply 不支持当前平台 macos）`。
   只给一个 code 时，现场还得去查代码才知道是“哪个 op、哪个平台”。
 - 旧版 agentd 不回 `stderr_summary` 时，回执与以前完全一致（不会多一个空冒号）。
+
+### 测试
+
+- `command_queue_exposes_the_action_id_of_plan_commands`（计划行带 id、其它行为 null）
+- `clearing_the_issued_marker_makes_the_approval_signable_again`（回滚后能重签）
+- `an_action_result_without_a_matching_command_is_still_accepted`
+  （**反向闸**：`settle` 返回 0 行是正常，不能回 5xx 让 agent 无限重送）
 
 ## [0.58.0-alpha] - 2026-11-23
 

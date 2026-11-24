@@ -963,7 +963,19 @@ pub async fn issue_approval(
     let dispatched_command_id = if query.dispatch.unwrap_or(true) {
         match action_plans::enqueue_plan(&state, &approval.agent_id, &plan).await {
             Ok(command) => Some(command.command_id),
-            Err(err) => return err.into_response(),
+            Err(err) => {
+                // 入队失败必须把「已签发」退回去：否则这张单永久显示已签发、队列里却没有命令，
+                // 重签又会被 `approval_already_issued` 拒 —— 只能重新发起，且审计上看不出为什么。
+                // 回滚失败只记日志（响应仍是原始错误），这时确实需要人工处理。
+                if let Err(rollback) = state.store.clear_action_approval_issued(&approval_id).await
+                {
+                    log::error!(
+                        "event=ActionApprovalIssueRollbackFailed approval_id={} detail=\"{rollback}\"",
+                        approval_id
+                    );
+                }
+                return err.into_response();
+            }
         }
     } else {
         None

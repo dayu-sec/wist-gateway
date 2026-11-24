@@ -2286,6 +2286,12 @@ pub trait Store: Send + Sync + fmt::Debug {
         issued_plan_json: &str,
     ) -> StoreResult<bool>;
 
+    /// 撤回「已签发」标记（把 `issued_plan_json` 置回 NULL）。
+    ///
+    /// 只给**入队失败的回滚**用：签发与下发是两步，中间失败时必须把标记退回去 ——
+    /// 否则审批单永久显示「已签发」而机器什么都没收到，重签又会被 `approval_already_issued` 拒。
+    async fn clear_action_approval_issued(&self, approval_id: &str) -> StoreResult<bool>;
+
     /// 登记一把审批公钥（外部签发）。同 `key_id` 重复导入 = 覆盖公钥（轮换）。
     ///
     /// `reactivate` 语义：**只有它为 true 才会把已吊销的行清回生效**。不用「裸 upsert」是因为
