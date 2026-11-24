@@ -144,22 +144,19 @@ GET /api/v1/admin/approvals/{approval_id}/signing-payload
 {
   "approval_id": "apv_…",
   "agent_id": "agent-…",
-  "approval": {
-    "plan_digest": "plan-v1:sha256:…",
-    "risk_level": "R2",
-    "approvers": ["user:…"],
-    "required_approvers": 1,
-    "approved_at": "…",
-    "expires_at": "…"
-  },
+  "plan_digest": "plan-v1:sha256:…",
+  "risk_level": "R2",
+  "approvers": ["admin:…"],
+  "required_approvers": 1,
+  "approved_at": "2026-11-24T00:39:19Z",
   "plan": { "api_version": "v1", "kind": "action_plan", "…": "…" },
-  "signing_payload": { "…": "去掉 signature 的 attestation" }
+  "plan_expires_at": "2026-11-24T01:08:47Z"
 }
 ```
 
-`signing_payload` 就是 `ActionPlanAttestation::signing_payload()` 的输出 ——
-**由网关生成、由 CLI 独立重算校验**，两者必须一致（`plan_digest` 已有黄金向量，
-见 `plan-attestation.md` §3）。
+**只有事实，没有待签包对象**：`key_id` / `issued_by` / `signed_at` / `expires_at` 都属于签名方，
+网关不代填（代填就等于“网关也在决定签名内容”）。CLI 拿 `plan` **本地重算** `plan_digest`
+并与响应里的那份比对，一致才拿它构造 attestation（`plan_digest` 已有黄金向量，见 `plan-attestation.md` §3）。
 
 ### 6.2 提交签名后的 attestation
 
@@ -189,13 +186,13 @@ Content-Type: application/json
 | 4 | `approvers` / `required_approvers` 与投票记录一致 | `approval_mismatch` |
 | 5 | `risk_level` 与库中计划一致 | `approval_risk_mismatch` |
 | 6 | `key_id` 命中登记表且未吊销 | `approver_key_unknown` |
-| 7 | 签名用该公钥验过 | `signature_invalid` |
+| 7 | 签名用该公钥验过 | `attestation_signature_invalid` |
 
 **防 confused deputy**（这条是整个改造的安全核心）：
 
 > 端点只接受「与库中**已批准的那份计划**摘要一致」的 attestation。
-> 计划原文只从库里读，**绝不从请求体读**；`issued_by` 由网关按登记公钥的属主填写，
-> 不接受客户端声明。
+> 计划原文只从库里读，**绝不从请求体读**。`issued_by` 在签名覆盖范围内，**只能由签名方声明**；
+> 网关不改它，只与登记公钥的属主比对，不一致打 `ApproverKeyOwnerMismatch` 告警（§6.2）。
 
 否则这个端点会退化成「拿任意计划来换签名」的预言机 —— 而签名是这个系统里唯一的授权凭证。
 
@@ -250,7 +247,7 @@ wist-approve approve       <approval_id>                  # 记录投票（服�
 wist-approve approve --sign <approval_id> --key …        # 一步：投票 + 签名 + 提交
 wist-approve reject        <approval_id> [--comment …]    # 驳回（也是一票）
 wist-approve sign          <approval_id> --key …          # 仅签名（不投票，用于已批单）
-wist-approve submit        --attestation apv_….json       # air-gap：人工带回签名
+wist-approve submit        <approval_id> --attestation apv_….json   # air-gap：人工带回签名
 wist-approve status        <approval_id>                  # 下发 / 执行结果
 ```
 
@@ -364,9 +361,13 @@ pending ──approve/reject──▶ approved ──（待签）──▶ issue
 **为什么不是只发 GitHub Release**：审批人是**客户内部的人**，能访问的是自己那台网关；
 隔离站点根本没有外网。网关是唯一必然可达的地址，与 agent 安装脚本同一条路径。
 
-页面上也有入口：审批页底部的「安装审批终端」（`ApproverInstallHint`）按平台给出这一条
-命令，基址取管理面的 **Agent 对外地址**（设置值优先、没设则用 `public_base_url`）。
+页面上也有入口：审批页顶部的「安装与钥匙」tab（与「响应审批」平级，`ApproverInstallHint`）按平台给出这一条命令，
+基址取管理面的 **Agent 对外地址**（设置值优先、没设则用 `public_base_url`）。
 不用页面自身的 `location`：页面在 nginx 的 `:8443`，审批人机器要连的是网关的 `:443`。
+
+**包来源的录入入口不在审批页**，而在「安装包管理」页动作行里的「审批终端安装包」——一个独立页
+（`/install-package/approver`，组件 `ApproverPackageSection`）；审批页那边只留一个交叉入口
+（命令 503 时一跳就到）。理由：它和 agentd 的包是同一类管理对象，放进审批页会被当成审批动作的一部分。
 
 三条刻意的约束（都已落在 `src/api/approver_install.rs`）：
 
@@ -391,38 +392,42 @@ Linux 必须静态：审批人是客户的人，跳板机常是 CentOS 7/8 这�
 宿主 libc 的理由。CI 对**当次产物**自证 `statically linked`（与 wist-agentd 同一口径），
 不靠人事后复核。
 
-**triple 必须三处一致**：网关白名单 / CI 构建矩阵 / 栈的投放脚本。写错一处不会报错，
-只会表现在「`/api/v1/approver/…` 一直 404」或「文件投了但一直 503」—— 因为网关只在自己
-认得的那三个目录里找文件。
+**triple 必须四处一致**：网关白名单 / CI 构建矩阵 / 栈的投放脚本 / 前端 `APPROVER_TRIPLES`。
+写错一处不会报错，只会表现在「`/api/v1/approver/…` 一直 404」或「文件投了但一直 503」——
+因为网关只在自己认得的那三个目录里找文件。
 
-**默认零手工**：三个平台的制品烘在**网关镜像**里
-（`/usr/share/wist/approver-package/<triple>/wist-approve`，见 `docker/Dockerfile`）。
-镜像自带 = 与网关版本天然一致，且隔离站点（没有外网）也能分发；这也避开了「要求谁登录
-网关主机手工投放一次」——多站点 / 四十台起步的现场，这一步一定会被漏，症状就是 503。
+**制品从哪来：网关的包管理（取代早期「烘进镜像」的写法）**
 
-站点仍可**覆盖**单个平台（换 CLI 不必等网关发版），优先级高于镜像：
+网关不猜、也不自己去 Release 找包：必须有人把某个平台的包**录入**一次，
+`POST /api/v1/admin/approver/install-package {platform, source, package_sha256?}`。
+`source` 是**网关进程自己能读到**的地址（`https://` 或本机绝对路径，容器里就是 `/packages/<文件名>`）。
+录入时网关立刻拉取、校验（可选摘要，不符即拒）并缓存到
+`<state>/approver-package/<platform>/package.tar.gz`；**拉取失败整次不生效**（不写记录、不留半截缓存）。
+分发端点此后只读缓存，所以 install.sh 内嵌的 sha256 与实际发出的字节永远同源。
+
+两条录入路径：
+
+- 管理面：「安装包管理」页动作行 →「审批终端安装包」（`/install-package/approver`）
+  （按平台登记 / 查看 / 撤销）；审批页的安装提示里有交叉入口（命令 503 时一跳就到）。
+- 栈脚本（首次部署与批量投放走这条）：
 
 ```bash
-scripts/install-approver-package.sh --tag "$GATEWAY_TAG"      # 有外网：从 Release 拉
-scripts/install-approver-package.sh --from ./downloads        # 隔离站点：用离线 tar.gz
-scripts/install-approver-package.sh --check --tag "$GATEWAY_TAG"   # 看哪些平台被站点覆盖了
+scripts/install-approver-package.sh --tag v0.58.0-alpha   # 从 Release 拉三平台并登记
+scripts/install-approver-package.sh --from ./downloads    # 隔离站点：用离线 tar.gz
+scripts/install-approver-package.sh --check               # 只看网关当前登记了什么
+... 任一命令加 --dry-run                                   # 只打印，不拷文件、不碰网络
 ```
 
-- 解析顺序：`<栈根>/configs/gateway/state/approver-package/<triple>/wist-approve` →（没有就）镜像内置。
-  **站点覆盖不需要重启**容器（读的是挂载卷里的 `state/`）；镜像内置随网关版本走。
-- **源基址** = `<仓库 + 发布渠道>`，下载地址 = `<基址>/<tag>/<文件名>`：
-  缺省 `https://github.com/dayu-sec/wist-gateway/releases/download`，可换 COS 镜像
-  `https://<COS 桶域>/wist-gateway`（对象键与 knowledge 同形）。
-  **不要**复用 vars 里的 `ARTIFACT_HOME` —— 那是 wist-knowledge 的基址，仓库名不同。
-- **故意不接进 localize**：隔离站点没外网，挂上去会让 `gops sys localize` 与升级的
-  `regenerate` 阶段直接失败；内置之后也**不再需要** localize 帮忙。
-- **覆盖会漂，内置不会**：站点覆盖的文件名固定，网关无从知道盘上那份是哪版 —— 所以投放脚本
-  把 tag 记在 `state/approver-package/VERSION`，`--check` 会报「覆盖自哪个 tag」。
-  覆盖只是少数场景（不等网关发版就换 CLI），日常应当就是「网关什么版本，CLI 就什么版本」。
-
-由此带上的一条工程约束：`BUILTIN_PACKAGE_DIR` 必须与 `docker/Dockerfile` 的 `COPY` 目标
-**逐字一致**，两边漂了就是现场 503 而单测全绿 —— 所以有一条单测直接 `include_str!` 那个 Dockerfile
-并断言路径出现在里面。
+- 脚本把 tar.gz 拷进栈的 `packages/`（只读挂到容器 `/packages`），再登记容器内路径
+  `/packages/<文件名>`；文件名是 `wist-approve-<tag>-<平台>.tar.gz`，与 wist-approve 的 Release 同名。
+- **故意不接进 localize**：隔离站点没外网，挂上去会让 `gops sys localize` 与升级的 `regenerate`
+  阶段直接失败。首次部署后手工跑一次投放脚本即可。
+- `GET` 每行带 `available`：`false` = 记录还在但缓存副本不在了（分发端点回 503
+  `approver_package_unavailable`），**重新录入一次**即可恢复。
+- `DELETE .../{platform}` 只删登记、**不删缓存副本**：现场回滚不必重新拉。但撤销后分发端点
+  立刻 503 —— 「换回旧版本」同样走「重新录入」。
+- 包来源不随网关版本自动前进：换 CLI 就是重发一次录入（脚本带新 `--tag` 或页面改 `source`）。
+  这与「跟网关版本走」的期望有差，所以两个入口都把 `version` 显示出来，避免盘上一份、以为另一份。
 
 ## 8. 单审批人（已决策，短期不做多人）
 
