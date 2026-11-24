@@ -3,6 +3,15 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.58.1-alpha] - 2026-11-24
+
+### 变更（命令回执带上人读原因）
+
+- 队列 `detail` 现在把 `exit_reason`（**机器码**）与失败步的 `stderr_summary` 拼在一起：
+  `执行结束：rejected（unsupported_platform：op disk.cleanup.apply 不支持当前平台 macos）`。
+  只给一个 code 时，现场还得去查代码才知道是“哪个 op、哪个平台”。
+- 旧版 agentd 不回 `stderr_summary` 时，回执与以前完全一致（不会多一个空冒号）。
+
 ## [0.58.0-alpha] - 2026-11-23
 
 ### 变更（审批终端拆为独立仓 `wist-approve`）

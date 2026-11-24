@@ -36,7 +36,7 @@ use wist_api::work::{
     WorkAccepted, WorkGrant, WorkResultAccepted,
 };
 use wist_contracts::API_VERSION_V1;
-use wist_contracts::action_result::FinalStatus;
+use wist_contracts::action_result::{FinalStatus, StepStatus};
 use wist_contracts::fact_summary::FactContent;
 use wist_contracts::work::AGENT_REPORTABLE_WORK_STATUSES;
 use wist_control::types::DateTime;
@@ -1044,14 +1044,75 @@ async fn store_action_result(state: &ApiState, input: &ReportActionResult) -> Re
     Ok(())
 }
 
-/// 队列 `detail` 里的一行注脚：优先写执行器给的 `exit_reason`，否则写步骤数。
+/// 队列 `detail` 里的一行注脚：`exit_reason`（**机器码**）+ 失败步的人读原因。
+///
+/// 为什么拼在一起：只给一个 code（如 `unsupported_platform`）时，现场还得去查代码才知道
+/// 是「哪个 op、哪个平台」；失败步的 `stderr_summary` 正是 agentd 给的人读原因。
+/// code 仍在前缀，按 code 检索/匹配的口径不变。
 fn outcome_note(input: &ReportActionResult) -> String {
-    if let Some(reason) = input.result.exit_reason.as_deref()
-        && !reason.trim().is_empty()
-    {
-        return reason.to_string();
+    let failed_detail = input
+        .result
+        .step_records
+        .iter()
+        .rev()
+        .filter(|record| record.status == StepStatus::Failed)
+        .find_map(|record| {
+            record
+                .stderr_summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        });
+
+    compose_note(
+        input
+            .result
+            .exit_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty()),
+        failed_detail,
+        input.result.step_records.len(),
+    )
+}
+
+/// 纯函数部分（便于单测）：`exit_reason` 居中、人读原因作附注。
+fn compose_note(exit_reason: Option<&str>, failed_detail: Option<&str>, steps: usize) -> String {
+    match (exit_reason, failed_detail) {
+        (Some(reason), Some(detail)) => format!("{reason}：{detail}"),
+        (Some(reason), None) => reason.to_string(),
+        (None, Some(detail)) => detail.to_string(),
+        (None, None) => format!("{steps} 个步骤"),
     }
-    format!("{} 个步骤", input.result.step_records.len())
+}
+
+#[cfg(test)]
+mod outcome_note_tests {
+    use super::compose_note;
+
+    #[test]
+    fn reason_keeps_the_code_prefix_and_appends_the_detail() {
+        assert_eq!(
+            compose_note(
+                Some("unsupported_platform"),
+                Some("op x 不支持当前平台 macos"),
+                2
+            ),
+            "unsupported_platform：op x 不支持当前平台 macos"
+        );
+    }
+
+    #[test]
+    fn without_detail_the_note_is_the_bare_code() {
+        assert_eq!(compose_note(Some("op_failed"), None, 2), "op_failed");
+    }
+
+    #[test]
+    fn without_reason_the_note_falls_back_to_step_count() {
+        assert_eq!(compose_note(None, None, 3), "3 个步骤");
+        // 有人读原因但没 exit_reason：也把它显示出来（总比“3 个步骤”有用）。
+        assert_eq!(compose_note(None, Some("boom"), 3), "boom");
+    }
 }
 
 /// 接收 agentd 上报的事实**摘要**（对应模型 `ReportAgentFactSummary` / `IngestAgentFactSummary`）。
