@@ -666,7 +666,9 @@ kind = "tcp"
 [telemetry.logs.output.tcp]
 addr = "{addr}"
 port = {port}
-framing = "line"
+# agentd 只用长度前缀上送（缺省即强制 len），模板写 len 与实际一致，
+# 避免每次新装都打一条 UplinkFramingForced。
+framing = "len"
 "#,
             addr = toml_escape(&setting.host),
             port = setting.port,
