@@ -60,6 +60,10 @@ pub const FAMILIES: &[&str] = &[
     "BackupJob",
     "NetworkService",
     "TrafficInspection",
+    // 主机流记录（五元组窗口聚合）。与 `TrafficInspection`（IDS 事件）、`NetworkFirewall`
+    //（规则快照/拦截事件）两回事：这一面回答「和谁、哪个端口、多大量」，
+    // 不是「被拦了什么」。载体是 Linux 的 tc + eBPF。
+    "NetworkFlow",
     // 外部系统指标（端点由 agentd 自探；平台 linux）。
     // 粒度是**领域**（要看见什么），产品差异在单元与 `CollectionSourceKind`。
     "DatabaseMetrics",
@@ -80,6 +84,8 @@ const LINUX_ONLY_FAMILIES: &[&str] = &[
     "BackupJob",
     "NetworkService",
     "TrafficInspection",
+    // 主机流记录：首版载体是 Linux 的 tc + eBPF（macOS 侧无此载体）。
+    "NetworkFlow",
     // 外部系统指标：自探读 /proc（macOS 已支持，见 `platforms` 词表；
     // 这个常量只用于**旧包回落**，带 `[[families]]` 的包不看它）。
     "MessageQueueMetrics",
