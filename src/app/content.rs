@@ -2982,6 +2982,9 @@ target = "/var/log/x.log"
                 ("linux-keyproc-postgres", "agent_too_old"),
                 ("linux-keyproc-redis", "agent_too_old"),
                 ("linux-suricata-eve", "fact_not_collected"),
+                // `linux-flow` 同理且更进一步：包与单元都是 draft，采集未就绪（`collect_not_ready`）。
+                // 挂进模板只是把“将来会派”这件事写清楚；展开只取 active 单元，现在不会多出一面。
+                ("linux-host-flow", "collect_not_ready"),
             ],
             "LinuxHost 只应排除事实门不成立的单元（容器根 / 关键进程 / Suricata 输出）"
         );
