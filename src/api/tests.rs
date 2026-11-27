@@ -16774,17 +16774,12 @@ async fn a_rejected_grant_auto_enqueues_a_probe() {
 }
 
 #[tokio::test]
-async fn a_rejected_grant_does_not_reprobe_when_the_evidence_is_complete() {
-    // 证据已经完整（两条路径都探过、都不在）→ 重探不会改变结论，白跑一趟。
+async fn a_rejected_grant_does_not_reprobe_when_the_evidence_is_complete_and_fresh() {
+    // 证据已经完整（两条路径都探过、都不在）**且刚探过** → 重探不会改变结论，白跑一趟。
     let env = TestEnv::new_with_container_content().await;
     linux_agent_classified(&env, "LinuxHost").await;
-    seed_path_probe(
-        &env,
-        "2026-10-26T00:00:00Z",
-        &[K8S_LOG_DIR, DOCKER_ROOT],
-        &[],
-    )
-    .await;
+    let fresh = chrono::Utc::now().to_rfc3339();
+    seed_path_probe(&env, &fresh, &[K8S_LOG_DIR, DOCKER_ROOT], &[]).await;
 
     let response = post_json_to_router(
         &env.config,
@@ -16802,6 +16797,38 @@ async fn a_rejected_grant_does_not_reprobe_when_the_evidence_is_complete() {
         .await
         .expect("list commands");
     assert!(pending.is_empty(), "{pending:?}");
+}
+
+#[tokio::test]
+async fn a_rejected_grant_reprobes_when_the_evidence_is_stale() {
+    // 「探全了」不等于「还是对的」：一次很久以前的负向预检（每条都探过、都不在）
+    // 会让 409 永远复读旧结论 —— 现场把 auditd 起来、把目录修好也没用，
+    // 因为没有一个入口会重新测量。所以**过期也算证据不足**。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    let stale = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    seed_path_probe(&env, &stale, &[K8S_LOG_DIR, DOCKER_ROOT], &[]).await;
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "ContainerWorkload" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let pending = env
+        .store
+        .list_pending_agent_commands("agent-node-a", 10)
+        .await
+        .expect("list commands");
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert!(
+        pending[0].params.contains("\"scope\":\"paths\""),
+        "{pending:?}"
+    );
 }
 
 #[tokio::test]
@@ -16839,6 +16866,53 @@ async fn a_grant_uses_the_same_facts_as_the_preflight() {
         .await
         .expect("list standing work");
     assert_eq!(works.len(), 1, "{works:?}");
+    assert!(
+        works[0].spec.contains("linux-docker-container-stdout"),
+        "{}",
+        works[0].spec
+    );
+}
+
+#[tokio::test]
+async fn a_fresher_report_unblocks_a_grant_after_an_old_negative_probe() {
+    // 现场回归：预检跑在日志文件还不存在时（探过、都不在），之后文件在了、
+    // 事实摘要也报了「在」。旧实测若继续压着新事实，授权永远是
+    // `match_unsatisfied`，而旧实现里 409 也不会自愈。
+    let env = TestEnv::new_with_container_content().await;
+    linux_agent_classified(&env, "LinuxHost").await;
+    seed_path_probe(
+        &env,
+        "2026-10-26T00:00:00Z",
+        &[K8S_LOG_DIR, DOCKER_ROOT],
+        &[],
+    )
+    .await;
+    env.store
+        .upsert_agent_fact_summary(&crate::infra::StoredAgentFactSummary {
+            agent_id: "agent-node-a".to_string(),
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            probed_paths: vec![K8S_LOG_DIR.to_string(), DOCKER_ROOT.to_string()],
+            present_paths: vec![DOCKER_ROOT.to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("store fact summary");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agents/agent-node-a/work",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "work_kind": "Standing", "family": "ContainerWorkload" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let works = env
+        .store
+        .list_standing_work("agent-node-a")
+        .await
+        .expect("list standing work");
     assert!(
         works[0].spec.contains("linux-docker-container-stdout"),
         "{}",

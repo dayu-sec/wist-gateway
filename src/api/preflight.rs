@@ -363,6 +363,8 @@ pub async fn evaluation_facts(
 }
 
 /// 事实摘要与路径实测的**唯一**合并规则（预检与授权共用）。
+///
+/// 路径维度**谁新用谁**（见 [`probe_is_at_least_as_fresh`]），不是「实测永远优先」。
 fn merge_facts(
     reported: Option<StoredAgentFactSummary>,
     probe: Option<&StoredAgentPathProbe>,
@@ -371,12 +373,36 @@ fn merge_facts(
         return None;
     }
     let mut facts = reported.unwrap_or_default();
-    if let Some(probe) = probe {
+    if let Some(probe) = probe
+        && probe_is_at_least_as_fresh(probe, &facts)
+    {
         // 实测是路径维度的全集：没列进来的路径算「没探过」（而不是沿用旧摘要）。
         facts.probed_paths = probe.probed_paths.clone();
         facts.present_paths = probe.present_paths.clone();
     }
     Some(facts)
+}
+
+/// 路径维度**谁新用谁**。
+///
+/// 为什么不能无条件让实测覆盖摘要：预检是**一次性**的（只在 agent 回传时写一次），
+/// 而事实摘要每 5 分钟上报。一次「文件还不存在时」做的预检是**完整**证据
+/// （每条路径都探过），于是它会永久压住后来变真的事实 —— 现场表现为：auditd 起起来了、
+/// `/var/log/audit/audit.log` 也在，授权却一直 `match_unsatisfied`。
+///
+/// 反向同样要保证：目录变新后跑过的预检必须能盖掉更旧的摘要，否则新加的路径永远判不了。
+/// 时刻解析不出来时按老行为（实测优先）—— 宁可显旧，不可静默丢一份实测。
+fn probe_is_at_least_as_fresh(
+    probe: &StoredAgentPathProbe,
+    reported: &StoredAgentFactSummary,
+) -> bool {
+    match (
+        parse_rfc3339_millis(&probe.observed_at),
+        parse_rfc3339_millis(&reported.observed_at),
+    ) {
+        (Some(probe_at), Some(reported_at)) => probe_at >= reported_at,
+        _ => true,
+    }
 }
 
 /// 纯求值（除了读时钟）—— 入参就是全部输入，方便单测。
@@ -403,10 +429,23 @@ fn build_view(
         .unwrap_or_default();
     let unreadable_set: BTreeSet<&str> = unreadable.iter().map(|item| item.path.as_str()).collect();
 
-    let (source, observed_at) = match (probe.as_ref(), reported.as_ref()) {
-        (Some(probe), _) => ("probe", Some(probe.observed_at.clone())),
-        (None, Some(reported)) => ("reported", Some(reported.observed_at.clone())),
-        (None, None) => ("none", None),
+    // 与 `merge_facts` 用同一个判据：页面说「用的是实测」就必须真的用的是实测，
+    // 否则结论里的人话和求值结果对不上。
+    let probe_authoritative = match (probe.as_ref(), reported.as_ref()) {
+        (Some(probe), Some(reported)) => probe_is_at_least_as_fresh(probe, reported),
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let (source, observed_at) = if probe_authoritative {
+        (
+            "probe",
+            probe.as_ref().map(|probe| probe.observed_at.clone()),
+        )
+    } else {
+        match reported.as_ref() {
+            Some(reported) => ("reported", Some(reported.observed_at.clone())),
+            None => ("none", None),
+        }
     };
     let age = observed_at.as_deref().and_then(|at| age_seconds(at, now));
     let probe_view = ProbeView {
@@ -923,8 +962,8 @@ fn parse_rfc3339_millis(value: &str) -> Option<i64> {
 
 /// `GET /api/v1/admin/agents/{agent_id}/collection-preflight`
 ///
-/// 看结论。不触发任何动作 —— 页面先 GET，看到 `probe.source = none` 或
-/// `probe.not_probed_paths` 非空时再 POST。
+/// 看结论。不触发任何动作 —— 页面先 GET，看到 `probe.source = none`、
+/// `probe.stale` 或 `probe.not_probed_paths` 非空时再 POST。
 pub async fn view_agent_preflight(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -973,26 +1012,41 @@ pub async fn run_agent_preflight(
     }
 }
 
-/// 授权被拒（409）时顺手让机器再探一次 —— **只在「证据缺失」时**。
+/// 授权被拒（409）时顺手让机器再探一次 —— **证据缺失或过期时**。
 ///
 /// 为什么放在 409 上：这是现场唯一的入口（人点了授权、被拒了）。让他再去点一次「预检」
 /// 是多余的一步；探针是只读、毫秒级的，代价可以忽略。页面下一次重试（≥3s）就拿到实测了。
 ///
-/// 已经探全的证据不再重探（`not_probed_paths` 为空且没有 `unprobed` 面）——
-/// 那种情况下重探不会改变结论，只是白跑一趟。
+/// 「探全了」不等于「还是对的」：**过期也算证据不足**。一次很久以前跑完的负向预检
+/// （每条路径都探过、都不存在）在 `not_probed_paths` 上是空的，但结论早已作废 ——
+/// 只判「缺」会让它永远卡住，409 也不会自愈。
 pub async fn enqueue_if_evidence_missing(state: &ApiState, agent_id: &str) -> bool {
     let Ok(view) = evaluate(state, agent_id).await else {
         return false;
     };
-    let missing = !view.probe.not_probed_paths.is_empty()
-        || view
-            .families
-            .iter()
-            .any(|family| family.state == "unprobed");
-    if !missing {
+    if !evidence_needs_refresh(&view) {
         return false;
     }
     enqueue_probe(state, agent_id).await.is_ok()
+}
+
+/// 值不值得自动再探一次：证据**不完整**，或者**实测本身**过期。
+///
+/// 为什么年龄只对实测算、不对摘要算：事实摘要每 5 分钟上报一次，它的 `observed_at`
+/// 还是**发现快照**的时刻（可能比实际探路径更旧）。拿它判「过期」会让正常机器
+/// 每次 409 都白跑一次探测；而摘要本来就会周期性刷新，不需要靠重探续期。
+///
+/// 而实测是一次性的 —— 一旦它成为权威来源，唯一能把它变新的手段就是再探。
+fn evidence_needs_refresh(view: &PreflightView) -> bool {
+    if !view.probe.not_probed_paths.is_empty()
+        || view
+            .families
+            .iter()
+            .any(|family| family.state == "unprobed")
+    {
+        return true;
+    }
+    view.probe.source == "probe" && view.probe.stale
 }
 
 /// 这条命令是「只探路径」还是「整轮重采」。
@@ -1279,6 +1333,117 @@ mod tests {
             &BTreeSet::new(),
         );
         assert_eq!(out[0].state, "absent");
+    }
+
+    /// 现场反例：预检在 `audit.log` 还不存在时跑过一次（每条路径都探过 → 证据「完整」），
+    /// 之后 auditd 起来了。旧实测不能继续压着更新的摘要，否则授权永远是
+    /// `match_unsatisfied`，而 409 又不会自愈。
+    #[test]
+    fn a_fresher_reported_summary_is_not_overridden_by_an_old_probe() {
+        let reported = StoredAgentFactSummary {
+            observed_at: "2026-11-27T08:00:00Z".to_string(),
+            probed_paths: vec!["/var/log/audit/audit.log".to_string()],
+            present_paths: vec!["/var/log/audit/audit.log".to_string()],
+            ..Default::default()
+        };
+        let probe = StoredAgentPathProbe {
+            observed_at: "2026-11-27T07:00:00Z".to_string(),
+            probed_paths: vec!["/var/log/audit/audit.log".to_string()],
+            present_paths: Vec::new(),
+            ..Default::default()
+        };
+
+        let merged = merge_facts(Some(reported), Some(&probe)).expect("facts");
+        assert_eq!(merged.present_paths, ["/var/log/audit/audit.log"]);
+    }
+
+    /// 反向不能被改坏：目录是预检之后才出现的，实测必须能盖掉更旧的摘要。
+    #[test]
+    fn a_fresher_probe_still_overrides_the_reported_summary() {
+        let reported = StoredAgentFactSummary {
+            observed_at: "2026-11-27T07:00:00Z".to_string(),
+            probed_paths: vec!["/var/log/audit/audit.log".to_string()],
+            present_paths: Vec::new(),
+            ..Default::default()
+        };
+        let probe = StoredAgentPathProbe {
+            observed_at: "2026-11-27T08:00:00Z".to_string(),
+            probed_paths: vec!["/var/log/audit/audit.log".to_string()],
+            present_paths: vec!["/var/log/audit/audit.log".to_string()],
+            ..Default::default()
+        };
+
+        let merged = merge_facts(Some(reported), Some(&probe)).expect("facts");
+        assert_eq!(merged.present_paths, ["/var/log/audit/audit.log"]);
+    }
+
+    /// 只有预检、还没收到过事实摘要时，实测照样是唯一来源。
+    #[test]
+    fn a_probe_without_any_summary_is_still_used() {
+        let probe = StoredAgentPathProbe {
+            observed_at: "2026-11-27T08:00:00Z".to_string(),
+            probed_paths: vec!["/var/log/sudo.log".to_string()],
+            present_paths: vec!["/var/log/sudo.log".to_string()],
+            ..Default::default()
+        };
+
+        let merged = merge_facts(None, Some(&probe)).expect("facts");
+        assert_eq!(merged.present_paths, ["/var/log/sudo.log"]);
+    }
+
+    fn probe_view(source: &str, stale: bool, not_probed: &[&str]) -> ProbeView {
+        ProbeView {
+            source: source.to_string(),
+            observed_at: None,
+            stale,
+            pending: false,
+            pending_since: None,
+            probed_paths: Vec::new(),
+            present_paths: Vec::new(),
+            unreadable_paths: Vec::new(),
+            not_probed_paths: not_probed.iter().map(|path| path.to_string()).collect(),
+        }
+    }
+
+    fn view_with_probe(probe: ProbeView) -> PreflightView {
+        PreflightView {
+            agent_id: "agent-a".to_string(),
+            machine_class: None,
+            platform: None,
+            catalog_version: None,
+            verdict: "undetermined".to_string(),
+            undetermined_reason: None,
+            summary: String::new(),
+            probe,
+            families: Vec::new(),
+            generated_at: String::new(),
+        }
+    }
+
+    /// 只判「缺」会让「探全了但已过期」的证据永远不被重探；
+    /// 但摘要的「年龄」不代表证据旧（它每 5 分钟就刷新），不能拿它触发重探。
+    #[test]
+    fn stale_probe_evidence_is_refreshed_but_a_stale_report_is_not() {
+        assert!(!evidence_needs_refresh(&view_with_probe(probe_view(
+            "probe",
+            false,
+            &[]
+        ))));
+        assert!(evidence_needs_refresh(&view_with_probe(probe_view(
+            "probe",
+            true,
+            &[]
+        ))));
+        assert!(!evidence_needs_refresh(&view_with_probe(probe_view(
+            "reported",
+            true,
+            &[]
+        ))));
+        assert!(evidence_needs_refresh(&view_with_probe(probe_view(
+            "probe",
+            false,
+            &["/var/log/audit/audit.log"]
+        ))));
     }
 
     #[test]

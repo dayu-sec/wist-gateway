@@ -3,6 +3,24 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.58.2-alpha] - 2026-11-27
+
+### 修复（采集授权：一次旧实测会让一个面永远授不了权）
+
+- **根因**：`collection-preflight` 的路径实测是**一次性**写入的（只在 agent 回传时落库），
+  而事实摘要每 5 分钟上报一次。此前合并两份路径事实时**无条件**用实测覆盖摘要，
+  于是「预检跑在日志文件还不存在时」得到的负向结论会永久压住后来变真的事实。
+  现场表现：auditd 已经启动、`/var/log/audit/audit.log` 就在，`POST /admin/agents/<id>/work`
+  仍回 `409 no unit selected for PrivilegeExecution: ... match_unsatisfied(path_exists:...)`；
+  而 409 的自动重探只判「证据缺失」，探全了（只是旧了）就再也不探，问题不会自愈。
+- 路径维度改为**谁新用谁**（比较 `probe.observed_at` 与事实摘要的 `observed_at`）：
+  实测只在确实更新时才覆盖摘要；页面的 `probe.source` / `observed_at` 与求值同源，
+  不会再出现「页面说用的是实测、判定其实用的是上报」。
+- 409 触发的自动重探改为「证据缺失**或实测过期**」：当路径实测是权威来源且超过
+  `STALE_PROBE_SECONDS`（10 分钟）时，重新入队一次路径探测，人下一次重试即可拿到新结论，
+  不必自己去点「预检」。事实摘要的年龄不触发重探（它本来就每 5 分钟刷新，
+  且 `observed_at` 是发现快照的时刻，拿它当“实测过期”会让正常机器每次 409 都白跑一次探测）。
+
 ## [0.58.1-alpha] - 2026-11-24
 
 ### 新增（命令队列带 `action_id`，页面能跳到执行详情）
