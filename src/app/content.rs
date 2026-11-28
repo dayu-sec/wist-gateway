@@ -70,6 +70,9 @@ pub const FAMILIES: &[&str] = &[
     "MessageQueueMetrics",
     // 关键进程指标（按策展签名选代表进程；平台 linux）。
     "ProcessMetrics",
+    // 容器运行指标（每容器一条序列；平台 linux）。与 `HostMetrics`（整机）粒度不同，
+    // 与 `ContainerWorkload`（容器 stdout 日志）是两类内容。
+    "ContainerMetrics",
 ];
 /// 只在 macOS 出现的面（照 `families.mju` 的分类）。**仅用于旧包回落**：
 /// 带 `[[families]]` 的包按词表里的 `platforms` 判，不看这里。
@@ -90,6 +93,8 @@ const LINUX_ONLY_FAMILIES: &[&str] = &[
     // 这个常量只用于**旧包回落**，带 `[[families]]` 的包不看它）。
     "MessageQueueMetrics",
     "ProcessMetrics",
+    // 容器指标：首版载体是 Linux 的宿主 `/proc` + cgroup（macOS 等 Docker API 载体，见设计）。
+    "ContainerMetrics",
 ];
 /// 能力闭集。
 pub const CAPABILITIES: &[&str] = &["collect_logs", "collect_metrics"];
@@ -2981,6 +2986,10 @@ target = "/var/log/x.log"
                 ("linux-keyproc-nginx", "agent_too_old"),
                 ("linux-keyproc-postgres", "agent_too_old"),
                 ("linux-keyproc-redis", "agent_too_old"),
+                // 容器指标同理：单元带 `min_agentd_version`（`ContainerMetrics` 来源是新契约），
+                // 本夹具没上报 agentd 版本 → 在派下之前就被裁掉。够版本的机器若没容器运行时，
+                // 会以 `match_unsatisfied` 排除（面不适用，不是失败）。
+                ("linux-container-metrics", "agent_too_old"),
                 ("linux-suricata-eve", "fact_not_collected"),
                 // `linux-flow` 同理且更进一步：包与单元都是 draft，采集未就绪（`collect_not_ready`）。
                 // 挂进模板只是把“将来会派”这件事写清楚；展开只取 active 单元，现在不会多出一面。
@@ -3583,6 +3592,43 @@ target = "/var/log/x.log"
                 .contains(&"/var/log/containers".to_string()),
             "{:?}",
             set.probe_paths()
+        );
+    }
+
+    /// 探测白名单是**从单元 `match` 推出来的**，不是手写的表 —— 所以新加的单元
+    /// （这里是 `linux-container-metrics`）只要 `match` 写了路径，就自动进白名单。
+    ///
+    /// 这条钉住的是“别为了省事另起一张表”：白名单与派活求值必须同源，
+    /// 分了家就会出现“求值要的路径没下发 → 永远无法判定 → 面永远展不开”。
+    #[test]
+    fn the_checked_in_container_unit_contributes_its_runtime_roots_to_the_probe_whitelist() {
+        let set = load_content(
+            &crate::test_support::knowledge_file("catalog.toml"),
+            &crate::test_support::knowledge_file("packs.toml"),
+            &crate::test_support::knowledge_file("templates.toml"),
+        )
+        .expect("load checked-in content");
+
+        let linux = set.probe_paths_for_platform("linux");
+        for root in [
+            "/run/containerd",
+            "/var/run/containerd",
+            "/run/docker",
+            "/var/run/docker",
+        ] {
+            assert!(
+                linux.iter().any(|path| path == root),
+                "linux 探测白名单缺 {root}: {linux:?}"
+            );
+        }
+
+        // 平台隔离：这些是 Linux 运行时根，macOS 不该去探（探了永远是「不存在」，白跑）。
+        let macos = set.probe_paths_for_platform("macos");
+        assert!(
+            macos
+                .iter()
+                .all(|path| !path.contains("/run/containerd") && !path.contains("/run/docker")),
+            "macos 白名单不该含 linux 运行时根: {macos:?}"
         );
     }
 
@@ -4613,6 +4659,39 @@ target = "/var/log/x.log"
             COLLECT_LOGS,
             "KeyProcessMetrics",
             "unit:kafka"
+        ));
+    }
+
+    /// 容器指标：只属于 `collect_metrics`，`target` 只认 `auto`（采哪些容器是本机事实）。
+    ///
+    /// 它跟四个自探域同一个谓词（`auto_target_only` + `accepts_target`）——
+    /// 写死容器 id / 运行时路径一律不采，否则等于让控制面指定“去哪读”。
+    #[test]
+    fn container_metrics_is_collectable_only_with_the_auto_target() {
+        use wist_contracts::work::capability::{COLLECT_LOGS, COLLECT_METRICS};
+
+        for target in ["", "auto", " AUTO "] {
+            assert!(
+                is_collectable_source(COLLECT_METRICS, "ContainerMetrics", target),
+                "{target:?}"
+            );
+        }
+        for target in [
+            "abc123",
+            "/run/containerd",
+            "docker:abc123",
+            "k8s:pod/nginx",
+        ] {
+            assert!(
+                !is_collectable_source(COLLECT_METRICS, "ContainerMetrics", target),
+                "{target:?}"
+            );
+        }
+        // 日志单元不能挂指标来源：容器日志 ∈ `ContainerWorkload`。
+        assert!(!is_collectable_source(
+            COLLECT_LOGS,
+            "ContainerMetrics",
+            "auto"
         ));
     }
 }

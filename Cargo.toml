@@ -2,7 +2,7 @@
 
 [package]
 name = "wist-gateway"
-version = "0.58.2" #@gxl:set(version)
+version = "0.59.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 
@@ -23,11 +23,11 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rustls-pki-types = "1"
 rustls-webpki = "0.103"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-wist-contracts = { version = "0.15" }
+wist-contracts = { version = "0.16" }
 # 本地联调：切 path（整条链一起切）
 #wist-contracts = { version = "0.12", path = "../wist-contracts" }
 # 跨进程 seam 报文（enrollment / agent_status / gateway / work / agent_uplink）。
-wist-api = { version = "0.14" }
+wist-api = { version = "0.15" }
 # 本地联调：切 path（整条链一起切）
 #wist-api = { version = "0.13", path = "../wist-api" }
 wist-control = { version = "0.23" }
@@ -41,9 +41,9 @@ wist-config = { version = "0.1" }
 wist-shared = { version = "0.2" }
 #wist-shared = { version = "0.2", path = "../wist-shared" }
 # 规范指标名 / label 键 / 单位换算的唯一来源（与 agentd 写入侧、center 读侧共用）。
-wist-metrics = { version = "0.21" }
+wist-metrics = { version = "0.22" }
 # 审批前先过一遍契约形状校验：把一份形状坏的计划批了再签发，审批就白做了。
-wist-validate = { version = "0.13" }
+wist-validate = { version = "0.14" }
 # 本地联调：切 path（整条链一起切）
 #wist-metrics = { version = "0.20", path = "../wist-metrics" }
 # 管理面鉴权原语（Bearer token / sha256 / 常数时间比较 / 失败限流桶）。
@@ -108,7 +108,10 @@ tower = { version = "0.5", features = ["util"] }
 # 留着的后果不是编译失败，而是 CI 上 `patch location ... does not contain packages`（v0.52.0-alpha 首次发布就这样红过）。
 # 四个 crate 已于 2026-11-22 全部上 crates.io（contracts 0.14.0 / api 0.13.2 / metrics 0.20.2 / validate 0.12.0），
 # 所以默认注释掉；本地联调需要时再取消注释。
-# [patch.crates-io]
+# 2026-11-28：`ContainerMetrics` 来源（容器指标面）需要 contracts 本地联调，整条链切 path（与 agentd 同期）。
+# **contracts 0.16.1 已于 2026-11-28 发布**，四行已注回 registry（api/metrics/validate 本版未动，
+# 仍为 0.15.0 / 0.22.0 / 0.14.0；`^0.16` 可解析到 0.16.1，不需连带发版）。
+[patch.crates-io]
 # wist-contracts = { path = "../wist-contracts" }
 # wist-api = { path = "../wist-api" }
 # wist-metrics = { path = "../wist-metrics" }

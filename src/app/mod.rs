@@ -27,6 +27,12 @@ pub mod discovery_policy;
 // 管理面登记生效包，运行时切换）。重生成控制面代码时需回补本模块。
 pub mod knowledge;
 
+/// 导出器运行参数表（知识库 `exporters.toml`）：二进制搜索目录 + 周期 / 超时。
+///
+/// 与 `discovery_policy` 同一姿态：**结构 + 校验在网关，值在知识库**；
+/// 不同点是它允许“可选”（旧包没有这个文件时回落到 agentd 内置表）。
+pub mod exporter_policy;
+
 // NOTE(hand-added): L1a 机械资产清单（从事实摘要派生，见 doc/design/center/
 // agent-work-delivery-plan.md §8.2）。只做机械归并，不做识别（识别在采集侧）。
 // 重新生成控制面代码时需回补本模块。

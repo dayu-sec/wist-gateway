@@ -12,6 +12,7 @@ use super::super::agent_ops::{
     submit_agent_status, submit_work_result,
 };
 use super::super::enrollment::enroll_agent;
+use super::super::exporter_policy::poll_exporter_policy;
 use super::super::metrics_labels::poll_agent_metrics_labels;
 use super::super::preflight::agent_preflight;
 use super::super::source_search_policy::poll_source_search_policy;
@@ -50,6 +51,10 @@ pub fn routes() -> Vec<(&'static str, MethodRouter<ApiState>)> {
             "/source-search-policy:poll",
             post(poll_source_search_policy),
         ),
+        // 导出器运行参数（二进制搜索目录 + 周期/超时）：数据在知识库 `exporters.toml`，
+        // 网关只校验（ID 属契约闭集、目录属系统目录、周期/超时在界内）后下发。
+        // 旧网关于 404 → 新 agentd 回落内置表；旧 agentd 从不调它。
+        ("/exporter-policy:poll", post(poll_exporter_policy)),
         // 选择类 label（`env` / `cluster` / `app` / …）的拉取。与其它 `:poll` 同形：身份在请求体，
         // `:poll` 表明它是幂等拉取。旧网关 404 → 新 agentd 按「没有选择类 label」继续跑。
         ("/metrics-labels:poll", post(poll_agent_metrics_labels)),

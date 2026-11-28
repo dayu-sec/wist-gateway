@@ -23,6 +23,7 @@ use std::{fmt, path::Path, sync::Arc};
 use wist_contracts::discovery_policy::DiscoveryAspectPolicySet;
 
 use crate::app::content::ContentSet;
+use crate::app::exporter_policy::ExporterPolicyTable;
 use crate::app::purpose::PurposeRuleTable;
 use crate::infra::{AdminConfig, Store, StoredKnowledgePackage};
 
@@ -50,6 +51,9 @@ pub struct LoadedKnowledge {
     pub content: Option<Arc<ContentSet>>,
     pub purpose_rules: Option<Arc<PurposeRuleTable>>,
     pub discovery_policies: Option<Arc<DiscoveryAspectPolicySet>>,
+    /// 导出器运行参数（二进制搜索目录 / 周期 / 超时）。**可选**：旧包没有这份文件，
+    /// 缺了就让 agentd 用内置表（不能因为少一份可选数据而拒载整包）。
+    pub exporters: Option<Arc<ExporterPolicyTable>>,
 }
 
 /// 这份内容从哪来 —— 决定了"空载"该怎么向人解释（设计 §8.7）。
@@ -105,6 +109,7 @@ impl LoadedKnowledge {
             content: None,
             purpose_rules: None,
             discovery_policies: None,
+            exporters: None,
         }
     }
 
@@ -156,8 +161,29 @@ impl LoadedKnowledge {
             },
             None => None,
         };
-        let configured =
-            content.is_some() || purpose_rules.is_some() || discovery_policies.is_some();
+        // 导出器运行参数：与三件套**同目录**的可选文件（不引入新的配置项：
+        // 它描述的是“这些策展数据的执行环境”，跟着数据走）。
+        let exporters = config
+            .content_catalog_file
+            .as_deref()
+            .and_then(|catalog| catalog.parent())
+            .map(|dir| dir.join("exporters.toml"))
+            .and_then(
+                |path| match crate::app::exporter_policy::load_optional(&path) {
+                    Ok(table) => table.map(Arc::new),
+                    Err(err) => {
+                        log::warn!(
+                            "warning: failed to load exporter policy {}: {err}",
+                            path.display()
+                        );
+                        None
+                    }
+                },
+            );
+        let configured = content.is_some()
+            || purpose_rules.is_some()
+            || discovery_policies.is_some()
+            || exporters.is_some();
         Self {
             source: if configured {
                 KnowledgeSource::ConfigFiles
@@ -168,6 +194,7 @@ impl LoadedKnowledge {
             content,
             purpose_rules,
             discovery_policies,
+            exporters,
         }
     }
 
@@ -252,12 +279,17 @@ impl LoadedKnowledge {
         let discovery_policies =
             crate::app::discovery_policy::load_policy_table(&at("aspect-policies.toml"))
                 .map_err(|err| KnowledgeLoadError::at(dir, format!("发现方向策略表：{err}")))?;
+        // 可选：旧包没有这份文件（它描述导出器的搜索目录 / 周期，缺了回落到 agentd 内置值）。
+        let exporters = crate::app::exporter_policy::load_optional(&at("exporters.toml"))
+            .map_err(|err| KnowledgeLoadError::at(dir, format!("导出器运行参数：{err}")))?
+            .map(Arc::new);
         Ok(Self {
             source: KnowledgeSource::None,
             generation: 0,
             content: Some(Arc::new(content)),
             purpose_rules: Some(Arc::new(purpose_rules)),
             discovery_policies: Some(Arc::new(discovery_policies)),
+            exporters,
         })
     }
 }

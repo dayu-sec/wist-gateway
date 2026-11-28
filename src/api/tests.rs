@@ -23614,3 +23614,131 @@ async fn approver_install_rejects_an_unknown_platform() {
         assert_eq!(body["error"]["code"], "unknown_platform");
     }
 }
+
+// ── 导出器运行参数（知识库 `exporters.toml` → `exporter-policy:poll`）──────────
+
+/// 拉一次导出器运行参数（mTLS 身份由路由扩展注入）。
+async fn poll_exporter_policy(
+    env: &TestEnv,
+    credential: &str,
+    platform: &str,
+) -> axum::response::Response {
+    post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/exporter-policy:poll",
+        Some(credential),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "exporter_policy",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "platform": platform,
+            "requested_at": "2026-11-28T00:00:00Z",
+        }),
+    )
+    .await
+}
+
+/// 一条**跨仓**的真实链路：知识库 `exporters.toml` → 网关装载校验 → 按平台下发。
+///
+/// 与 `admin_discovery_view_shows_the_probe_paths_agents_actually_get` 同一姿态：夹具目录
+/// 没有这份文件，必须换成真实知识目录，否则这条用例只能验到“空表”。
+#[tokio::test]
+async fn exporter_policy_comes_from_the_knowledge_file_per_platform() {
+    let mut env = TestEnv::new().await;
+    env.config.content_catalog_file = Some(crate::test_support::knowledge_file("catalog.toml"));
+    env.config.content_packs_file = Some(crate::test_support::knowledge_file("packs.toml"));
+    env.config.content_templates_file = Some(crate::test_support::knowledge_file("templates.toml"));
+    let credential = enroll_agent_credential(&env).await;
+
+    let linux: serde_json::Value =
+        decode_json_response(poll_exporter_policy(&env, &credential, "linux").await).await;
+    assert_eq!(linux["kind"], "exporter_policy");
+    assert!(
+        linux["exporters_version"].as_i64().unwrap_or(0) >= 1,
+        "真实知识包应当带 exporters.toml：{linux}"
+    );
+    let dirs = linux["bin_dirs"].as_array().expect("bin_dirs");
+    assert!(
+        dirs.iter().any(|dir| dir == "/usr/bin"),
+        "linux 必须包含标准目录：{linux}"
+    );
+    assert!(
+        !dirs
+            .iter()
+            .any(|dir| dir.as_str().unwrap_or("").contains("homebrew")),
+        "不能把 macOS 的 Homebrew 目录发给 linux：{linux}"
+    );
+
+    // 同一份表，换平台就是另一套目录（平台是**本机事实**，由 agent 自报）。
+    let macos: serde_json::Value =
+        decode_json_response(poll_exporter_policy(&env, &credential, "macos").await).await;
+    assert!(
+        macos["bin_dirs"]
+            .as_array()
+            .expect("bin_dirs")
+            .iter()
+            .any(|dir| dir.as_str().unwrap_or("").contains("homebrew")),
+        "macos 必须带上 Homebrew 前缀：{macos}"
+    );
+}
+
+/// 网关空载（没装知识库）：**200 + 空表**，不是 503 —— 这里没有需要人修的东西，
+/// agentd 拿空表就用内置值。
+#[tokio::test]
+async fn exporter_policy_without_knowledge_is_an_empty_answer_not_an_error() {
+    let env = TestEnv::new_without_content().await;
+    let credential = enroll_agent_credential(&env).await;
+
+    let response = poll_exporter_policy(&env, &credential, "linux").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["exporters_version"], 0);
+    assert!(
+        body["bin_dirs"].as_array().expect("bin_dirs").is_empty(),
+        "{body}"
+    );
+    assert!(body["exporters"].as_array().expect("exporters").is_empty());
+}
+
+/// 这条端点同样只认 mTLS 身份：证书说是谁就必须是谁。
+#[tokio::test]
+async fn exporter_policy_poll_requires_the_agent_identity() {
+    let env = TestEnv::new().await;
+    let _credential = enroll_agent_credential(&env).await;
+
+    // 证书身份是 agent-node-a，请求体写成别人 → 拒。
+    let response = post_agent_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/exporter-policy:poll",
+        Some("agent-node-a"),
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "exporter_policy",
+            "agent_id": "agent-node-b",
+            "instance_id": "node-a",
+            "platform": "linux",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 完全没有身份 → 拒（不给 bearer 通道）。
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/exporter-policy:poll",
+        None,
+        &serde_json::json!({
+            "api_version": "v1",
+            "kind": "exporter_policy",
+            "agent_id": "agent-node-a",
+            "instance_id": "node-a",
+            "platform": "linux",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

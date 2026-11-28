@@ -105,6 +105,11 @@ mod refresh;
 // 生效值 = 知识库 `[[units]] search_roots` ∩ `[collection] allowed_source_roots`；
 // agentd 侧不留配置，拿不到策略就不搜索。见 api/source_search_policy.rs 与设计 §6.1.1。
 mod source_search_policy;
+// NOTE(hand-added): 导出器运行参数的下发（`POST /api/v1/agent/exporter-policy:poll`）。
+// 数据在知识库 `exporters.toml`（二进制搜索目录 + 周期/超时），网关只做结构校验与下发；
+// 旧网关 404 → agentd 回落内置表。见 api/exporter_policy.rs 与
+// `wist-agentd/docs/design/log-source-exporters.md`。
+mod exporter_policy;
 // NOTE(hand-added): 网关自述面（环回；CR-003）。对应 jumo 模型 Control.GatewayApp.SelfInterface
 // 的 QuerySelfState（模型 bind 未定、环回鉴权未决），故路由手加。供 host 侧 wist-gwlinkd 消费。
 mod self_state;

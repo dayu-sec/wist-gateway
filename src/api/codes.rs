@@ -159,6 +159,7 @@ codes! {
     INVALID_METRICS_LABELS_POLL => "invalid_metrics_labels_poll",
     INVALID_PREFLIGHT_REQUEST => "invalid_preflight_request",
     INVALID_SOURCE_SEARCH_POLICY_POLL => "invalid_source_search_policy_poll",
+    INVALID_EXPORTER_POLICY_POLL => "invalid_exporter_policy_poll",
     INVALID_TOKEN => "invalid_token",
     INVALID_UPLINK_POLL => "invalid_uplink_poll",
     INVALID_WORK_ACK => "invalid_work_ack",
