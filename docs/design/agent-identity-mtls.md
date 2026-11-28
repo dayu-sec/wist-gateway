@@ -143,7 +143,7 @@ spiffe://<tenant_id>/<environment_id>/agent/<agent_id>
 `CredentialBundle.certificate` / `private_key_ref` / `ca_bundle`）。
 
 **批量首装（短时多机，2026-11-28 增）**：同一套流程，token 换成管理面「批量安装」签发的短时码
-（`POST /api/v1/agent/install-code/batch`；默认 60s，`[agent] batch_bootstrap_ttl_seconds`，上限 600s；
+（`POST /api/v1/agent/install-code/batch`；默认 300s（5 分钟），`[agent] batch_bootstrap_ttl_seconds`，上限 600s；
 另受 `batch_bootstrap_max_uses`（默认 200，上限 10000）约束可注册台数）。
 两个值可在管理面当场调整（`GET/POST /api/v1/admin/agent/install-policy`，只影响之后签发的码），
 配置文件里的是**部署默认值**。策略读不出来时**拒绝签发**（不回落默认值：管理员可能把策略调得
@@ -336,6 +336,6 @@ agent 走 **mTLS**（出示客户端证书）→ 网关 `WebPkiClientVerifier` �
    **已定：网关侧「按 `agent_id` 的拒绝名单（状态表）」+ 短命证书做 GC，不用 CRL / OCSP**（见 §5.6）。
 4. ~~是否提供「**站点级恢复凭据**」用于无人值守批量重装。~~ **已定：不做站点级长期凭据** ——
    不提供可长期流通的共享恢复凭据；恢复场景以 mTLS 自愈覆盖。**批量首装是短时例外**：
-   提供默认 60s（上限 600s）、窗口内可多机的批量安装码（见 §5.1），它到点即失效、
+   提供默认 300s（5 分钟，上限 600s）、窗口内可多机的批量安装码（见 §5.1），它到点即失效、
    每次显式签发，不是能长期留存的共享密钥。
 5. ~~续期**宽限期**长度。~~ **已定：无宽限** —— 离线容忍就是硬保底 30 天，过期即带 token 重装（§4.2）。

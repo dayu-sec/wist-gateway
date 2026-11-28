@@ -49,7 +49,7 @@ const ENV_DATABASE_URL: &str = "WIST_GATEWAY_DATABASE_URL";
 const MIN_ADMIN_API_TOKEN_BYTES: usize = 8;
 const MAX_BOOTSTRAP_TOKEN_TTL_SECONDS: i64 = 60 * 60;
 /// 批量安装码的有效期上限（秒）。它可在窗口内被多台主机复用，所以窗口必须短：
-/// 默认 60s，最多 10 分钟（再长就不该用「批量码」而该走逐台发放）。
+/// 默认 300s（5 分钟），最多 10 分钟（再长就不该用「批量码」而该走逐台发放）。
 pub const MAX_BATCH_BOOTSTRAP_TOKEN_TTL_SECONDS: i64 = 60 * 10;
 /// 批量安装码的**注册台数上限**的允许配置上限。
 ///
@@ -105,7 +105,7 @@ pub struct AdminConfig {
     /// 批量安装码（`POST /api/v1/agent/install-code/batch`）的有效期（秒）。
     ///
     /// 与 [`Self::bootstrap_token_ttl_seconds`] 分开：一次性安装码可以有几分钟，
-    /// 而批量码**同一窗口里可装多台**，窗口本身就暴露面 —— 默认 60s，上限 600s。
+    /// 而批量码**同一窗口里可装多台**，窗口本身就暴露面 —— 默认 300s（5 分钟），上限 600s。
     pub batch_bootstrap_token_ttl_seconds: i64,
     /// 批量安装码最多可注册多少台（`[agent] batch_bootstrap_max_uses`，默认 200）。
     ///
@@ -1299,9 +1299,10 @@ fn default_bootstrap_ttl_seconds() -> i64 {
     900
 }
 
-/// 批量安装码默认只活 1 分钟：它是「同一分钟内批量首装」的凭据，不是站点级长期凭据。
+/// 批量安装码默认活 5 分钟：「在一台机器上复制命令、再逐台粘到下一个终端」的实际节奏
+/// 决定的 —— 1 分钟常常只够装两三台，窗口得留到能覆盖一批首装。
 fn default_batch_bootstrap_ttl_seconds() -> i64 {
-    60
+    300
 }
 
 /// 批量安装码默认最多注册 200 台：覆盖常见的一批，又不把泄露时的爆炸半径交给窗口长度。
@@ -1675,7 +1676,7 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         admin_api_token_hash: sha256_hex("test-admin-token-0001"),
         self_face_allow: Vec::new(),
         bootstrap_token_ttl_seconds: 900,
-        batch_bootstrap_token_ttl_seconds: 60,
+        batch_bootstrap_token_ttl_seconds: 300,
         batch_bootstrap_max_uses: 200,
         credential_ttl_seconds: 30 * 24 * 60 * 60,
         store_file: root.join("state").join("admin-store.json"),
@@ -2480,9 +2481,9 @@ environment_id = "env-default"
         let _ = fs::remove_file(path);
     }
 
-    /// 批量安装码没配时默认 60s：它是「同一分钟批量首装」的凭据，不该跟着一次性码走 900s。
+    /// 批量安装码没配时默认 300s（5 分钟）：够装一批，又不跟着一次性码走 900s。
     #[test]
-    fn batch_bootstrap_ttl_defaults_to_one_minute() {
+    fn batch_bootstrap_ttl_defaults_to_five_minutes() {
         let path = write_temp_config(
             r#"
 [server]
@@ -2499,7 +2500,7 @@ environment_id = "env-default"
 
         let config = AdminConfig::load_from_path(&path).expect("config loads");
 
-        assert_eq!(config.batch_bootstrap_token_ttl_seconds, 60);
+        assert_eq!(config.batch_bootstrap_token_ttl_seconds, 300);
         let _ = fs::remove_file(path);
     }
 

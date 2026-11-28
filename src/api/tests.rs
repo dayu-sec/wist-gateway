@@ -916,7 +916,7 @@ async fn issue_install_code_persists_one_time_token() {
 
 /// 批量安装码：同一张 token 在有效期窗口内可以给多台新主机用。
 ///
-/// 它是「一分钟内批量首装」的凭据，不是站点级长期恢复凭据：时间到点即失效
+/// 它是「一批机器首装」的凭据，不是站点级长期恢复凭据：时间到点即失效
 /// （见 `docs/design/agent-identity-mtls.md` §5.1）。
 #[tokio::test]
 async fn batch_install_code_is_reusable_within_its_window() {
@@ -935,8 +935,8 @@ async fn batch_install_code_is_reusable_within_its_window() {
         .with_timezone(&chrono::Utc)
         - chrono::Utc::now();
     assert!(
-        (55..=60).contains(&window_seconds.num_seconds()),
-        "批量码应该只活 60s，实际窗口 {}s",
+        (295..=300).contains(&window_seconds.num_seconds()),
+        "批量码应该只活 300s（5 分钟），实际窗口 {}s",
         window_seconds.num_seconds()
     );
 
@@ -953,9 +953,9 @@ async fn batch_install_code_is_reusable_within_its_window() {
     assert_eq!(stored.status, StoredEnrollmentTokenStatus::Active);
     assert_eq!(stored.issued_by, "admin-api:batch");
     assert!(stored.token_id.starts_with("batch-"));
-    // 有效期就是配置的批量窗口（默认 60s），不跟随一次性码的 900s。
+    // 有效期就是配置的批量窗口（默认 300s），不跟随一次性码的 900s。
     assert_eq!(
-        env.config.batch_bootstrap_token_ttl_seconds, 60,
+        env.config.batch_bootstrap_token_ttl_seconds, 300,
         "测试夹具的批量窗口"
     );
     // 台数上限也是配置的（默认 200），不是 `u32::MAX` 那种「事实上的无上限」。
@@ -1147,7 +1147,7 @@ async fn install_policy_view_defaults_to_deployment_config() {
     .await;
     assert_eq!(view.status(), StatusCode::OK);
     let body: serde_json::Value = decode_json_response(view).await;
-    assert_eq!(body["batch_ttl_seconds"], 60);
+    assert_eq!(body["batch_ttl_seconds"], 300);
     assert_eq!(body["batch_max_uses"], 200);
     // 没设置过 = 用的是部署配置 —— 页面要能把“当前值从哪来”说清楚。
     assert_eq!(body["source"], "config");
@@ -1252,7 +1252,7 @@ async fn install_policy_rejects_out_of_range_and_keeps_previous_value() {
     .await;
     let body: serde_json::Value = decode_json_response(view).await;
     assert_eq!(body["source"], "config");
-    assert_eq!(body["batch_ttl_seconds"], 60);
+    assert_eq!(body["batch_ttl_seconds"], 300);
     assert_eq!(body["batch_max_uses"], 200);
 }
 
@@ -1278,7 +1278,7 @@ async fn install_policy_falls_back_when_stored_row_is_out_of_bounds() {
     .await;
     let body: serde_json::Value = decode_json_response(view).await;
     assert_eq!(body["source"], "config");
-    assert_eq!(body["batch_ttl_seconds"], 60);
+    assert_eq!(body["batch_ttl_seconds"], 300);
     assert_eq!(body["batch_max_uses"], 200);
 
     // 签发也不能被坏行放大。
@@ -1332,7 +1332,7 @@ async fn install_policy_change_alone_does_not_touch_issued_tokens() {
         chrono::DateTime::parse_from_rfc3339(&stored_before.issued_at).expect("issued_at");
     let expires_at =
         chrono::DateTime::parse_from_rfc3339(&stored_before.expires_at).expect("expires_at");
-    assert_eq!((expires_at - issued_at).num_seconds(), 60);
+    assert_eq!((expires_at - issued_at).num_seconds(), 300);
 
     // 之后签发的才跟着新策略走。
     let (after, after_policy) = issue_batch_install_code(&env.config, &env.store_handle)
@@ -11398,7 +11398,7 @@ impl TestEnv {
             allowed_source_roots: crate::infra::config::default_allowed_source_roots(),
             knowledge_allowed_maturity: crate::infra::config::default_knowledge_allowed_maturity(),
             bootstrap_token_ttl_seconds: 900,
-            batch_bootstrap_token_ttl_seconds: 60,
+            batch_bootstrap_token_ttl_seconds: 300,
             batch_bootstrap_max_uses: 200,
             credential_ttl_seconds: 30 * 24 * 60 * 60,
             store_file,

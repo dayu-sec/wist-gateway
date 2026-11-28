@@ -12,8 +12,8 @@ victoria_metrics_url = "http://127.0.0.1:18429"
 [agent]
 bootstrap_ttl_seconds = 900
 # 批量安装码（管理面「批量安装」生成）的有效期：窗口内同一张 token 可给多台新主机用。
-# 默认 60s，上限 600s —— 它是短时凭据，不是站点级长期恢复凭据。
-# batch_bootstrap_ttl_seconds = 60
+# 默认 300s（5 分钟），上限 600s —— 它是短时凭据，不是站点级长期恢复凭据。
+# batch_bootstrap_ttl_seconds = 300
 # 每张批量码最多可注册的台数（防泄露后的爆炸半径；与有效期是两个独立旋钮）。
 # 默认 200，上限 10000；`0` 不允许（那是一台也装不了）。
 # batch_bootstrap_max_uses = 200
