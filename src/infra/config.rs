@@ -144,12 +144,6 @@ pub struct AdminConfig {
     /// 数据面订阅端的内部接入端点（明文 HTTP，只应绑环回）。
     /// `None` = 关闭订阅（见 [`RawIngestConfig`]）。
     pub ingest_listen_addr: Option<String>,
-    /// 证据服务的流记录写端点（完整 URL，例如 `http://10.0.0.5:6800/internal/flows`）。
-    ///
-    /// `None` = **不转发**主机流记录：`POST /api/v1/ingest/agent-flows` 回 503
-    /// （可见的"没配"，而不是静默丢弃）。见
-    /// `wist-design/doc/design/center/agent-flow-storage.md`。
-    pub evidence_flows_url: Option<String>,
     /// 数据面工作根（宿主 `data-plane-run/work`，容器内只读挂载）：
     /// 管理面「配置与规则」从这里读 conf / topology / connectors / models。
     /// `None` = 没挂载（该页面回 503）。
@@ -404,9 +398,6 @@ struct RawKnowledgeConfig {
 struct RawIngestConfig {
     #[serde(default)]
     listen_addr: Option<String>,
-    /// 证据服务的流记录写端点（完整 URL）。缺省 = 不转发流记录。
-    #[serde(default)]
-    evidence_flows_url: Option<String>,
 }
 
 /// `[data_plane]` 段：数据面工作根（只读浏览）。
@@ -900,13 +891,6 @@ impl AdminConfig {
                 None => Some(DEFAULT_INGEST_LISTEN_ADDR.to_string()),
                 Some(value) => normalize_optional(Some(expand(&env, value)?)),
             },
-            evidence_flows_url: normalize_optional(
-                raw.ingest
-                    .evidence_flows_url
-                    .as_deref()
-                    .map(|value| expand(&env, value))
-                    .transpose()?,
-            ),
             data_plane_work_dir: normalize_optional(
                 raw.data_plane
                     .work_dir
@@ -1172,15 +1156,6 @@ impl AdminConfig {
                 return Err(config_validation(format!(
                     "ingest.listen_addr must differ from server.listen_addr ({ingest_addr}): \
                      the ingest endpoint is plain HTTP and must not share the TLS listener"
-                )));
-            }
-        }
-        if let Some(url) = self.evidence_flows_url.as_deref() {
-            // 写错了要在启动时被拒：这条 URL 只有在第一帧流记录进来时才会用到，
-            // 那时再发现就是一个"看起来在采、其实一条都没落库"的现场。
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                return Err(config_validation(format!(
-                    "ingest.evidence_flows_url must be an absolute http(s) URL, got {url}"
                 )));
             }
         }
@@ -1720,7 +1695,6 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         content_packs_file: None,
         content_templates_file: None,
         ingest_listen_addr: None,
-        evidence_flows_url: None,
         data_plane_work_dir: None,
         investigation_allowed_topics: None,
         investigation_max_per_agent_per_hour: DEFAULT_INVESTIGATION_MAX_PER_AGENT_PER_HOUR,
