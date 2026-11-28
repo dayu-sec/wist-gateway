@@ -3,6 +3,15 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.60.0-alpha] - 2026-11-28
+
+### 变更（批量安装码默认有效期 1 分钟 → 5 分钟）
+
+- `[agent] batch_bootstrap_ttl_seconds` 的默认值改为 **300 秒（5 分钟）**（上限仍是 600 秒）：
+  1 分钟常常只够装两三台，一批首装还没跑完窗口就没了；5 分钟够走完一批。
+- 只改**部署默认值**：管理面设置过「批量安装策略」的（`source=setting`）与显式配了这个键的现场
+  不受影响；已经发出的批量码仍按它签发时的窗口走，不会被改设置提前作废或放宽。
+
 ## [0.59.0-alpha] - 2026-11-28
 
 ### 新增（容器指标独立面 `ContainerMetrics`）
