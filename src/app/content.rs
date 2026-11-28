@@ -2792,6 +2792,7 @@ target = "/var/log/x.log"
             "HostMetrics",
             "ContainerWorkload",
             "DatabaseService",
+            "NetworkFlow",
         ] {
             assert!(
                 set.is_family_ready("linux", family),
@@ -2958,6 +2959,8 @@ target = "/var/log/x.log"
                 "KernelSystem",
                 "StorageHealth",
                 "HostMetrics",
+                // 知识库 0.15.0 起 `linux-flow` 翻 active：主机流记录（eBPF 五元组）也是可授权面
+                "NetworkFlow",
             ]
         );
         assert_eq!(
@@ -2991,9 +2994,8 @@ target = "/var/log/x.log"
                 // 会以 `match_unsatisfied` 排除（面不适用，不是失败）。
                 ("linux-container-metrics", "agent_too_old"),
                 ("linux-suricata-eve", "fact_not_collected"),
-                // `linux-flow` 同理且更进一步：包与单元都是 draft，采集未就绪（`collect_not_ready`）。
-                // 挂进模板只是把“将来会派”这件事写清楚；展开只取 active 单元，现在不会多出一面。
-                ("linux-host-flow", "collect_not_ready"),
+                // `linux-flow`（`linux-host-flow`）自知识库 0.15.0 起是 active：不再出现在排除名单里，
+                // 它已经作为 `NetworkFlow` 面展开（见上面 `works` 的期望）。
             ],
             "LinuxHost 只应排除事实门不成立的单元（容器根 / 关键进程 / Suricata 输出）"
         );

@@ -167,7 +167,9 @@ use data_plane::{
     list_data_plane_files, list_data_plane_outputs, read_data_plane_file, tail_data_plane_output,
 };
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
-use ingest::{MAX_INGEST_BODY_BYTES, ingest_agent_facts};
+use ingest::{
+    MAX_FLOW_INGEST_BODY_BYTES, MAX_INGEST_BODY_BYTES, ingest_agent_facts, ingest_agent_flows,
+};
 use install::{
     download_agent_package, download_agent_package_by_id, get_agent_batch_install_code,
     get_agent_initial_config_with_token, get_agent_install_code, get_agent_install_script,
@@ -372,6 +374,12 @@ pub fn ingest_router(state: ApiState) -> Router {
         .route(
             "/api/v1/ingest/agent-logs",
             post(ingest_agent_logs).layer(DefaultBodyLimit::max(MAX_LOG_INGEST_BODY_BYTES)),
+        )
+        // 主机流记录：网关补 `cust_id` 后转给证据服务（`ingest.evidence_flows_url`）。
+        // 见 `wist-design/doc/design/center/agent-flow-storage.md` §4。
+        .route(
+            "/api/v1/ingest/agent-flows",
+            post(ingest_agent_flows).layer(DefaultBodyLimit::max(MAX_FLOW_INGEST_BODY_BYTES)),
         )
         .with_state(state)
 }

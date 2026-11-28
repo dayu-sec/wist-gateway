@@ -30,4 +30,7 @@ pub mod store;
 pub use store::*;
 pub mod tls;
 pub use tls::*;
+// NOTE(hand-added): 证据服务的流记录写端点（`POST /internal/flows`）。
+// 网关按登记表补 `cust_id` 后转发，见 `wist-design/.../agent-flow-storage.md`。
+pub mod evidence_flows;
 pub mod victoria_metrics;
