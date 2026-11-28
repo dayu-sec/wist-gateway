@@ -138,8 +138,9 @@ fn revocation_is_live(retain_until: &str, now: DateTime<Utc>) -> bool {
     }
 }
 
-/// 回收超时的预留（与既有 `recover_expired_reservation` 语义一致：`reserved_at`
-/// 缺失或不可解析视为立即可回收）。返回是否发生了回收。
+/// 回收超时的预留（仅限**一次性 token**：多用途 token 不进入 `Reserved`，它的容量上限是时间
+/// 窗口，进程崩溃留下的那次计数会随窗口到期一起作废）。
+/// `reserved_at` 缺失或不可解析视为立即可回收。返回是否发生了回收。
 fn recover_stale_reservation(
     token: &mut StoredEnrollmentToken,
     now: DateTime<Utc>,
@@ -905,6 +906,31 @@ async fn agent_exists_tx(tx: &mut SqliteConnection, agent_id: &str) -> StoreResu
     Ok(found.is_some())
 }
 
+/// 吊销同租户/环境下**仍可用**的批量码（事务内用；替换与独立作废共用）。
+///
+/// 只认 `batch-` 前缀：一次性安装码（`install-`）不受影响；`expired` / `used` / 已 `revoked`
+/// 的行不动（它们已经不可用，保留原状态作为审计事实）。
+/// `Reserved` 是批量码的在途预留（正常不会出现，但既然还“占着名额”就一并切断）。
+async fn revoke_active_batch_tokens(
+    tx: &mut SqliteConnection,
+    tenant_id: &str,
+    environment_id: &str,
+    now: &str,
+) -> StoreResult<u64> {
+    let result = sqlx::query(
+        "UPDATE enrollment_tokens SET status = 'revoked', revoked_at = ?1, reserved_at = NULL \
+         WHERE token_id LIKE 'batch-%' AND tenant_id = ?2 AND environment_id = ?3 \
+         AND status IN ('active', 'reserved')",
+    )
+    .bind(now)
+    .bind(tenant_id)
+    .bind(environment_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|err| sql_error(err, "revoke active batch tokens"))?;
+    Ok(result.rows_affected())
+}
+
 #[async_trait]
 impl Store for SqliteStore {
     async fn insert_enrollment_token(&self, token: &StoredEnrollmentToken) -> StoreResult<()> {
@@ -1014,7 +1040,11 @@ impl Store for SqliteStore {
 
         token.used_count = token.used_count.saturating_add(1);
         token.reserved_at = Some(now.to_rfc3339());
-        token.status = StoredEnrollmentTokenStatus::Reserved;
+        // 一次性 token 整张独占（Reserved）；多用途 token（批量安装码）保持 Active，
+        // 否则同一窗口内其它机器来取配置/取包时会看到「token 已被占用」而直接失败。
+        if token.max_uses == 1 {
+            token.status = StoredEnrollmentTokenStatus::Reserved;
+        }
         persist_token_state(&mut tx, &token).await?;
         tx.commit()
             .await
@@ -1034,9 +1064,12 @@ impl Store for SqliteStore {
         let Some(mut token) = fetch_token(&mut tx, request.token_hash).await? else {
             return Ok(Err(CommitRejection::InvalidToken));
         };
-        if token.status != StoredEnrollmentTokenStatus::Reserved
-            || token.token_hash != request.token_hash
-        {
+        // 一次性 token 预留在 `Reserved`；多用途 token 预留期间仍是 `Active`，靠 used_count 认账。
+        let reservation_live = token.status == StoredEnrollmentTokenStatus::Reserved
+            || (token.status == StoredEnrollmentTokenStatus::Active
+                && token.max_uses > 1
+                && token.used_count > 0);
+        if !reservation_live || token.token_hash != request.token_hash {
             return Ok(Err(CommitRejection::InvalidToken));
         }
         if agent_exists_tx(&mut tx, request.agent_id).await? {
@@ -1044,7 +1077,11 @@ impl Store for SqliteStore {
         }
 
         // ① token 收尾
-        token.status = if token.used_count >= token.max_uses {
+        //
+        // 多用途 token **不落 `Used`**：容量一律由 `used_count`/`max_uses` 判定，而同一窗口里
+        // 可能还有别的机器在途 —— 先到的那一笔 commit 若把整张标成 `Used`，
+        // 后到的那笔（它确实预留过）会在下面的 `reservation_live` 检查里被误拒。
+        token.status = if token.max_uses == 1 && token.used_count >= token.max_uses {
             StoredEnrollmentTokenStatus::Used
         } else {
             StoredEnrollmentTokenStatus::Active
@@ -1174,11 +1211,16 @@ impl Store for SqliteStore {
     }
 
     async fn rollback_enrollment_token_reservation(&self, token_hash: &str) -> StoreResult<()> {
-        // 只归还处于 reserved 的预留；其它状态为无操作（与既有实现一致）。
+        // 一次性 token：只归还处于 reserved 的预留；多用途 token：只要还有用量就归还一笔
+        // （它预留期间保持 active，见 Store::reserve_enrollment_token）。
+        //
+        // 只认「还在途」的状态：`expired` / `revoked` 不能被一次迟到的回滚改回 `active`
+        // （回滚来自一次失败的注册，可能发生在窗口到期/管理员吊销之后）。
         sqlx::query(
             "UPDATE enrollment_tokens SET used_count = CASE WHEN used_count > 0 THEN used_count - 1 \
              ELSE 0 END, reserved_at = NULL, status = 'active' \
-             WHERE token_hash = ?1 AND status = 'reserved'",
+             WHERE token_hash = ?1 AND used_count > 0 \
+             AND (status = 'reserved' OR (max_uses > 1 AND status IN ('active', 'used')))",
         )
         .bind(token_hash)
         .execute(&self.pool)
@@ -1210,6 +1252,44 @@ impl Store for SqliteStore {
         .await
         .map_err(|err| sql_error(err, "revoke enrollment token"))?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn revoke_active_batch_enrollment_tokens(
+        &self,
+        tenant_id: &str,
+        environment_id: &str,
+        now: &str,
+    ) -> StoreResult<u64> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin revoke batch tokens"))?;
+        let revoked = revoke_active_batch_tokens(&mut tx, tenant_id, environment_id, now).await?;
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit revoke batch tokens"))?;
+        Ok(revoked)
+    }
+
+    async fn insert_batch_enrollment_token_replacing_active(
+        &self,
+        token: &StoredEnrollmentToken,
+        tenant_id: &str,
+        environment_id: &str,
+        now: &str,
+    ) -> StoreResult<u64> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| sql_error(err, "begin replace batch token"))?;
+        let revoked = revoke_active_batch_tokens(&mut tx, tenant_id, environment_id, now).await?;
+        insert_token(&mut tx, token).await?;
+        tx.commit()
+            .await
+            .map_err(|err| sql_error(err, "commit replace batch token"))?;
+        Ok(revoked)
     }
 
     async fn get_agent(&self, agent_id: &str) -> StoreResult<Option<StoredAgentRegistration>> {
@@ -2559,6 +2639,50 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(|err| sql_error(err, "upsert agent advertise url"))?;
+        Ok(())
+    }
+
+    async fn get_agent_install_policy(&self) -> StoreResult<Option<StoredAgentInstallPolicy>> {
+        let row = sqlx::query(
+            "SELECT setting_id, batch_ttl_seconds, batch_max_uses, updated_by, updated_at \
+             FROM agent_install_policy WHERE setting_id = ?1",
+        )
+        .bind(DEFAULT_AGENT_INSTALL_POLICY_SETTING_ID)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "select agent install policy"))?;
+        match row {
+            Some(row) => Ok(Some(StoredAgentInstallPolicy {
+                setting_id: column!(row, "setting_id"),
+                batch_ttl_seconds: column!(row, "batch_ttl_seconds"),
+                batch_max_uses: column!(row, "batch_max_uses"),
+                updated_by: column!(row, "updated_by"),
+                updated_at: column!(row, "updated_at"),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert_agent_install_policy(
+        &self,
+        policy: &StoredAgentInstallPolicy,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO agent_install_policy (setting_id, batch_ttl_seconds, batch_max_uses, \
+             updated_by, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (setting_id) DO UPDATE SET \
+             batch_ttl_seconds = excluded.batch_ttl_seconds, \
+             batch_max_uses = excluded.batch_max_uses, \
+             updated_by = excluded.updated_by, updated_at = excluded.updated_at",
+        )
+        .bind(DEFAULT_AGENT_INSTALL_POLICY_SETTING_ID)
+        .bind(policy.batch_ttl_seconds)
+        .bind(policy.batch_max_uses as i64)
+        .bind(&policy.updated_by)
+        .bind(&policy.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sql_error(err, "upsert agent install policy"))?;
         Ok(())
     }
 
@@ -5382,6 +5506,39 @@ mod tests {
             .expect("committed");
     }
 
+    /// 落库一台（与 [`register`] 同形，但 token 由调用方先建好）。
+    async fn commit_registration(store: &SqliteStore, token_hash: &str, agent_id: &str) {
+        let credential_id = format!("cred-{agent_id}");
+        let credential_token_hash = format!("cred-hash-{agent_id}");
+        let instance_id = format!("inst-{agent_id}");
+        let node_id = format!("node-{agent_id}");
+        let hostname = format!("host-{agent_id}");
+        let machine_id = format!("machine-{agent_id}");
+        let request = CommitRegistration {
+            token_hash,
+            agent_id,
+            instance_id: &instance_id,
+            boot_id: "boot-1",
+            tenant_id: TENANT,
+            environment_id: ENVIRONMENT,
+            node_id: &node_id,
+            hostname: &hostname,
+            machine_id: &machine_id,
+            version: "0.1.0",
+            credential_id: &credential_id,
+            credential_token_hash: &credential_token_hash,
+            credential_issued_at: "2026-01-01T00:00:00+00:00",
+            credential_expires_at: "2026-12-31T00:00:00+00:00",
+            registered_at: "2026-01-01T00:00:00+00:00",
+            now: "2026-01-01T00:00:00+00:00",
+        };
+        store
+            .commit_reserved_registration(&request)
+            .await
+            .unwrap()
+            .expect("committed");
+    }
+
     fn cert_registration<'a>(
         agent_id: &'a str,
         credential_id: &'a str,
@@ -5571,6 +5728,402 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay, Err(ReservationRejection::InvalidToken));
+    }
+
+    /// 批量安装码：同一窗口内多台可以**并发预留**，token 不能被第一台占住。
+    ///
+    /// 回归点：此前预留把 token 整体置 `Reserved`，第二台既预留不了，连取配置/取包
+    /// （`validate` 要求 `Active`）也一起失败 —— 批量安装本身就装不起来。
+    #[tokio::test]
+    async fn batch_token_allows_multiple_reservations_and_stays_active() {
+        let store = store().await;
+        store
+            .insert_enrollment_token(&token("hash-batch", u32::MAX))
+            .await
+            .unwrap();
+
+        store
+            .reserve_enrollment_token(&reserve("hash-batch", "agent-1"))
+            .await
+            .unwrap()
+            .expect("first reserve");
+        // 第一台还没 commit 时，第二台也能预留。
+        store
+            .reserve_enrollment_token(&reserve("hash-batch", "agent-2"))
+            .await
+            .unwrap()
+            .expect("second reserve");
+        // 且窗口内仍然对「取配置 / 取包」可用。
+        store
+            .validate_bootstrap_token(&bootstrap("hash-batch"))
+            .await
+            .unwrap()
+            .expect("still usable while reserved");
+
+        let reserved = store
+            .get_enrollment_token("hash-batch")
+            .await
+            .unwrap()
+            .expect("token");
+        assert_eq!(reserved.status, StoredEnrollmentTokenStatus::Active);
+        assert_eq!(reserved.used_count, 2);
+
+        commit_registration(&store, "hash-batch", "agent-1").await;
+        commit_registration(&store, "hash-batch", "agent-2").await;
+
+        let after = store
+            .get_enrollment_token("hash-batch")
+            .await
+            .unwrap()
+            .expect("token");
+        assert_eq!(after.status, StoredEnrollmentTokenStatus::Active);
+        assert_eq!(after.used_count, 2);
+        assert!(after.reserved_at.is_none());
+    }
+
+    /// 批量安装码的单次失败（凭据签发/落库失败）要把那一格还回去，不影响其它在途的机器。
+    #[tokio::test]
+    async fn batch_token_rollback_returns_only_one_slot() {
+        let store = store().await;
+        store
+            .insert_enrollment_token(&token("hash-batch-rollback", 10))
+            .await
+            .unwrap();
+        store
+            .reserve_enrollment_token(&reserve("hash-batch-rollback", "agent-1"))
+            .await
+            .unwrap()
+            .expect("reserved 1");
+        store
+            .reserve_enrollment_token(&reserve("hash-batch-rollback", "agent-2"))
+            .await
+            .unwrap()
+            .expect("reserved 2");
+
+        store
+            .rollback_enrollment_token_reservation("hash-batch-rollback")
+            .await
+            .unwrap();
+
+        let token = store
+            .get_enrollment_token("hash-batch-rollback")
+            .await
+            .unwrap()
+            .expect("token");
+        assert_eq!(token.status, StoredEnrollmentTokenStatus::Active);
+        assert_eq!(token.used_count, 1);
+
+        // 剩下那笔预留仍可正常落库。
+        commit_registration(&store, "hash-batch-rollback", "agent-2").await;
+    }
+
+    /// 迟到的回滚不能把已经过期的批量码改回 `active`。
+    #[tokio::test]
+    async fn rollback_does_not_revive_an_expired_multi_use_token() {
+        let store = store().await;
+        store
+            .insert_enrollment_token(&token("hash-expired-rollback", 10))
+            .await
+            .unwrap();
+        store
+            .reserve_enrollment_token(&reserve("hash-expired-rollback", "agent-1"))
+            .await
+            .unwrap()
+            .expect("reserved");
+
+        // 窗口到期：validate 会把状态落成 expired。
+        sqlx::query("UPDATE enrollment_tokens SET expires_at = ?1 WHERE token_hash = ?2")
+            .bind("2020-01-01T00:00:00+00:00")
+            .bind("hash-expired-rollback")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .validate_bootstrap_token(&bootstrap("hash-expired-rollback"))
+                .await
+                .unwrap(),
+            Err(EnrollmentTokenRejection::Expired)
+        );
+
+        // 一次迟到的失败回滚：终态必须保持 expired。
+        store
+            .rollback_enrollment_token_reservation("hash-expired-rollback")
+            .await
+            .unwrap();
+        let after = store
+            .get_enrollment_token("hash-expired-rollback")
+            .await
+            .unwrap()
+            .expect("token");
+        assert_eq!(after.status, StoredEnrollmentTokenStatus::Expired);
+        assert_eq!(after.used_count, 1);
+    }
+
+    /// 同理，管理员已吊销的批量码不能被回滚“复活”。
+    #[tokio::test]
+    async fn rollback_does_not_revive_a_revoked_multi_use_token() {
+        let store = store().await;
+        store
+            .insert_enrollment_token(&token("hash-revoked-rollback", 10))
+            .await
+            .unwrap();
+        store
+            .reserve_enrollment_token(&reserve("hash-revoked-rollback", "agent-1"))
+            .await
+            .unwrap()
+            .expect("reserved");
+        assert!(
+            store
+                .revoke_enrollment_token("token-hash-revoked-rollback")
+                .await
+                .unwrap()
+        );
+
+        store
+            .rollback_enrollment_token_reservation("hash-revoked-rollback")
+            .await
+            .unwrap();
+        let after = store
+            .get_enrollment_token("hash-revoked-rollback")
+            .await
+            .unwrap()
+            .expect("token");
+        assert_eq!(after.status, StoredEnrollmentTokenStatus::Revoked);
+        assert_eq!(after.used_count, 1);
+    }
+
+    /// 没有任何在途用量时的回滚是无操作（不能把 used_count 减成负数、也不能改状态）。
+    #[tokio::test]
+    async fn rollback_without_any_use_is_a_no_op() {
+        let store = store().await;
+        store
+            .insert_enrollment_token(&token("hash-noop-rollback", 10))
+            .await
+            .unwrap();
+
+        store
+            .rollback_enrollment_token_reservation("hash-noop-rollback")
+            .await
+            .unwrap();
+
+        let after = store
+            .get_enrollment_token("hash-noop-rollback")
+            .await
+            .unwrap()
+            .expect("token");
+        assert_eq!(after.status, StoredEnrollmentTokenStatus::Active);
+        assert_eq!(after.used_count, 0);
+        assert!(after.reserved_at.is_none());
+    }
+
+    /// 批量安装策略：未设置时为 `None`（生效值回落到部署配置）；写入后按单例行覆盖。
+    #[tokio::test]
+    async fn stores_and_updates_agent_install_policy() {
+        let store = store().await;
+        assert!(store.get_agent_install_policy().await.unwrap().is_none());
+
+        let policy = StoredAgentInstallPolicy {
+            setting_id: DEFAULT_AGENT_INSTALL_POLICY_SETTING_ID.to_string(),
+            batch_ttl_seconds: 120,
+            batch_max_uses: 30,
+            updated_by: "ops".to_string(),
+            updated_at: "2026-01-01T00:00:00+00:00".to_string(),
+        };
+        store.upsert_agent_install_policy(&policy).await.unwrap();
+        let stored = store
+            .get_agent_install_policy()
+            .await
+            .unwrap()
+            .expect("policy");
+        assert_eq!(stored.batch_ttl_seconds, 120);
+        assert_eq!(stored.batch_max_uses, 30);
+        assert_eq!(stored.updated_by, "ops");
+
+        let mut next = policy.clone();
+        next.batch_ttl_seconds = 300;
+        next.batch_max_uses = 5;
+        next.updated_by = "ops-2".to_string();
+        next.updated_at = "2026-01-02T00:00:00+00:00".to_string();
+        store.upsert_agent_install_policy(&next).await.unwrap();
+        let stored = store
+            .get_agent_install_policy()
+            .await
+            .unwrap()
+            .expect("policy");
+        assert_eq!(stored.batch_ttl_seconds, 300);
+        assert_eq!(stored.batch_max_uses, 5);
+        assert_eq!(stored.updated_by, "ops-2");
+        assert_eq!(stored.updated_at, "2026-01-02T00:00:00+00:00");
+    }
+
+    /// 带指定 `token_id` / 环境的 token（批量码相关测试用）。
+    fn token_with_id(
+        token_hash: &str,
+        token_id: &str,
+        environment_id: &str,
+        max_uses: u32,
+    ) -> StoredEnrollmentToken {
+        StoredEnrollmentToken {
+            token_id: token_id.to_string(),
+            token_hash: token_hash.to_string(),
+            tenant_id: TENANT.to_string(),
+            environment_id: environment_id.to_string(),
+            issued_by: "test".to_string(),
+            allowed_node_selector: None,
+            max_uses,
+            used_count: 0,
+            status: StoredEnrollmentTokenStatus::Active,
+            issued_at: now_rfc3339(),
+            expires_at: (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            reserved_at: None,
+            revoked_at: None,
+        }
+    }
+
+    /// 作废批量码：只动**同租户/环境**下仍可用的 `batch-` 码；一次性码与别的环境不碰。
+    #[tokio::test]
+    async fn revoke_active_batch_tokens_is_scoped_and_leaves_one_time_codes() {
+        let store = store().await;
+        store
+            .insert_enrollment_token(&token_with_id("hash-ba", "batch-a", ENVIRONMENT, 10))
+            .await
+            .unwrap();
+        store
+            .insert_enrollment_token(&token_with_id("hash-bb", "batch-b", "env-other", 10))
+            .await
+            .unwrap();
+        store
+            .insert_enrollment_token(&token_with_id("hash-bi", "install-i", ENVIRONMENT, 1))
+            .await
+            .unwrap();
+        // 在途的批量码（`max_uses = 1` 会进 `Reserved`）也要切断。
+        store
+            .insert_enrollment_token(&token_with_id("hash-br", "batch-r", ENVIRONMENT, 1))
+            .await
+            .unwrap();
+        store
+            .reserve_enrollment_token(&reserve("hash-br", "agent-br"))
+            .await
+            .unwrap()
+            .expect("reserved");
+
+        let revoked = store
+            .revoke_active_batch_enrollment_tokens(TENANT, ENVIRONMENT, &now_rfc3339())
+            .await
+            .unwrap();
+        assert_eq!(revoked, 2, "同环境的两张批量码（一个 active、一个在途）");
+
+        for (hash, expected) in [
+            ("hash-ba", StoredEnrollmentTokenStatus::Revoked),
+            ("hash-br", StoredEnrollmentTokenStatus::Revoked),
+            ("hash-bi", StoredEnrollmentTokenStatus::Active),
+            ("hash-bb", StoredEnrollmentTokenStatus::Active),
+        ] {
+            let stored = store
+                .get_enrollment_token(hash)
+                .await
+                .unwrap()
+                .expect("token");
+            assert_eq!(stored.status, expected, "{hash}");
+        }
+    }
+
+    /// 原子替换：吊销旧的批量码并插入新的（同一事务），返回吊销张数。
+    #[tokio::test]
+    async fn inserting_a_batch_token_replaces_the_active_one() {
+        let store = store().await;
+        store
+            .insert_enrollment_token(&token_with_id("hash-old", "batch-old", ENVIRONMENT, 10))
+            .await
+            .unwrap();
+        store
+            .insert_enrollment_token(&token_with_id("hash-keep", "install-keep", ENVIRONMENT, 1))
+            .await
+            .unwrap();
+
+        let revoked = store
+            .insert_batch_enrollment_token_replacing_active(
+                &token_with_id("hash-new", "batch-new", ENVIRONMENT, 10),
+                TENANT,
+                ENVIRONMENT,
+                &now_rfc3339(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked, 1);
+
+        let old = store
+            .get_enrollment_token("hash-old")
+            .await
+            .unwrap()
+            .expect("old token");
+        let new = store
+            .get_enrollment_token("hash-new")
+            .await
+            .unwrap()
+            .expect("new token");
+        let one_time = store
+            .get_enrollment_token("hash-keep")
+            .await
+            .unwrap()
+            .expect("one-time token");
+        assert_eq!(old.status, StoredEnrollmentTokenStatus::Revoked);
+        assert_eq!(new.status, StoredEnrollmentTokenStatus::Active);
+        assert_eq!(one_time.status, StoredEnrollmentTokenStatus::Active);
+    }
+
+    /// 多用途 token 的 `max_uses` 仍然是真的上限（批量码只是把上限取满）；
+    /// 且**先落库的那一笔不能把整张标成 `used`**，否则同窗口内在途的最后一笔会被误拒。
+    #[tokio::test]
+    async fn multi_use_token_still_enforces_max_uses() {
+        let store = store().await;
+        store
+            .insert_enrollment_token(&token("hash-cap", 2))
+            .await
+            .unwrap();
+        store
+            .reserve_enrollment_token(&reserve("hash-cap", "agent-1"))
+            .await
+            .unwrap()
+            .expect("reserved 1");
+        store
+            .reserve_enrollment_token(&reserve("hash-cap", "agent-2"))
+            .await
+            .unwrap()
+            .expect("reserved 2");
+
+        let third = store
+            .reserve_enrollment_token(&reserve("hash-cap", "agent-3"))
+            .await
+            .unwrap();
+        assert_eq!(third, Err(ReservationRejection::InvalidToken));
+
+        // 两笔都预留过就都必须能落库（容量是 2，两笔都在容量内）。
+        commit_registration(&store, "hash-cap", "agent-1").await;
+        commit_registration(&store, "hash-cap", "agent-2").await;
+
+        let after = store
+            .get_enrollment_token("hash-cap")
+            .await
+            .unwrap()
+            .expect("token");
+        assert_eq!(after.status, StoredEnrollmentTokenStatus::Active);
+        assert_eq!(after.used_count, 2);
+
+        // 容量已满：再预留、再取配置都拒（但状态不必落成 `used`，计数已经说明一切）。
+        let third = store
+            .reserve_enrollment_token(&reserve("hash-cap", "agent-4"))
+            .await
+            .unwrap();
+        assert_eq!(third, Err(ReservationRejection::InvalidToken));
+        assert_eq!(
+            store
+                .validate_bootstrap_token(&bootstrap("hash-cap"))
+                .await
+                .unwrap(),
+            Err(EnrollmentTokenRejection::Exhausted)
+        );
     }
 
     /// `delete_agent` 要把**没有外键**的派生态行也清干净 —— 不是只删 `agents`。

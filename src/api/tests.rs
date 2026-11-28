@@ -46,8 +46,8 @@ use super::{
     AdminRuntimeState, ApiState,
     enrollment::{agent_enrollment_result, enroll_agent},
     install::{
-        agent_initial_config_toml, agent_install_code, issue_agent_install_code, token_hash,
-        validate_bootstrap_token_for_config,
+        agent_initial_config_toml, agent_install_code, issue_agent_install_code,
+        issue_batch_install_code, token_hash, validate_bootstrap_token_for_config,
     },
     install_package::{
         AgentPackageSource, PLATFORM_LINUX_ARM, PLATFORM_LINUX_X86, PLATFORM_MACOS_ARM,
@@ -912,6 +912,736 @@ async fn issue_install_code_persists_one_time_token() {
     assert_eq!(stored.max_uses, 1);
     assert_eq!(stored.used_count, 0);
     assert_eq!(stored.status, StoredEnrollmentTokenStatus::Active);
+}
+
+/// 批量安装码：同一张 token 在有效期窗口内可以给多台新主机用。
+///
+/// 它是「一分钟内批量首装」的凭据，不是站点级长期恢复凭据：时间到点即失效
+/// （见 `docs/design/agent-identity-mtls.md` §5.1）。
+#[tokio::test]
+async fn batch_install_code_is_reusable_within_its_window() {
+    let env = TestEnv::new().await;
+    let (install_code, _) = issue_batch_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("batch install code");
+
+    // UI 的倒计时读的就是这个字段（`bootstrap_bundle.expires_at`）：必须是可解析的 RFC3339。
+    let raw = serde_json::to_value(&install_code).expect("serialize install code");
+    let expires_at = raw["bootstrap_bundle"]["expires_at"]
+        .as_str()
+        .expect("bootstrap_bundle.expires_at");
+    let window_seconds = chrono::DateTime::parse_from_rfc3339(expires_at)
+        .expect("rfc3339 expires_at")
+        .with_timezone(&chrono::Utc)
+        - chrono::Utc::now();
+    assert!(
+        (55..=60).contains(&window_seconds.num_seconds()),
+        "批量码应该只活 60s，实际窗口 {}s",
+        window_seconds.num_seconds()
+    );
+
+    let token = install_code.bootstrap_enrollment_token;
+
+    let stored = env
+        .store
+        .get_enrollment_token(&token_hash(&token))
+        .await
+        .expect("store read")
+        .expect("stored batch token");
+    assert_eq!(stored.max_uses, env.config.batch_bootstrap_max_uses);
+    assert_eq!(stored.used_count, 0);
+    assert_eq!(stored.status, StoredEnrollmentTokenStatus::Active);
+    assert_eq!(stored.issued_by, "admin-api:batch");
+    assert!(stored.token_id.starts_with("batch-"));
+    // 有效期就是配置的批量窗口（默认 60s），不跟随一次性码的 900s。
+    assert_eq!(
+        env.config.batch_bootstrap_token_ttl_seconds, 60,
+        "测试夹具的批量窗口"
+    );
+    // 台数上限也是配置的（默认 200），不是 `u32::MAX` 那种「事实上的无上限」。
+    assert_eq!(
+        env.config.batch_bootstrap_max_uses, 200,
+        "测试夹具的批量台数上限"
+    );
+
+    // 同一张 token 依次注册两台；真正的并发预留由 store 层用例覆盖。
+    for index in 1..=2 {
+        let response = post_enrollment_to_router(
+            &env.config,
+            &env.store_handle,
+            enrollment_request_json_for(
+                &token,
+                &format!("node-batch-{index}"),
+                &format!("host-batch-{index}"),
+                &format!("machine-batch-{index}"),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let envelope = decode_enrollment_response(response).await;
+        assert_eq!(envelope.result.status, EnrollmentStatus::Accepted);
+    }
+
+    // 两台都注册完，窗口内 token 仍然有效（边界是时间，不是次数）。
+    validate_bootstrap_token_for_config(&env.config, &env.store_handle, &token)
+        .await
+        .expect("batch token still valid after two enrollments");
+    let after = env
+        .store
+        .get_enrollment_token(&token_hash(&token))
+        .await
+        .expect("store read")
+        .expect("stored batch token");
+    assert_eq!(after.used_count, 2);
+    assert_eq!(after.status, StoredEnrollmentTokenStatus::Active);
+}
+
+#[tokio::test]
+async fn batch_install_code_expires_with_its_window() {
+    let env = TestEnv::new().await;
+    let (install_code, _) = issue_batch_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("batch install code");
+    let token = install_code.bootstrap_enrollment_token;
+
+    sqlx::query("UPDATE enrollment_tokens SET expires_at = ?1 WHERE token_hash = ?2")
+        .bind("2020-01-01T00:00:00+00:00")
+        .bind(token_hash(&token))
+        .execute(env.store.pool())
+        .await
+        .expect("expire batch token");
+
+    let err = validate_bootstrap_token_for_config(&env.config, &env.store_handle, &token)
+        .await
+        .expect_err("expired batch token");
+    assert_eq!(err, "enrollment token is expired");
+    let stored = env
+        .store
+        .get_enrollment_token(&token_hash(&token))
+        .await
+        .expect("store read")
+        .expect("stored batch token");
+    assert_eq!(stored.status, StoredEnrollmentTokenStatus::Expired);
+}
+
+#[tokio::test]
+async fn batch_install_code_route_requires_admin_bearer() {
+    let env = TestEnv::new().await;
+    let denied = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/install-code/batch",
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+    let allowed = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/install-code/batch",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+    assert_no_store(&allowed);
+    // 响应是「`AgentInstallCode` 全字段 + 追加的 `max_uses`」：页面靠它显示台数上限。
+    let payload = decode_json_response::<serde_json::Value>(allowed).await;
+    assert!(
+        payload["bootstrap_enrollment_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()),
+        "安装码字段不能因追加字段而丢失：{payload}"
+    );
+    assert!(
+        payload["bootstrap_bundle"]["expires_at"].is_string(),
+        "引导包的到期时间要留着（倒计时靠它）"
+    );
+    assert_eq!(
+        payload["max_uses"].as_u64(),
+        Some(u64::from(env.config.batch_bootstrap_max_uses)),
+        "追加的台数上限要与配置一致"
+    );
+}
+
+/// 台数上限是真上限：到顶后同窗口内再注册一律拒（口径与其它 token 失败一致）。
+#[tokio::test]
+async fn batch_install_code_caps_registrations() {
+    let env = TestEnv::new().await;
+    let mut config = env.config.clone();
+    config.batch_bootstrap_max_uses = 2;
+    let (code, _) = issue_batch_install_code(&config, &env.store_handle)
+        .await
+        .expect("batch install code");
+    let token = code.bootstrap_enrollment_token;
+
+    for index in 1..=2 {
+        let accepted = post_enrollment_to_router(
+            &config,
+            &env.store_handle,
+            enrollment_request_json_for(
+                &token,
+                &format!("node-cap-{index}"),
+                &format!("host-cap-{index}"),
+                &format!("machine-cap-{index}"),
+            ),
+        )
+        .await;
+        let envelope = decode_enrollment_response(accepted).await;
+        assert_eq!(envelope.result.status, EnrollmentStatus::Accepted);
+    }
+
+    // 第三台：窗口还没到，但台数已满。
+    let rejected = post_enrollment_to_router(
+        &config,
+        &env.store_handle,
+        enrollment_request_json_for(&token, "node-cap-3", "host-cap-3", "machine-cap-3"),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::CREATED);
+    let envelope = decode_enrollment_response(rejected).await;
+    assert_eq!(envelope.result.status, EnrollmentStatus::Rejected);
+    assert_eq!(
+        envelope.result.reason_code.as_deref(),
+        Some("invalid_enrollment_token")
+    );
+
+    // 账本不超发；多用途码不落 `used`，靠计数表达“已满”。
+    let stored = env
+        .store
+        .get_enrollment_token(&token_hash(&token))
+        .await
+        .expect("store read")
+        .expect("stored batch token");
+    assert_eq!(stored.max_uses, 2);
+    assert_eq!(stored.used_count, 2);
+    assert_eq!(stored.status, StoredEnrollmentTokenStatus::Active);
+
+    // 同窗口内取初始配置也一并拒（Exhausted）。
+    let initial_config = get_to_router(
+        &config,
+        &env.store_handle,
+        "/api/v1/agent/initial-config",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(initial_config.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn install_policy_view_defaults_to_deployment_config() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/install-policy";
+
+    let unauthorized = get_to_router(&env.config, &env.store_handle, uri, None).await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(view.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["batch_ttl_seconds"], 60);
+    assert_eq!(body["batch_max_uses"], 200);
+    // 没设置过 = 用的是部署配置 —— 页面要能把“当前值从哪来”说清楚。
+    assert_eq!(body["source"], "config");
+    assert_eq!(body["updated_by"], "");
+    assert_eq!(body["updated_at"], serde_json::Value::Null);
+    // 允许上限随视图下发：页面做输入约束时不用再硬编一份。
+    assert_eq!(body["limits"]["batch_ttl_seconds"], 600);
+    assert_eq!(body["limits"]["batch_max_uses"], 10_000);
+}
+
+#[tokio::test]
+async fn install_policy_update_drives_the_next_batch_install_code() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/install-policy";
+
+    let saved = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "batch_ttl_seconds": 300, "batch_max_uses": 7, "requested_by": "ops" }),
+    )
+    .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved_body: serde_json::Value = decode_json_response(saved).await;
+    assert_eq!(saved_body["source"], "setting");
+    assert_eq!(saved_body["batch_ttl_seconds"], 300);
+    assert_eq!(saved_body["batch_max_uses"], 7);
+    assert_eq!(saved_body["updated_by"], "ops");
+    assert!(
+        saved_body["updated_at"].is_string(),
+        "设置过就要给出修改时间（页面/审计用）"
+    );
+
+    // 设置生效在下一次签发上（已经发出去的码不受影响）。
+    let issued = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/install-code/batch",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(issued.status(), StatusCode::OK);
+    let payload: serde_json::Value = decode_json_response(issued).await;
+    assert_eq!(payload["max_uses"], 7);
+    let expires_at = payload["bootstrap_bundle"]["expires_at"]
+        .as_str()
+        .expect("bootstrap_bundle.expires_at");
+    let window_seconds = chrono::DateTime::parse_from_rfc3339(expires_at)
+        .expect("rfc3339 expires_at")
+        .with_timezone(&chrono::Utc)
+        - chrono::Utc::now();
+    assert!(
+        (295..=300).contains(&window_seconds.num_seconds()),
+        "窗口应跟随管理面设置（300s），实际 {}s",
+        window_seconds.num_seconds()
+    );
+    let token = payload["bootstrap_enrollment_token"]
+        .as_str()
+        .expect("token");
+    let stored = env
+        .store
+        .get_enrollment_token(&token_hash(token))
+        .await
+        .expect("store read")
+        .expect("stored batch token");
+    assert_eq!(stored.max_uses, 7);
+}
+
+#[tokio::test]
+async fn install_policy_rejects_out_of_range_and_keeps_previous_value() {
+    let env = TestEnv::new().await;
+    let uri = "/api/v1/admin/agent/install-policy";
+
+    for bad in [
+        serde_json::json!({ "batch_ttl_seconds": 0, "batch_max_uses": 10 }),
+        serde_json::json!({ "batch_ttl_seconds": 601, "batch_max_uses": 10 }),
+        serde_json::json!({ "batch_ttl_seconds": 60, "batch_max_uses": 0 }),
+        serde_json::json!({ "batch_ttl_seconds": 60, "batch_max_uses": 10_001 }),
+    ] {
+        let response = post_json_to_router(
+            &env.config,
+            &env.store_handle,
+            uri,
+            Some(TEST_ADMIN_API_TOKEN),
+            &bad,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "input {bad}");
+        let body: serde_json::Value = decode_json_response(response).await;
+        assert_eq!(body["error"]["code"], "agent_install_policy_invalid");
+    }
+
+    // 一次都没写进去：仍是部署配置值。
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["source"], "config");
+    assert_eq!(body["batch_ttl_seconds"], 60);
+    assert_eq!(body["batch_max_uses"], 200);
+}
+
+/** 库里被外部改坏的越界行不能被直接放行：生效值回落到部署配置（更不能被放大）。 */
+#[tokio::test]
+async fn install_policy_falls_back_when_stored_row_is_out_of_bounds() {
+    let env = TestEnv::new().await;
+    sqlx::query(
+        "INSERT INTO agent_install_policy (setting_id, batch_ttl_seconds, batch_max_uses, \
+         updated_by, updated_at) VALUES ('default', 0, 999999999, 'tampered', \
+         '2026-01-01T00:00:00+00:00')",
+    )
+    .execute(env.store.pool())
+    .await
+    .expect("seed tampered policy");
+
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-policy",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["source"], "config");
+    assert_eq!(body["batch_ttl_seconds"], 60);
+    assert_eq!(body["batch_max_uses"], 200);
+
+    // 签发也不能被坏行放大。
+    let (code, policy) = issue_batch_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("batch install code");
+    assert!(!policy.from_setting);
+    assert_eq!(policy.max_uses, 200);
+    let stored = env
+        .store
+        .get_enrollment_token(&token_hash(&code.bootstrap_enrollment_token))
+        .await
+        .expect("store read")
+        .expect("stored batch token");
+    assert_eq!(stored.max_uses, 200);
+}
+
+/// 只改**策略**不会动已发出的码：旧码按它签发时的窗口/台数走（「签发新码」才会替换旧码，
+/// 见 `regenerating_a_batch_code_revokes_the_previous_one`）。
+#[tokio::test]
+async fn install_policy_change_alone_does_not_touch_issued_tokens() {
+    let env = TestEnv::new().await;
+    let (before, before_policy) = issue_batch_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("batch install code");
+    assert!(!before_policy.from_setting);
+    let before_token = before.bootstrap_enrollment_token;
+
+    let saved = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-policy",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "batch_ttl_seconds": 300, "batch_max_uses": 7 }),
+    )
+    .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+
+    // 已发出的码：仍然有效，台数/窗口仍是签发时的值。
+    validate_bootstrap_token_for_config(&env.config, &env.store_handle, &before_token)
+        .await
+        .expect("issued token still valid");
+    let stored_before = env
+        .store
+        .get_enrollment_token(&token_hash(&before_token))
+        .await
+        .expect("store read")
+        .expect("stored batch token");
+    assert_eq!(stored_before.max_uses, 200);
+    let issued_at =
+        chrono::DateTime::parse_from_rfc3339(&stored_before.issued_at).expect("issued_at");
+    let expires_at =
+        chrono::DateTime::parse_from_rfc3339(&stored_before.expires_at).expect("expires_at");
+    assert_eq!((expires_at - issued_at).num_seconds(), 60);
+
+    // 之后签发的才跟着新策略走。
+    let (after, after_policy) = issue_batch_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("batch install code");
+    assert!(after_policy.from_setting);
+    assert_eq!(after_policy.max_uses, 7);
+    let stored_after = env
+        .store
+        .get_enrollment_token(&token_hash(&after.bootstrap_enrollment_token))
+        .await
+        .expect("store read")
+        .expect("stored batch token");
+    assert_eq!(stored_after.max_uses, 7);
+}
+
+/// 批量策略不影响**单台**一次性安装码（那是另一条路径，窗口/次数都按 `[agent] bootstrap_*`）。
+#[tokio::test]
+async fn batch_policy_does_not_change_the_one_time_install_code() {
+    let env = TestEnv::new().await;
+    let saved = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-policy",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({ "batch_ttl_seconds": 300, "batch_max_uses": 7 }),
+    )
+    .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+
+    let code = issue_agent_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("one-time install code");
+    let stored = env
+        .store
+        .get_enrollment_token(&token_hash(&code.bootstrap_enrollment_token))
+        .await
+        .expect("store read")
+        .expect("stored one-time token");
+    assert_eq!(stored.max_uses, 1);
+    assert_eq!(stored.issued_by, "admin-api");
+    let issued_at = chrono::DateTime::parse_from_rfc3339(&stored.issued_at).expect("issued_at");
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&stored.expires_at).expect("expires_at");
+    assert_eq!(
+        (expires_at - issued_at).num_seconds(),
+        env.config.bootstrap_token_ttl_seconds,
+        "一次性码的窗口不能被批量策略带跑"
+    );
+}
+
+#[tokio::test]
+async fn install_policy_set_requires_admin_bearer() {
+    let env = TestEnv::new().await;
+    let denied = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-policy",
+        None,
+        &serde_json::json!({ "batch_ttl_seconds": 60, "batch_max_uses": 200 }),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    // 鉴权失败不落库：仍然是部署配置值。
+    let view = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/admin/agent/install-policy",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    let body: serde_json::Value = decode_json_response(view).await;
+    assert_eq!(body["source"], "config");
+}
+
+/// 策略读不出来时**不发码**（fail-closed）：否则管理员把策略调严之后，
+/// 一次读失败就会按部署默认（可能更宽）签出一张码。
+#[tokio::test]
+async fn batch_install_code_fails_closed_when_policy_unreadable() {
+    let env = TestEnv::new().await;
+    sqlx::query("DROP TABLE agent_install_policy")
+        .execute(env.store.pool())
+        .await
+        .expect("drop policy table");
+
+    let response = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/install-code/batch",
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: serde_json::Value = decode_json_response(response).await;
+    assert_eq!(body["error"]["code"], "install_code_issue_failed");
+
+    // 没有凭空铸出一张码。
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM enrollment_tokens")
+        .fetch_one(env.store.pool())
+        .await
+        .expect("count tokens");
+    assert_eq!(count, 0);
+}
+
+/// 「生成新码即作废旧码」：旧码不必等窗口/台数到期，立刻不可用。
+#[tokio::test]
+async fn regenerating_a_batch_code_revokes_the_previous_one() {
+    let env = TestEnv::new().await;
+    let (first, _) = issue_batch_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("first batch code");
+    let first_token = first.bootstrap_enrollment_token;
+    let (second, _) = issue_batch_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("second batch code");
+    let second_token = second.bootstrap_enrollment_token;
+
+    let err = validate_bootstrap_token_for_config(&env.config, &env.store_handle, &first_token)
+        .await
+        .expect_err("old batch token must be revoked");
+    assert_eq!(err, "enrollment token is not active");
+    let stored_first = env
+        .store
+        .get_enrollment_token(&token_hash(&first_token))
+        .await
+        .expect("store read")
+        .expect("first token");
+    assert_eq!(stored_first.status, StoredEnrollmentTokenStatus::Revoked);
+
+    // 旧码在注册入口也被拒；新码可用。
+    let rejected = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&first_token),
+    )
+    .await;
+    let envelope = decode_enrollment_response(rejected).await;
+    assert_eq!(envelope.result.status, EnrollmentStatus::Rejected);
+
+    let accepted = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&second_token),
+    )
+    .await;
+    let envelope = decode_enrollment_response(accepted).await;
+    assert_eq!(envelope.result.status, EnrollmentStatus::Accepted);
+}
+
+/// 一键作废：泄露时立即切断；只动批量码，一次性安装码不受影响。
+#[tokio::test]
+async fn batch_revoke_endpoint_cuts_the_code_and_leaves_one_time_codes() {
+    let env = TestEnv::new().await;
+    let (batch, _) = issue_batch_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("batch install code");
+    let batch_token = batch.bootstrap_enrollment_token;
+    let one_time_token = env.issue_token().await;
+
+    let uri = "/api/v1/agent/install-code/batch/revoke";
+    let denied = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+    let revoked = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    assert_no_store(&revoked);
+    let body: serde_json::Value = decode_json_response(revoked).await;
+    assert_eq!(body["revoked"], 1);
+
+    let err = validate_bootstrap_token_for_config(&env.config, &env.store_handle, &batch_token)
+        .await
+        .expect_err("batch token must be revoked");
+    assert_eq!(err, "enrollment token is not active");
+    validate_bootstrap_token_for_config(&env.config, &env.store_handle, &one_time_token)
+        .await
+        .expect("one-time install code must be untouched");
+
+    // 幂等：已经没有可用批量码时返回 0。
+    let again = post_json_to_router(
+        &env.config,
+        &env.store_handle,
+        uri,
+        Some(TEST_ADMIN_API_TOKEN),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json_response(again).await;
+    assert_eq!(body["revoked"], 0);
+}
+
+/// 签发是**副作用动作**：只收 `POST`。GET 若能用，预取/缓存就可能凭空铸出一把凭据。
+#[tokio::test]
+async fn batch_install_code_endpoint_is_post_only() {
+    let env = TestEnv::new().await;
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/install-code/batch",
+        Some(TEST_ADMIN_API_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// 一台机器已经预留（还没落库）时，其它机器取初始配置不能被挡住 ——
+/// 这是批量安装能真正并发的关键。
+#[tokio::test]
+async fn batch_token_keeps_initial_config_open_while_another_machine_is_reserved() {
+    let env = TestEnv::new().await;
+    let (code, _) = issue_batch_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("batch install code");
+    let token = code.bootstrap_enrollment_token;
+    reserve_token_for(&env, &token, "agent-batch-pending").await;
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/initial-config",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_no_store(&response);
+}
+
+/// 对照：一次性码在预留期间本来就是「整张占用」，取初始配置会被拒。
+/// 批量码没有把这个保护放松，只是走了另一条状态路径（`Active` + 计数）。
+#[tokio::test]
+async fn one_time_token_rejects_initial_config_while_reserved() {
+    let env = TestEnv::new().await;
+    let token = env.issue_token().await;
+    reserve_token_for(&env, &token, "agent-once-pending").await;
+
+    let response = get_to_router(
+        &env.config,
+        &env.store_handle,
+        "/api/v1/agent/initial-config",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 批量码同样绑租户/环境：跨环境部署拿到的 token 不能拿来注册。
+#[tokio::test]
+async fn batch_token_is_bound_to_tenant_and_environment() {
+    let env = TestEnv::new().await;
+    let (code, _) = issue_batch_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("batch install code");
+    let token = code.bootstrap_enrollment_token;
+
+    let mut other_env = env.config.clone();
+    other_env.environment_id = "env-other".to_string();
+    let err = validate_bootstrap_token_for_config(&other_env, &env.store_handle, &token)
+        .await
+        .expect_err("batch token must not cross environments");
+    assert_eq!(err, "enrollment token environment mismatch");
+
+    // 同环境仍然可用（拒绝只针对绑定不匹配）。
+    validate_bootstrap_token_for_config(&env.config, &env.store_handle, &token)
+        .await
+        .expect("same environment still valid");
+}
+
+/// 窗口过后连注册入口也一并拒（不只是 `validate`）。
+#[tokio::test]
+async fn expired_batch_token_is_rejected_at_enrollment() {
+    let env = TestEnv::new().await;
+    let (code, _) = issue_batch_install_code(&env.config, &env.store_handle)
+        .await
+        .expect("batch install code");
+    let token = code.bootstrap_enrollment_token;
+    sqlx::query("UPDATE enrollment_tokens SET expires_at = ?1 WHERE token_hash = ?2")
+        .bind("2020-01-01T00:00:00+00:00")
+        .bind(token_hash(&token))
+        .execute(env.store.pool())
+        .await
+        .expect("expire batch token");
+
+    let response = post_enrollment_to_router(
+        &env.config,
+        &env.store_handle,
+        enrollment_request_json(&token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let envelope = decode_enrollment_response(response).await;
+    assert_eq!(envelope.result.status, EnrollmentStatus::Rejected);
+    assert_eq!(
+        envelope.result.reason_code.as_deref(),
+        Some("invalid_enrollment_token")
+    );
 }
 
 fn rendered_install_script(env: &TestEnv) -> String {
@@ -10668,6 +11398,8 @@ impl TestEnv {
             allowed_source_roots: crate::infra::config::default_allowed_source_roots(),
             knowledge_allowed_maturity: crate::infra::config::default_knowledge_allowed_maturity(),
             bootstrap_token_ttl_seconds: 900,
+            batch_bootstrap_token_ttl_seconds: 60,
+            batch_bootstrap_max_uses: 200,
             credential_ttl_seconds: 30 * 24 * 60 * 60,
             store_file,
             database_url: None,
@@ -10787,6 +11519,36 @@ async fn issue_token_for_state(state: &ApiState) -> String {
 
 fn enrollment_request_json(token: &str) -> String {
     serde_json::to_string(&enrollment_request(token)).expect("serialize request")
+}
+
+/// 同一张 token、**不同主机画像**的注册请求（批量安装测试用）。
+fn enrollment_request_json_for(
+    token: &str,
+    node_id: &str,
+    hostname: &str,
+    machine_id: &str,
+) -> String {
+    let mut request = enrollment_request(token);
+    request.host_profile.node_id = node_id.to_string();
+    request.host_profile.hostname = hostname.to_string();
+    request.host_profile.machine_id = machine_id.to_string();
+    serde_json::to_string(&request).expect("serialize request")
+}
+
+/// 直接从 store 预留一笔（模拟「另一台机器已经进到注册中途、还没落库」）。
+async fn reserve_token_for(env: &TestEnv, token: &str, agent_id: &str) {
+    let token_hash = token_hash(token);
+    env.store
+        .reserve_enrollment_token(&crate::infra::ReserveEnrollmentToken {
+            token_hash: &token_hash,
+            tenant_id: &env.config.tenant_id,
+            environment_id: &env.config.environment_id,
+            agent_id,
+            reservation_ttl_seconds: super::install::ENROLLMENT_TOKEN_RESERVATION_TTL_SECONDS,
+        })
+        .await
+        .expect("reserve token")
+        .expect("reserved");
 }
 
 /// 共享一份**测试用 agent CA**（证书 + 私钥），只在首次调用时生成。

@@ -229,6 +229,9 @@ pub const DEFAULT_AGENT_UPLINK_SETTING_ID: &str = "default";
 /// 单例设置行 id：网关对外地址只有一个生效值。
 pub const DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID: &str = "default";
 
+/// 单例设置行 id：批量安装码策略只有一个生效值。
+pub const DEFAULT_AGENT_INSTALL_POLICY_SETTING_ID: &str = "default";
+
 /// 知识库生效指针的单例 id（`knowledge_active.setting_id`）。
 pub const DEFAULT_KNOWLEDGE_SETTING_ID: &str = "default";
 
@@ -518,6 +521,20 @@ pub struct StoredAgentAdvertiseUrl {
     pub setting_id: String,
     /// 对外基址，形如 `https://gateway.example.com`（无尾斜杠）。
     pub url: String,
+    pub updated_by: String,
+    pub updated_at: String,
+}
+
+/// 批量安装码策略（管理面设置；单例行）。
+///
+/// 两个**独立**旋钮：`batch_ttl_seconds` 是时间窗口，`batch_max_uses` 是泄露时的
+/// 爆炸半径。未设置过时生效值回落到部署配置（`[agent] batch_bootstrap_*`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredAgentInstallPolicy {
+    pub setting_id: String,
+    pub batch_ttl_seconds: i64,
+    pub batch_max_uses: u32,
     pub updated_by: String,
     pub updated_at: String,
 }
@@ -1461,13 +1478,21 @@ pub trait Store: Send + Sync + fmt::Debug {
         check: &BootstrapTokenCheck<'_>,
     ) -> StoreResult<Result<(), EnrollmentTokenRejection>>;
 
-    /// 原子预留一次使用：token 置 Reserved、used_count += 1，并保证 agent 未注册。
+    /// 原子预留一次使用：used_count += 1（每台一次），并保证 agent 未注册。
+    ///
+    /// **一次性 token（`max_uses == 1`）同时置 `Reserved`**：它整张只能被一台机器占用。
+    /// **多用途 token（批量安装码）保持 `Active`**：置 `Reserved` 会挡住同窗口内其它机器的
+    /// 配置/取包校验（它们看的是这张 token 的状态），批量安装就变成串行且互相撞车。
+    /// 容量仍然靠 `used_count`/`max_uses` 计数（与预留同事务），不会超发。
     async fn reserve_enrollment_token(
         &self,
         request: &ReserveEnrollmentToken<'_>,
     ) -> StoreResult<Result<(), ReservationRejection>>;
 
     /// 落库注册：token 状态收尾 + 写 agents/agent_instances/agent_credentials（单事务）。
+    ///
+    /// 一次性 token 认 `Reserved`；多用途 token（批量安装码）认 `Active` + `used_count > 0`
+    /// （它预留期间不离开 `Active`，见 [`Store::reserve_enrollment_token`]）。
     async fn commit_reserved_registration(
         &self,
         request: &CommitRegistration<'_>,
@@ -1483,10 +1508,40 @@ pub trait Store: Send + Sync + fmt::Debug {
     ) -> StoreResult<bool>;
 
     /// 归还预留（凭据签发或落库失败时）。
+    ///
+    /// 一次性 token 只归还处于 `Reserved` 的预留；多用途 token 在有效窗口内可以有多笔预留，
+    /// 那么只要 `used_count > 0` 就回收一笔（每笔失败都对应一次成功的预留）。
+    ///
+    /// 已 `expired` / `revoked` 的 token **不会**被回滚改回 `active`：回滚可能迟到于
+    /// 窗口到期或管理员吊销，那两种终态不能被一次失败注册“复活”。
     async fn rollback_enrollment_token_reservation(&self, token_hash: &str) -> StoreResult<()>;
 
     /// 吊销注册 token（存在则置 revoked，返回是否命中）。
     async fn revoke_enrollment_token(&self, token_id: &str) -> StoreResult<bool>;
+
+    /// 吊销**仍可用**的批量码（同租户/环境内；`Reserved` 视为在途一并吊销）。
+    ///
+    /// 用途：① 批量码泄露时立即切断（不必等窗口到期）；② 签发新批量码时替换旧的。
+    /// 只认 `token_id` 的 `batch-` 前缀：一次性安装码（`install-`）不受影响。
+    /// 返回被吊销的张数。
+    async fn revoke_active_batch_enrollment_tokens(
+        &self,
+        tenant_id: &str,
+        environment_id: &str,
+        now: &str,
+    ) -> StoreResult<u64>;
+
+    /// **原子替换**：吊销同租户/环境下仍可用的旧批量码，并插入新码（单事务）。
+    ///
+    /// 为什么必须原子：两次并发签发若各自“先吊销、再插入”，交错执行会留下两张可用码。
+    /// 返回被吊销的张数。
+    async fn insert_batch_enrollment_token_replacing_active(
+        &self,
+        token: &StoredEnrollmentToken,
+        tenant_id: &str,
+        environment_id: &str,
+        now: &str,
+    ) -> StoreResult<u64>;
 
     /// 按明文 hash 读回 token 记录（审计/排查与测试断言用）。
     async fn get_enrollment_token(
@@ -1811,6 +1866,15 @@ pub trait Store: Send + Sync + fmt::Debug {
     async fn upsert_agent_advertise_url(
         &self,
         setting: &StoredAgentAdvertiseUrl,
+    ) -> StoreResult<()>;
+
+    /// 读取批量安装码策略；未设置过返回 `None`（生效值回落到部署配置）。
+    async fn get_agent_install_policy(&self) -> StoreResult<Option<StoredAgentInstallPolicy>>;
+
+    /// 写入/覆盖批量安装码策略。
+    async fn upsert_agent_install_policy(
+        &self,
+        policy: &StoredAgentInstallPolicy,
     ) -> StoreResult<()>;
 
     // ── Agent 事实摘要与用途推断 ──

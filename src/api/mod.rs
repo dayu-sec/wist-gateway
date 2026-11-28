@@ -151,10 +151,11 @@ use admin_ops::{
     get_agent_runtime_status, grant_work, lift_agent_revocation, list_agent_install_packages,
     list_agent_revocations, list_agents, pause_work, request_agent_fact_refresh, resume_work,
     revoke_agent, revoke_agent_credential, revoke_work, set_agent_advertise_url,
-    set_agent_discovery_snapshot, set_agent_install_package, set_agent_uplink,
-    set_discovery_snapshot_global, view_agent_advertise_url, view_agent_fact_refresh,
-    view_agent_install_package, view_agent_purpose, view_agent_uplink, view_agent_work,
-    view_discovery_policies, view_discovery_snapshot, view_purpose_coverage,
+    set_agent_discovery_snapshot, set_agent_install_package, set_agent_install_policy,
+    set_agent_uplink, set_discovery_snapshot_global, view_agent_advertise_url,
+    view_agent_fact_refresh, view_agent_install_package, view_agent_install_policy,
+    view_agent_purpose, view_agent_uplink, view_agent_work, view_discovery_policies,
+    view_discovery_snapshot, view_purpose_coverage,
 };
 use content_ops::view_content;
 use data_plane::{
@@ -163,8 +164,9 @@ use data_plane::{
 use host_metrics::{get_agent_host_metrics, get_all_agents_host_metrics};
 use ingest::{MAX_INGEST_BODY_BYTES, ingest_agent_facts};
 use install::{
-    download_agent_package, download_agent_package_by_id, get_agent_initial_config_with_token,
-    get_agent_install_code, get_agent_install_script,
+    download_agent_package, download_agent_package_by_id, get_agent_batch_install_code,
+    get_agent_initial_config_with_token, get_agent_install_code, get_agent_install_script,
+    revoke_batch_install_code,
 };
 use investigations::{
     gateway_launch_agent_investigation, launch_agent_investigation, list_agent_investigations,
@@ -374,6 +376,16 @@ pub fn router_with_state(state: ApiState) -> Router {
         // NOTE(hand-added): 网关版本（公开、无鉴权）—— 页面左下角常驻显示，未登录也要答。见 api/version.rs。
         .route("/api/v1/version", get(gateway_version))
         .route("/api/v1/agent/install-code", get(get_agent_install_code))
+        // NOTE(hand-added): 批量安装码（短时、窗口内可多机）—— 与上一条同一套命令，见 api/install.rs。
+        .route(
+            "/api/v1/agent/install-code/batch",
+            post(get_agent_batch_install_code),
+        )
+        // NOTE(hand-added): 作废当前仍可用的批量码（泄露时立即切断；只动 `batch-` 码）。
+        .route(
+            "/api/v1/agent/install-code/batch/revoke",
+            post(revoke_batch_install_code),
+        )
         // NOTE(hand-added): 网关自述面（环回；CR-003）。见上方 `mod self_state` 说明。
         .route(
             "/api/v1/gateway/self-state",
@@ -781,6 +793,12 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/agent/advertise-url",
             get(view_agent_advertise_url).post(set_agent_advertise_url),
+        )
+        // NOTE(hand-added): 批量安装码策略（有效期 + 台数上限）。管理面可改，
+        // 只影响之后签发的批量码，见 api/admin_ops.rs。
+        .route(
+            "/api/v1/admin/agent/install-policy",
+            get(view_agent_install_policy).post(set_agent_install_policy),
         )
         // NOTE(hand-added): 页面发起接入（网关侧命令源，供 host gwlinkd 环回拉取）。见
         // api/link_request.rs 与设计 edge/gateway-onboard-request.md。

@@ -10,9 +10,9 @@ use axum::{
 
 use crate::infra::{
     AdminConfig, BootstrapTokenCheck, DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
-    Store, StoreResult, StoredAgentUplinkAddress, StoredEnrollmentToken,
-    StoredEnrollmentTokenStatus, VerifiedAgentIdentity, bytes_sha256_hex, new_secret_token,
-    sha256_hex,
+    MAX_BATCH_BOOTSTRAP_MAX_USES, MAX_BATCH_BOOTSTRAP_TOKEN_TTL_SECONDS, Store, StoreResult,
+    StoredAgentUplinkAddress, StoredEnrollmentToken, StoredEnrollmentTokenStatus,
+    VerifiedAgentIdentity, bytes_sha256_hex, new_secret_token, sha256_hex,
 };
 use wist_control::types::{AgentBootstrapBundle, AgentInstallCode, AgentPlatformPackage, DateTime};
 
@@ -51,6 +51,111 @@ pub async fn get_agent_install_code(
         Err(err) => ApiError::internal(
             codes::INSTALL_CODE_ISSUE_FAILED,
             "failed to issue install code",
+            err,
+        )
+        .into_response(),
+    }
+}
+
+/// 批量安装码：短时（默认 60s）、窗口内可多机复用。
+///
+/// 与一次性安装码共用同一套安装命令与注册流程，差异只在 token 的**有效期与次数语义**：
+/// 一次性码装完一台即失效，批量码在有效期到点前可由多台新主机使用（见
+/// `docs/design/agent-identity-mtls.md` §5.1）。
+/// 批量安装码的响应：`AgentInstallCode` 的全部字段 + `max_uses`。
+///
+/// 为什么不改 `AgentInstallCode`：它是 jumo 生成的模型类型（`wist-control`），
+/// 为一个展示用的元数据改模型意味着跨 crate 发版；而这是个**纯追加**字段，
+/// 旧客户端会忽略未知字段。页面靠它告诉运维「这张最多 N 台」。
+#[derive(serde::Serialize)]
+struct BatchInstallCodeResponse<'a> {
+    #[serde(flatten)]
+    install_code: &'a AgentInstallCode,
+    max_uses: u32,
+}
+
+pub async fn get_agent_batch_install_code(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    match issue_batch_install_code(&state.config, &state.store).await {
+        Ok((install_code, policy)) => {
+            log::info!(
+                "audit batch_install_code_issued tenant={} environment={} bundle={} ttl_seconds={} max_uses={} policy_source={}",
+                state.config.tenant_id,
+                state.config.environment_id,
+                install_code.bootstrap_bundle.bundle_id,
+                policy.ttl_seconds,
+                policy.max_uses,
+                if policy.from_setting {
+                    "setting"
+                } else {
+                    "deployment-config"
+                },
+            );
+            (
+                [(header::CACHE_CONTROL, NO_STORE)],
+                Json(BatchInstallCodeResponse {
+                    install_code: &install_code,
+                    max_uses: policy.max_uses,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => ApiError::internal(
+            codes::INSTALL_CODE_ISSUE_FAILED,
+            "failed to issue batch install code",
+            err,
+        )
+        .into_response(),
+    }
+}
+
+/// 作废当前仍可用的批量码：泄露时不必干等窗口到期（也用于运维主动收回）。
+///
+/// 只动同租户/环境下的 `batch-` 码；一次性安装码不受影响。旧码一旦吊销，
+/// 在途的注册会失败（预留过但未落库的那台需用新码重试）。
+#[derive(Debug, serde::Serialize)]
+pub struct RevokeBatchInstallCodeResponse {
+    /// 本次实际被吊销的张数（0 = 本来就没有可用批量码）。
+    pub revoked: u64,
+}
+
+pub async fn revoke_batch_install_code(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    match state
+        .store
+        .revoke_active_batch_enrollment_tokens(
+            &state.config.tenant_id,
+            &state.config.environment_id,
+            &now,
+        )
+        .await
+    {
+        Ok(revoked) => {
+            log::info!("audit batch_install_code_revoked count={revoked}");
+            (
+                [(header::CACHE_CONTROL, NO_STORE)],
+                Json(RevokeBatchInstallCodeResponse { revoked }),
+            )
+                .into_response()
+        }
+        Err(err) => ApiError::internal(
+            codes::BATCH_INSTALL_CODE_REVOKE_FAILED,
+            "failed to revoke batch install code",
             err,
         )
         .into_response(),
@@ -369,29 +474,119 @@ pub async fn issue_agent_install_code(
     config: &AdminConfig,
     store: &Arc<dyn Store>,
 ) -> Result<AgentInstallCode, String> {
+    issue_install_code(
+        config,
+        store,
+        config.bootstrap_token_ttl_seconds,
+        1,
+        "install",
+        "admin-api",
+        false,
+    )
+    .await
+}
+
+/// 批量安装码：同样是一张注册 token，只是**窗口内可多机且台数有上限**
+/// （`[agent] batch_bootstrap_ttl_seconds` / `batch_bootstrap_max_uses`，可在管理面改）。
+///
+/// 返回「安装码 + 本次生效的策略」：调用方（管理面响应 / 审计日志）需要把实际生效的
+/// 窗口与台数报给运维，不能各自再猜一次。
+pub async fn issue_batch_install_code(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+) -> Result<(AgentInstallCode, EffectiveBatchInstallPolicy), String> {
+    let policy = effective_batch_install_policy(config, store).await?;
+    let install_code = issue_install_code(
+        config,
+        store,
+        policy.ttl_seconds,
+        policy.max_uses,
+        "batch",
+        "admin-api:batch",
+        true,
+    )
+    .await?;
+    Ok((install_code, policy))
+}
+
+/// 批量安装码策略的生效值：管理面设置 → 部署配置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveBatchInstallPolicy {
+    pub ttl_seconds: i64,
+    pub max_uses: u32,
+    /// `true` = 来自管理面设置；`false` = 部署配置的默认值。
+    pub from_setting: bool,
+    pub updated_by: String,
+    pub updated_at: Option<String>,
+}
+
+/// 两个旋钮的合法范围（管理面写入校验与**读回防御**共用同一判据）。
+pub fn batch_install_policy_is_valid(ttl_seconds: i64, max_uses: u32) -> bool {
+    ttl_seconds > 0
+        && ttl_seconds <= MAX_BATCH_BOOTSTRAP_TOKEN_TTL_SECONDS
+        && max_uses > 0
+        && max_uses <= MAX_BATCH_BOOTSTRAP_MAX_USES
+}
+
+/// 生效的批量安装策略。
+///
+/// 库里存着越界值（被外部改过 / 旧版本写坏）时**回落到部署配置**（不直接放行）；
+/// 但**读库失败时返回 `Err`，由调用方拒绝签发** —— 这里不能像「对外地址」那样回落：
+/// 管理员可能把策略调得比部署默认更严（更短、更小），读不出来就默许用默认值
+/// 等于**把安全参数放宽**，宁可这次不发码。
+pub async fn effective_batch_install_policy(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+) -> Result<EffectiveBatchInstallPolicy, String> {
+    let from_config = || EffectiveBatchInstallPolicy {
+        ttl_seconds: config.batch_bootstrap_token_ttl_seconds,
+        max_uses: config.batch_bootstrap_max_uses,
+        from_setting: false,
+        updated_by: String::new(),
+        updated_at: None,
+    };
+    match store.get_agent_install_policy().await {
+        Ok(Some(policy))
+            if batch_install_policy_is_valid(policy.batch_ttl_seconds, policy.batch_max_uses) =>
+        {
+            Ok(EffectiveBatchInstallPolicy {
+                ttl_seconds: policy.batch_ttl_seconds,
+                max_uses: policy.batch_max_uses,
+                from_setting: true,
+                updated_by: policy.updated_by,
+                updated_at: Some(policy.updated_at),
+            })
+        }
+        Ok(Some(policy)) => {
+            log::warn!(
+                "warning: stored agent install policy out of bounds (ttl_seconds={} max_uses={}), \
+                 falling back to deployment config",
+                policy.batch_ttl_seconds,
+                policy.batch_max_uses,
+            );
+            Ok(from_config())
+        }
+        Ok(None) => Ok(from_config()),
+        Err(err) => Err(format!("failed to read agent install policy: {err}")),
+    }
+}
+
+async fn issue_install_code(
+    config: &AdminConfig,
+    store: &Arc<dyn Store>,
+    ttl_seconds: i64,
+    max_uses: u32,
+    token_id_prefix: &str,
+    issued_by: &str,
+    replace_active_batch: bool,
+) -> Result<AgentInstallCode, String> {
     let token = new_enrollment_token()?;
     let token_hash = token_hash(&token);
     let issued_at = chrono::Utc::now();
-    let expires_at = issued_at + chrono::Duration::seconds(config.bootstrap_token_ttl_seconds);
-    let stored = StoredEnrollmentToken {
-        token_id: format!("install-{}", short_token_id(&token)),
-        token_hash,
-        tenant_id: config.tenant_id.clone(),
-        environment_id: config.environment_id.clone(),
-        issued_by: "admin-api".to_string(),
-        allowed_node_selector: None,
-        max_uses: 1,
-        used_count: 0,
-        issued_at: issued_at.to_rfc3339(),
-        expires_at: expires_at.to_rfc3339(),
-        reserved_at: None,
-        revoked_at: None,
-        status: StoredEnrollmentTokenStatus::Active,
-    };
-    store
-        .insert_enrollment_token(&stored)
-        .await
-        .map_err(|err| err.to_string())?;
+    let expires_at = issued_at + chrono::Duration::seconds(ttl_seconds);
+    // 先确认这次真能发行（安装包地址可解析），再落 token：
+    // 否则一次注定失败的签发会留下一张死码 —— 对批量码还会把上一张也白白作废。
+    //
     // 分发地址恒为网关自身端点；管理面设置的是来源地址，制品已缓存到网关本地。
     // 基址取「网关对外地址」：安装命令、脚本与安装包的分发地址、以及 Agent 的控制面
     // endpoint 全部由它派生，必须同源。
@@ -402,6 +597,41 @@ pub async fn issue_agent_install_code(
             "没有可用的 agent 安装包：管理面未录入任何平台（或副本已不在）—— 到「安装包」页按平台录入"
                 .to_string(),
         );
+    }
+    let stored = StoredEnrollmentToken {
+        token_id: format!("{}-{}", token_id_prefix, short_token_id(&token)),
+        token_hash,
+        tenant_id: config.tenant_id.clone(),
+        environment_id: config.environment_id.clone(),
+        issued_by: issued_by.to_string(),
+        allowed_node_selector: None,
+        max_uses,
+        used_count: 0,
+        issued_at: issued_at.to_rfc3339(),
+        expires_at: expires_at.to_rfc3339(),
+        reserved_at: None,
+        revoked_at: None,
+        status: StoredEnrollmentTokenStatus::Active,
+    };
+    if replace_active_batch {
+        // 「生成新码即作废旧码」：吊销与插入在同一事务里，并发签发也不会留下两张可用码。
+        let revoked = store
+            .insert_batch_enrollment_token_replacing_active(
+                &stored,
+                &config.tenant_id,
+                &config.environment_id,
+                &issued_at.to_rfc3339(),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        if revoked > 0 {
+            log::info!("audit batch_install_code_replaced previous={revoked}");
+        }
+    } else {
+        store
+            .insert_enrollment_token(&stored)
+            .await
+            .map_err(|err| err.to_string())?;
     }
     Ok(agent_install_code(
         config, &token, expires_at, &packages, &base,

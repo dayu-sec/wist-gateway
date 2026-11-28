@@ -48,6 +48,13 @@ const ENV_DATABASE_URL: &str = "WIST_GATEWAY_DATABASE_URL";
 // entropy check in require_non_weak_admin_token (>= 8 alphanumeric chars).
 const MIN_ADMIN_API_TOKEN_BYTES: usize = 8;
 const MAX_BOOTSTRAP_TOKEN_TTL_SECONDS: i64 = 60 * 60;
+/// 批量安装码的有效期上限（秒）。它可在窗口内被多台主机复用，所以窗口必须短：
+/// 默认 60s，最多 10 分钟（再长就不该用「批量码」而该走逐台发放）。
+pub const MAX_BATCH_BOOTSTRAP_TOKEN_TTL_SECONDS: i64 = 60 * 10;
+/// 批量安装码的**注册台数上限**的允许配置上限。
+///
+/// 允许调大，但不能把它配成事实上的「无上限」（那等于把泄露时的爆炸半径又交回给时间窗口）。
+pub const MAX_BATCH_BOOTSTRAP_MAX_USES: u32 = 10_000;
 /// 采集日志单文件上限的下限。
 ///
 /// 必须**大于单次 append 的字节数**（内部接入端点 body 上限 4 MiB）：否则一批就能把文件顶到上限
@@ -95,6 +102,18 @@ pub struct AdminConfig {
     /// 犯的错，宁可起不来也不静默放行。
     pub self_face_allow: Vec<IpNet>,
     pub bootstrap_token_ttl_seconds: i64,
+    /// 批量安装码（`POST /api/v1/agent/install-code/batch`）的有效期（秒）。
+    ///
+    /// 与 [`Self::bootstrap_token_ttl_seconds`] 分开：一次性安装码可以有几分钟，
+    /// 而批量码**同一窗口里可装多台**，窗口本身就暴露面 —— 默认 60s，上限 600s。
+    pub batch_bootstrap_token_ttl_seconds: i64,
+    /// 批量安装码最多可注册多少台（`[agent] batch_bootstrap_max_uses`，默认 200）。
+    ///
+    /// 与有效期是**两个独立旋钮**：时间是窗口，次数是「泄露时最坏能加进来多少台」——
+    /// 两者都不限，等于把爆炸半径交给窗口长度。到上限后再拿这张码注册一律被拒，
+    /// 需重新生成（拒绝口径与其它 token 失败一致，不向外区分原因）。
+    /// 配成 1 时退化为一次性码语义（预留期间整张占用），但仍是短时的。
+    pub batch_bootstrap_max_uses: u32,
     pub credential_ttl_seconds: i64,
     /// 旧版单文件 JSON 存储路径：现在只作为「首次启动一次性导入」的来源。
     pub store_file: PathBuf,
@@ -585,6 +604,12 @@ struct RawServerConfig {
 struct RawAgentConfig {
     #[serde(default = "default_bootstrap_ttl_seconds")]
     bootstrap_ttl_seconds: i64,
+    /// 批量安装码有效期（秒）：一张 token 在窗口内可给多台新主机用。
+    #[serde(default = "default_batch_bootstrap_ttl_seconds")]
+    batch_bootstrap_ttl_seconds: i64,
+    /// 批量安装码最多可注册的台数（防泄露后的爆炸半径；`0` 不是合法取值）。
+    #[serde(default = "default_batch_bootstrap_max_uses")]
+    batch_bootstrap_max_uses: u32,
     #[serde(default = "default_credential_ttl_seconds")]
     credential_ttl_seconds: i64,
     #[serde(default = "default_store_file")]
@@ -794,6 +819,8 @@ impl AdminConfig {
                 })
                 .collect::<Result<Vec<IpNet>, ConfigError>>()?,
             bootstrap_token_ttl_seconds: raw.agent.bootstrap_ttl_seconds,
+            batch_bootstrap_token_ttl_seconds: raw.agent.batch_bootstrap_ttl_seconds,
+            batch_bootstrap_max_uses: raw.agent.batch_bootstrap_max_uses,
             credential_ttl_seconds: raw.agent.credential_ttl_seconds,
             store_file: absolutize_path(
                 config_dir,
@@ -991,6 +1018,25 @@ impl AdminConfig {
             "agent.bootstrap_ttl_seconds",
             self.bootstrap_token_ttl_seconds,
             MAX_BOOTSTRAP_TOKEN_TTL_SECONDS,
+        )?;
+        require_positive_seconds(
+            "agent.batch_bootstrap_ttl_seconds",
+            self.batch_bootstrap_token_ttl_seconds,
+        )?;
+        require_seconds_at_most(
+            "agent.batch_bootstrap_ttl_seconds",
+            self.batch_bootstrap_token_ttl_seconds,
+            MAX_BATCH_BOOTSTRAP_TOKEN_TTL_SECONDS,
+        )?;
+        if self.batch_bootstrap_max_uses == 0 {
+            return Err(config_validation(
+                "agent.batch_bootstrap_max_uses must be greater than 0".to_string(),
+            ));
+        }
+        require_count_at_most(
+            "agent.batch_bootstrap_max_uses",
+            self.batch_bootstrap_max_uses,
+            MAX_BATCH_BOOTSTRAP_MAX_USES,
         )?;
         require_positive_seconds("agent.credential_ttl_seconds", self.credential_ttl_seconds)?;
         require_positive_seconds(
@@ -1253,6 +1299,16 @@ fn default_bootstrap_ttl_seconds() -> i64 {
     900
 }
 
+/// 批量安装码默认只活 1 分钟：它是「同一分钟内批量首装」的凭据，不是站点级长期凭据。
+fn default_batch_bootstrap_ttl_seconds() -> i64 {
+    60
+}
+
+/// 批量安装码默认最多注册 200 台：覆盖常见的一批，又不把泄露时的爆炸半径交给窗口长度。
+fn default_batch_bootstrap_max_uses() -> u32 {
+    200
+}
+
 fn default_credential_ttl_seconds() -> i64 {
     30 * 24 * 60 * 60
 }
@@ -1507,6 +1563,15 @@ fn require_seconds_at_most(field: &str, value: i64, max: i64) -> Result<(), Conf
     )))
 }
 
+fn require_count_at_most(field: &str, value: u32, max: u32) -> Result<(), ConfigError> {
+    if value <= max {
+        return Ok(());
+    }
+    Err(config_validation(format!(
+        "{field} must be less than or equal to {max}"
+    )))
+}
+
 fn require_min_bytes(field: &str, value: u64, min: u64) -> Result<(), ConfigError> {
     if value < min {
         return Err(config_validation(format!(
@@ -1610,6 +1675,8 @@ pub(crate) fn config_for_tests(root: &Path) -> AdminConfig {
         admin_api_token_hash: sha256_hex("test-admin-token-0001"),
         self_face_allow: Vec::new(),
         bootstrap_token_ttl_seconds: 900,
+        batch_bootstrap_token_ttl_seconds: 60,
+        batch_bootstrap_max_uses: 200,
         credential_ttl_seconds: 30 * 24 * 60 * 60,
         store_file: root.join("state").join("admin-store.json"),
         database_url: None,
@@ -2337,6 +2404,130 @@ environment_id = "env-default"
 
         assert!(err.to_string().contains("agent.bootstrap_ttl_seconds"));
         assert!(err.to_string().contains("less than or equal to 3600"));
+        let _ = fs::remove_file(path);
+    }
+
+    /// 台数上限没配时默认 200：覆盖常见的一批，同时又不把泄露爆炸半径交给窗口长度。
+    #[test]
+    fn batch_bootstrap_max_uses_defaults_to_200() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[agent]
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+
+        assert_eq!(config.batch_bootstrap_max_uses, 200);
+        let _ = fs::remove_file(path);
+    }
+
+    /// `0` 不是「不限」的意思，而是一台也装不了 —— 不许配成这种无效状态。
+    #[test]
+    fn rejects_zero_batch_bootstrap_max_uses() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[agent]
+batch_bootstrap_max_uses = 0
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+
+        let err = AdminConfig::load_from_path(&path).expect_err("zero max_uses rejected");
+
+        assert!(err.to_string().contains("agent.batch_bootstrap_max_uses"));
+        assert!(err.to_string().contains("greater than 0"));
+        let _ = fs::remove_file(path);
+    }
+
+    /// 允许调大，但不允许配成事实上的「无上限」。
+    #[test]
+    fn rejects_excessive_batch_bootstrap_max_uses() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[agent]
+batch_bootstrap_max_uses = 10001
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+
+        let err = AdminConfig::load_from_path(&path).expect_err("excessive max_uses rejected");
+
+        assert!(err.to_string().contains("agent.batch_bootstrap_max_uses"));
+        assert!(err.to_string().contains("less than or equal to 10000"));
+        let _ = fs::remove_file(path);
+    }
+
+    /// 批量安装码没配时默认 60s：它是「同一分钟批量首装」的凭据，不该跟着一次性码走 900s。
+    #[test]
+    fn batch_bootstrap_ttl_defaults_to_one_minute() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[agent]
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+
+        let config = AdminConfig::load_from_path(&path).expect("config loads");
+
+        assert_eq!(config.batch_bootstrap_token_ttl_seconds, 60);
+        let _ = fs::remove_file(path);
+    }
+
+    /// 批量码可在窗口内多机复用，窗口本身就是暴露面 —— 超过 10 分钟拒启。
+    #[test]
+    fn rejects_long_batch_bootstrap_token_ttl() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3000"
+public_base_url = "https://127.0.0.1:3000"
+admin_api_token = "test-admin-token"
+
+[agent]
+batch_bootstrap_ttl_seconds = 601
+trust_bundle = "internal-ca-stub"
+tenant_id = "tenant-default"
+environment_id = "env-default"
+"#,
+        );
+
+        let err = AdminConfig::load_from_path(&path).expect_err("long batch ttl rejected");
+
+        assert!(
+            err.to_string()
+                .contains("agent.batch_bootstrap_ttl_seconds")
+        );
+        assert!(err.to_string().contains("less than or equal to 600"));
         let _ = fs::remove_file(path);
     }
 

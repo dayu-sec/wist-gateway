@@ -14,17 +14,20 @@ use crate::app::content::{MACHINE_CLASSES, platform_for_machine_class};
 use crate::app::work as work_rules;
 use crate::app::work::WorkRejection;
 use crate::infra::{
-    AgentQuery, DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID, DEFAULT_AGENT_UPLINK_PORT,
-    DEFAULT_AGENT_UPLINK_SETTING_ID, DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS,
-    DISCOVERY_SNAPSHOT_SCOPE_AGENT, DISCOVERY_SNAPSHOT_SCOPE_APPLIED,
-    DISCOVERY_SNAPSHOT_SCOPE_GLOBAL, StoredAgentAdvertiseUrl, StoredAgentClassification,
-    StoredAgentCommand, StoredAgentFactSummary, StoredAgentInstallPackage,
-    StoredAgentInstallPackageAddress, StoredAgentRevocation, StoredAgentUplinkAddress,
-    StoredDiscoverySnapshotSetting, StoredOneShotWork, StoredPurposeSuggestion, StoredWorkAck,
-    StoredWorkResult, contains_shell_metacharacters, effective_standing, outstanding_one_shot,
+    AgentQuery, DEFAULT_AGENT_ADVERTISE_URL_SETTING_ID, DEFAULT_AGENT_INSTALL_POLICY_SETTING_ID,
+    DEFAULT_AGENT_UPLINK_PORT, DEFAULT_AGENT_UPLINK_SETTING_ID,
+    DISCOVERY_SNAPSHOT_MIN_INTERVAL_SECONDS, DISCOVERY_SNAPSHOT_SCOPE_AGENT,
+    DISCOVERY_SNAPSHOT_SCOPE_APPLIED, DISCOVERY_SNAPSHOT_SCOPE_GLOBAL,
+    MAX_BATCH_BOOTSTRAP_MAX_USES, MAX_BATCH_BOOTSTRAP_TOKEN_TTL_SECONDS, StoredAgentAdvertiseUrl,
+    StoredAgentClassification, StoredAgentCommand, StoredAgentFactSummary,
+    StoredAgentInstallPackage, StoredAgentInstallPackageAddress, StoredAgentInstallPolicy,
+    StoredAgentRevocation, StoredAgentUplinkAddress, StoredDiscoverySnapshotSetting,
+    StoredOneShotWork, StoredPurposeSuggestion, StoredWorkAck, StoredWorkResult,
+    contains_shell_metacharacters, effective_standing, outstanding_one_shot,
 };
 use wist_contracts::work::{OneShotWork, StandingWork, WorkKind, WorkReceipt};
 
+use super::install::{EffectiveBatchInstallPolicy, batch_install_policy_is_valid};
 use super::install_package::{PackageFetchError, cache_verified_package, fetch_verified_package};
 use super::{ApiState, admin_auth::require_admin_bearer, error::ApiError, rate_limit};
 
@@ -274,6 +277,40 @@ pub struct AgentAdvertiseUrlResponse {
     pub updated_by: String,
     /// 未设置过时为 null。
     pub updated_at: Option<DateTime>,
+}
+
+/// 设置批量安装码策略的请求体。
+///
+/// 两个字段都**必填**：它们是一组策略，只改一个会让“我看到的值”和“实际生效的值”分家。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetAgentInstallPolicyRequest {
+    /// 批量码有效期（秒）。
+    pub batch_ttl_seconds: i64,
+    /// 批量码最多可注册台数。
+    pub batch_max_uses: u32,
+    pub requested_by: Option<String>,
+}
+
+/// 批量安装码策略的生效值视图。
+///
+/// `source=config` = 管理面没设置过，用的是部署配置的 `[agent] batch_bootstrap_*`。
+/// `limits` 把允许上限一并下发，页面做输入约束时不用再硬编码一份。
+#[derive(Debug, Serialize)]
+pub struct AgentInstallPolicyResponse {
+    pub batch_ttl_seconds: i64,
+    pub batch_max_uses: u32,
+    /// `setting` / `config`。
+    pub source: String,
+    pub updated_by: String,
+    /// 未设置过时为 null。
+    pub updated_at: Option<DateTime>,
+    pub limits: AgentInstallPolicyLimits,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentInstallPolicyLimits {
+    pub batch_ttl_seconds: i64,
+    pub batch_max_uses: u32,
 }
 
 /// 当前生效的发现方向策略表视图（管理面）。
@@ -3256,6 +3293,147 @@ fn validate_advertise_url(value: &str) -> Result<&str, String> {
         return Err("url must not contain whitespace or shell metacharacters".to_string());
     }
     Ok(url)
+}
+
+/// 批量安装码策略的生效值（管理面读）。
+///
+/// 与签发**同一套解析规则**（设置值优先、越界/未设置回落部署配置），但读库失败时
+/// 报 500 而不是静默回落 —— 页面要能分辨「没设置」和「设置读不出来」；
+/// 签发路径仍选择回落（见 `install::effective_batch_install_policy`）。
+pub async fn view_agent_install_policy(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let from_config = || EffectiveBatchInstallPolicy {
+        ttl_seconds: state.config.batch_bootstrap_token_ttl_seconds,
+        max_uses: state.config.batch_bootstrap_max_uses,
+        from_setting: false,
+        updated_by: String::new(),
+        updated_at: None,
+    };
+    match state.store.get_agent_install_policy().await {
+        Ok(Some(policy))
+            if batch_install_policy_is_valid(policy.batch_ttl_seconds, policy.batch_max_uses) =>
+        {
+            Json(install_policy_response(&EffectiveBatchInstallPolicy {
+                ttl_seconds: policy.batch_ttl_seconds,
+                max_uses: policy.batch_max_uses,
+                from_setting: true,
+                updated_by: policy.updated_by,
+                updated_at: Some(policy.updated_at),
+            }))
+            .into_response()
+        }
+        Ok(Some(policy)) => {
+            log::warn!(
+                "warning: stored agent install policy out of bounds (ttl_seconds={} max_uses={}), \
+                 reporting deployment config",
+                policy.batch_ttl_seconds,
+                policy.batch_max_uses,
+            );
+            Json(install_policy_response(&from_config())).into_response()
+        }
+        Ok(None) => Json(install_policy_response(&from_config())).into_response(),
+        Err(err) => ApiError::internal(
+            codes::AGENT_INSTALL_POLICY_UNAVAILABLE,
+            "failed to load agent install policy",
+            err,
+        )
+        .into_response(),
+    }
+}
+
+/// 设置批量安装码策略（管理面写）。
+///
+/// 只影响**之后签发**的批量码：已经发出去的那张按签发时的窗口 / 台数走，不会被改设置
+/// 提前作废，也不会被放宽。已安装的 agent 与本设置无关。
+pub async fn set_agent_install_policy(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    rate_limit::OptionalConnectInfo(client): rate_limit::OptionalConnectInfo,
+    Json(input): Json<SetAgentInstallPolicyRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Err(message) = validate_install_policy(input.batch_ttl_seconds, input.batch_max_uses) {
+        return ApiError::bad_request(codes::AGENT_INSTALL_POLICY_INVALID, message).into_response();
+    }
+    let stored = StoredAgentInstallPolicy {
+        setting_id: DEFAULT_AGENT_INSTALL_POLICY_SETTING_ID.to_string(),
+        batch_ttl_seconds: input.batch_ttl_seconds,
+        batch_max_uses: input.batch_max_uses,
+        updated_by: input
+            .requested_by
+            .unwrap_or_else(|| "platform-maintenance-engineer".to_string()),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match state.store.upsert_agent_install_policy(&stored).await {
+        Ok(()) => {
+            log::info!(
+                "audit agent_install_policy_updated by={} ttl_seconds={} max_uses={}",
+                stored.updated_by,
+                stored.batch_ttl_seconds,
+                stored.batch_max_uses,
+            );
+            Json(install_policy_response(&EffectiveBatchInstallPolicy {
+                ttl_seconds: stored.batch_ttl_seconds,
+                max_uses: stored.batch_max_uses,
+                from_setting: true,
+                updated_by: stored.updated_by,
+                updated_at: Some(stored.updated_at),
+            }))
+            .into_response()
+        }
+        Err(err) => ApiError::internal(
+            codes::AGENT_INSTALL_POLICY_STORE_FAILED,
+            "failed to store agent install policy",
+            err,
+        )
+        .into_response(),
+    }
+}
+
+/// 两个旋钮的范围校验（与配置层同一组上限，不在页面里另写一份）。
+fn validate_install_policy(ttl_seconds: i64, max_uses: u32) -> Result<(), String> {
+    if ttl_seconds <= 0 || ttl_seconds > MAX_BATCH_BOOTSTRAP_TOKEN_TTL_SECONDS {
+        return Err(format!(
+            "batch_ttl_seconds must be between 1 and {MAX_BATCH_BOOTSTRAP_TOKEN_TTL_SECONDS}"
+        ));
+    }
+    if max_uses == 0 || max_uses > MAX_BATCH_BOOTSTRAP_MAX_USES {
+        return Err(format!(
+            "batch_max_uses must be between 1 and {MAX_BATCH_BOOTSTRAP_MAX_USES}"
+        ));
+    }
+    Ok(())
+}
+
+fn install_policy_response(policy: &EffectiveBatchInstallPolicy) -> AgentInstallPolicyResponse {
+    AgentInstallPolicyResponse {
+        batch_ttl_seconds: policy.ttl_seconds,
+        batch_max_uses: policy.max_uses,
+        source: if policy.from_setting {
+            "setting".to_string()
+        } else {
+            "config".to_string()
+        },
+        updated_by: policy.updated_by.clone(),
+        updated_at: policy
+            .updated_at
+            .as_deref()
+            .and_then(DateTime::from_rfc3339),
+        limits: AgentInstallPolicyLimits {
+            batch_ttl_seconds: MAX_BATCH_BOOTSTRAP_TOKEN_TTL_SECONDS,
+            batch_max_uses: MAX_BATCH_BOOTSTRAP_MAX_USES,
+        },
+    }
 }
 
 /// 校验安装包地址与摘要。
