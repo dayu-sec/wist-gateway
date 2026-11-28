@@ -3,9 +3,73 @@
 本文件记录 `wist-gateway` 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.59.0-alpha] - 2026-11-28
+
+### 新增（容器指标独立面 `ContainerMetrics`）
+
+- 采集面词表新增 `ContainerMetrics`：容器运行指标（**每个容器**一条序列）。与 `HostMetrics` 的粒度
+  不同（整机 vs 每容器，与把 `ProcessMetrics` 拆出去同构），与 `ContainerWorkload`（容器 stdout 日志）
+  是完全不同的两类内容。
+- 来源 kind `ContainerMetrics`：`target` **只认 `auto`**（含空，兼容旧网关）—— 采哪些容器是本机发现的事实。
+  写容器 id / 运行时路径一律不可执行，页面给可操作原因而不是「未知类型」。
+- 预检白名单与派活求值同源：新单元的 `match` 用 `path_exists:` 判「这台机器有没有容器运行时」
+  （`/run/containerd`、`/var/run/containerd`、`/run/docker`、`/var/run/docker`），四条路径自动进探测白名单。
+- 旧 agent 未达 `min_agentd_version` 时单元在派下前就被裁掉（`agent_too_old`），不会派下去再报 unsupported。
+
+### 变化（采集状态：空集不是故障）
+
+- 指标域的 `idle` 且**本机说不出原因** → `no_targets`（信息级），不再把整面拉成「部分失败」。
+  一台没跑容器的机器不再因为「容器指标零目标」被判成采集有问题。
+- `idle` 但**带原因**（关键进程签名一条没命中 / 容器运行时读不了）仍算 `target_not_ready`，
+  并把这句原因带到管理面 —— 「授权了为什么没数据」能直接看到。
+
+### 新增（导出器运行参数由知识库下发）
+
+- 新端点 `POST /api/v1/agent/exporter-policy:poll`：下发导出器二进制的**搜索目录**（按平台）
+  与可选周期/超时覆盖，数据在 `wist-knowledge` 的 `exporters.toml`。
+- 装载时校验，不过则**整份拒载**（宁可不采，也不按半份坏策略跑）：`id` 必须在契约
+  `EXPORTER_IDS` 闭集里（数据引入不了新命令）；`bin_dirs` 必须是绝对路径、不含 `..`、
+  且落在网关的系统目录白名单内；`period_secs` / `timeout_secs` 在上下界内。
+- 旧包没有 `exporters.toml` 照常工作（端点回“无策略”，agentd 用内置目录表）；
+  旧 agentd 从不调这个端点。
 
 ### 新增（批量安装码：一分钟内可给多台新主机首装）
+
+- 管理面新增 `POST /api/v1/agent/install-code/batch`：签发**短时、窗口内可复用**的注册码
+  （默认 60s，`[agent] batch_bootstrap_ttl_seconds`，上限 600s）。窗口到点即失效，
+  每次显式签发 —— 不是站点级长期共享凭据。
+- 批量码另设**注册台数上限** `[agent] batch_bootstrap_max_uses`（默认 200，上限 10000，
+  `0` 非法）：时间与次数是两个独立旋钮 —— 泄露时最坏能加进来多少台不再随窗口长度放大。
+  到上限后同窗口内再注册一律拒（对外口径与其它 token 失败一致），需重新生成。
+  响应在 `AgentInstallCode` 全字段之外**追加** `max_uses`，供页面显示台数上限。
+- 两个旋钮可在**管理面**当场调整（`GET/POST /api/v1/admin/agent/install-policy`），
+  不必改配置文件 + 重启：只影响之后签发的批量码，已发出的码按签发时的窗口/台数走。
+  `[agent] batch_bootstrap_*` 仍是**部署默认值**；未在管理面设置过时生效值回落到它们。
+  响应带 `source`（`setting` / `config`）与 `limits`，页面据此显示来源并做输入约束。
+  库里越界的策略行（被外部改坏）不放行，回落部署配置；**策略读不出来时拒绝签发**
+  （fail-closed）—— 否则管理员把策略调严后，一次读失败会按可能更宽的部署默认发码。
+- 批量码支持**主动作废**与**替换**：`POST /api/v1/agent/install-code/batch/revoke`
+  立即吊销同租户/环境下仍可用的批量码（泄露时不必干等窗口）；签发新码时也会**原子替换**旧码
+  （吊销与插入同一事务，并发签发不会留下两张可用码）。一次性安装码不受影响；
+  包地址解析失败时不会作废旧码（先确认能发行，再替换）。
+- 安装页新增「批量安装」模式：点一下生成、显示剩余秒数，三种架构命令复用同一张 token；
+  批量模式**不会**在页面打开时自动签发（短时码的寿命不该烧在等用户复制上）。
+- 注册 token 的预留语义按用途分开：一次性码（`max_uses = 1`）仍整张占用（`Reserved`）；
+  多用途码预留时保持 `Active`，容量靠 `used_count` 逐次计数。否则同一窗口内第一台在途时，
+  其它机器连取配置/取包都会被一起拒掉（`validate` 只认 `Active`），批量安装根本装不起来。
+  失败回滚对两种码都只归还一笔。
+
+### 变更（依赖）
+
+- 升 `wist-contracts 0.16.1`（`ContainerMetrics` 来源与 `metric_domain()`）；
+  `api 0.15` / `metrics 0.22` / `validate 0.14` 本版未动（`^0.16` 可解析到 0.16.1）。
+
+### 升级注意
+
+- 先升网关（本版），再升 agentd（≥ 0.45.0），最后才录入/激活带 `ContainerMetrics` 单元的知识库包。
+  旧网关遇到未知来源 kind 会把整个单元判成不可采 —— 不会坏事，但容器指标面暂时不出现。
+
+## [0.58.2-alpha] - 2026-11-27
 
 - 管理面新增 `POST /api/v1/agent/install-code/batch`：签发**短时、窗口内可复用**的注册码
   （默认 60s，`[agent] batch_bootstrap_ttl_seconds`，上限 600s）。窗口到点即失效，
