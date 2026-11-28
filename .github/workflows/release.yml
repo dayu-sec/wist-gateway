@@ -8,8 +8,63 @@ permissions:
   contents: read
 
 jobs:
+  # 0. 发版前先把测试跑完：**测试不过就不发二进制、不推镜像**。
+  #
+  # 为什么 release.yml 自己也要跑一遍：`build-and-test.yml` 是**另一个 workflow**，
+  # 它的红拦不住本 workflow。2026-11-28 事故：`v0.59.0-alpha` 的 Build & Test 红着
+  # （跨仓检出到旧知识库/旧模型），镜像和制品都已经发出去了。
+  #
+  # 跨仓检出必须与 `build-and-test.yml` **完全同口径** —— 否则这里会因“缺兄弟仓”而假红：
+  # tag 推的 `github.ref_name` 是 `vX.Y.Z[-alpha|-beta]`，归一后 alpha，与分支面一致。
+  test:
+    name: Test before publishing
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout wist-gateway
+        uses: actions/checkout@v7
+        with:
+          path: wist-gateway
+
+      - name: Resolve cross-repo channel
+        id: channel
+        run: |
+          ref="${{ github.base_ref || github.ref_name }}"
+          case "${ref}" in
+            main | beta) ;;
+            *) ref=alpha ;;
+          esac
+          echo "knowledge_ref=${ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout wist-knowledge（策展知识）
+        uses: actions/checkout@v7
+        with:
+          repository: dayu-sec/wist-knowledge
+          ref: ${{ steps.channel.outputs.knowledge_ref }}
+          path: wist-knowledge
+
+      - name: Checkout wist-design（jumo 模型）
+        uses: actions/checkout@v7
+        with:
+          repository: dayu-sec/wist-design
+          ref: main
+          path: wist-design
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cargo fmt
+        working-directory: wist-gateway
+        run: cargo fmt --check
+
+      # 与 `build-and-test.yml` 同口径（`--release --all`）：**不要**用 `--lib` 子集。
+      - name: Cargo test
+        working-directory: wist-gateway
+        run: cargo test --release --all
+
   # 1. 按平台原生编译二进制，产出 tarball（直接下载 + 供 Docker 镜像用）
   build-binaries:
+    needs: [test]
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -57,7 +112,7 @@ jobs:
   #   · 一个架构失败会拖死整条链；拆开 + `fail-fast: false` 时另一份照常产出。
   # manifest list 由下面的 `manifest` job 合并。
   docker:
-    needs: [build-binaries]
+    needs: [build-binaries, test]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -182,7 +237,7 @@ jobs:
 
   # 4. 发布 tarball 到 GitHub Release
   release:
-    needs: [build-binaries]
+    needs: [build-binaries, test]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
